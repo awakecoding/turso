@@ -18,6 +18,7 @@
     "@tursodatabase/cli-darwin-x64": "0.6.0-pre.24",
     "@tursodatabase/cli-linux-arm64-gnu": "0.6.0-pre.24",
     "@tursodatabase/cli-linux-x64-gnu": "0.6.0-pre.24",
+    "@tursodatabase/cli-win32-arm64-msvc": "0.6.0-pre.24",
     "@tursodatabase/cli-win32-x64-msvc": "0.6.0-pre.24"
   }
 }
