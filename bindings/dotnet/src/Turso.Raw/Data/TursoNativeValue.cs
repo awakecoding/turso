@@ -6,9 +6,9 @@ namespace Turso.Raw.Data;
 [StructLayout(LayoutKind.Explicit)]
 internal ref struct TursoNativeValue
 {
-    [FieldOffset(0)] 
+    [FieldOffset(0)]
     public TursoValueType ValueType;
 
-    [FieldOffset(8)] 
+    [FieldOffset(8)]
     public TursoNativeRowValueUnion RowValueUnion;
 }
