@@ -7,7 +7,10 @@ use std::slice;
 use std::sync::Arc;
 use turso_core::types::Text;
 use turso_core::{
-    self, Connection, DatabaseOpts, EncryptionOpts, LimboError, OpenFlags, Statement, Value, IO,
+    self, Connection, ContextAggregateFinalFunction, ContextAggregateInitFunction,
+    ContextAggregateStepFunction, ContextCollationFunction, ContextDestructor,
+    ContextScalarFunction, ContextValueDestructor, DatabaseOpts, EncryptionOpts, LimboError,
+    OpenFlags, Statement, Value, IO,
 };
 
 type Error = *const std::ffi::c_char;
@@ -250,6 +253,269 @@ pub unsafe extern "C" fn db_close(db_ptr: *mut Database) {
     let _ = unsafe { Box::from_raw(db_ptr) };
 }
 
+/// Registers a connection-local scalar function callback.
+///
+/// # Safety
+///
+/// - `db_ptr` must not be null and must point to a database returned by `db_open`.
+/// - `name_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - `callback` must be a valid function pointer for the lifetime of the process.
+/// - `context` is owned by the registered function after this call succeeds.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn db_register_scalar_function(
+    db_ptr: *mut Database,
+    name_ptr: *const c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: Option<ContextScalarFunction>,
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ContextValueDestructor>,
+    error_ptr: *mut Error,
+) -> bool {
+    if db_ptr.is_null() || name_ptr.is_null() || error_ptr.is_null() {
+        return false;
+    }
+    let Some(callback) = callback else {
+        unsafe { *error_ptr = allocate_string("Missing scalar callback") };
+        return false;
+    };
+    let name = match unsafe { CStr::from_ptr(name_ptr) }.to_str() {
+        Ok(name) => name.to_string(),
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid function name: {err}").as_str())
+            };
+            return false;
+        }
+    };
+    let db = unsafe { &mut (*db_ptr) };
+    db.connection.register_external_scalar_function(
+        name,
+        argc,
+        deterministic,
+        context,
+        callback,
+        context_destructor,
+        value_destructor,
+    );
+    true
+}
+
+/// Registers a connection-local aggregate function callback.
+///
+/// # Safety
+///
+/// - `db_ptr` must not be null and must point to a database returned by `db_open`.
+/// - `name_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - `init`, `step`, and `finalize` must be valid function pointers for the lifetime of the process.
+/// - `context` is owned by the registered function after this call succeeds.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn db_register_aggregate_function(
+    db_ptr: *mut Database,
+    name_ptr: *const c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    init: Option<ContextAggregateInitFunction>,
+    step: Option<ContextAggregateStepFunction>,
+    finalize: Option<ContextAggregateFinalFunction>,
+    context_destructor: Option<ContextDestructor>,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ContextValueDestructor>,
+    error_ptr: *mut Error,
+) -> bool {
+    if db_ptr.is_null() || name_ptr.is_null() || error_ptr.is_null() {
+        return false;
+    }
+    let (Some(init), Some(step), Some(finalize)) = (init, step, finalize) else {
+        unsafe { *error_ptr = allocate_string("Missing aggregate callback") };
+        return false;
+    };
+    let name = match unsafe { CStr::from_ptr(name_ptr) }.to_str() {
+        Ok(name) => name.to_string(),
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid function name: {err}").as_str())
+            };
+            return false;
+        }
+    };
+    let db = unsafe { &mut (*db_ptr) };
+    db.connection.register_external_aggregate_function(
+        name,
+        argc,
+        deterministic,
+        context,
+        init,
+        step,
+        finalize,
+        context_destructor,
+        aggregate_destructor,
+        value_destructor,
+    );
+    true
+}
+
+/// Removes a connection-local scalar or aggregate function.
+///
+/// # Safety
+///
+/// - `db_ptr` must not be null and must point to a database returned by `db_open`.
+/// - `name_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn db_unregister_function(
+    db_ptr: *mut Database,
+    name_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> bool {
+    if db_ptr.is_null() || name_ptr.is_null() || error_ptr.is_null() {
+        return false;
+    }
+    let name = match unsafe { CStr::from_ptr(name_ptr) }.to_str() {
+        Ok(name) => name,
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid function name: {err}").as_str())
+            };
+            return false;
+        }
+    };
+    let db = unsafe { &mut (*db_ptr) };
+    db.connection.unregister_external_function(name);
+    true
+}
+
+/// Registers a connection-local collation callback.
+///
+/// # Safety
+///
+/// - `db_ptr` must not be null and must point to a database returned by `db_open`.
+/// - `name_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - `callback` must be a valid function pointer for the lifetime of the process.
+/// - `context` is owned by the registered collation after this call succeeds.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn db_register_collation(
+    db_ptr: *mut Database,
+    name_ptr: *const c_char,
+    context: usize,
+    callback: Option<ContextCollationFunction>,
+    context_destructor: Option<ContextDestructor>,
+    error_ptr: *mut Error,
+) -> bool {
+    if db_ptr.is_null() || name_ptr.is_null() || error_ptr.is_null() {
+        return false;
+    }
+    let Some(callback) = callback else {
+        unsafe { *error_ptr = allocate_string("Missing collation callback") };
+        return false;
+    };
+    let name = match unsafe { CStr::from_ptr(name_ptr) }.to_str() {
+        Ok(name) => name.to_string(),
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid collation name: {err}").as_str())
+            };
+            return false;
+        }
+    };
+    let db = unsafe { &mut (*db_ptr) };
+    db.connection
+        .register_external_collation(name, context, callback, context_destructor);
+    true
+}
+
+/// Removes a connection-local collation.
+///
+/// # Safety
+///
+/// - `db_ptr` must not be null and must point to a database returned by `db_open`.
+/// - `name_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn db_unregister_collation(
+    db_ptr: *mut Database,
+    name_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> bool {
+    if db_ptr.is_null() || name_ptr.is_null() || error_ptr.is_null() {
+        return false;
+    }
+    let name = match unsafe { CStr::from_ptr(name_ptr) }.to_str() {
+        Ok(name) => name,
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid collation name: {err}").as_str())
+            };
+            return false;
+        }
+    };
+    let db = unsafe { &mut (*db_ptr) };
+    db.connection.unregister_external_collation(name);
+    true
+}
+
+/// Enables or disables SQL load_extension() for this connection.
+///
+/// # Safety
+///
+/// - `db_ptr` must not be null and must point to a database returned by `db_open`.
+#[no_mangle]
+pub unsafe extern "C" fn db_enable_load_extension(db_ptr: *mut Database, enabled: bool) -> bool {
+    if db_ptr.is_null() {
+        return false;
+    }
+    let db = unsafe { &mut (*db_ptr) };
+    db.connection.set_load_extension_enabled(enabled);
+    true
+}
+
+/// Loads an extension library on this connection.
+///
+/// # Safety
+///
+/// - `db_ptr` must not be null and must point to a database returned by `db_open`.
+/// - `path_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn db_load_extension(
+    db_ptr: *mut Database,
+    path_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> bool {
+    if db_ptr.is_null() || path_ptr.is_null() || error_ptr.is_null() {
+        return false;
+    }
+    let path = match unsafe { CStr::from_ptr(path_ptr) }.to_str() {
+        Ok(path) => path,
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid extension path: {err}").as_str())
+            };
+            return false;
+        }
+    };
+    let ext = match turso_core::resolve_ext_path(path) {
+        Ok(ext) => ext,
+        Err(err) => {
+            unsafe { *error_ptr = allocate_string(err.to_string().as_str()) };
+            return false;
+        }
+    };
+    let db = unsafe { &mut (*db_ptr) };
+    match db.connection.load_extension(ext) {
+        Ok(()) => true,
+        Err(err) => {
+            unsafe { *error_ptr = allocate_string(err.to_string().as_str()) };
+            false
+        }
+    }
+}
+
 /// Frees a null-terminated string previously allocated by this library.
 ///
 /// # Safety
@@ -323,7 +589,7 @@ pub unsafe extern "C" fn bind_named_parameter(
     statement_ptr: *mut Statement,
     parameter_name: *const c_char,
     parameter_value: *const TursoValue,
-) {
+) -> i32 {
     let statement = unsafe { &mut (*statement_ptr) };
     let parameter_name = unsafe { CStr::from_ptr(parameter_name) }.to_str().unwrap();
 
@@ -335,8 +601,45 @@ pub unsafe extern "C" fn bind_named_parameter(
         };
         if parameter_name == name {
             statement.bind_at(non_zero_idx, to_value(*parameter_value));
-            return;
+            return idx as i32;
         }
+    }
+    0
+}
+
+/// Returns the number of bind parameters in the statement.
+///
+/// # Safety
+///
+/// - `statement_ptr` must not be null.
+#[no_mangle]
+pub unsafe extern "C" fn db_statement_parameter_count(statement_ptr: *mut Statement) -> i32 {
+    let statement = unsafe { &mut (*statement_ptr) };
+    statement.parameters_count().try_into().unwrap()
+}
+
+/// Gets the bind parameter name at the specified 1-based index.
+///
+/// # Safety
+///
+/// - `statement_ptr` must not be null.
+/// - `index` must be >= 1 and <= `db_statement_parameter_count`.
+/// - The returned string must be freed with `free_string` when not null.
+#[no_mangle]
+pub unsafe extern "C" fn db_statement_parameter_name(
+    statement_ptr: *mut Statement,
+    index: i32,
+) -> *const std::ffi::c_char {
+    if statement_ptr.is_null() || index < 1 {
+        return null();
+    }
+    let statement = unsafe { &mut (*statement_ptr) };
+    let Some(non_zero_idx) = NonZero::new(index as usize) else {
+        return null();
+    };
+    match statement.parameters().name(non_zero_idx) {
+        Some(name) => allocate_string(&name),
+        None => null(),
     }
 }
 

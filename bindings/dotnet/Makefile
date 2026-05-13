@@ -39,6 +39,7 @@ build-rust:
 
 build-dotnet:
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso/Turso.csproj
+	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
 
 build: build-rust build-dotnet
 
@@ -53,7 +54,7 @@ benchmark: build-production
 
 pack:
 	dotnet build -c Release ./src/Turso.Raw/Turso.Raw.csproj
-	dotnet build -c Release ./src/Turso.Raw/Turso.Raw.csproj
 	
 	dotnet pack -c Release ./src/Turso.Raw/Turso.Raw.csproj
 	dotnet pack -c Release ./src/Turso/Turso.csproj
+	dotnet pack -c Release ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
