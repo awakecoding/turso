@@ -3913,7 +3913,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             });
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            collation = Some(CollationSeq::new(collation_name.as_str())?);
+                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                            if collation_seq.is_custom() {
+                                crate::bail_parse_error!(
+                                    "custom collations are not supported in schema definitions"
+                                );
+                            }
+                            collation = Some(collation_seq);
                         }
                         ast::ColumnConstraint::ForeignKey {
                             clause,
@@ -4477,7 +4483,7 @@ impl Column {
         let mut raw = 0u16;
         raw |= (ty as u16) << TYPE_SHIFT;
         if let Some(c) = col {
-            raw |= (c as u16) << COLL_SHIFT;
+            raw |= (c.to_bits() as u16) << COLL_SHIFT;
         }
         if coldef.primary_key {
             raw |= F_PRIMARY_KEY
@@ -4534,13 +4540,13 @@ impl Column {
     #[inline]
     pub const fn has_explicit_collation(&self) -> bool {
         let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
-        v != CollationSeq::Unset as u8
+        v != CollationSeq::Unset.to_bits()
     }
 
     #[inline]
     pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
         if let Some(c) = c {
-            self.raw = (self.raw & !COLL_MASK) | (((c as u16) << COLL_SHIFT) & COLL_MASK);
+            self.raw = (self.raw & !COLL_MASK) | (((c.to_bits() as u16) << COLL_SHIFT) & COLL_MASK);
         }
     }
 
@@ -4699,7 +4705,13 @@ impl TryFrom<&ColumnDefinition> for Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    collation.replace(CollationSeq::new(collation_name.as_str())?);
+                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                    if collation_seq.is_custom() {
+                        crate::bail_parse_error!(
+                            "custom collations are not supported in schema definitions"
+                        );
+                    }
+                    collation.replace(collation_seq);
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
                     generated = Some(expr.clone());
@@ -5064,7 +5076,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -5081,6 +5093,10 @@ impl Index {
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
             Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
+                || resolver
+                    .symbol_table
+                    .resolve_function(&n, argc)
+                    .is_some_and(|f| f.is_deterministic())
         };
 
         let mut ok = true;

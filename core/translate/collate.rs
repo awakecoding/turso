@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, str::FromStr as _};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
+    sync::{Mutex, OnceLock},
+};
 
 use turso_parser::ast::Expr;
 
@@ -10,46 +15,150 @@ use crate::{
     Result,
 };
 
-// TODO: in the future allow user to define collation sequences
-// Will have to meddle with ffi for this
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum_macros::Display, strum_macros::EnumString, Default,
-)]
-#[strum(ascii_case_insensitive)]
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
-#[repr(u8)]
-pub enum CollationSeq {
-    Unset = 0,
-    #[default]
-    Binary = 1,
-    NoCase = 2,
-    Rtrim = 3,
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct CollationSeq(u32);
+
+#[derive(Default)]
+struct CustomCollations {
+    by_name: HashMap<String, u32>,
+    by_id: HashMap<u32, String>,
+    active: HashSet<u32>,
 }
 
+static CUSTOM_COLLATIONS: OnceLock<Mutex<CustomCollations>> = OnceLock::new();
+
 impl CollationSeq {
+    #[allow(non_upper_case_globals)]
+    pub const Unset: Self = Self(0);
+    #[allow(non_upper_case_globals)]
+    pub const Binary: Self = Self(1);
+    #[allow(non_upper_case_globals)]
+    pub const NoCase: Self = Self(2);
+    #[allow(non_upper_case_globals)]
+    pub const Rtrim: Self = Self(3);
+
     pub fn new(collation: &str) -> crate::Result<Self> {
-        CollationSeq::from_str(collation).map_err(|_| {
-            crate::LimboError::ParseError(format!("no such collation sequence: {collation}"))
-        })
+        match crate::util::normalize_ident(collation).as_str() {
+            "binary" => Ok(Self::Binary),
+            "nocase" => Ok(Self::NoCase),
+            "rtrim" => Ok(Self::Rtrim),
+            _ => Self::active_custom(collation).ok_or_else(|| {
+                crate::LimboError::ParseError(format!("no such collation sequence: {collation}"))
+            }),
+        }
     }
+
     #[inline]
     /// Returns the collation, defaulting to BINARY if unset
     pub const fn from_bits(bits: u8) -> Self {
         match bits {
-            2 => CollationSeq::NoCase,
-            3 => CollationSeq::Rtrim,
-            _ => CollationSeq::Binary,
+            2 => Self::NoCase,
+            3 => Self::Rtrim,
+            _ => Self::Binary,
+        }
+    }
+
+    #[inline]
+    pub const fn to_bits(self) -> u8 {
+        match self.0 {
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    pub const fn id(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_custom(self) -> bool {
+        self.0 > 3
+    }
+
+    pub fn custom(collation: &str) -> Self {
+        let normalized = crate::util::normalize_ident(collation);
+        let registry = CUSTOM_COLLATIONS.get_or_init(|| Mutex::new(CustomCollations::default()));
+        let mut registry = registry.lock().expect("custom collation registry poisoned");
+        if let Some(id) = registry.by_name.get(&normalized) {
+            return Self(*id);
+        }
+
+        let mut id = custom_collation_id(&normalized);
+        while id <= 3 || registry.by_id.contains_key(&id) {
+            id = id.wrapping_add(1).max(4);
+        }
+
+        registry.by_name.insert(normalized, id);
+        registry.by_id.insert(id, collation.to_string());
+        Self(id)
+    }
+
+    pub fn register_custom(collation: &str) -> Self {
+        let collation = Self::custom(collation);
+        let registry = CUSTOM_COLLATIONS.get_or_init(|| Mutex::new(CustomCollations::default()));
+        registry
+            .lock()
+            .expect("custom collation registry poisoned")
+            .active
+            .insert(collation.id());
+        collation
+    }
+
+    pub fn unregister_custom(collation: &str) -> Option<Self> {
+        let collation = Self::known_custom(collation)?;
+        let registry = CUSTOM_COLLATIONS.get_or_init(|| Mutex::new(CustomCollations::default()));
+        registry
+            .lock()
+            .expect("custom collation registry poisoned")
+            .active
+            .remove(&collation.id());
+        Some(collation)
+    }
+
+    fn active_custom(collation: &str) -> Option<Self> {
+        let collation = Self::known_custom(collation)?;
+        let registry = CUSTOM_COLLATIONS.get_or_init(|| Mutex::new(CustomCollations::default()));
+        registry
+            .lock()
+            .expect("custom collation registry poisoned")
+            .active
+            .contains(&collation.id())
+            .then_some(collation)
+    }
+
+    fn known_custom(collation: &str) -> Option<Self> {
+        let normalized = crate::util::normalize_ident(collation);
+        CUSTOM_COLLATIONS
+            .get()
+            .and_then(|registry| registry.lock().ok()?.by_name.get(&normalized).copied())
+            .map(Self)
+    }
+
+    pub fn name(self) -> String {
+        match self.0 {
+            0 | 1 => "Binary".to_string(),
+            2 => "NoCase".to_string(),
+            3 => "RTrim".to_string(),
+            id => CUSTOM_COLLATIONS
+                .get()
+                .and_then(|registry| registry.lock().ok()?.by_id.get(&id).cloned())
+                .unwrap_or_else(|| format!("collation_{id}")),
         }
     }
 
     #[inline(always)]
     pub fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
-        match self {
-            CollationSeq::Unset | CollationSeq::Binary => Self::binary_cmp(lhs, rhs),
-            CollationSeq::NoCase => Self::nocase_cmp(lhs, rhs),
-            CollationSeq::Rtrim => Self::rtrim_cmp(lhs, rhs),
+        match *self {
+            Self::Unset | Self::Binary => Self::binary_cmp(lhs, rhs),
+            Self::NoCase => Self::nocase_cmp(lhs, rhs),
+            Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
+            _ => Self::binary_cmp(lhs, rhs),
         }
     }
 
@@ -69,6 +178,24 @@ impl CollationSeq {
     fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
         lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
     }
+}
+
+impl Default for CollationSeq {
+    fn default() -> Self {
+        Self::Binary
+    }
+}
+
+impl std::fmt::Display for CollationSeq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name())
+    }
+}
+
+fn custom_collation_id(name: &str) -> u32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    ((hasher.finish() as u32) & 0x7fff_fffc).max(4)
 }
 
 /// Every column of every table has an associated collating function. If no collating function is explicitly defined,
