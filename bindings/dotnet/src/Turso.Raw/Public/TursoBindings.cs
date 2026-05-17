@@ -51,6 +51,128 @@ public static class TursoBindings
         return TursoStatementHandle.FromPtr(statementPtr);
     }
 
+    public static void RegisterScalarFunction(
+        TursoDatabaseHandle db,
+        string name,
+        int argc,
+        bool deterministic,
+        IntPtr context,
+        TursoScalarFunctionCallback callback,
+        TursoContextDestructorCallback contextDestructor,
+        TursoValueDestructorCallback valueDestructor)
+    {
+        db.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(callback);
+        ArgumentNullException.ThrowIfNull(contextDestructor);
+        ArgumentNullException.ThrowIfNull(valueDestructor);
+
+        _ = TursoInterop.RegisterScalarFunction(
+            db,
+            name,
+            argc,
+            deterministic,
+            context,
+            callback,
+            contextDestructor,
+            valueDestructor,
+            out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            ThrowException(errorPtr);
+    }
+
+    public static void RegisterAggregateFunction(
+        TursoDatabaseHandle db,
+        string name,
+        int argc,
+        bool deterministic,
+        IntPtr context,
+        TursoAggregateInitCallback init,
+        TursoAggregateStepCallback step,
+        TursoAggregateFinalCallback finalize,
+        TursoContextDestructorCallback contextDestructor,
+        TursoContextDestructorCallback aggregateDestructor,
+        TursoValueDestructorCallback valueDestructor)
+    {
+        db.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(init);
+        ArgumentNullException.ThrowIfNull(step);
+        ArgumentNullException.ThrowIfNull(finalize);
+        ArgumentNullException.ThrowIfNull(contextDestructor);
+        ArgumentNullException.ThrowIfNull(aggregateDestructor);
+        ArgumentNullException.ThrowIfNull(valueDestructor);
+
+        _ = TursoInterop.RegisterAggregateFunction(
+            db,
+            name,
+            argc,
+            deterministic,
+            context,
+            init,
+            step,
+            finalize,
+            contextDestructor,
+            aggregateDestructor,
+            valueDestructor,
+            out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            ThrowException(errorPtr);
+    }
+
+    public static void UnregisterFunction(TursoDatabaseHandle db, string name)
+    {
+        db.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(name);
+
+        _ = TursoInterop.UnregisterFunction(db, name, out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            ThrowException(errorPtr);
+    }
+
+    public static void RegisterCollation(
+        TursoDatabaseHandle db,
+        string name,
+        IntPtr context,
+        TursoCollationCallback callback,
+        TursoContextDestructorCallback contextDestructor)
+    {
+        db.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(callback);
+        ArgumentNullException.ThrowIfNull(contextDestructor);
+
+        _ = TursoInterop.RegisterCollation(db, name, context, callback, contextDestructor, out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            ThrowException(errorPtr);
+    }
+
+    public static void UnregisterCollation(TursoDatabaseHandle db, string name)
+    {
+        db.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(name);
+
+        _ = TursoInterop.UnregisterCollation(db, name, out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            ThrowException(errorPtr);
+    }
+
+    public static void EnableLoadExtension(TursoDatabaseHandle db, bool enabled)
+    {
+        db.ThrowIfInvalid();
+        TursoInterop.EnableLoadExtension(db, enabled);
+    }
+
+    public static void LoadExtension(TursoDatabaseHandle db, string path)
+    {
+        db.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(path);
+
+        _ = TursoInterop.LoadExtension(db, path, out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            ThrowException(errorPtr);
+    }
+
     public static void BindParameter(TursoStatementHandle statement, int index, TursoValue parameter)
     {
         statement.ThrowIfInvalid();
@@ -72,7 +194,7 @@ public static class TursoBindings
         }
     }
 
-    public static void BindNamedParameter(TursoStatementHandle statement, string name, TursoValue parameter)
+    public static int BindNamedParameter(TursoStatementHandle statement, string name, TursoValue parameter)
     {
         statement.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(name);
@@ -83,7 +205,7 @@ public static class TursoBindings
             unsafe
             {
                 var ptr = &nativeValue;
-                TursoInterop.BindNamedParameter(statement, name, (IntPtr)ptr);
+                return TursoInterop.BindNamedParameter(statement, name, (IntPtr)ptr);
             }
         }
         finally
@@ -160,6 +282,32 @@ public static class TursoBindings
         return TursoInterop.StatementHasRows(statement);
     }
 
+    public static int GetParameterCount(TursoStatementHandle statement)
+    {
+        statement.ThrowIfInvalid();
+
+        return TursoInterop.StatementParameterCount(statement);
+    }
+
+    public static string? GetParameterName(TursoStatementHandle statement, int index)
+    {
+        statement.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(index);
+
+        var name = TursoInterop.StatementParameterName(statement, index);
+        if (name == IntPtr.Zero)
+            return null;
+
+        try
+        {
+            return Marshal.PtrToStringUTF8(name);
+        }
+        finally
+        {
+            TursoInterop.FreeString(name);
+        }
+    }
+
 
     private static TursoNativeValue FromValue(TursoValue value, out GCHandle? handle)
     {
@@ -174,14 +322,14 @@ public static class TursoBindings
             var bytes = Encoding.UTF8.GetBytes(value.StringValue);
             handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
             union.StringValue = new TursoNativeArray
-                { Data = handle.Value.AddrOfPinnedObject(), Length = (ulong)bytes.Length };
+            { Data = handle.Value.AddrOfPinnedObject(), Length = (ulong)bytes.Length };
         }
 
         if (value.ValueType == TursoValueType.Blob)
         {
             handle = GCHandle.Alloc(value.BlobValue, GCHandleType.Pinned);
             union.BlobValue = new TursoNativeArray
-                { Data = handle.Value.AddrOfPinnedObject(), Length = (ulong)value.BlobValue.Length };
+            { Data = handle.Value.AddrOfPinnedObject(), Length = (ulong)value.BlobValue.Length };
         }
 
         return new TursoNativeValue
