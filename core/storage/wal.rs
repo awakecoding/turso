@@ -28,7 +28,7 @@ use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum, PageCodecLocation};
 #[cfg(host_shared_wal)]
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
 #[cfg(host_shared_wal)]
@@ -3500,6 +3500,22 @@ impl Wal for WalFile {
                             }
                         }
                     }
+                    EncryptionOrChecksum::PageCodec(ctx) => {
+                        match ctx.decode_page(body_slice, expected_page_id, PageCodecLocation::Wal)
+                        {
+                            Ok(decoded) => body_slice.copy_from_slice(&decoded),
+                            Err(e) => {
+                                mark_unlikely();
+                                tracing::error!(
+                                    "Failed to decode WAL batch frame for page_idx={expected_page_id}: {e}"
+                                );
+                                clear_slots_on_err(&slots);
+                                return Some(CompletionError::DecryptionError {
+                                    page_idx: expected_page_id,
+                                });
+                            }
+                        }
+                    }
                     EncryptionOrChecksum::Checksum(ctx) => {
                         if let Err(e) = ctx.verify_checksum(body_slice, expected_page_id) {
                             mark_unlikely();
@@ -3542,6 +3558,13 @@ impl Wal for WalFile {
             let io_ctx = self.io_ctx.read();
             io_ctx.encryption_context().cloned()
         };
+        let page_codec = {
+            let io_ctx = self.io_ctx.read();
+            match io_ctx.encryption_or_checksum() {
+                EncryptionOrChecksum::PageCodec(ctx) => Some(ctx.clone()),
+                _ => None,
+            }
+        };
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return None; // IO error already captured in completion
@@ -3582,6 +3605,24 @@ impl Wal for WalFile {
                     }
                     Err(_) => {
                         tracing::debug!("Failed to decrypt page data for frame_id={frame_id}");
+                    }
+                }
+            } else if let Some(ctx) = page_codec.clone() {
+                match ctx.decode_page(
+                    raw_page,
+                    header.page_number as usize,
+                    PageCodecLocation::Wal,
+                ) {
+                    Ok(decoded_data) => {
+                        turso_assert!(
+                            (frame_len - WAL_FRAME_HEADER_SIZE) == decoded_data.len(),
+                            "frame_len minus header_size does not equal expected decoded data length",
+                            { "frame_len_minus_header": frame_len - WAL_FRAME_HEADER_SIZE, "decoded_data_len": decoded_data.len() }
+                        );
+                        frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decoded_data);
+                    }
+                    Err(_) => {
+                        tracing::debug!("Failed to decode page data for frame_id={frame_id}");
                     }
                 }
             }
@@ -4125,6 +4166,9 @@ impl Wal for WalFile {
                     EncryptionOrChecksum::Encryption(ctx) => {
                         Cow::Owned(ctx.encrypt_page(plain, page_id)?)
                     }
+                    EncryptionOrChecksum::PageCodec(ctx) => {
+                        Cow::Owned(ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?)
+                    }
                     EncryptionOrChecksum::Checksum(ctx) => {
                         ctx.add_checksum_to_page(plain, page_id)?;
                         Cow::Borrowed(plain)
@@ -4241,6 +4285,9 @@ impl Wal for WalFile {
                 match &io_ctx.encryption_or_checksum() {
                     EncryptionOrChecksum::Encryption(ctx) => {
                         Cow::Owned(ctx.encrypt_page(plain, page_id)?)
+                    }
+                    EncryptionOrChecksum::PageCodec(ctx) => {
+                        Cow::Owned(ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?)
                     }
                     EncryptionOrChecksum::Checksum(ctx) => {
                         ctx.add_checksum_to_page(plain, page_id)?;
