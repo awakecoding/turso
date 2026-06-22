@@ -13,6 +13,8 @@
 *.sqlite
 !bindings/dotnet/src/Turso.Data.Sqlite/
 !bindings/dotnet/src/Turso.Data.Sqlite/**
+!bindings/dotnet/src/Turso.EntityFrameworkCore.Sqlite/
+!bindings/dotnet/src/Turso.EntityFrameworkCore.Sqlite/**
 # Python
 .mypy_cache/
 .pytest_cache/
