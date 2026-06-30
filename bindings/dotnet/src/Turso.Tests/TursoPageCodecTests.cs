@@ -120,16 +120,21 @@ public class TursoPageCodecTests
     }
 
     [Test]
-    public void ManagedPageCodecRejectsOverlappingCachedDatabaseOpen()
+    public void ManagedPageCodecAllowsOverlappingCachedDatabaseOpen()
     {
         var path = Path.Combine(Path.GetTempPath(), $"turso-codec-cache-{Guid.NewGuid():N}.db");
         try
         {
             using var db = TursoBindings.OpenDatabaseWithPageCodec(path, new XorPageCodec(0xA5));
             Execute(db, "CREATE TABLE data(value TEXT)");
+            Execute(db, "INSERT INTO data VALUES ('first-connection')");
 
-            Assert.Throws<TursoException>(() =>
-                TursoBindings.OpenDatabaseWithPageCodec(path, new XorPageCodec(0xA5)));
+            using var second = TursoBindings.OpenDatabaseWithPageCodec(path, new XorPageCodec(0xA5));
+            ScalarText(second, "SELECT value FROM data").Should().Be("first-connection");
+            Execute(second, "INSERT INTO data VALUES ('second-connection')");
+
+            ScalarLong(db, "SELECT count(*) FROM data").Should().Be(2);
+            Assert.Throws<TursoException>(() => TursoBindings.OpenDatabase(path));
         }
         finally
         {
