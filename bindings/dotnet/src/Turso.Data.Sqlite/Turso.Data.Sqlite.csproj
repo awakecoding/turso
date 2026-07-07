@@ -67,6 +67,62 @@
       <Pack>true</Pack>
       <PackagePath>runtimes\win-arm64\native\turso_sdk_kit.dll</PackagePath>
     </None>
+    <None Include="..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.lib"
+          Visible="false"
+          Condition="Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.lib')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\win-x64\turso_sdk_kit.lib</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_sdk_kit.lib"
+          Visible="false"
+          Condition="!Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.lib') and Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_sdk_kit.lib')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\win-x64\turso_sdk_kit.lib</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\native-static-libs\*.lib"
+          Visible="false"
+          Condition="Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\native-static-libs')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\win-x64\</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\x86_64-pc-windows-msvc\release\native-static-libs\*.lib"
+          Visible="false"
+          Condition="!Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\native-static-libs') and Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\native-static-libs')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\win-x64\</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\turso_sdk_kit.lib"
+          Visible="false"
+          Condition="Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\turso_sdk_kit.lib')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\win-arm64\turso_sdk_kit.lib</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\aarch64-pc-windows-msvc\release\turso_sdk_kit.lib"
+          Visible="false"
+          Condition="!Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\turso_sdk_kit.lib') and Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release\turso_sdk_kit.lib')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\win-arm64\turso_sdk_kit.lib</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\native-static-libs\*.lib"
+          Visible="false"
+          Condition="Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\native-static-libs')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\win-arm64\</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\aarch64-pc-windows-msvc\release\native-static-libs\*.lib"
+          Visible="false"
+          Condition="!Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\native-static-libs') and Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release\native-static-libs')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\win-arm64\</PackagePath>
+    </None>
     <None Include="..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.so"
           Visible="false"
           Condition="Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.so')">
@@ -98,6 +154,34 @@
       <TargetPath>runtimes\linux-arm64\native\libturso_sdk_kit.so</TargetPath>
       <Pack>true</Pack>
       <PackagePath>runtimes\linux-arm64\native\libturso_sdk_kit.so</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.a"
+          Visible="false"
+          Condition="Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.a')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\linux-x64\libturso_sdk_kit.a</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\x86_64-unknown-linux-gnu\release\libturso_sdk_kit.a"
+          Visible="false"
+          Condition="!Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.a') and Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release\libturso_sdk_kit.a')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\linux-x64\libturso_sdk_kit.a</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\aarch64-unknown-linux-gnu\release-official\libturso_sdk_kit.a"
+          Visible="false"
+          Condition="Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release-official\libturso_sdk_kit.a')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\linux-arm64\libturso_sdk_kit.a</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\aarch64-unknown-linux-gnu\release\libturso_sdk_kit.a"
+          Visible="false"
+          Condition="!Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release-official\libturso_sdk_kit.a') and Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release\libturso_sdk_kit.a')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\linux-arm64\libturso_sdk_kit.a</PackagePath>
     </None>
     <None Include="..\..\rs_compiled\aarch64-linux-android\release-official\libturso_sdk_kit.so"
           Visible="false"
@@ -195,6 +279,34 @@
       <Pack>true</Pack>
       <PackagePath>runtimes\osx-arm64\native\libturso_sdk_kit.dylib</PackagePath>
     </None>
+    <None Include="..\..\rs_compiled\x86_64-apple-darwin\release-official\libturso_sdk_kit.a"
+          Visible="false"
+          Condition="Exists('..\..\rs_compiled\x86_64-apple-darwin\release-official\libturso_sdk_kit.a')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\osx-x64\libturso_sdk_kit.a</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\x86_64-apple-darwin\release\libturso_sdk_kit.a"
+          Visible="false"
+          Condition="!Exists('..\..\rs_compiled\x86_64-apple-darwin\release-official\libturso_sdk_kit.a') and Exists('..\..\rs_compiled\x86_64-apple-darwin\release\libturso_sdk_kit.a')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\osx-x64\libturso_sdk_kit.a</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\aarch64-apple-darwin\release-official\libturso_sdk_kit.a"
+          Visible="false"
+          Condition="Exists('..\..\rs_compiled\aarch64-apple-darwin\release-official\libturso_sdk_kit.a')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\osx-arm64\libturso_sdk_kit.a</PackagePath>
+    </None>
+    <None Include="..\..\rs_compiled\aarch64-apple-darwin\release\libturso_sdk_kit.a"
+          Visible="false"
+          Condition="!Exists('..\..\rs_compiled\aarch64-apple-darwin\release-official\libturso_sdk_kit.a') and Exists('..\..\rs_compiled\aarch64-apple-darwin\release\libturso_sdk_kit.a')">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <Pack>true</Pack>
+      <PackagePath>buildTransitive\native\osx-arm64\libturso_sdk_kit.a</PackagePath>
+    </None>
     <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\Info.plist"
           Visible="false"
           Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\Info.plist')">
@@ -251,10 +363,22 @@
            Text="Missing win-x64 native asset. Build turso_sdk_kit.dll before packing Turso.Data.Sqlite." />
     <Error Condition="!Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release\turso_sdk_kit.dll') and !Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\turso_sdk_kit.dll')"
            Text="Missing win-arm64 native asset. Build turso_sdk_kit.dll before packing Turso.Data.Sqlite." />
+    <Error Condition="!Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_sdk_kit.lib') and !Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.lib')"
+           Text="Missing win-x64 static native asset. Build turso_sdk_kit.lib before packing Turso.Data.Sqlite." />
+    <Error Condition="!Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release\turso_sdk_kit.lib') and !Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\turso_sdk_kit.lib')"
+           Text="Missing win-arm64 static native asset. Build turso_sdk_kit.lib before packing Turso.Data.Sqlite." />
+    <Error Condition="!Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\native-static-libs') and !Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\native-static-libs')"
+           Text="Missing win-x64 static native dependency assets. Collect windows*.lib before packing Turso.Data.Sqlite." />
+    <Error Condition="!Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release\native-static-libs') and !Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\native-static-libs')"
+           Text="Missing win-arm64 static native dependency assets. Collect windows*.lib before packing Turso.Data.Sqlite." />
     <Error Condition="!Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.so')"
            Text="Missing linux-x64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
     <Error Condition="!Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release-official\libturso_sdk_kit.so')"
            Text="Missing linux-arm64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
+    <Error Condition="!Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release\libturso_sdk_kit.a') and !Exists('..\..\rs_compiled\x86_64-unknown-linux-gnu\release-official\libturso_sdk_kit.a')"
+           Text="Missing linux-x64 static native asset. Build libturso_sdk_kit.a before packing Turso.Data.Sqlite." />
+    <Error Condition="!Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release\libturso_sdk_kit.a') and !Exists('..\..\rs_compiled\aarch64-unknown-linux-gnu\release-official\libturso_sdk_kit.a')"
+           Text="Missing linux-arm64 static native asset. Build libturso_sdk_kit.a before packing Turso.Data.Sqlite." />
     <Error Condition="!Exists('..\..\rs_compiled\aarch64-linux-android\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\aarch64-linux-android\release-official\libturso_sdk_kit.so')"
            Text="Missing android-arm64 native asset. Build libturso_sdk_kit.so before packing Turso.Data.Sqlite." />
     <Error Condition="!Exists('..\..\rs_compiled\armv7-linux-androideabi\release\libturso_sdk_kit.so') and !Exists('..\..\rs_compiled\armv7-linux-androideabi\release-official\libturso_sdk_kit.so')"
@@ -267,6 +391,10 @@
            Text="Missing osx-x64 native asset. Build libturso_sdk_kit.dylib before packing Turso.Data.Sqlite." />
     <Error Condition="!Exists('..\..\rs_compiled\aarch64-apple-darwin\release\libturso_sdk_kit.dylib') and !Exists('..\..\rs_compiled\aarch64-apple-darwin\release-official\libturso_sdk_kit.dylib')"
            Text="Missing osx-arm64 native asset. Build libturso_sdk_kit.dylib before packing Turso.Data.Sqlite." />
+    <Error Condition="!Exists('..\..\rs_compiled\x86_64-apple-darwin\release\libturso_sdk_kit.a') and !Exists('..\..\rs_compiled\x86_64-apple-darwin\release-official\libturso_sdk_kit.a')"
+           Text="Missing osx-x64 static native asset. Build libturso_sdk_kit.a before packing Turso.Data.Sqlite." />
+    <Error Condition="!Exists('..\..\rs_compiled\aarch64-apple-darwin\release\libturso_sdk_kit.a') and !Exists('..\..\rs_compiled\aarch64-apple-darwin\release-official\libturso_sdk_kit.a')"
+           Text="Missing osx-arm64 static native asset. Build libturso_sdk_kit.a before packing Turso.Data.Sqlite." />
     <Error Condition="!Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\Info.plist')"
            Text="Missing iOS framework asset. Build libturso_sdk_kit.xcframework before packing Turso.Data.Sqlite." />
   </Target>

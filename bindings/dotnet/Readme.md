@@ -14,6 +14,26 @@ Application code only needs to reference `Turso.Data.Sqlite`.
 
 The package targets `net8.0`, `net9.0`, and `net10.0`. It includes native runtime assets for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices.
 
+## NativeAOT static linking
+
+NativeAOT apps can opt into statically linking the Turso native library so publish output does not include a sidecar `turso_sdk_kit` DLL, `.so`, or `.dylib`:
+
+```xml
+<PropertyGroup>
+  <PublishAot>true</PublishAot>
+  <SelfContained>true</SelfContained>
+  <TursoUseStaticNativeLibrary>true</TursoUseStaticNativeLibrary>
+</PropertyGroup>
+```
+
+Publish with a supported runtime identifier, for example:
+
+```bash
+dotnet publish -c Release -r win-x64
+```
+
+Static native assets are included for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`. The dynamic native assets remain the default for non-AOT apps and for mobile targets. See `samples/NativeAot` for a complete executable sample.
+
 ## Getting started
 
 ```C#
