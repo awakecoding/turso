@@ -74,7 +74,7 @@ jobs:
           cache-on-failure: true
 
       - name: Set up Android NDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk

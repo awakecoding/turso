@@ -70,25 +70,25 @@ jobs:
           artifact-name: native-android-x86
           target: i686-linux-android
 
-        - os: macos-latest
+        - os: macos-26-intel
           make-target: build-rust-macos64
           artifact-name: native-osx-x64
           target: x86_64-apple-darwin
           macos-deployment-target: "10.13"
 
-        - os: macos-latest
+        - os: macos-26
           make-target: build-rust-macosarm64
           target: aarch64-apple-darwin
           artifact-name: native-osx-arm64
           macos-deployment-target: "11.0"
 
-        - os: macos-latest
+        - os: macos-26
           make-target: build-rust-iosarm64
           target: aarch64-apple-ios
           artifact-name: native-ios-arm64
           ios-deployment-target: "12.2"
 
-        - os: macos-latest
+        - os: macos-26
           make-target: build-rust-iossimulatorarm64
           target: aarch64-apple-ios-sim
           artifact-name: native-iossimulator-arm64
@@ -133,7 +133,7 @@ jobs:
 
       - name: Set up Android SDK
         if: contains(matrix.target, 'linux-android')
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android NDK
         if: contains(matrix.target, 'linux-android')
@@ -276,7 +276,7 @@ jobs:
 
   package-ios-framework:
     needs: build-natives
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 15
     permissions:
       contents: read
@@ -427,11 +427,11 @@ jobs:
           rid: linux-arm64
           executable: NativeAotSample
 
-        - os: macos-15-intel
+        - os: macos-26-intel
           rid: osx-x64
           executable: NativeAotSample
 
-        - os: macos-15
+        - os: macos-26
           rid: osx-arm64
           executable: NativeAotSample
 
