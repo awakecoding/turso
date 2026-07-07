@@ -427,7 +427,7 @@ jobs:
           rid: linux-arm64
           executable: NativeAotSample
 
-        - os: macos-13
+        - os: macos-15-intel
           rid: osx-x64
           executable: NativeAotSample
 
