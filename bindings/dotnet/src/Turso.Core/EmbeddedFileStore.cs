@@ -1232,8 +1232,8 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// adjacent separator into its surviving sibling before freelisting the
     /// retired page. All routing changes retain their catalog rootpage and are
     /// published with the replacement table page in one WAL transaction whose
-    /// final frame is page one. Any overflow ownership change, propagation beyond
-    /// those three interior levels, rebalance, unsupported index coordination,
+    /// final frame is page one. Any overflow ownership change, unsupported deep
+    /// topology, rebalance, unsupported index coordination,
     /// root-type change, multi-table mutation, or nonempty freelist returns false
     /// before a write so the complete catalog rewrite remains the safe fallback.
     /// </remarks>
@@ -1326,6 +1326,14 @@ internal sealed class EmbeddedFileStore : IDisposable
                           existingPage,
                           currentHeader)
                        || TryPersistBoundedTableInteriorThirdLevelLeafMutation(
+                          tableName,
+                          table,
+                          persisted.Tables[tableName],
+                          rootPage,
+                          schemaPage,
+                          existingPage,
+                          currentHeader)
+                       || TryPersistBoundedTableInteriorDeepLeafMutation(
                           tableName,
                           table,
                           persisted.Tables[tableName],
@@ -2913,6 +2921,268 @@ internal sealed class EmbeddedFileStore : IDisposable
         return true;
     }
 
+    private bool TryPersistBoundedTableInteriorDeepLeafMutation(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedTable persistedTable,
+        uint rootPage,
+        ReadOnlySpan<byte> schemaPage,
+        ReadOnlySpan<byte> existingRootPage,
+        SqliteDatabaseHeader currentHeader)
+    {
+        if (!TryGetBoundedSingleLeafChange(
+                tableName,
+                table,
+                persistedTable,
+                out var persistedCells,
+                out var change))
+        {
+            return false;
+        }
+
+        var sourcePageCount = currentHeader.DatabaseSizeInPages;
+        var ownedPages = new HashSet<uint> { SchemaRootPage };
+        if (rootPage < 2 || rootPage > sourcePageCount || !ownedPages.Add(rootPage))
+            return false;
+
+        var persistedCellIndex = 0;
+        long? previousRowId = null;
+        int? leafDepth = null;
+        byte[]? sourceLeafPage = null;
+        SqliteTableLeafPageView? sourceLeaf = null;
+        uint targetLeafPage = 0;
+        BoundedTableInteriorPathEntry[] targetPath = [];
+
+        bool Visit(
+            uint pageNumber,
+            byte[] pageImage,
+            List<BoundedTableInteriorPathEntry> path,
+            int depth,
+            out long maximumRowId)
+        {
+            maximumRowId = 0;
+            switch (SqliteBtreePageHeader.Parse(pageImage).PageType)
+            {
+                case SqliteBtreePageType.TableLeaf:
+                {
+                    var leaf = SqliteTableLeafPageView.Parse(pageImage, _usableSpace);
+                    if (leaf.Cells.Count == 0
+                        || leaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
+                        || (leafDepth is { } expectedDepth && expectedDepth != depth))
+                    {
+                        return false;
+                    }
+
+                    leafDepth ??= depth;
+                    foreach (var cell in leaf.Cells)
+                    {
+                        if (persistedCellIndex >= persistedCells.Count
+                            || cell.Cell.RowId != persistedCells[persistedCellIndex].RowId
+                            || !cell.Cell.LocalPayload.Span.SequenceEqual(
+                                persistedCells[persistedCellIndex].Record)
+                            || (previousRowId is { } previous && cell.Cell.RowId <= previous))
+                        {
+                            return false;
+                        }
+
+                        persistedCellIndex++;
+                        previousRowId = cell.Cell.RowId;
+                    }
+
+                    if (leaf.Search(change.RowId).IsExact)
+                    {
+                        if (sourceLeaf is not null)
+                            return false;
+
+                        sourceLeaf = leaf;
+                        sourceLeafPage = pageImage;
+                        targetLeafPage = pageNumber;
+                        targetPath = path.ToArray();
+                    }
+
+                    maximumRowId = leaf.Cells[^1].Cell.RowId;
+                    return true;
+                }
+
+                case SqliteBtreePageType.TableInterior:
+                {
+                    var interior = SqliteTableInteriorPageView.Parse(pageImage, _usableSpace);
+                    if (interior.Cells.Count == 0)
+                        return false;
+
+                    var childPages = interior.Cells
+                        .Select(cell => cell.Cell.LeftChildPage)
+                        .Append(interior.Header.RightMostChildPage)
+                        .ToArray();
+                    if (childPages.Length != interior.Cells.Count + 1)
+                        return false;
+
+                    long? childMaximumRowId = null;
+                    for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
+                    {
+                        var childPage = childPages[childIndex];
+                        if (childPage < 2
+                            || childPage > sourcePageCount
+                            || !ownedPages.Add(childPage))
+                        {
+                            return false;
+                        }
+
+                        var childImage = _pager.ReadCommittedPage(childPage);
+                        path.Add(new BoundedTableInteriorPathEntry(
+                            pageNumber,
+                            pageImage,
+                            interior,
+                            childIndex,
+                            childPage));
+                        if (!Visit(childPage, childImage, path, depth + 1, out var childMaximum))
+                        {
+                            path.RemoveAt(path.Count - 1);
+                            return false;
+                        }
+
+                        path.RemoveAt(path.Count - 1);
+                        if (childIndex < interior.Cells.Count
+                            && interior.Cells[childIndex].Cell.RowId != childMaximum)
+                        {
+                            return false;
+                        }
+
+                        childMaximumRowId = childMaximum;
+                    }
+
+                    if (childMaximumRowId is null)
+                        return false;
+
+                    maximumRowId = childMaximumRowId.Value;
+                    return true;
+                }
+
+                default:
+                    return false;
+            }
+        }
+
+        if (!Visit(rootPage, existingRootPage.ToArray(), [], depth: 1, out _)
+            || persistedCellIndex != persistedCells.Count
+            || sourceLeaf is null
+            || sourceLeafPage is null
+            || targetLeafPage == 0
+            // The narrower paths above own roots with up to three interior levels.
+            || targetPath.Length <= 3)
+        {
+            return false;
+        }
+
+        if (change.IsDelete && sourceLeaf.Cells.Count == 1)
+            return false;
+
+        var replacementCells = new List<SqliteTableLeafCell>(
+            sourceLeaf.Cells.Count - (change.IsDelete ? 1 : 0));
+        foreach (var sourceCell in sourceLeaf.Cells)
+        {
+            if (sourceCell.Cell.RowId != change.RowId)
+            {
+                replacementCells.Add(sourceCell.Cell);
+                continue;
+            }
+
+            if (change.IsDelete)
+                continue;
+
+            try
+            {
+                replacementCells.Add(SqliteTableLeafCell.Create(
+                    sourceCell.Cell.RowId,
+                    change.ReplacementRecord!,
+                    _usableSpace));
+            }
+            catch (ArgumentException)
+            {
+                return false;
+            }
+        }
+
+        if (replacementCells.Count == 0
+            || !TryBuildBoundedTableLeafPage(
+                replacementCells,
+                0,
+                replacementCells.Count,
+                out var replacementLeafPage))
+        {
+            return false;
+        }
+
+        byte[]? replacementSeparatorOwnerPage = null;
+        BoundedTableInteriorPathEntry? separatorOwner = null;
+        if (change.IsDelete && sourceLeaf.Cells[^1].Cell.RowId == change.RowId)
+        {
+            for (var pathIndex = targetPath.Length - 1; pathIndex >= 0; pathIndex--)
+            {
+                var candidate = targetPath[pathIndex];
+                if (candidate.ChildIndex >= candidate.Page.Cells.Count)
+                    continue;
+
+                separatorOwner = candidate;
+                break;
+            }
+
+            if (separatorOwner is not null
+                && !TryReplaceTableInteriorSeparator(
+                    separatorOwner.SourcePage,
+                    separatorOwner.Page,
+                    separatorOwner.ChildIndex,
+                    separatorOwner.ChildPage,
+                    replacementCells[^1].RowId,
+                    out replacementSeparatorOwnerPage))
+            {
+                return false;
+            }
+        }
+
+        var sourceSchemaPage = schemaPage.ToArray();
+        var targetSchemaPage = schemaPage.ToArray();
+        var newChangeCounter = currentHeader.ChangeCounter + 1;
+        var newHeader = currentHeader with
+        {
+            ChangeCounter = newChangeCounter,
+            VersionValidFor = newChangeCounter,
+        };
+        newHeader.WriteTo(targetSchemaPage);
+
+        var sourcePages = new List<SqlitePageImage>
+        {
+            new(SchemaRootPage, sourceSchemaPage),
+            new(targetLeafPage, sourceLeafPage),
+        };
+        var writeImages = new List<SqlitePageImage>
+        {
+            new(targetLeafPage, replacementLeafPage),
+        };
+        if (separatorOwner is not null)
+        {
+            sourcePages.Add(new SqlitePageImage(
+                separatorOwner.PageNumber,
+                separatorOwner.SourcePage));
+            writeImages.Add(new SqlitePageImage(
+                separatorOwner.PageNumber,
+                replacementSeparatorOwnerPage!));
+        }
+
+        // Page one is the final WAL frame after every changed tree page.
+        writeImages.Add(new SqlitePageImage(SchemaRootPage, targetSchemaPage));
+        var mutation = new SqliteBtreeSplitMutation(
+            sourcePageCount,
+            sourcePageCount,
+            _pageSize,
+            sourcePages,
+            writeImages);
+        mutation.CommitTo(_pager);
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
+        _header = newHeader;
+        return true;
+    }
+
     private bool TryReplaceTableInteriorSeparator(
         ReadOnlySpan<byte> sourcePage,
         SqliteTableInteriorPageView parent,
@@ -3772,6 +4042,13 @@ internal sealed class EmbeddedFileStore : IDisposable
         long RowId,
         byte[]? ReplacementRecord,
         bool IsDelete);
+
+    private sealed record BoundedTableInteriorPathEntry(
+        uint PageNumber,
+        byte[] SourcePage,
+        SqliteTableInteriorPageView Page,
+        int ChildIndex,
+        uint ChildPage);
 
     private static bool IsBoundedIndexLeafMutationCompatible(IndexDefinition definition)
         => definition.Index.Columns.Count != 0

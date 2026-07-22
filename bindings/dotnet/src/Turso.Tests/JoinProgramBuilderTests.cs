@@ -346,6 +346,34 @@ public class JoinProgramBuilderTests
     }
 
     [Test]
+    public void LeftOuterJoinAppliesPostJoinPredicateAfterNullExtension()
+    {
+        var program = JoinProgramBuilder.Build(
+            "l",
+            leftColumnCount: 1,
+            "r",
+            rightColumnCount: 1,
+            JoinType.LeftOuter,
+            projections: [JoinProjection.ForColumn(0), JoinProjection.ForColumn(1)],
+            predicate: CombinedIntegerEquals(0, 1),
+            postJoinPredicate: row => row[1].Kind == SqlValueKind.Null);
+
+        var rows = Run(program, Rows([1], [2]), Rows([1], [9]));
+
+        // The matched (1,1) pair fails the post-join filter, but it must still set the match flag
+        // before filtering so no null-extended (1,NULL) row is fabricated. Only unmatched 2 survives.
+        rows.Should().ContainSingle();
+        rows[0][0].Should().Be(SqlValue.Integer(2));
+        rows[0][1].Kind.Should().Be(SqlValueKind.Null);
+
+        var postJoinFilters = program.Instructions
+            .OfType<FilterRegistersInstruction>()
+            .Where(filter => filter.Description.StartsWith("skip result when post-join WHERE is false"))
+            .ToArray();
+        postJoinFilters.Should().HaveCount(2);
+    }
+
+    [Test]
     public void BuildValidatesItsArguments()
     {
         JoinProjection[] projection = [JoinProjection.ForColumn(0)];

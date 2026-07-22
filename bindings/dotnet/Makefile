@@ -123,15 +123,18 @@ build-dotnet:
 restore: restore-managed
 
 restore-managed:
-	dotnet restore ./src/Turso.Tests/Turso.Tests.csproj
+	dotnet restore ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
+	dotnet restore ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	dotnet restore ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
+	dotnet restore ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
 
 build-managed: restore-managed
 	dotnet build --no-restore -c Debug ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
 	dotnet build --no-restore -c Debug ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
-	dotnet build --no-restore -c Debug ./src/Turso.Tests/Turso.Tests.csproj
+	dotnet build --no-restore -c Debug ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
+	dotnet build --no-restore -c Debug ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
 
-test-managed: build-managed
-	dotnet test --no-build --no-restore -c Debug --filter "FullyQualifiedName~Managed&FullyQualifiedName!~Native&FullyQualifiedName!~MixedProviders" ./src/Turso.Tests/Turso.Tests.csproj
+test-managed: validate-managed-package
 
 pack-managed: restore-managed
 	rm -rf "$(MANAGED_PACKAGE_OUTPUT)"

@@ -270,6 +270,25 @@ public class ManagedSqltestConformanceTests
     public void ManagedPrintfAndFormatSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("views.sqltest", "view-basic-filtering")]
+    [TestCase("views.sqltest", "view-aggregation-groupby")]
+    [TestCase("views.sqltest", "view-with-join")]
+    [TestCase("views.sqltest", "view-composition-with-functions")]
+    [TestCase("views.sqltest", "view-referencing-view")]
+    [TestCase("views.sqltest", "view-case-expression")]
+    [TestCase("views.sqltest", "view-drop-and-recreate")]
+    [TestCase("views.sqltest", "view-recreate-after-drop")]
+    [TestCase("views.sqltest", "view-arithmetic-expression")]
+    [TestCase("views.sqltest", "view-with-having")]
+    [TestCase("views.sqltest", "view-filter-clause")]
+    [TestCase("views.sqltest", "view-self-circle-detection")]
+    [TestCase("views.sqltest", "view-if-not-exists-idempotent")]
+    [TestCase("views.sqltest", "view-duplicate-without-if-not-exists-errors")]
+    [TestCase("views.sqltest", "view-bracket-column-list")]
+    [TestCase("views.sqltest", "view-quoted-column-list")]
+    public void ManagedViewSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

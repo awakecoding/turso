@@ -17,6 +17,9 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
     private const int ThirdInteriorMutationRowCount = 5_000;
     private const int ThirdInteriorMutationPayloadLength = 100;
     private const long ThirdInteriorMutationFirstRowId = 9_000_000_000_000_000_000L;
+    private const int FourthInteriorMutationRowCount = 17;
+    private const int FourthInteriorMutationPayloadLength = 10;
+    private const long FourthInteriorMutationFirstRowId = 9_000_000_000_000_000_000L;
     private const string BoundedMutationEncryptionKey =
         "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
 
@@ -664,6 +667,97 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeReopen);
     }
 
+    [Test]
+    public void FourthInteriorLevelMaximumDeletePropagatesToTheRootReopensAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("four-interior-root-separator");
+        try
+        {
+            CreateBoundedFourthInteriorTable(path, PhysicalFileSystem.Instance);
+            var target = FindFourthInteriorRootBoundaryTarget(PhysicalFileSystem.Instance, path);
+            byte[] greatGrandparentBefore;
+            byte[] grandparentBefore;
+            byte[] parentBefore;
+            using (var pager = SqlitePager.Open(
+                       PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                greatGrandparentBefore = pager.ReadCommittedPage(target.GreatGrandparentPage);
+                grandparentBefore = pager.ReadCommittedPage(target.GrandparentPage);
+                parentBefore = pager.ReadCommittedPage(target.ParentPage);
+            }
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+                Execute(connection, $"DELETE FROM t WHERE id = {target.DeletedRowId};");
+
+            AssertFourthInteriorRootBoundaryDeletion(
+                PhysicalFileSystem.Instance,
+                path,
+                target,
+                greatGrandparentBefore,
+                grandparentBefore,
+                parentBefore);
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path, readOnly: true))
+            using (var connection = reopened.Connect())
+            {
+                QueryCount(connection).Should().Be(FourthInteriorMutationRowCount - 1);
+                QueryText(connection, target.ReplacementSeparator)
+                    .Should()
+                    .Be(new string('x', FourthInteriorMutationPayloadLength));
+            }
+
+            VerifyNestedMutationWithSqlite(
+                path,
+                FourthInteriorMutationRowCount - 1,
+                target.DeletedRowId);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void InterruptedFourthInteriorLevelRootSeparatorMutationRecoversThePriorCommittedTree()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "four-interior-root-separator-wal.db";
+        CreateBoundedFourthInteriorTable(path, fileSystem);
+        var target = FindFourthInteriorRootBoundaryTarget(fileSystem, path);
+
+        for (var failedWrite = 1; failedWrite <= 3; failedWrite++)
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                faults.FailNext(FileSystemOperation.Write);
+                Assert.Throws<IOException>(() => Execute(connection, $"DELETE FROM t WHERE id = {target.DeletedRowId};"));
+            }
+
+            using (var recovered = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = recovered.Connect())
+            {
+                QueryCount(connection).Should().Be(FourthInteriorMutationRowCount);
+                QueryText(connection, target.DeletedRowId)
+                    .Should()
+                    .Be(new string('x', FourthInteriorMutationPayloadLength));
+            }
+
+            using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+            var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+            var root = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(target.RootPage),
+                header.UsableSpace);
+            root.Cells[target.RootGreatGrandparentIndex].Cell.RowId.Should().Be(target.DeletedRowId);
+        }
+    }
+
     private static void CreateBoundedNestedTable(string path, IFileSystem fileSystem)
     {
         var header = SqliteDatabaseHeader.CreateDefault() with { PageSize = BoundedMutationPageSize };
@@ -701,6 +795,209 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
             ThirdInteriorMutationRowCount,
             ThirdInteriorMutationPayloadLength,
             ThirdInteriorMutationFirstRowId));
+    }
+
+    private static void CreateBoundedFourthInteriorTable(string path, IFileSystem fileSystem)
+    {
+        var header = SqliteDatabaseHeader.CreateDefault() with { PageSize = BoundedMutationPageSize };
+        using (SqlitePager.Create(
+                   fileSystem,
+                   path,
+                   path + "-wal",
+                   SqliteWalHeader.Create(header.PageSize, salt1: 0x99AA_BBCC, salt2: 0xDDEE_FF00),
+                   header))
+        {
+        }
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);");
+            Execute(connection, BuildPressureInsert(
+                FourthInteriorMutationRowCount,
+                FourthInteriorMutationPayloadLength,
+                FourthInteriorMutationFirstRowId));
+        }
+
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: false);
+        var sourceHeader = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var rootPage = FindTableRootPage(pager.ReadCommittedPage(1), sourceHeader);
+        var sourceRootPage = pager.ReadCommittedPage(rootPage);
+        var sourceRoot = SqliteTableLeafPageView.Parse(sourceRootPage, sourceHeader.UsableSpace);
+        if (rootPage != 2
+            || sourceHeader.DatabaseSizeInPages != rootPage
+            || sourceRoot.Cells.Count != FourthInteriorMutationRowCount
+            || sourceRoot.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null))
+        {
+            throw new InvalidOperationException(
+                "The bounded four-interior test requires a single non-overflow table root leaf.");
+        }
+
+        var leafGroups = new List<IReadOnlyList<SqliteTableLeafCell>>(16);
+        for (var cellIndex = 0; cellIndex < 7; cellIndex++)
+            leafGroups.Add([sourceRoot.Cells[cellIndex].Cell]);
+        leafGroups.Add([sourceRoot.Cells[7].Cell, sourceRoot.Cells[8].Cell]);
+        for (var cellIndex = 9; cellIndex < sourceRoot.Cells.Count; cellIndex++)
+            leafGroups.Add([sourceRoot.Cells[cellIndex].Cell]);
+
+        if (leafGroups.Count != 16)
+            throw new InvalidOperationException("The bounded four-interior test requires sixteen table leaves.");
+
+        var pageImages = new List<(uint PageNumber, byte[] Page)>();
+        var children = new List<FourInteriorTreeChild>(leafGroups.Count);
+        var nextPageNumber = checked(sourceHeader.DatabaseSizeInPages + 1);
+        foreach (var leafGroup in leafGroups)
+        {
+            var builder = new SqliteTableLeafPageBuilder(
+                sourceHeader.PageSize,
+                sourceHeader.UsableSpace);
+            foreach (var cell in leafGroup)
+                builder.Append(cell);
+
+            var pageNumber = nextPageNumber++;
+            pageImages.Add((pageNumber, builder.Build()));
+            children.Add(new FourInteriorTreeChild(pageNumber, leafGroup[^1].RowId));
+        }
+
+        for (var level = 0; level < 3; level++)
+        {
+            if (children.Count < 2 || children.Count % 2 != 0)
+                throw new InvalidOperationException("The bounded four-interior test cannot pair its table children.");
+
+            var parents = new List<FourInteriorTreeChild>(children.Count / 2);
+            for (var childIndex = 0; childIndex < children.Count; childIndex += 2)
+            {
+                var left = children[childIndex];
+                var right = children[childIndex + 1];
+                var builder = new SqliteTableInteriorPageBuilder(
+                    sourceHeader.PageSize,
+                    sourceHeader.UsableSpace,
+                    right.PageNumber);
+                builder.Append(SqliteTableInteriorCell.Create(left.PageNumber, left.MaximumRowId));
+
+                var pageNumber = nextPageNumber++;
+                pageImages.Add((pageNumber, builder.Build()));
+                parents.Add(new FourInteriorTreeChild(pageNumber, right.MaximumRowId));
+            }
+
+            children = parents;
+        }
+
+        if (children.Count != 2)
+            throw new InvalidOperationException("The bounded four-interior test requires two root children.");
+
+        var rootBuilder = new SqliteTableInteriorPageBuilder(
+            sourceHeader.PageSize,
+            sourceHeader.UsableSpace,
+            children[1].PageNumber);
+        rootBuilder.Append(SqliteTableInteriorCell.Create(
+            children[0].PageNumber,
+            children[0].MaximumRowId));
+        var replacementRootPage = sourceRootPage.ToArray();
+        rootBuilder.WriteTo(replacementRootPage);
+
+        var targetPageCount = checked(nextPageNumber - 1);
+        var replacementSchemaPage = pager.ReadCommittedPage(1);
+        var replacementHeader = sourceHeader with
+        {
+            ChangeCounter = sourceHeader.ChangeCounter + 1,
+            DatabaseSizeInPages = targetPageCount,
+            VersionValidFor = sourceHeader.ChangeCounter + 1,
+        };
+        replacementHeader.WriteTo(replacementSchemaPage);
+        using var transaction = pager.BeginTransaction(targetPageCount);
+        foreach (var (pageNumber, page) in pageImages)
+            transaction.WritePage(pageNumber, page);
+        transaction.WritePage(rootPage, replacementRootPage);
+        transaction.WritePage(1, replacementSchemaPage);
+        transaction.Commit();
+    }
+
+    private static FourthInteriorLeafTarget FindFourthInteriorRootBoundaryTarget(
+        IFileSystem fileSystem,
+        string path)
+    {
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var rootPage = FindTableRootPage(pager.ReadCommittedPage(1), header);
+        ReadTableHeight(pager, header, rootPage, new HashSet<uint>()).Should().Be(5);
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(rootPage),
+            header.UsableSpace);
+        root.Cells.Should().NotBeEmpty();
+
+        for (var greatGrandparentIndex = 0;
+             greatGrandparentIndex < root.Cells.Count;
+             greatGrandparentIndex++)
+        {
+            var greatGrandparentPage = root.Cells[greatGrandparentIndex].Cell.LeftChildPage;
+            var greatGrandparent = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(greatGrandparentPage),
+                header.UsableSpace);
+            var grandparentPage = greatGrandparent.Header.RightMostChildPage;
+            var grandparent = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(grandparentPage),
+                header.UsableSpace);
+            var parentPage = grandparent.Header.RightMostChildPage;
+            var parent = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(parentPage),
+                header.UsableSpace);
+            var leafPage = parent.Header.RightMostChildPage;
+            var leaf = SqliteTableLeafPageView.Parse(
+                pager.ReadCommittedPage(leafPage),
+                header.UsableSpace);
+            if (leaf.Cells.Count < 2)
+                continue;
+
+            var deletedRowId = leaf.Cells[^1].Cell.RowId;
+            deletedRowId.Should().Be(root.Cells[greatGrandparentIndex].Cell.RowId);
+            return new FourthInteriorLeafTarget(
+                rootPage,
+                greatGrandparentPage,
+                grandparentPage,
+                parentPage,
+                leafPage,
+                greatGrandparentIndex,
+                deletedRowId,
+                leaf.Cells[^2].Cell.RowId);
+        }
+
+        throw new InvalidOperationException(
+            "Unable to create a four-interior-level table with a root-owned multi-cell boundary leaf.");
+    }
+
+    private static void AssertFourthInteriorRootBoundaryDeletion(
+        IFileSystem fileSystem,
+        string path,
+        FourthInteriorLeafTarget target,
+        ReadOnlySpan<byte> greatGrandparentBefore,
+        ReadOnlySpan<byte> grandparentBefore,
+        ReadOnlySpan<byte> parentBefore)
+    {
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        header.FirstFreelistTrunkPage.Should().Be(0);
+        header.FreelistPageCount.Should().Be(0);
+        SqliteFreelist.Read(header, pager.CommittedPageCount, pager.ReadCommittedPage)
+            .PageNumbers
+            .Should()
+            .BeEmpty();
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(target.RootPage),
+            header.UsableSpace);
+        root.Cells[target.RootGreatGrandparentIndex].Cell.LeftChildPage.Should()
+            .Be(target.GreatGrandparentPage);
+        root.Cells[target.RootGreatGrandparentIndex].Cell.RowId.Should()
+            .Be(target.ReplacementSeparator);
+        pager.ReadCommittedPage(target.GreatGrandparentPage).Should().Equal(greatGrandparentBefore.ToArray());
+        pager.ReadCommittedPage(target.GrandparentPage).Should().Equal(grandparentBefore.ToArray());
+        pager.ReadCommittedPage(target.ParentPage).Should().Equal(parentBefore.ToArray());
+        var leaf = SqliteTableLeafPageView.Parse(
+            pager.ReadCommittedPage(target.LeafPage),
+            header.UsableSpace);
+        leaf.Search(target.DeletedRowId).IsExact.Should().BeFalse();
+        leaf.Cells[^1].Cell.RowId.Should().Be(target.ReplacementSeparator);
+        ReadTableHeight(pager, header, target.RootPage, new HashSet<uint>()).Should().Be(5);
     }
 
     private static ThirdInteriorLeafTarget FindThirdInteriorRootBoundaryTarget(
@@ -1147,4 +1444,16 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         int GrandparentParentIndex,
         long DeletedRowId,
         long ReplacementSeparator);
+
+    private sealed record FourthInteriorLeafTarget(
+        uint RootPage,
+        uint GreatGrandparentPage,
+        uint GrandparentPage,
+        uint ParentPage,
+        uint LeafPage,
+        int RootGreatGrandparentIndex,
+        long DeletedRowId,
+        long ReplacementSeparator);
+
+    private sealed record FourInteriorTreeChild(uint PageNumber, long MaximumRowId);
 }

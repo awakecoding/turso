@@ -349,6 +349,8 @@ jobs:
           managed_packages=(
             artifacts/managed-release-packages/Turso.Data.Sqlite.*.nupkg
             artifacts/managed-release-packages/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+            artifacts/managed-release-packages/Turso.Platform.Client.*.nupkg
+            artifacts/managed-release-packages/Turso.Serverless.Client.*.nupkg
           )
           for package in "${managed_packages[@]}"; do
             if [ ! -f "$package" ]; then
@@ -365,12 +367,28 @@ jobs:
                   "lib/net10.0/Turso.Data.Sqlite.dll"
                 )
                 ;;
-              *)
+              *Turso.EntityFrameworkCore.Sqlite.*)
                 required_files=(
                   "README.md"
                   "lib/net8.0/Turso.EntityFrameworkCore.Sqlite.dll"
                   "lib/net9.0/Turso.EntityFrameworkCore.Sqlite.dll"
                   "lib/net10.0/Turso.EntityFrameworkCore.Sqlite.dll"
+                )
+                ;;
+              *Turso.Platform.Client.*)
+                required_files=(
+                  "README.md"
+                  "lib/net8.0/Turso.Platform.Client.dll"
+                  "lib/net9.0/Turso.Platform.Client.dll"
+                  "lib/net10.0/Turso.Platform.Client.dll"
+                )
+                ;;
+              *Turso.Serverless.Client.*)
+                required_files=(
+                  "README.md"
+                  "lib/net8.0/Turso.Serverless.Client.dll"
+                  "lib/net9.0/Turso.Serverless.Client.dll"
+                  "lib/net10.0/Turso.Serverless.Client.dll"
                 )
                 ;;
             esac
@@ -381,22 +399,26 @@ jobs:
               fi
             done
 
-            if unzip -Z1 "$package" | grep -Eq '(^runtimes/|^buildTransitive/|turso_sdk_kit|Turso\.Raw\.|\.(cs|fs|vb)$)'; then
+            if unzip -Z1 "$package" | grep -Eq '(^runtimes/|^buildTransitive/|turso_sdk_kit|Turso\.(Raw|Data\.Native)\.|\.(cs|fs|vb)$)'; then
               echo "$package must remain source-free and managed-only"
               exit 1
             fi
-            if unzip -p "$package" '*.nuspec' | grep -Eq 'id="Turso\.(Raw|Data\.Sqlite\.Native)"'; then
+            if unzip -p "$package" '*.nuspec' | grep -Eq 'id="Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native)"'; then
               echo "$package must not declare an optional-native package dependency"
               exit 1
             fi
-            if ! unzip -p "$package" README.md | grep -Fq 'managed-only'; then
-              echo "$package README must document the managed-only distribution"
-              exit 1
-            fi
-            if ! unzip -p "$package" README.md | grep -Fq 'Turso.Data.Sqlite.Native'; then
-              echo "$package README must document the optional native companion"
-              exit 1
-            fi
+            case "$package" in
+              *Turso.Data.Sqlite.*)
+                if ! unzip -p "$package" README.md | grep -Fq 'managed-only'; then
+                  echo "$package README must document the managed-only distribution"
+                  exit 1
+                fi
+                if ! unzip -p "$package" README.md | grep -Fq 'Turso.Data.Sqlite.Native'; then
+                  echo "$package README must document the optional native companion"
+                  exit 1
+                fi
+                ;;
+            esac
           done
 
       - name: Upload managed .NET packages

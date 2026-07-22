@@ -60,16 +60,17 @@ public readonly record struct JoinProjection
 /// each pair into a combined register block, and projects a result row for every pair the join
 /// predicate accepts — so the join runs entirely through the resumable state machine rather than
 /// the tree-walking evaluator. <see cref="JoinType.LeftOuter"/> additionally maintains a per-outer-row
-/// match flag and emits one inner-null-extended row for every outer row that matched nothing.
+/// match flag and emits one inner-null-extended row for every outer row that matched nothing. An optional
+/// post-join predicate runs after that null extension, preserving LEFT JOIN <c>WHERE</c> timing.
 /// </summary>
 /// <remarks>
 /// The builder owns only the program's control flow and register/jump layout. Row-value semantics —
 /// the join (ON) predicate over the combined row, expressed as a <see cref="VdbeRowPredicate"/> — are
 /// supplied by the caller, exactly as the scan, sorted-scan, and aggregate builders delegate their
 /// semantics. The predicate is the join condition: it decides which inner rows match an outer row, and
-/// for a left outer join unmatched outer rows are still null-extended (a post-join WHERE is out of scope
-/// and stays with the caller). The emitted program is data-free: the two scanned tables are bound at
-/// execution time as cursor sources 0 (outer/left) and 1 (inner/right).
+/// for a left outer join unmatched outer rows are still null-extended. The optional post-join predicate
+/// then tests each matched or null-extended combined row. The emitted program is data-free: the two
+/// scanned tables are bound at execution time as cursor sources 0 (outer/left) and 1 (inner/right).
 /// <para>
 /// The combined staging block <c>r[0..W-1]</c> (W = leftColumnCount + rightColumnCount) holds the current
 /// pair; the output block <c>r[W..W+P-1]</c> holds the projected result row; the left outer match flag,
@@ -85,12 +86,14 @@ public readonly record struct JoinProjection
 ///                Column c1.* -> staging[WL..W-1]
 ///                [FilterRegisters staging[0..W-1] -> nextInner]  (join predicate)
 ///                [LoadConstant r[flag]=1]            (LEFT OUTER: mark matched)
+///                [FilterRegisters staging -> nextInner] (post-join WHERE)
 ///                Copy/LoadConstant per output -> out[0..P-1]
 ///                ResultRow out
 ///   nextInner    Next c1          -> innerLoop
 ///                [JumpIf r[flag]  -> nextOuter]      (LEFT OUTER: matched, skip null-extension)
 ///   noMatch      [Column c0.* -> staging[0..WL-1]]   (LEFT OUTER)
 ///                [LoadConstant NULL -> staging[WL..W-1]]
+///                [FilterRegisters staging -> nextOuter] (post-join WHERE)
 ///                [Copy/LoadConstant per output -> out] [ResultRow out]
 ///   nextOuter    Next c0          -> outerLoop
 ///   closeAddr    CloseCursor c1; CloseCursor c0; Halt
@@ -105,7 +108,8 @@ public static class JoinProgramBuilder
         int rightColumnCount,
         JoinType joinType,
         IReadOnlyList<JoinProjection> projections,
-        VdbeRowPredicate? predicate = null)
+        VdbeRowPredicate? predicate = null,
+        VdbeRowPredicate? postJoinPredicate = null)
     {
         ArgumentNullException.ThrowIfNull(leftTableName);
         ArgumentNullException.ThrowIfNull(rightTableName);
@@ -168,6 +172,13 @@ public static class JoinProgramBuilder
         if (isLeftOuter)
             ins.Add(new LoadConstantInstruction(flag, SqlValue.Integer(1)));
 
+        var postJoinMatchFilterIndex = -1;
+        if (postJoinPredicate is not null)
+        {
+            postJoinMatchFilterIndex = ins.Count;
+            ins.Add(new FilterRegistersInstruction(combinedRange, postJoinPredicate, new ProgramCounter(0), string.Empty));
+        }
+
         EmitProjection(ins, projections, outputBase);
         ins.Add(new ResultRowInstruction(outputRange));
 
@@ -176,6 +187,7 @@ public static class JoinProgramBuilder
 
         var jumpIfIndex = -1;
         var noMatchAddr = -1;
+        var postJoinNoMatchFilterIndex = -1;
         if (isLeftOuter)
         {
             jumpIfIndex = ins.Count;
@@ -186,6 +198,12 @@ public static class JoinProgramBuilder
                 ins.Add(new ColumnInstruction(outer, i, new Register(i)));
             for (var j = 0; j < rightColumnCount; j++)
                 ins.Add(new LoadConstantInstruction(new Register(leftColumnCount + j), SqlValue.Null));
+
+            if (postJoinPredicate is not null)
+            {
+                postJoinNoMatchFilterIndex = ins.Count;
+                ins.Add(new FilterRegistersInstruction(combinedRange, postJoinPredicate, new ProgramCounter(0), string.Empty));
+            }
 
             EmitProjection(ins, projections, outputBase);
             ins.Add(new ResultRowInstruction(outputRange));
@@ -211,6 +229,24 @@ public static class JoinProgramBuilder
                 predicate!,
                 new ProgramCounter(nextInnerAddr),
                 $"skip pair when join predicate is false, goto {nextInnerAddr}");
+        }
+
+        if (postJoinMatchFilterIndex >= 0)
+        {
+            ins[postJoinMatchFilterIndex] = new FilterRegistersInstruction(
+                combinedRange,
+                postJoinPredicate!,
+                new ProgramCounter(nextInnerAddr),
+                $"skip result when post-join WHERE is false, goto {nextInnerAddr}");
+        }
+
+        if (postJoinNoMatchFilterIndex >= 0)
+        {
+            ins[postJoinNoMatchFilterIndex] = new FilterRegistersInstruction(
+                combinedRange,
+                postJoinPredicate!,
+                new ProgramCounter(nextOuterAddr),
+                $"skip result when post-join WHERE is false, goto {nextOuterAddr}");
         }
 
         if (jumpIfIndex >= 0)

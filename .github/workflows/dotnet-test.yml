@@ -68,10 +68,13 @@ jobs:
           cache-on-failure: true
 
 
-      - name: Install dotnet sdk 9.0
+      - name: Install dotnet SDKs
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
 
-      - name: Run tests
-        run: make test
+      - name: Run native-inclusive tests
+        run: make test-native

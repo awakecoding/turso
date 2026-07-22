@@ -407,6 +407,40 @@ public class TursoEfCoreTests
     }
 
     [Test]
+    public async Task ManagedEnsureCreatedRejectsCompositeForeignKeysBeforeSchemaMutation()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        await connection.OpenAsync();
+
+        var options = new DbContextOptionsBuilder<CompositeForeignKeyContext>()
+            .UseTurso(connection)
+            .Options;
+        await using var context = new CompositeForeignKeyContext(options);
+
+        var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
+
+        await ensureCreated.Should().ThrowAsync<NotSupportedException>()
+            .WithMessage("*exactly one child column and one explicitly named parent column*");
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table';";
+
+        (await command.ExecuteScalarAsync()).Should().Be(0L);
+    }
+
+    [Test]
+    public void NativeMigrationsKeepCompositeForeignKeys()
+    {
+        using var context = CreateContext("Data Source=:memory:;Local Provider=Native");
+        var operation = CreateCompositeForeignKeyTable();
+
+        var commands = context.GetService<IMigrationsSqlGenerator>().Generate([operation]);
+        var sql = string.Concat(commands.Select(command => command.CommandText));
+
+        sql.Should().Contain("FOREIGN KEY (\"ParentId1\", \"ParentId2\") REFERENCES \"Parents\" (\"Id1\", \"Id2\")");
+    }
+
+    [Test]
     public async Task ManagedEnsureCreatedRejectsCascadeBeforeSchemaMutation()
     {
         using var database = TemporaryDatabase.Create();
@@ -546,6 +580,40 @@ public class TursoEfCoreTests
         return operation;
     }
 
+    private static CreateTableOperation CreateCompositeForeignKeyTable()
+    {
+        var operation = new CreateTableOperation
+        {
+            Name = "Children"
+        };
+        operation.Columns.Add(new AddColumnOperation
+        {
+            Table = "Children",
+            Name = "ParentId1",
+            ClrType = typeof(long),
+            ColumnType = "INTEGER",
+            IsNullable = false
+        });
+        operation.Columns.Add(new AddColumnOperation
+        {
+            Table = "Children",
+            Name = "ParentId2",
+            ClrType = typeof(long),
+            ColumnType = "INTEGER",
+            IsNullable = false
+        });
+        operation.ForeignKeys.Add(new AddForeignKeyOperation
+        {
+            Name = "FK_Children_Parents",
+            Table = "Children",
+            Columns = ["ParentId1", "ParentId2"],
+            PrincipalTable = "Parents",
+            PrincipalColumns = ["Id1", "Id2"]
+        });
+
+        return operation;
+    }
+
     private sealed class TestDbContext(DbContextOptions<TestDbContext> options) : DbContext(options)
     {
         public DbSet<Customer> Customers => Set<Customer>();
@@ -630,6 +698,46 @@ public class TursoEfCoreTests
         public long ParentId { get; set; }
 
         public CascadeParent Parent { get; set; } = null!;
+    }
+
+    private sealed class CompositeForeignKeyContext(DbContextOptions<CompositeForeignKeyContext> options) : DbContext(options)
+    {
+        public DbSet<CompositeParent> Parents => Set<CompositeParent>();
+
+        public DbSet<CompositeChild> Children => Set<CompositeChild>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<CompositeParent>()
+                .HasKey(parent => new { parent.Id1, parent.Id2 });
+            modelBuilder.Entity<CompositeChild>()
+                .HasKey(child => child.Id);
+            modelBuilder.Entity<CompositeChild>()
+                .HasOne(child => child.Parent)
+                .WithMany(parent => parent.Children)
+                .HasForeignKey(child => new { child.ParentId1, child.ParentId2 })
+                .OnDelete(DeleteBehavior.NoAction);
+        }
+    }
+
+    private sealed class CompositeParent
+    {
+        public long Id1 { get; set; }
+
+        public long Id2 { get; set; }
+
+        public List<CompositeChild> Children { get; set; } = [];
+    }
+
+    private sealed class CompositeChild
+    {
+        public long Id { get; set; }
+
+        public long ParentId1 { get; set; }
+
+        public long ParentId2 { get; set; }
+
+        public CompositeParent Parent { get; set; } = null!;
     }
 
     private sealed class Customer

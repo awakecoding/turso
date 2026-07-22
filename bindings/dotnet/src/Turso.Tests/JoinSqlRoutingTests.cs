@@ -572,38 +572,58 @@ public class JoinSqlRoutingTests
         SeedLeftJoinCases(connection);
 
         using var routed = connection.Prepare(
-            "SELECT l.label AS left_label, r.amount AS right_amount FROM l LEFT JOIN r ON l.key = r.key COLLATE NOCASE LIMIT ? OFFSET ?;");
+            "SELECT l.label AS left_label, r.amount AS right_amount FROM l LEFT JOIN r ON l.key = r.key COLLATE NOCASE WHERE r.amount >= ? LIMIT ? OFFSET ?;");
         using var evaluated = connection.Prepare(
-            "SELECT l.label AS left_label, r.amount AS right_amount FROM l LEFT JOIN r ON l.key = r.key COLLATE NOCASE WHERE 1 LIMIT ? OFFSET ?;");
+            "SELECT l.label || '' AS left_label, r.amount AS right_amount FROM l LEFT JOIN r ON l.key = r.key COLLATE NOCASE WHERE r.amount >= ? LIMIT ? OFFSET ?;");
 
         routed.GetColumnCount().Should().Be(2);
         routed.GetColumnName(0).Should().Be("left_label");
         routed.GetColumnName(1).Should().Be("right_amount");
 
-        routed.Bind(1, SqlValue.Integer(2));
-        routed.Bind(2, SqlValue.Integer(1));
-        evaluated.Bind(1, SqlValue.Integer(2));
-        evaluated.Bind(2, SqlValue.Integer(1));
+        routed.Bind(1, SqlValue.Integer(0));
+        routed.Bind(2, SqlValue.Integer(2));
+        routed.Bind(3, SqlValue.Integer(1));
+        evaluated.Bind(1, SqlValue.Integer(0));
+        evaluated.Bind(2, SqlValue.Integer(2));
+        evaluated.Bind(3, SqlValue.Integer(1));
         var first = DrainRows(routed);
         first.Select(row => (row[0], row[1])).Should().Equal(
             (SqlValue.Text("first"), SqlValue.Integer(11)),
-            (SqlValue.Text("null-key"), SqlValue.Null));
+            (SqlValue.Text("third"), SqlValue.Integer(20)));
         first.Select(row => (row[0], row[1])).Should().Equal(
             DrainRows(evaluated).Select(row => (row[0], row[1])));
 
         routed.Reset();
         evaluated.Reset();
-        routed.Bind(1, SqlValue.Integer(3));
-        routed.Bind(2, SqlValue.Integer(2));
-        evaluated.Bind(1, SqlValue.Integer(3));
-        evaluated.Bind(2, SqlValue.Integer(2));
+        routed.Bind(1, SqlValue.Integer(15));
+        routed.Bind(2, SqlValue.Integer(3));
+        routed.Bind(3, SqlValue.Integer(0));
+        evaluated.Bind(1, SqlValue.Integer(15));
+        evaluated.Bind(2, SqlValue.Integer(3));
+        evaluated.Bind(3, SqlValue.Integer(0));
         var second = DrainRows(routed);
         second.Select(row => (row[0], row[1])).Should().Equal(
-            (SqlValue.Text("null-key"), SqlValue.Null),
             (SqlValue.Text("third"), SqlValue.Integer(20)),
-            (SqlValue.Text("unmatched"), SqlValue.Null));
+            (SqlValue.Text("affinity"), SqlValue.Integer(40)));
         second.Select(row => (row[0], row[1])).Should().Equal(
             DrainRows(evaluated).Select(row => (row[0], row[1])));
+
+        routed.Reset();
+        evaluated.Reset();
+        routed.Bind(1, SqlValue.Null);
+        routed.Bind(2, SqlValue.Integer(3));
+        routed.Bind(3, SqlValue.Integer(0));
+        evaluated.Bind(1, SqlValue.Null);
+        evaluated.Bind(2, SqlValue.Integer(3));
+        evaluated.Bind(3, SqlValue.Integer(0));
+        DrainRows(routed).Should().BeEmpty();
+        DrainRows(evaluated).Should().BeEmpty();
+
+        var explain = ReadRows(
+            connection,
+            "EXPLAIN SELECT l.label AS left_label, r.amount AS right_amount FROM l LEFT JOIN r ON l.key = r.key COLLATE NOCASE WHERE r.amount >= 0 LIMIT 2 OFFSET 1;");
+        Opcodes(explain).Count(opcode => opcode == "FilterRegisters").Should().Be(3);
+        Comments(explain).Should().Contain(comment => comment.StartsWith("skip result when post-join WHERE is false"));
     }
 
     [Test]
@@ -625,6 +645,10 @@ public class JoinSqlRoutingTests
                 connection,
                 "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;")
             .Should().ContainSingle();
+        ReadRows(
+                connection,
+                "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;")
+            .Should().ContainSingle();
         // Bounded lowering requires an outer equi-join with direct columns, so the evaluator retains
         // ownership of cross joins and computed ON/WHERE predicates.
         foreach (var sql in new[]
@@ -632,6 +656,7 @@ public class JoinSqlRoutingTests
             "EXPLAIN SELECT u.name, o.amount FROM users u CROSS JOIN orders o LIMIT 1;",
             "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id + 0 = o.user_id LIMIT 1;",
             "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;",
+            "EXPLAIN SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;",
         })
         {
             Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, sql));
@@ -646,11 +671,11 @@ public class JoinSqlRoutingTests
 
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(
                 connection,
-                "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE o.missing = 1 LIMIT 1;"))
+                "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE o.missing = 1 LIMIT 1;"))!
             .Message.Should().Be("no such column: o.missing");
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(
                 connection,
-                "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id LIMIT 'x';"))
+                "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id LIMIT 'x';"))!
             .Message.Should().Be("datatype mismatch");
 
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(
@@ -660,33 +685,72 @@ public class JoinSqlRoutingTests
         SeedLeftJoinCases(connection);
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(
                 connection,
-                "SELECT l.label FROM l LEFT JOIN r ON l.missing = r.key LIMIT 1;"))
+                "SELECT l.label FROM l LEFT JOIN r ON l.missing = r.key LIMIT 1;"))!
             .Message.Should().Be("no such column: l.missing");
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(
                 connection,
-                "SELECT l.label FROM l LEFT JOIN r ON l.key = r.key LIMIT 'x';"))
+                "SELECT l.label FROM l LEFT JOIN r ON l.key = r.key LIMIT 'x';"))!
             .Message.Should().Be("datatype mismatch");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+                connection,
+                "SELECT l.label FROM l LEFT JOIN r ON l.key = r.key WHERE r.missing IS NULL LIMIT 1;"))!
+            .Message.Should().Be("no such column: r.missing");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+                connection,
+                "SELECT l.label FROM l LEFT JOIN r ON l.key = r.key WHERE r.missing IS NULL LIMIT 'x';"))!
+            .Message.Should().Be("datatype mismatch");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+            connection,
+            "EXPLAIN SELECT l.label FROM l LEFT JOIN r ON l.key = r.key WHERE r.missing IS NULL LIMIT 1;"));
     }
 
     [Test]
-    public void BoundedLeftOuterJoinWhereFallsBackAfterNullExtension()
+    public void BoundedLeftOuterJoinWhereRoutesAfterNullExtension()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
         Execute(connection, "INSERT INTO users VALUES (3, 'cy');");
 
-        // A LEFT join WHERE is a post-join filter over null-extended rows the nested loop cannot
-        // express, so it stays on the evaluator and sees the NULL it created for "cy".
+        const string routedSql =
+            "SELECT u.name AS user_name, o.amount AS order_amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL LIMIT 5 OFFSET 0;";
+        var routed = ReadRows(
+            connection,
+            routedSql);
+        routed.Should().ContainSingle();
+        routed[0].Should().Equal(SqlValue.Text("cy"), SqlValue.Null);
+        ColumnNames(connection, routedSql).Should().Equal("user_name", "order_amount");
+
+        // The computed projection declines lowering and supplies the evaluator differential oracle.
+        var evaluated = ReadRows(
+            connection,
+            "SELECT u.name || '' AS user_name, o.amount AS order_amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL LIMIT 5 OFFSET 0;");
+        routed.Select(row => (row[0], row[1]))
+            .Should().Equal(evaluated.Select(row => (row[0], row[1])));
+
+        var explain = ReadRows(
+            connection,
+            "EXPLAIN SELECT u.name AS user_name, o.amount AS order_amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL LIMIT 5 OFFSET 0;");
+        Opcodes(explain).Should().Contain("JumpIf").And.Contain("LimitGate");
+        Opcodes(explain).Count(opcode => opcode == "FilterRegisters").Should().Be(3);
+        Comments(explain).Should().Contain(comment => comment.StartsWith("skip result when post-join WHERE is false"));
+    }
+
+    [Test]
+    public void UnboundedLeftOuterJoinWhereFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        SeedOrders(connection);
+        Execute(connection, "INSERT INTO users VALUES (3, 'cy');");
+
         var rows = ReadRows(
             connection,
-            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL LIMIT 5 OFFSET 0;");
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL;");
         rows.Should().ContainSingle();
         rows[0].Should().Equal(SqlValue.Text("cy"), SqlValue.Null);
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(
-                connection,
-                "EXPLAIN SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL LIMIT 5 OFFSET 0;"));
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+            connection,
+            "EXPLAIN SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL;"));
     }
 
     [Test]

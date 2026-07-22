@@ -140,5 +140,8 @@
         <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\on_conflict.sqltest"
                  Link="Conformance\on_conflict.sqltest"
                  CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\views.sqltest"
+                 Link="Conformance\views.sqltest"
+                 CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 </Project>

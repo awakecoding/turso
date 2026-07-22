@@ -302,6 +302,11 @@ public class TursoDataReader : DbDataReader
         return false;
     }
 
+    public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
+    {
+        return CompleteAsync(NextResult, cancellationToken);
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing)
@@ -319,11 +324,41 @@ public class TursoDataReader : DbDataReader
         return _hasCurrentRow;
     }
 
+    public override Task<bool> ReadAsync(CancellationToken cancellationToken)
+    {
+        return CompleteAsync(Read, cancellationToken);
+    }
+
+    public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
+    {
+        return CompleteAsync(() => IsDBNull(ordinal), cancellationToken);
+    }
+
+    public override Task<T> GetFieldValueAsync<T>(int ordinal, CancellationToken cancellationToken)
+    {
+        return CompleteAsync(() => GetFieldValue<T>(ordinal), cancellationToken);
+    }
+
     public override int Depth => 0;
 
     public override IEnumerator GetEnumerator()
     {
         return new DbEnumerator(this, closeReader: false);
+    }
+
+    private static Task<T> CompleteAsync<T>(Func<T> operation, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<T>(cancellationToken);
+
+        try
+        {
+            return Task.FromResult(operation());
+        }
+        catch (Exception exception)
+        {
+            return Task.FromException<T>(exception);
+        }
     }
 
     private static long CopyValue<T>(T[] source, long dataOffset, T[]? buffer, int bufferOffset, int length)

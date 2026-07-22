@@ -3570,7 +3570,7 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         // A SELECT carrying LIMIT/OFFSET lowers only when its LIMIT/OFFSET-free base is a
         // gate-able route. Direct scans, constant projections, aggregates, the deliberately
-        // narrow bounded sorted-scan subset, and a strictly-gated inner equi-join subset route
+        // narrow bounded sorted-scan subset, and a strictly-gated equi-join subset route
         // through the dedicated path that layers LimitOffsetProgramBuilder gates onto that base.
         // DISTINCT, computed shapes, outer joins, and compounds keep LIMIT/OFFSET on the evaluator.
         if (select.Limit is not null || select.Offset is not null)
@@ -3622,7 +3622,13 @@ public sealed class EmbeddedDatabase : IDisposable
         // OpenReadCursor/Rewind/Column/FilterRegisters/JumpIf/ResultRow opcode family instead
         // of the evaluator, delegating the ON/WHERE predicate to the evaluator's own
         // comparison semantics so routed rows stay byte-identical.
-        return TryCompileJoinSelect(select, parameters, context, outerRow, out compiled);
+        return TryCompileJoinSelect(
+            select,
+            parameters,
+            context,
+            outerRow,
+            allowPostJoinWhere: false,
+            compiled: out compiled);
     }
 
     // The direct-scan / source-less constant-projection subset, delegated to the shared
@@ -4024,8 +4030,8 @@ public sealed class EmbeddedDatabase : IDisposable
         // Gate only the row-count-preserving routes whose unconditional ResultRows the builder
         // can bound exactly. The join branch below is intentionally stricter than the existing
         // unbounded join route: bounded joins currently claim only explicit INNER or LEFT equi-joins
-        // over two base tables with direct projections. LEFT joins exclude WHERE because it filters
-        // null-extended rows after matching, while the reusable nested loop only gates the join stream.
+        // over two base tables with direct projections. A narrowly validated LEFT WHERE runs after
+        // null extension inside the reusable nested loop.
         var baseSelect = select with { Limit = null, Offset = null };
         if (!TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase)
             && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase)
@@ -4047,8 +4053,9 @@ public sealed class EmbeddedDatabase : IDisposable
     // mechanically valid over every unconditional ResultRow that JoinProgramBuilder emits, including the
     // mutually-exclusive matched and null-extension emission sites of a LEFT join. This route claims two base
     // tables, an explicit equality between one direct column from each side, and direct column/literal
-    // projections. INNER joins may add a direct post-join WHERE; LEFT joins must not, because filtering the
-    // null-extended row is post-join work that the nested-loop program cannot express.
+    // projections. INNER joins may add a direct post-join WHERE. LEFT joins may add only a direct,
+    // collation-free comparison over the combined input row, which the nested-loop program applies after
+    // null extension.
     private bool TryCompileLimitedEquiJoinSelect(
         SelectStatement select,
         SqlValue[] parameters,
@@ -4069,11 +4076,6 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        // The left-outer builder's predicate controls matching only. Keeping every LEFT WHERE on the
-        // evaluator preserves filtering after the unmatched row has been null-extended.
-        if (join.Kind == JoinKind.Left && select.Where is not null)
-            return false;
-
         var leftTarget = ResolveScanTarget(join.Left, context);
         var rightTarget = ResolveScanTarget(join.Right, context);
         if (leftTarget is null
@@ -4082,12 +4084,20 @@ public sealed class EmbeddedDatabase : IDisposable
             || select.Projections.Any(projection =>
                 !IsDirectJoinProjection(projection.Expression, leftTarget, rightTarget))
             || (select.Where is not null
-                && !IsDirectJoinWherePredicate(select.Where, leftTarget, rightTarget)))
+                && (join.Kind == JoinKind.Left
+                    ? !IsExactLeftOuterJoinWherePredicate(select.Where, leftTarget, rightTarget)
+                    : !IsDirectJoinWherePredicate(select.Where, leftTarget, rightTarget))))
         {
             return false;
         }
 
-        return TryCompileJoinSelect(select, parameters, context, outerRow, out compiled);
+        return TryCompileJoinSelect(
+            select,
+            parameters,
+            context,
+            outerRow,
+            allowPostJoinWhere: join.Kind == JoinKind.Left,
+            compiled: out compiled);
     }
 
     // The ON comparison must use one direct column from each input. Requiring a qualifier keeps duplicate
@@ -4145,6 +4155,42 @@ public sealed class EmbeddedDatabase : IDisposable
         => IsDirectColumnFrom(expression, leftTarget, rightTarget)
             || IsDirectColumnFrom(expression, rightTarget, leftTarget)
             || UnwrapCollation(expression) is LiteralExpression or ParameterExpression;
+
+    // An explicit WHERE collation can raise a late "no such collation sequence" error. The evaluator
+    // materializes the complete join before it evaluates WHERE, while the VDBE checks per row, so retain
+    // those shapes on the evaluator. Direct comparison/IS predicates otherwise cannot fail after parameter
+    // binding and use the evaluator itself for all SQL NULL truth semantics.
+    private static bool IsExactLeftOuterJoinWherePredicate(
+        Expression expression,
+        ScanTarget leftTarget,
+        ScanTarget rightTarget)
+    {
+        if (ContainsExplicitCollation(expression))
+            return false;
+
+        if (expression is BinaryExpression { Operator: BinaryOperator.Is or BinaryOperator.IsNot } comparison)
+        {
+            return IsDirectJoinPredicateOperand(comparison.Left, leftTarget, rightTarget)
+                && IsDirectJoinPredicateOperand(comparison.Right, leftTarget, rightTarget)
+                && (IsDirectColumnFrom(comparison.Left, leftTarget, rightTarget)
+                    || IsDirectColumnFrom(comparison.Left, rightTarget, leftTarget)
+                    || IsDirectColumnFrom(comparison.Right, leftTarget, rightTarget)
+                    || IsDirectColumnFrom(comparison.Right, rightTarget, leftTarget));
+        }
+
+        return IsDirectJoinWherePredicate(expression, leftTarget, rightTarget);
+    }
+
+    private static bool ContainsExplicitCollation(Expression expression)
+    {
+        return expression switch
+        {
+            CollationExpression => true,
+            BinaryExpression binary => ContainsExplicitCollation(binary.Left)
+                || ContainsExplicitCollation(binary.Right),
+            _ => false,
+        };
+    }
 
     private static bool IsDirectColumnFrom(
         Expression expression,
@@ -4559,19 +4605,19 @@ public sealed class EmbeddedDatabase : IDisposable
     //  - the ON condition and, for INNER joins only, a post-join WHERE, each a row-at-a-time
     //    scan predicate that reads no unbacked rowid over the combined row. Because an INNER
     //    join emits exactly the ON-matching pairs the evaluator then filters by WHERE,
-    //    testing "ON AND WHERE" per pair is identical; a LEFT OUTER WHERE is a post-join
-    //    filter over null-extended rows the nested loop cannot express, so LEFT + WHERE
-    //    stays on the evaluator.
+    //    testing "ON AND WHERE" per pair is identical. A bounded caller may additionally opt
+    //    into the exact direct LEFT WHERE subset, which runs after null extension.
     //
     // Deliberately excluded (kept on the evaluator): DISTINCT, GROUP BY/HAVING, ORDER BY,
     // LIMIT/OFFSET, aggregate/window projections, computed-expression projections, USING/
     // NATURAL joins, RIGHT/FULL joins, joins of more than two base tables, and LEFT OUTER
-    // joins carrying a WHERE clause.
+    // joins carrying a WHERE clause outside the bounded exact subset.
     private bool TryCompileJoinSelect(
         SelectStatement select,
         SqlValue[] parameters,
         QueryContext context,
         SourceRow? outerRow,
+        bool allowPostJoinWhere,
         out CompiledSelect compiled)
     {
         compiled = null!;
@@ -4668,11 +4714,14 @@ public sealed class EmbeddedDatabase : IDisposable
         if (projections.Count == 0)
             return false;
 
-        // A LEFT OUTER join's WHERE filters null-extended rows after the join, which the
-        // nested loop cannot express; keep it on the evaluator. An INNER join's WHERE folds
-        // into the per-pair predicate because the join emits exactly the ON-matching pairs.
+        // A LEFT WHERE must run only after the matching state has decided whether a null-extended
+        // row exists. Only the bounded caller can opt into its narrow direct-comparison subset;
+        // an INNER join instead folds WHERE into the per-pair predicate.
         var whereExpr = select.Where;
-        if (whereExpr is not null && joinType == JoinType.LeftOuter)
+        if (whereExpr is not null
+            && joinType == JoinType.LeftOuter
+            && (!allowPostJoinWhere
+                || !IsExactLeftOuterJoinWherePredicate(whereExpr, leftTarget, rightTarget)))
             return false;
 
         var condition = join.Condition;
@@ -4682,7 +4731,28 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
 
         VdbeRowPredicate? predicate = null;
-        if (condition is not null || whereExpr is not null)
+        VdbeRowPredicate? postJoinPredicate = null;
+        if (joinType == JoinType.LeftOuter)
+        {
+            if (condition is not null)
+            {
+                predicate = row => IsTrue(Evaluate(
+                    condition,
+                    parameters,
+                    new SourceRow(combinedColumns, row, combinedQualified, outerRow, outputColumns),
+                    context));
+            }
+
+            if (whereExpr is not null)
+            {
+                postJoinPredicate = row => IsTrue(Evaluate(
+                    whereExpr,
+                    parameters,
+                    new SourceRow(combinedColumns, row, combinedQualified, outerRow, outputColumns),
+                    context));
+            }
+        }
+        else if (condition is not null || whereExpr is not null)
         {
             // Reconstruct the combined SourceRow exactly as GetJoinRows does and defer value
             // semantics to the evaluator, so the compiled gate matches JoinConditionMatches
@@ -4704,7 +4774,8 @@ public sealed class EmbeddedDatabase : IDisposable
             rightColumns.Length,
             joinType,
             projections,
-            predicate);
+            predicate,
+            postJoinPredicate);
         compiled = new CompiledSelect(
             program,
             [new VdbeCursorSource(leftTarget.Rows), new VdbeCursorSource(rightTarget.Rows)]);

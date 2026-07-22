@@ -39,6 +39,21 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                         entry.FullName.Contains("turso_sdk_kit", StringComparison.OrdinalIgnoreCase) ||
                         entry.FullName.Contains("Turso.Raw", StringComparison.OrdinalIgnoreCase),
                         "the managed package must not carry native implementation assets or assemblies");
+
+                var nuspecEntry = archive.Entries.Single(entry =>
+                    entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase));
+                using var nuspecStream = nuspecEntry.Open();
+                var nativeDependencies = XDocument.Load(nuspecStream)
+                    .Descendants()
+                    .Where(element => element.Name.LocalName == "dependency")
+                    .Select(element => element.Attribute("id")?.Value)
+                    .Where(id => id is not null)
+                    .ToArray();
+                nativeDependencies.Should().NotContain(
+                    dependency => dependency == "Turso.Raw" ||
+                                  dependency == "Turso.Data.Native" ||
+                                  dependency == "Turso.Data.Sqlite.Native",
+                    "the managed package must not restore an optional native companion");
             }
 
             foreach (var file in new[]
