@@ -10,11 +10,11 @@ namespace Turso.Tests;
 // while every deliberate fallback shape throws because EXPLAIN only describes lowered programs.
 //
 // Routable subset (the base with LIMIT/OFFSET stripped must itself lower): a direct single-table
-// scan, a source-less constant projection, and scalar/grouped aggregates with an aggregate-only HAVING
-// predicate (no ORDER BY, DISTINCT, join, or compound). Deliberate fallbacks keep the evaluator's
-// exact rows AND error timing:
-// LIMIT 0 (validate-then-skip-the-scan), ORDER BY + LIMIT, JOIN + LIMIT, DISTINCT + LIMIT,
-// compound + LIMIT, and non-integer LIMIT/OFFSET ("datatype mismatch").
+// scan, a source-less constant projection, scalar/grouped aggregates with an aggregate-only HAVING
+// predicate, or a bounded single-table sorter over bare-column/literal projections and resolved
+// column ORDER BY keys. Deliberate fallbacks keep the evaluator's exact rows AND error timing:
+// LIMIT 0 (validate-then-skip-the-scan), JOIN + LIMIT, DISTINCT + LIMIT, compound + LIMIT,
+// unsupported ORDER BY shapes, and non-integer LIMIT/OFFSET ("datatype mismatch").
 public class LimitOffsetSqlRoutingTests
 {
     // ---- Scan + LIMIT / OFFSET routing ------------------------------------------------------
@@ -381,17 +381,17 @@ public class LimitOffsetSqlRoutingTests
     }
 
     [Test]
-    public void OrderByLimitFallsBackToTheEvaluator()
+    public void SimpleOrderByLimitRoutesThroughSorterAndLimitGate()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (3), (1), (2);");
 
-        // ORDER BY reshapes cardinality-sensitive ordering, so LIMIT stays on the evaluator.
         ReadRows(connection, "SELECT value FROM t ORDER BY value LIMIT 2;")
             .Select(row => row[0]).Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT value FROM t ORDER BY value LIMIT 2;"));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT value FROM t ORDER BY value LIMIT 2;"))
+            .Should().Contain("OpenSorter").And.Contain("SorterInsert").And.Contain("SorterSort")
+            .And.Contain("LimitGate");
     }
 
     [Test]

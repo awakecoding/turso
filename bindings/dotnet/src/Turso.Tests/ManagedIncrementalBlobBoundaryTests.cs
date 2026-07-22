@@ -142,7 +142,35 @@ public sealed class ManagedIncrementalBlobBoundaryTests
         var error = Assert.Throws<SqliteException>(() => blob.Write([3], 0, 1));
 
         error!.SqliteErrorCode.Should().Be(1);
-        error.Message.Should().Contain("cannot write to an incremental blob on a table with UPDATE triggers");
+        error.Message.Should().Be(
+            Turso.Data.Sqlite.Properties.Resources.SqliteNativeError(
+                1,
+                "cannot write to an incremental blob on a table with UPDATE triggers"));
+        connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE rowid = 1;").Should().Equal(1, 2);
+        connection.ExecuteScalar<long>("SELECT COUNT(*) FROM audit;").Should().Be(0);
+    }
+
+    [Test]
+    public void ManagedReadOnlyBlobReadsTablesWithUpdateTriggers()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery("""
+            CREATE TABLE data(value BLOB);
+            CREATE TABLE audit(value TEXT);
+            INSERT INTO data(rowid, value) VALUES (1, X'0102');
+            CREATE TRIGGER data_audit AFTER UPDATE ON data
+            BEGIN
+                INSERT INTO audit VALUES ('updated');
+            END;
+            """);
+        using var blob = new SqliteBlob(connection, "data", "value", 1, readOnly: true);
+
+        var value = new byte[2];
+        blob.Read(value, 0, value.Length).Should().Be(value.Length);
+
+        blob.CanWrite.Should().BeFalse();
+        value.Should().Equal(1, 2);
         connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE rowid = 1;").Should().Equal(1, 2);
         connection.ExecuteScalar<long>("SELECT COUNT(*) FROM audit;").Should().Be(0);
     }

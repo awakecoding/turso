@@ -3568,9 +3568,10 @@ public sealed class EmbeddedDatabase : IDisposable
         out CompiledSelect compiled)
     {
         // A SELECT carrying LIMIT/OFFSET lowers only when its LIMIT/OFFSET-free base is a
-        // gate-able route (direct scan, constant projection, or aggregate); route it through
-        // the dedicated path that layers the LimitOffsetProgramBuilder gates onto that base.
-        // ORDER BY, joins, DISTINCT, and compounds keep LIMIT/OFFSET on the evaluator.
+        // gate-able route. Direct scans, constant projections, aggregates, and the deliberately
+        // narrow bounded sorted-scan subset route through the dedicated path that layers
+        // LimitOffsetProgramBuilder gates onto that base. Joins, DISTINCT, computed shapes,
+        // and compounds keep LIMIT/OFFSET on the evaluator.
         if (select.Limit is not null || select.Offset is not null)
             return TryCompileLimitedSelect(select, parameters, context, outerRow, out compiled);
 
@@ -3971,20 +3972,18 @@ public sealed class EmbeddedDatabase : IDisposable
     //
     // Routed entirely through the VDBE:
     //  - the base (the same SELECT with LIMIT/OFFSET stripped) lowers via the direct-scan /
-    //    constant-projection compiler or the aggregate route. Each emits its result set
-    //    through a single unconditional ResultRow, which is exactly what the gate can bound
-    //    exactly: OFFSET skips leading candidates without charging LIMIT, then LIMIT caps the
-    //    survivors, matching the evaluator's OFFSET-then-LIMIT ApplyDistinctLimit order.
+    //    constant-projection compiler, aggregate route, or bounded sorted-scan route. Each
+    //    emits through one unconditional ResultRow, which is exactly what the gate can bound:
+    //    OFFSET skips leading candidates without charging LIMIT, then LIMIT caps the survivors,
+    //    matching the evaluator's OFFSET-then-LIMIT ApplyDistinctLimit order.
     //  - LIMIT/OFFSET resolve to integers exactly as ExecuteSelect resolves them
     //    (RequireLimitInteger, with a negative OFFSET clamped to zero and a null/negative
     //    LIMIT treated as unbounded), so the gated program yields the identical row window.
     //
     // Deliberately kept on the evaluator (fallback):
-    //  - ORDER BY (the sorter route) and joins: their LIMIT/OFFSET-free base still carries the
-    //    ORDER BY clause or the join source, which the scan/constant/aggregate routes reject,
-    //    so the base never lowers here and the evaluator trims the reshaped/reordered stream.
-    //    (Layering a pre-emit gate over a sorted or joined stream would also change how many
-    //    rows are materialized, so it is left to the evaluator on purpose.)
+    //  - ORDER BY outside the bounded sorted-scan subset: joins, DISTINCT,
+    //    aggregate/window shapes, non-base sources, computed projections, and non-column order
+    //    keys all need semantics this scan/sorter/gate pipeline does not represent exactly.
     //  - DISTINCT: the base carries DISTINCT, which every gate-able route rejects, so the
     //    evaluator applies de-duplication before trimming.
     //  - LIMIT 0: the evaluator validates every projection/WHERE/GROUP BY/HAVING/ORDER BY
@@ -4003,41 +4002,30 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         compiled = null!;
 
-        // Gate only the row-count-preserving routes whose lone unconditional ResultRow the
-        // builder can bound exactly. The base still carries any ORDER BY / DISTINCT / join
-        // source, so the sorter and join routes are never reached: a sorted or joined base
-        // simply declines here and its LIMIT/OFFSET stays on the evaluator.
-        var baseSelect = select with { Limit = null, Offset = null };
-        if (!TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase)
-            && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase))
-        {
-            return false;
-        }
+        // ORDER BY needs a sorter before row gates run. Its bounded subset has an explicit
+        // preflight below; every other ordered shape remains evaluator-owned.
+        if (select.OrderBy.Count != 0)
+            return TryCompileLimitedSortedSelect(select, parameters, context, outerRow, out compiled);
 
-        // Resolve LIMIT/OFFSET exactly as ExecuteSelect does. A non-integral value throws
-        // "datatype mismatch" from RequireLimitInteger; catch it (and any other resolution
-        // error) and fall back so the evaluator reproduces the identical error and timing.
-        long? limit;
-        long offset;
-        try
-        {
-            limit = select.Limit is null
-                ? null
-                : RequireLimitInteger(Evaluate(select.Limit, parameters, outerRow, context));
-            offset = select.Offset is null
-                ? 0
-                : Math.Max(0, RequireLimitInteger(Evaluate(select.Offset, parameters, outerRow, context)));
-        }
-        catch (EmbeddedSqlException)
-        {
+        // Resolve bounds before compiling the base. This keeps a bad bound's error ahead of
+        // any projection folding or source work, as in ExecuteSelect.
+        if (!TryResolveLimitOffset(select, parameters, context, outerRow, out var limit, out var offset))
             return false;
-        }
 
         // LIMIT 0 has evaluator-specific validate-and-skip-the-scan semantics the gate cannot
         // reproduce; keep it on the evaluator (which also returns empty, but only after its
         // LIMIT 0 expression validation).
         if (limit == 0)
             return false;
+
+        // Gate only the row-count-preserving routes whose lone unconditional ResultRow the
+        // builder can bound exactly.
+        var baseSelect = select with { Limit = null, Offset = null };
+        if (!TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase)
+            && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase))
+        {
+            return false;
+        }
 
         // The gate returns the program unchanged when neither bound is needed (offset <= 0 and
         // an unbounded limit), so an unbounded LIMIT -1 still routes as the plain base scan.
@@ -4046,6 +4034,72 @@ public sealed class EmbeddedDatabase : IDisposable
             ? compiledBase
             : new CompiledSelect(gated, compiledBase.CursorSources);
         return true;
+    }
+
+    // Lowers the intentionally small ORDER BY + LIMIT/OFFSET family. The base sorter consumes
+    // all qualifying rows before its unconditional ResultRow reaches the offset/limit gates, so
+    // the gates trim the already ordered stream exactly. The preflight is deliberately stricter
+    // than the unbounded sorter route: only a single base table, non-DISTINCT non-aggregate
+    // projections made from bare columns, "*", or literals, and resolved column (or
+    // COLLATE-column) ORDER BY keys are admitted. This prevents aliases/ordinals that resolve to
+    // computed expressions from being mistaken for row-backed sort keys.
+    private bool TryCompileLimitedSortedSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+
+        // ExecuteSelect validates collations before it resolves LIMIT/OFFSET. Do that before
+        // any lowering work so a missing collation keeps its evaluator error precedence.
+        ValidateOrderByCollations(select.OrderBy);
+        if (!TryResolveLimitOffset(select, parameters, context, outerRow, out var limit, out var offset))
+            return false;
+
+        // LIMIT 0 validates all expressions but deliberately avoids scanning. A sorter would
+        // materialize rows before its zero gate, so retain evaluator ownership.
+        if (limit == 0)
+            return false;
+
+        var baseSelect = select with { Limit = null, Offset = null };
+        if (!TryCompileBoundedSortedSelect(baseSelect, parameters, context, outerRow, out var compiledBase))
+            return false;
+
+        var gated = LimitOffsetProgramBuilder.Apply(compiledBase.Program, offset, limit);
+        compiled = ReferenceEquals(gated, compiledBase.Program)
+            ? compiledBase
+            : new CompiledSelect(gated, compiledBase.CursorSources);
+        return true;
+    }
+
+    private bool TryResolveLimitOffset(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out long? limit,
+        out long offset)
+    {
+        limit = null;
+        offset = 0;
+        try
+        {
+            limit = select.Limit is null
+                ? null
+                : RequireLimitInteger(Evaluate(select.Limit, parameters, outerRow, context));
+            offset = select.Offset is null
+                ? 0
+                : Math.Max(0, RequireLimitInteger(Evaluate(select.Offset, parameters, outerRow, context)));
+            return true;
+        }
+        catch (EmbeddedSqlException)
+        {
+            // The evaluator owns diagnostics for non-integral bounds and any expression
+            // failure, preserving its exact error text and timing.
+            return false;
+        }
     }
 
     // Lowers a compound SELECT whose terms are all lowerable SELECTs sequenced by a single uniform
@@ -4200,15 +4254,33 @@ public sealed class EmbeddedDatabase : IDisposable
     // returns false so the evaluator keeps ownership of shapes the sorted route cannot
     // preserve exactly. Supported: a single real base table, one or more projections that
     // are bare columns, "*", or folded constants, an optional row-at-a-time WHERE, and one
-    // or more ORDER BY keys evaluable against the scanned row. Deliberately excluded (kept
-    // on the evaluator): DISTINCT, GROUP BY/HAVING, LIMIT/OFFSET (so LIMIT 0 column
-    // validation and row-count trimming stay on the evaluator), qualified-star projections,
-    // and any ORDER BY key that needs a subquery/aggregate/window or an unbacked rowid.
+    // or more ORDER BY keys evaluable against the scanned row. LIMIT/OFFSET are accepted only
+    // through TryCompileLimitedSortedSelect, which strips the bounds and asks the bounded
+    // overload below for its stricter column-key subset. Deliberately excluded (kept on the
+    // evaluator): DISTINCT, GROUP BY/HAVING, qualified-star projections, and any ORDER BY key
+    // that needs a subquery/aggregate/window or an unbacked rowid.
     private bool TryCompileSortedSelect(
         SelectStatement select,
         SqlValue[] parameters,
         QueryContext context,
         SourceRow? outerRow,
+        out CompiledSelect compiled)
+        => TryCompileSortedSelect(select, parameters, context, outerRow, bounded: false, out compiled);
+
+    private bool TryCompileBoundedSortedSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+        => TryCompileSortedSelect(select, parameters, context, outerRow, bounded: true, out compiled);
+
+    private bool TryCompileSortedSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        bool bounded,
         out CompiledSelect compiled)
     {
         compiled = null!;
@@ -4224,8 +4296,13 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
         }
 
+        ValidateOrderByCollations(select.OrderBy);
+
         var target = ResolveScanTarget(select.Source, context);
         if (target is null)
+            return false;
+
+        if (bounded && select.Projections.Any(projection => !IsBoundedSortedProjection(projection.Expression)))
             return false;
 
         // Lower every projection to a column read or folded constant, exactly as the
@@ -4247,7 +4324,9 @@ public sealed class EmbeddedDatabase : IDisposable
         var resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
         foreach (var term in resolvedOrderBy)
         {
-            if (!IsScanPredicate(term.Expression) || ReferencesUnbackedRowid(term.Expression, target))
+            if ((!IsScanPredicate(term.Expression)
+                    || ReferencesUnbackedRowid(term.Expression, target))
+                || (bounded && !IsBoundedSortedOrderKey(term, target)))
                 return false;
         }
 
@@ -4279,6 +4358,19 @@ public sealed class EmbeddedDatabase : IDisposable
             predicate);
         compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows)]);
         return true;
+    }
+
+    private static bool IsBoundedSortedProjection(Expression expression)
+        => expression is StarExpression or ColumnExpression or LiteralExpression;
+
+    private static bool IsBoundedSortedOrderKey(OrderByTerm term, ScanTarget target)
+    {
+        var expression = term.Expression;
+        while (expression is CollationExpression collation)
+            expression = collation.Expression;
+
+        return expression is ColumnExpression column
+            && target.ResolveColumnIndex(column.Name) is not null;
     }
 
     // Mirrors SelectStatementCompiler's projection lowering: bare columns and "*" become

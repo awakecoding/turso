@@ -10,6 +10,8 @@ namespace Turso.Tests;
 
 public class TursoDataSqlitePackageArtifactReleaseTests
 {
+    private const string RawPackageTargetFrameworks = "net8.0;net9.0;net10.0";
+
     [Test]
     public void PackageContainsManagedDependenciesWithoutRawAndLoadsManagedConnection()
     {
@@ -71,13 +73,68 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             var packageVersion = $"0.0.0-native-package-validation-{Guid.NewGuid():N}";
             var projectDirectory = Path.GetDirectoryName(FindProjectPath())!;
             Pack(Path.Combine(projectDirectory, "Turso.Data.Sqlite.csproj"), packageDirectory, packageVersion);
-            Pack(Path.Combine(projectDirectory, "..", "Turso.Raw", "Turso.Raw.csproj"), packageDirectory, packageVersion);
+            PackRawPackage(
+                Path.Combine(projectDirectory, "..", "Turso.Raw", "Turso.Raw.csproj"),
+                packageDirectory,
+                packageVersion);
             var nativeProjectPath = Path.Combine(projectDirectory, "..", "Turso.Data.Native", "Turso.Data.Native.csproj");
             Restore(nativeProjectPath);
             BuildNativeCompanion(nativeProjectPath);
             Pack(nativeProjectPath, packageDirectory, packageVersion);
 
             RunNativePackageConsumer(packageDirectory, packageVersion);
+        }
+        finally
+        {
+            Directory.Delete(packageDirectory, recursive: true);
+        }
+    }
+
+    [Test]
+    public void RawPackageContainsManagedClosureForEveryTargetFramework()
+    {
+        var packageDirectory = Path.Combine(AppContext.BaseDirectory, $"turso-raw-package-validation-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(packageDirectory);
+
+        try
+        {
+            var packageVersion = $"0.0.0-raw-package-validation-{Guid.NewGuid():N}";
+            var projectDirectory = Path.GetDirectoryName(FindProjectPath())!;
+            var rawProjectPath = Path.Combine(projectDirectory, "..", "Turso.Raw", "Turso.Raw.csproj");
+            PackRawPackage(rawProjectPath, packageDirectory, packageVersion);
+
+            var packagePath = Path.Combine(packageDirectory, $"Turso.Raw.{packageVersion}.nupkg");
+            File.Exists(packagePath).Should().BeTrue();
+
+            using var archive = ZipFile.OpenRead(packagePath);
+            foreach (var targetFramework in RawPackageTargetFrameworks.Split(';'))
+            {
+                foreach (var assembly in new[] { "Turso.Raw.dll", "Turso.Core.dll", "Turso.Data.dll" })
+                {
+                    archive.Entries.Should().Contain(
+                        entry => string.Equals(
+                            entry.FullName,
+                            $"lib/{targetFramework}/{assembly}",
+                            StringComparison.OrdinalIgnoreCase),
+                        $"{assembly} must be present for Raw package consumers targeting {targetFramework}");
+                }
+            }
+
+            var nuspecEntry = archive.Entries.Single(entry =>
+                entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase));
+            using var nuspecStream = nuspecEntry.Open();
+            var nuspec = XDocument.Load(nuspecStream);
+            var dependencyGroups = nuspec
+                .Descendants()
+                .Where(element => element.Name.LocalName == "group")
+                .ToArray();
+
+            dependencyGroups
+                .Select(group => group.Attribute("targetFramework")!.Value)
+                .Should()
+                .BeEquivalentTo(RawPackageTargetFrameworks.Split(';'));
+            dependencyGroups.Should().OnlyContain(group =>
+                !group.Elements().Any(element => element.Name.LocalName == "dependency"));
         }
         finally
         {
@@ -104,9 +161,8 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             var rawProjectPath = Path.Combine(projectDirectory, "..", "Turso.Raw", "Turso.Raw.csproj");
 
             BuildForPackage(sqliteProjectPath, "net8.0");
-            BuildForPackage(rawProjectPath, "net8.0");
             Pack(sqliteProjectPath, packageDirectory, packageVersion, "net8.0");
-            Pack(rawProjectPath, packageDirectory, packageVersion, "net8.0");
+            PackRawPackage(rawProjectPath, packageDirectory, packageVersion);
             Restore(nativeAotProjectPath, packageDirectory, packageVersion);
             BuildNativeAotPackage(nativeAotProjectPath, packageVersion);
             PackNativeAotPackage(nativeAotProjectPath, packageDirectory, packageVersion);
@@ -187,11 +243,11 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         Assert.That(loadContextReference.IsAlive, Is.False, "The package validation AssemblyLoadContext did not unload.");
     }
 
-    private static void Pack(
+    private static string Pack(
         string projectPath,
         string packageDirectory,
         string packageVersion,
-        string targetFrameworks = "net9.0")
+        string? targetFrameworks = "net9.0")
     {
         using var process = new Process
         {
@@ -212,7 +268,8 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         process.StartInfo.ArgumentList.Add("--no-restore");
         process.StartInfo.ArgumentList.Add("--output");
         process.StartInfo.ArgumentList.Add(packageDirectory);
-        process.StartInfo.ArgumentList.Add($"-p:TursoTargetFrameworks={targetFrameworks}");
+        if (targetFrameworks is not null)
+            process.StartInfo.ArgumentList.Add($"-p:TursoTargetFrameworks={targetFrameworks}");
         process.StartInfo.ArgumentList.Add($"-p:PackageVersion={packageVersion}");
 
         process.Start();
@@ -220,18 +277,34 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         var error = process.StandardError.ReadToEndAsync();
         process.WaitForExit();
         Task.WaitAll(output, error);
-        Assert.That(process.ExitCode, Is.EqualTo(0), output.Result + Environment.NewLine + error.Result);
+        var result = output.Result + Environment.NewLine + error.Result;
+        Assert.That(process.ExitCode, Is.EqualTo(0), result);
+        return result;
     }
 
-    private static void BuildForPackage(string projectPath, string targetFrameworks)
-        => RunDotnet(
-            Path.GetDirectoryName(projectPath)!,
+    private static void PackRawPackage(string projectPath, string packageDirectory, string packageVersion)
+    {
+        BuildForPackage(projectPath);
+        var output = Pack(projectPath, packageDirectory, packageVersion, targetFrameworks: null);
+        Assert.That(output, Does.Not.Contain("NU5128"));
+        Assert.That(output, Does.Not.Contain("NU5130"));
+    }
+
+    private static void BuildForPackage(string projectPath, string? targetFrameworks = null)
+    {
+        var arguments = new List<string>
+        {
             "build",
             projectPath,
             "--configuration",
             "Debug",
             "--no-restore",
-            $"-p:TursoTargetFrameworks={targetFrameworks}");
+        };
+        if (targetFrameworks is not null)
+            arguments.Add($"-p:TursoTargetFrameworks={targetFrameworks}");
+
+        RunDotnet(Path.GetDirectoryName(projectPath)!, arguments.ToArray());
+    }
 
     private static void Restore(
         string projectPath,

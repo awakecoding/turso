@@ -203,7 +203,7 @@ public sealed class ManagedInteriorSingleLeafMutationTests
                 Integer(connection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
             }
 
-            VerifyCollapsedWithSqlite(path, expectedCount, after.Header.FreelistPageCount);
+            VerifyTableIntegrityWithSqlite(path, expectedCount, after.Header.FreelistPageCount);
         }
         finally
         {
@@ -285,6 +285,199 @@ public sealed class ManagedInteriorSingleLeafMutationTests
         using var readOnlyConnection = reopened.Connect();
         Integer(readOnlyConnection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
         Integer(readOnlyConnection, $"SELECT COUNT(*) FROM target WHERE id = {deletedId};").Should().Be(0);
+    }
+
+    [Test]
+    public void ThreeChildRootSingletonDeleteRemovesChildReopensAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("empty-child-removal-integrity");
+        try
+        {
+            CreateMinimumPageDatabase(PhysicalFileSystem.Instance, path);
+            CollapseTopology before;
+            long expectedCount;
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                _ = SeedUntilThreeChildInteriorRootWithSingletonLeftLeaf(
+                    connection,
+                    PhysicalFileSystem.Instance,
+                    path);
+                before = ReadCollapseTopology(PhysicalFileSystem.Instance, path);
+                expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;") - 1;
+
+                Execute(connection, "DELETE FROM target WHERE id = 1;");
+            }
+
+            var after = ReadCollapseTopology(PhysicalFileSystem.Instance, path);
+            after.RootPage.Should().Be(before.RootPage);
+            after.PageCount.Should().Be(before.PageCount);
+            after.RootType.Should().Be(SqliteBtreePageType.TableInterior);
+            after.ChildPages.Should().Equal(before.ChildPages.Skip(1));
+            after.Header.FreelistPageCount.Should().Be(1);
+            after.FreelistPages.Should().Equal(before.ChildPages[0]);
+            after.FreelistTrunkPages.Should().Equal(before.ChildPages[0]);
+            after.FreelistLeafPages.Should().BeEmpty();
+            after.ChildPages
+                .SelectMany(page => ReadLeaf(PhysicalFileSystem.Instance, path, page).Cells)
+                .Select(cell => cell.Cell.RowId)
+                .Should()
+                .Equal(Enumerable.Range(2, checked((int)expectedCount)).Select(id => (long)id));
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Integer(connection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
+                Integer(connection, "SELECT COUNT(*) FROM target WHERE id = 1;").Should().Be(0);
+            }
+
+            VerifyTableIntegrityWithSqlite(path, expectedCount, after.Header.FreelistPageCount);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void ThreeChildRootRightmostSingletonDeleteRemovesTrailingParentSeparator()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "three-child-rightmost-empty-child-removal.db";
+        CreateMinimumPageDatabase(fileSystem, path);
+        Topology before;
+        long expectedCount;
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            before = SeedThreeChildInteriorRootWithSingletonRightLeaf(connection, fileSystem, path);
+            expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;") - 1;
+            Execute(connection, "DELETE FROM target WHERE id = 4;");
+        }
+
+        var after = ReadCollapseTopology(fileSystem, path);
+        var afterRouting = ReadTopology(fileSystem, path);
+        after.RootPage.Should().Be(before.RootPage);
+        after.RootType.Should().Be(SqliteBtreePageType.TableInterior);
+        after.ChildPages.Should().Equal(before.ChildPages.Take(before.ChildPages.Count - 1));
+        afterRouting.Separators.Should().Equal(before.Separators.Take(before.Separators.Count - 1));
+        after.Header.FreelistPageCount.Should().Be(1);
+        after.FreelistPages.Should().Equal(before.ChildPages[^1]);
+        after.ChildPages
+            .SelectMany(page => ReadLeaf(fileSystem, path, page).Cells)
+            .Select(cell => cell.Cell.RowId)
+            .Should()
+            .Equal(1, 2, 3);
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Integer(reopenedConnection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
+        Integer(reopenedConnection, "SELECT COUNT(*) FROM target WHERE id = 4;").Should().Be(0);
+    }
+
+    [Test]
+    public void EveryInterruptedThreeChildSingletonDeleteRecoversThePriorRootAndFreelist()
+    {
+        for (var failedWrite = 1; failedWrite <= 3; failedWrite++)
+        {
+            var faults = new DeterministicFaultInjector();
+            var fileSystem = new InMemoryFileSystem(faults);
+            var path = $"three-child-empty-child-removal-wal-{failedWrite}.db";
+            CreateMinimumPageDatabase(fileSystem, path);
+            Topology before;
+            long expectedCount;
+
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                before = SeedUntilThreeChildInteriorRootWithSingletonLeftLeaf(connection, fileSystem, path);
+                expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;");
+
+                faults.FailOnOccurrence(
+                    FileSystemOperation.Write,
+                    faults.GetOperationCount(FileSystemOperation.Write) + failedWrite);
+                Assert.Throws<IOException>(() => Execute(connection, "DELETE FROM target WHERE id = 1;"));
+            }
+
+            using (var recovered = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = recovered.Connect())
+            {
+                Integer(connection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
+                Integer(connection, "SELECT COUNT(*) FROM target WHERE id = 1;").Should().Be(1);
+            }
+
+            var recoveredTopology = ReadCollapseTopology(fileSystem, path);
+            recoveredTopology.RootPage.Should().Be(before.RootPage);
+            recoveredTopology.RootType.Should().Be(SqliteBtreePageType.TableInterior);
+            recoveredTopology.ChildPages.Should().Equal(before.ChildPages);
+            recoveredTopology.Header.FreelistPageCount.Should().Be(0);
+            recoveredTopology.FreelistPages.Should().BeEmpty();
+        }
+    }
+
+    [Test]
+    public void EncryptedThreeChildSingletonDeleteReopensReadOnly()
+    {
+        using var encryption = TursoEncryptionOptions.FromHex(
+            TursoEncryptionCipher.Aes256Gcm,
+            EncryptionKey);
+        var fileSystem = new TursoEncryptionFileSystem(new InMemoryFileSystem(), encryption);
+        const string path = "encrypted-three-child-empty-child-removal.db";
+        CreateMinimumPageDatabase(fileSystem, path);
+        long expectedCount;
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            _ = SeedUntilThreeChildInteriorRootWithSingletonLeftLeaf(connection, fileSystem, path);
+            expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;") - 1;
+            Execute(connection, "DELETE FROM target WHERE id = 1;");
+        }
+
+        var after = ReadCollapseTopology(fileSystem, path);
+        after.RootType.Should().Be(SqliteBtreePageType.TableInterior);
+        after.Header.FreelistPageCount.Should().Be(1);
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true);
+        using var readOnlyConnection = reopened.Connect();
+        Integer(readOnlyConnection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
+        Integer(readOnlyConnection, "SELECT COUNT(*) FROM target WHERE id = 1;").Should().Be(0);
+    }
+
+    [Test]
+    public void ThreeChildSingletonDeleteCannotBypassReadOnlyPager()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "three-child-empty-child-removal-read-only.db";
+        CreateMinimumPageDatabase(fileSystem, path);
+        Topology before;
+        long expectedCount;
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            before = SeedUntilThreeChildInteriorRootWithSingletonLeftLeaf(connection, fileSystem, path);
+            expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;");
+        }
+
+        var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
+        using (var readOnly = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true))
+        using (var connection = readOnly.Connect())
+        {
+            Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "DELETE FROM target WHERE id = 1;"));
+        }
+
+        faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBefore);
+        var unchanged = ReadCollapseTopology(fileSystem, path);
+        unchanged.RootPage.Should().Be(before.RootPage);
+        unchanged.RootType.Should().Be(SqliteBtreePageType.TableInterior);
+        unchanged.ChildPages.Should().Equal(before.ChildPages);
+        unchanged.Header.FreelistPageCount.Should().Be(0);
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Integer(reopenedConnection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
     }
 
     [Test]
@@ -383,6 +576,60 @@ public sealed class ManagedInteriorSingleLeafMutationTests
         }
 
         throw new InvalidOperationException("Unable to create a two-child table-interior root.");
+    }
+
+    private static Topology SeedUntilThreeChildInteriorRootWithSingletonLeftLeaf(
+        EmbeddedConnection connection,
+        IFileSystem fileSystem,
+        string path)
+    {
+        Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, payload TEXT);");
+        Execute(connection, $"INSERT INTO target VALUES (1, '{new string('l', 400)}');");
+        for (var id = 2; id <= 128; id++)
+        {
+            Execute(connection, InsertStatement(id));
+            var topology = ReadTopology(fileSystem, path);
+            if (topology.RootType != SqliteBtreePageType.TableInterior
+                || topology.ChildPages.Count < 3)
+            {
+                continue;
+            }
+
+            var leftLeaf = ReadLeaf(fileSystem, path, topology.ChildPages[0]);
+            if (leftLeaf.Cells.Count == 1 && leftLeaf.Cells[0].Cell.RowId == 1)
+                return topology;
+        }
+
+        throw new InvalidOperationException(
+            "Unable to create a three-child table-interior root with a singleton left leaf.");
+    }
+
+    private static Topology SeedThreeChildInteriorRootWithSingletonRightLeaf(
+        EmbeddedConnection connection,
+        IFileSystem fileSystem,
+        string path)
+    {
+        Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, payload TEXT);");
+        Execute(connection, InsertStatement(1));
+        Execute(connection, InsertStatement(2));
+        Execute(connection, $"INSERT INTO target VALUES (3, '{new string('m', 400)}');");
+        Execute(connection, InsertStatement(4));
+
+        var topology = ReadTopology(fileSystem, path);
+        if (topology.RootType != SqliteBtreePageType.TableInterior
+            || topology.ChildPages.Count != 3)
+        {
+            throw new InvalidOperationException("Unable to create a three-child table-interior root.");
+        }
+
+        var rightLeaf = ReadLeaf(fileSystem, path, topology.ChildPages[^1]);
+        if (rightLeaf.Cells.Count != 1 || rightLeaf.Cells[0].Cell.RowId != 4)
+        {
+            throw new InvalidOperationException(
+                "Unable to create a three-child table-interior root with a singleton right leaf.");
+        }
+
+        return topology;
     }
 
     private static void CreateMinimumPageDatabase(IFileSystem fileSystem, string path)
@@ -502,7 +749,7 @@ public sealed class ManagedInteriorSingleLeafMutationTests
             freelist.LeafPageNumbers.ToArray());
     }
 
-    private static void VerifyCollapsedWithSqlite(string path, long expectedCount, uint expectedFreelistCount)
+    private static void VerifyTableIntegrityWithSqlite(string path, long expectedCount, uint expectedFreelistCount)
     {
         var verificationPath = CreateDatabasePath("collapse-integrity");
         try

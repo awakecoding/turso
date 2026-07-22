@@ -134,8 +134,8 @@ public class CompiledSelectExecutionTests
         // A projected expression over a column (not a bare column) is not lowered.
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN SELECT value + 1 FROM t;"));
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN SELECT DISTINCT 1;"));
-        // LIMIT changes sorted-row cardinality, so it remains on the evaluator.
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN SELECT value FROM t ORDER BY value LIMIT 1;"));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT value FROM t ORDER BY value LIMIT 1;"))
+            .Should().Contain("SorterSort").And.Contain("LimitGate");
         // A DELETE whose WHERE embeds a subquery cannot run against a single scanned row.
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN DELETE FROM t WHERE value IN (SELECT 1);"));
     }

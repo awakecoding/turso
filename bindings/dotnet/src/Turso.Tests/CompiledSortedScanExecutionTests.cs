@@ -302,20 +302,37 @@ public class CompiledSortedScanExecutionTests
     }
 
     [Test]
-    public void LimitAndOffsetStayOnTheEvaluatorButReturnOrderedRows()
+    public void LimitAndOffsetRouteThroughSorterAndGates()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (3), (1), (2), (4);");
 
-        // LIMIT/OFFSET are deliberately excluded from the sorter route, so EXPLAIN reports
-        // that the statement was not lowered to bytecode.
-        RouteUsesSorter(connection, "SELECT value FROM t ORDER BY value LIMIT 2;").Should().BeFalse();
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT value FROM t ORDER BY value LIMIT 2;"));
+        RouteUsesSorter(connection, "SELECT value FROM t ORDER BY value LIMIT 2 OFFSET 1;").Should().BeTrue();
+        var program = ReadRows(connection, "EXPLAIN SELECT value FROM t ORDER BY value LIMIT 2 OFFSET 1;");
+        Opcodes(program).Should().Equal(
+            "LoadConstant",
+            "LoadConstant",
+            "OpenReadCursor",
+            "OpenSorter",
+            "Rewind",
+            "Column",
+            "SorterInsert",
+            "Next",
+            "CloseCursor",
+            "SorterSort",
+            "SorterData",
+            "Copy",
+            "OffsetGate",
+            "LimitGate",
+            "ResultRow",
+            "SorterNext",
+            "CloseSorter",
+            "Halt");
+        program[12][6].Should().Be(SqlValue.Text("goto 15 and decrement r[2] while r[2]>0"));
+        program[13][6].Should().Be(SqlValue.Text("goto 17 when r[3]<=0, else decrement r[3]"));
 
-        // ...but the evaluator still returns the correctly ordered, trimmed rows.
         ReadRows(connection, "SELECT value FROM t ORDER BY value LIMIT 2;")
             .Select(row => row[0])
             .Should()
@@ -327,18 +344,145 @@ public class CompiledSortedScanExecutionTests
     }
 
     [Test]
-    public void DistinctStaysOnTheEvaluator()
+    public void BoundedSorterPreservesAffinityAliasesOrdinalsAndEvaluatorResults()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(rank NUMERIC, name TEXT);");
+        Execute(connection, "INSERT INTO t VALUES ('10', 'zulu'), ('2', 'bravo'), (NULL, 'alpha'), ('7', 'charlie');");
+
+        const string routedSql =
+            "SELECT name, rank AS score FROM t ORDER BY 2 DESC LIMIT 2 OFFSET 1;";
+        RouteUsesSorter(connection, routedSql).Should().BeTrue();
+        ColumnNames(connection, routedSql).Should().Equal("name", "score");
+
+        var routed = ReadRows(connection, routedSql);
+        routed.Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Text("charlie"), SqlValue.Integer(7)),
+            (SqlValue.Text("bravo"), SqlValue.Integer(2)));
+
+        const string aliasSql =
+            "SELECT name, rank AS score FROM t ORDER BY score DESC LIMIT 2 OFFSET 1;";
+        RouteUsesSorter(connection, aliasSql).Should().BeTrue();
+        ReadRows(connection, aliasSql).Select(row => (row[0], row[1]))
+            .Should().Equal(routed.Select(row => (row[0], row[1])));
+
+        // rank + 0 has the same numeric ordering for these NUMERIC-affinity values but is a
+        // computed ORDER BY expression, so it deliberately stays on the evaluator.
+        const string evaluatorSql =
+            "SELECT name, rank AS score FROM t ORDER BY rank + 0 DESC LIMIT 2 OFFSET 1;";
+        RouteUsesSorter(connection, evaluatorSql).Should().BeFalse();
+        ReadRows(connection, evaluatorSql).Select(row => (row[0], row[1]))
+            .Should().Equal(routed.Select(row => (row[0], row[1])));
+    }
+
+    [Test]
+    public void BoundedSorterPreservesNoCaseNullAndDescendingOrdering()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(name TEXT);");
+        Execute(connection, "INSERT INTO t VALUES (NULL), ('Banana'), ('apple'), ('Cherry');");
+
+        const string sql =
+            "SELECT name FROM t ORDER BY name COLLATE NOCASE DESC LIMIT 3 OFFSET 1;";
+        RouteUsesSorter(connection, sql).Should().BeTrue();
+
+        ReadRows(connection, sql).Select(row => row[0]).Should().Equal(
+            SqlValue.Text("Banana"),
+            SqlValue.Text("apple"),
+            SqlValue.Null);
+    }
+
+    [Test]
+    public void BoundedSorterRecompilesWithResetAndReboundParameters()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1), (2), (3), (4), (5);");
+
+        using var statement = connection.Prepare(
+            "SELECT value AS ranked FROM t WHERE value >= ?1 ORDER BY 1 DESC LIMIT ?2 OFFSET ?3;");
+        statement.GetColumnName(0).Should().Be("ranked");
+        statement.Bind(1, SqlValue.Integer(2));
+        statement.Bind(2, SqlValue.Integer(2));
+        statement.Bind(3, SqlValue.Integer(1));
+        Drain(statement).Should().Equal(SqlValue.Integer(4), SqlValue.Integer(3));
+
+        statement.Reset();
+        statement.Bind(1, SqlValue.Integer(3));
+        statement.Bind(2, SqlValue.Integer(3));
+        statement.Bind(3, SqlValue.Integer(0));
+        Drain(statement).Should().Equal(SqlValue.Integer(5), SqlValue.Integer(4), SqlValue.Integer(3));
+    }
+
+    [Test]
+    public void DistinctBoundedOrderStaysOnTheEvaluator()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1), (1), (2);");
 
-        RouteUsesSorter(connection, "SELECT DISTINCT value FROM t ORDER BY value;").Should().BeFalse();
-        ReadRows(connection, "SELECT DISTINCT value FROM t ORDER BY value;")
+        RouteUsesSorter(connection, "SELECT DISTINCT value FROM t ORDER BY value LIMIT 2;").Should().BeFalse();
+        ReadRows(connection, "SELECT DISTINCT value FROM t ORDER BY value LIMIT 2;")
             .Select(row => row[0])
             .Should()
             .Equal(SqlValue.Integer(1), SqlValue.Integer(2));
+    }
+
+    [Test]
+    public void BoundedOrderPreflightLeavesComputedJoinAndCompoundShapesOnTheEvaluator()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "CREATE TABLE u(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (3), (1), (2);");
+        Execute(connection, "INSERT INTO u VALUES (2), (1), (3);");
+
+        const string computedProjection = "SELECT value + 1 FROM t ORDER BY value LIMIT 2;";
+        RouteUsesSorter(connection, computedProjection).Should().BeFalse();
+        ReadRows(connection, computedProjection).Select(row => row[0])
+            .Should().Equal(SqlValue.Integer(2), SqlValue.Integer(3));
+
+        const string join = "SELECT t.value FROM t JOIN u ON t.value = u.value ORDER BY t.value LIMIT 2;";
+        RouteUsesSorter(connection, join).Should().BeFalse();
+        ReadRows(connection, join).Select(row => row[0])
+            .Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
+
+        const string compound = "SELECT value FROM t UNION ALL SELECT value FROM u ORDER BY 1 LIMIT 2;";
+        RouteUsesSorter(connection, compound).Should().BeFalse();
+        ReadRows(connection, compound).Select(row => row[0])
+            .Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
+    }
+
+    [Test]
+    public void BoundedOrderFallsBackForLimitZeroAndEvaluatorErrors()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1), (2);");
+
+        // LIMIT 0 validates expressions without scanning, so a gated sorter cannot own it.
+        RouteUsesSorter(connection, "SELECT value FROM t ORDER BY value LIMIT 0;").Should().BeFalse();
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "SELECT missing FROM t ORDER BY value LIMIT 0;"));
+
+        // Unsupported order keys and bad bounds remain evaluator errors rather than partially
+        // compiled programs with different diagnostics.
+        RouteUsesSorter(connection, "SELECT value FROM t ORDER BY missing LIMIT 1;").Should().BeFalse();
+        var orderError = Assert.Throws<InvalidOperationException>(
+            () => ReadRows(connection, "SELECT value FROM t ORDER BY missing LIMIT 1;"))!;
+        orderError.InnerException.Should().BeOfType<EmbeddedSqlException>()
+            .Which.Message.Should().Be("no such column: missing");
+
+        RouteUsesSorter(connection, "SELECT value FROM t ORDER BY value LIMIT 'x';").Should().BeFalse();
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "SELECT value FROM t ORDER BY value LIMIT 'x';"))!
+            .Message.Should().Be("datatype mismatch");
     }
 
     [Test]
@@ -411,6 +555,15 @@ public class CompiledSortedScanExecutionTests
 
     private static IEnumerable<string> Opcodes(IEnumerable<SqlValue[]> rows)
         => rows.Select(row => row[1].AsText());
+
+    private static List<SqlValue> Drain(EmbeddedStatement statement)
+    {
+        var rows = new List<SqlValue>();
+        while (statement.Step() == StatementStepResult.Row)
+            rows.Add(statement.GetValue(0));
+
+        return rows;
+    }
 
     private static void Execute(EmbeddedConnection connection, string sql)
     {

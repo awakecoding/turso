@@ -1210,7 +1210,9 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// non-empty child-leaf record beneath a one-level unindexed table root.
     /// A deletion can also collapse an exactly-two-child root back into its
     /// catalog-root leaf when every surviving record fits there, returning both
-    /// retired children to a new exact freelist. A deletion that changes a
+    /// retired children to a new exact freelist. It can remove an empty child
+    /// from a compatible one-level root with at least three children, returning
+    /// that retired child to a new exact freelist. A deletion that changes a
     /// non-rightmost child's maximum rowid replaces its parent separator in the
     /// same transaction. It can also append one
     /// maximum-rowid record to the right-most table leaf and split that leaf
@@ -2027,6 +2029,22 @@ internal sealed class EmbeddedFileStore : IDisposable
             return true;
         }
 
+        if (change.IsDelete
+            && sourceLeaf.Cells.Count == 1
+            && TryPersistBoundedTableInteriorRootEmptyChildRemoval(
+                rootPage,
+                schemaPage,
+                existingRootPage,
+                currentHeader,
+                parent,
+                childPages,
+                targetChildIndex,
+                targetLeafPage,
+                sourceLeafPage))
+        {
+            return true;
+        }
+
         if (change.IsDelete && sourceLeaf.Cells.Count == 1)
             return false;
 
@@ -2126,6 +2144,121 @@ internal sealed class EmbeddedFileStore : IDisposable
             _pageSize,
             sourcePages,
             writeImages);
+        mutation.CommitTo(_pager);
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
+        _header = newHeader;
+        return true;
+    }
+
+    private bool TryPersistBoundedTableInteriorRootEmptyChildRemoval(
+        uint rootPage,
+        ReadOnlySpan<byte> schemaPage,
+        ReadOnlySpan<byte> existingRootPage,
+        SqliteDatabaseHeader currentHeader,
+        SqliteTableInteriorPageView parent,
+        IReadOnlyList<uint> childPages,
+        int targetChildIndex,
+        uint targetLeafPage,
+        ReadOnlySpan<byte> sourceLeafPage)
+    {
+        if (parent.Cells.Count < 2
+            || childPages.Count != parent.Cells.Count + 1
+            || childPages.Count < 3
+            || targetChildIndex < 0
+            || targetChildIndex >= childPages.Count
+            || childPages[targetChildIndex] != targetLeafPage)
+        {
+            return false;
+        }
+
+        byte[] replacementRootPage;
+        try
+        {
+            var removedSeparatorIndex = targetChildIndex == parent.Cells.Count
+                ? parent.Cells.Count - 1
+                : targetChildIndex;
+            var rightMostChildPage = targetChildIndex == parent.Cells.Count
+                ? parent.Cells[^1].Cell.LeftChildPage
+                : parent.Header.RightMostChildPage;
+            var parentBuilder = new SqliteTableInteriorPageBuilder(
+                _pageSize,
+                _usableSpace,
+                rightMostChildPage);
+            for (var cellIndex = 0; cellIndex < parent.Cells.Count; cellIndex++)
+            {
+                if (cellIndex != removedSeparatorIndex)
+                    parentBuilder.Append(parent.Cells[cellIndex].Cell);
+            }
+
+            replacementRootPage = existingRootPage.ToArray();
+            parentBuilder.WriteTo(replacementRootPage);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+
+        SqliteFreelist retiredChild;
+        try
+        {
+            retiredChild = SqliteFreelist.CreateFromFreePages(
+                currentHeader.DatabaseSizeInPages,
+                [targetLeafPage],
+                _pageSize,
+                _usableSpace);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+
+        if (retiredChild.PageCount != 1
+            || retiredChild.FirstTrunkPage != targetLeafPage
+            || retiredChild.PageNumbers.Count != 1
+            || retiredChild.PageNumbers[0] != targetLeafPage
+            || retiredChild.TrunkPageNumbers.Count != 1
+            || retiredChild.TrunkPageNumbers[0] != targetLeafPage
+            || retiredChild.PageImages.Count != 1
+            || retiredChild.PageImages[0].PageNumber != targetLeafPage)
+        {
+            return false;
+        }
+
+        var sourceSchemaPage = schemaPage.ToArray();
+        var targetSchemaPage = schemaPage.ToArray();
+        var newChangeCounter = currentHeader.ChangeCounter + 1;
+        var newHeader = currentHeader with
+        {
+            ChangeCounter = newChangeCounter,
+            VersionValidFor = newChangeCounter,
+            FirstFreelistTrunkPage = retiredChild.FirstTrunkPage,
+            FreelistPageCount = retiredChild.PageCount,
+        };
+        newHeader.WriteTo(targetSchemaPage);
+
+        var mutation = new SqliteBtreeSplitMutation(
+            currentHeader.DatabaseSizeInPages,
+            currentHeader.DatabaseSizeInPages,
+            _pageSize,
+            [
+                new SqlitePageImage(SchemaRootPage, sourceSchemaPage),
+                new SqlitePageImage(rootPage, existingRootPage),
+                new SqlitePageImage(targetLeafPage, sourceLeafPage),
+            ],
+            [
+                new SqlitePageImage(rootPage, replacementRootPage),
+                retiredChild.PageImages[0],
+                // Page one publishes both the replacement root and retired child.
+                new SqlitePageImage(SchemaRootPage, targetSchemaPage),
+            ]);
         mutation.CommitTo(_pager);
         CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
