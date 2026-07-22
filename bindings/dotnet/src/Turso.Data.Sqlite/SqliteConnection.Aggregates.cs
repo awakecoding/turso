@@ -1,15 +1,9 @@
-using System.Runtime.InteropServices;
-using Turso.Raw.Public;
-using Turso.Raw.Public.Value;
+using Turso.Core;
 
 namespace Turso.Data.Sqlite;
 
 public partial class SqliteConnection
 {
-    private static readonly TursoAggregateInitCallback AggregateInitCallback = InitializeAggregate;
-    private static readonly TursoAggregateStepCallback AggregateStepCallback = StepAggregate;
-    private static readonly TursoAggregateFinalCallback AggregateFinalCallback = FinalizeAggregate;
-    private static readonly TursoContextDestructorCallback AggregateDestructorCallback = DestroyAggregate;
     private readonly Dictionary<FunctionSignature, AggregateFunctionRegistration> _aggregateFunctions = new(FunctionSignatureComparer.Instance);
 
     private void RegisterAggregateFunction(string name, int argc, bool isDeterministic, object? seed, Func<object?, object?[], object?>? step, Func<object?, object?> resultSelector)
@@ -18,25 +12,44 @@ public partial class SqliteConnection
         if (step is null)
         {
             RemoveFunctionRegistrations(_aggregateFunctions, name);
-            if (_database is not null)
-                TursoBindings.UnregisterFunction(DatabaseHandle, name);
+            if (IsManagedConnection)
+                ManagedConnection.UnregisterAggregateFunctions(name);
+            else if (_database is not null)
+                SqliteNativeProvider.Current.UnregisterFunctions(NativeDatabase, name);
             return;
         }
 
         var registration = new AggregateFunctionRegistration(name, argc, isDeterministic, seed, step, resultSelector);
         _aggregateFunctions[new FunctionSignature(name, argc)] = registration;
-        if (_database is not null)
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+        if (IsManagedConnection)
+        {
+            ManagedConnection.UnregisterAggregateFunctions(name);
+            foreach (var registeredFunction in _aggregateFunctions.Where(
+                         pair => string.Equals(pair.Key.Name, name, StringComparison.OrdinalIgnoreCase))
+                     .Select(static pair => pair.Value))
+            {
+                registeredFunction.RegisterManaged(ManagedConnection);
+            }
+        }
+        else if (_database is not null)
+            registration.RegisterNative(NativeDatabase);
     }
 
     private void RegisterAggregateFunctions()
     {
-        foreach (var registration in IsManagedProvider
-            ? _aggregateFunctions.Values
-            : _aggregateFunctions
-                .GroupBy(static pair => pair.Key.Name, StringComparer.OrdinalIgnoreCase)
-                .Select(static group => group.Last().Value))
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+        if (IsManagedConnection)
+        {
+            foreach (var registration in _aggregateFunctions.Values)
+                registration.RegisterManaged(ManagedConnection);
+            return;
+        }
+
+        foreach (var registration in _aggregateFunctions
+                     .GroupBy(static pair => pair.Key.Name, StringComparer.OrdinalIgnoreCase)
+                     .Select(static group => group.Last().Value))
+        {
+            registration.RegisterNative(NativeDatabase);
+        }
     }
 
     private static object? InvokeNullableAggregateStep<TAccumulate>(Func<TAccumulate?, TAccumulate> function, object? accumulator, object?[] args)
@@ -63,62 +76,6 @@ public partial class SqliteConnection
     private static object? InvokeResultSelector<TAccumulate, TResult>(Func<TAccumulate, TResult> resultSelector, object? accumulator)
         => resultSelector((TAccumulate)accumulator!);
 
-    private static IntPtr InitializeAggregate(IntPtr context)
-    {
-        var registration = (AggregateFunctionRegistration?)GCHandle.FromIntPtr(context).Target
-            ?? throw new ObjectDisposedException(nameof(AggregateFunctionRegistration));
-        return registration.CreateInvocationHandle();
-    }
-
-    private static TursoExtensionValue StepAggregate(IntPtr context, IntPtr aggregateContext, int argc, IntPtr argv)
-    {
-        try
-        {
-            var invocation = (AggregateInvocation?)GCHandle.FromIntPtr(aggregateContext).Target
-                ?? throw new ObjectDisposedException(nameof(AggregateInvocation));
-            invocation.Step(ReadArguments(argc, argv));
-            return CreateResult(null);
-        }
-        catch (SqliteException ex)
-        {
-            return CreateError("__turso_sqlite_error__:" + ex.SqliteErrorCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + ex.Message);
-        }
-        catch (Exception ex)
-        {
-            return CreateError(ex.Message);
-        }
-    }
-
-    private static TursoExtensionValue FinalizeAggregate(IntPtr context, IntPtr aggregateContext)
-    {
-        try
-        {
-            var invocation = (AggregateInvocation?)GCHandle.FromIntPtr(aggregateContext).Target
-                ?? throw new ObjectDisposedException(nameof(AggregateInvocation));
-            return CreateResult(invocation.FinalizeResult());
-        }
-        catch (SqliteException ex)
-        {
-            return CreateError("__turso_sqlite_error__:" + ex.SqliteErrorCode.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + ex.Message);
-        }
-        catch (Exception ex)
-        {
-            return CreateError(ex.Message);
-        }
-    }
-
-    private static void DestroyAggregate(IntPtr aggregateContext)
-    {
-        if (aggregateContext == IntPtr.Zero)
-            return;
-
-        var handle = GCHandle.FromIntPtr(aggregateContext);
-        if (handle.Target is AggregateInvocation invocation)
-            invocation.Registration.FreeInvocation(handle);
-        else if (handle.IsAllocated)
-            handle.Free();
-    }
-
     private sealed class AggregateFunctionRegistration(
         string name,
         int argc,
@@ -127,121 +84,53 @@ public partial class SqliteConnection
         Func<object?, object?[], object?> step,
         Func<object?, object?> resultSelector)
     {
-        private readonly List<GCHandle> _invocations = [];
-
-        public IntPtr CreateInvocationHandle()
+        public void RegisterManaged(IManagedConnectionAdapter connection)
         {
-            var handle = GCHandle.Alloc(new AggregateInvocation(this, seed, step, resultSelector));
-            lock (_invocations)
-            {
-                _invocations.Add(handle);
-            }
-
-            return GCHandle.ToIntPtr(handle);
+            ArgumentNullException.ThrowIfNull(connection);
+            connection.RegisterAggregateFunction(
+                name,
+                argc,
+                ToManagedSqlValue(seed),
+                InvokeManagedStep,
+                InvokeManagedFinal);
         }
 
-        public void FreeInvocation(GCHandle handle)
+        public void RegisterNative(TursoNativeDatabase database)
         {
-            lock (_invocations)
-            {
-                _invocations.Remove(handle);
-            }
-
-            if (handle.IsAllocated)
-                handle.Free();
+            ArgumentNullException.ThrowIfNull(database);
+            SqliteNativeProvider.Current.RegisterAggregateFunction(
+                database,
+                name,
+                argc,
+                isDeterministic,
+                seed,
+                step,
+                resultSelector);
         }
 
-        public void FreeInvocations()
+        private SqlValue InvokeManagedStep(SqlValue accumulator, IReadOnlyList<SqlValue> arguments)
         {
-            lock (_invocations)
-            {
-                foreach (var handle in _invocations)
-                {
-                    if (handle.IsAllocated)
-                        handle.Free();
-                }
-
-                _invocations.Clear();
-            }
-        }
-
-        public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
-        {
-            var handle = GCHandle.Alloc(this);
             try
             {
-                if (database.IsManaged)
-                {
-                    TursoBindings.RegisterManagedAggregateFunction(
-                        database,
-                        name,
-                        argc,
-                        ToManagedTursoValue(seed),
-                        InvokeManagedStep,
-                        InvokeManagedFinal);
-                }
-                else
-                {
-                    TursoBindings.RegisterAggregateFunction(
-                        database,
-                        name,
-                        argc,
-                        isDeterministic,
-                        GCHandle.ToIntPtr(handle),
-                        AggregateInitCallback,
-                        AggregateStepCallback,
-                        AggregateFinalCallback,
-                        ContextDestructorCallback,
-                        AggregateDestructorCallback,
-                        ValueDestructorCallback);
-                }
-
-                return handle;
+                return ToManagedSqlValue(step(ToManagedObject(accumulator), ToManagedObjects(arguments)));
             }
-            catch
+            catch (Exception ex)
             {
-                handle.Free();
-                throw;
-            }
-
-            TursoValue InvokeManagedStep(TursoValue accumulator, IReadOnlyList<TursoValue> arguments)
-            {
-                try
-                {
-                    return ToManagedTursoValue(step(ToManagedObject(accumulator), ToManagedObjects(arguments)));
-                }
-                catch (Exception ex)
-                {
-                    throw ToTursoCallbackException(ex);
-                }
-            }
-
-            TursoValue InvokeManagedFinal(TursoValue accumulator)
-            {
-                try
-                {
-                    return ToManagedTursoValue(resultSelector(ToManagedObject(accumulator)));
-                }
-                catch (Exception ex)
-                {
-                    throw ToTursoCallbackException(ex);
-                }
+                throw ToManagedCallbackException(ex);
             }
         }
-    }
 
-    private sealed class AggregateInvocation(AggregateFunctionRegistration registration, object? seed, Func<object?, object?[], object?> step, Func<object?, object?> resultSelector)
-    {
-        private object? _accumulator = seed;
-
-        public AggregateFunctionRegistration Registration { get; } = registration;
-
-        public void Step(object?[] args)
+        private SqlValue InvokeManagedFinal(SqlValue accumulator)
         {
-            _accumulator = step(_accumulator, args);
+            try
+            {
+                return ToManagedSqlValue(resultSelector(ToManagedObject(accumulator)));
+            }
+            catch (Exception ex)
+            {
+                throw ToManagedCallbackException(ex);
+            }
         }
-
-        public object? FinalizeResult()
-            => resultSelector(_accumulator);
     }
+
 }

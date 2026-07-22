@@ -2,7 +2,6 @@ using System.Collections.ObjectModel;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
-using Turso.Raw.Public.Value;
 
 namespace Turso;
 
@@ -164,6 +163,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         get => GetEnum("Local Provider", TursoLocalProvider.Native);
         set => this["Local Provider"] = value;
     }
+
+    internal bool IsLocalProviderConfigured => base.ContainsKey("Local Provider");
 
     [AllowNull]
     public override object this[string keyword]

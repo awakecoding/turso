@@ -24,7 +24,8 @@ public class TursoSqliteDatabaseCreator(
         try
         {
             var connectionOptions = new TursoSqliteConnectionStringBuilder(connection.ConnectionString);
-            if (connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+            if (!connectionOptions.IsLocalProviderConfigured
+                || connectionOptions.LocalProvider == TursoLocalProvider.Managed)
                 return;
 
             rawSqlCommandBuilder.Build("PRAGMA journal_mode = 'wal';")
@@ -48,6 +49,13 @@ public class TursoSqliteDatabaseCreator(
         var connectionOptions = new TursoSqliteConnectionStringBuilder(connection.ConnectionString);
         if (connectionOptions.DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
             || connectionOptions.Mode == TursoSqliteOpenMode.Memory)
+        {
+            return true;
+        }
+
+        if ((!connectionOptions.IsLocalProviderConfigured
+                || connectionOptions.LocalProvider == Turso.TursoLocalProvider.Managed)
+            && File.Exists(connectionOptions.DataSource))
         {
             return true;
         }
@@ -89,11 +97,25 @@ public class TursoSqliteDatabaseCreator(
     {
         var dbConnection = Dependencies.Connection.DbConnection;
         var wasOpen = dbConnection.State == ConnectionState.Open;
+        var path = dbConnection.DataSource;
+        var connectionOptions = new TursoSqliteConnectionStringBuilder(connection.ConnectionString);
+
+        if (!wasOpen
+            && UsesManagedLocalProvider(connectionOptions)
+            && !IsRemoteTursoUrl(connectionOptions.DataSource)
+            && !string.IsNullOrEmpty(path)
+            && !path.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
+        {
+            TursoSqliteConnection.ClearAllPools();
+            File.Delete(path);
+            File.Delete(path + "-wal");
+            File.Delete(path + "-shm");
+            return;
+        }
 
         if (!wasOpen)
             Dependencies.Connection.Open();
 
-        var path = dbConnection.DataSource;
         Dependencies.Connection.Close();
 
         if (!string.IsNullOrEmpty(path) && !path.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
@@ -111,4 +133,16 @@ public class TursoSqliteDatabaseCreator(
         if (wasOpen)
             Dependencies.Connection.Open();
     }
+
+    private static bool UsesManagedLocalProvider(TursoSqliteConnectionStringBuilder connectionOptions)
+        => !connectionOptions.IsLocalProviderConfigured
+            || connectionOptions.LocalProvider == Turso.TursoLocalProvider.Managed;
+
+    private static bool IsRemoteTursoUrl(string dataSource)
+        => Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
+            && (uri.Scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("ws", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("wss", StringComparison.OrdinalIgnoreCase));
 }

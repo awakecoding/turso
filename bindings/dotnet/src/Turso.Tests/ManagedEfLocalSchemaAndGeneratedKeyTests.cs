@@ -32,7 +32,7 @@ public class ManagedEfLocalSchemaAndGeneratedKeyTests
     public void NativeLocalProviderRetainsAutoincrementSchemaGeneration()
     {
         var options = new DbContextOptionsBuilder<ManagedSchemaContext>()
-            .UseTurso("Data Source=:memory:")
+            .UseTurso("Data Source=:memory:;Local Provider=Native")
             .Options;
 
         using var context = new ManagedSchemaContext(options);

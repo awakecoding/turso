@@ -132,14 +132,15 @@ public sealed class ManagedBackupSnapshotTests
     }
 
     [Test]
-    public void ManagedIncrementalBlobRemainsExplicitlyRejected()
+    public void ManagedIncrementalBlobWritesThroughTheManagedConnection()
     {
         using var connection = OpenManagedConnection();
         connection.ExecuteNonQuery("CREATE TABLE data(value BLOB); INSERT INTO data VALUES (X'0102');");
 
-        connection.Invoking(connection => new SqliteBlob(connection, "data", "value", 1))
-            .Should().Throw<NotSupportedException>()
-            .WithMessage(Data.Sqlite.Properties.Resources.ManagedIncrementalBlobNotSupported);
+        using (var blob = new SqliteBlob(connection, "data", "value", 1))
+            blob.Write([3], 0, 1);
+
+        connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE rowid = 1;").Should().Equal(3, 2);
     }
 
     private static SqliteConnection OpenManagedConnection()

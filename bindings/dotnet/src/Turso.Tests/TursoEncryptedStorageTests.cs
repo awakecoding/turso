@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using AwesomeAssertions;
 using Turso.Core.Storage;
+using StorageCipher = Turso.Core.Storage.TursoEncryptionCipher;
 
 namespace Turso.Tests;
 
@@ -13,7 +14,7 @@ public class TursoEncryptedStorageTests
     public void PageStoreEncryptsPagesAndReopensOnlyWithTheCorrectKey()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var encryption = new TursoEncryptionOptions(TursoEncryptionCipher.Aes256Gcm, Aes256Key);
+        using var encryption = new TursoEncryptionOptions(StorageCipher.Aes256Gcm, Aes256Key);
         var page = CreatePlainPage(SqlitePageSize.Default, 0xA1);
 
         using (var store = SqlitePageStore.Create(fileSystem, "encrypted.db", encryption: encryption))
@@ -43,7 +44,7 @@ public class TursoEncryptedStorageTests
         missingKey!.Message.Should().Contain("encrypted");
 
         using var wrongKey = new TursoEncryptionOptions(
-            TursoEncryptionCipher.Aes256Gcm,
+            StorageCipher.Aes256Gcm,
             Convert.FromHexString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"));
         var wrongKeyFailure = Assert.Throws<InvalidDataException>(
             () => SqlitePageStore.Open(fileSystem, "encrypted.db", encryption: wrongKey));
@@ -54,7 +55,7 @@ public class TursoEncryptedStorageTests
     public void PageStoreRejectsPlaintextAndTamperedEncryptedFiles()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var encryption = new TursoEncryptionOptions(TursoEncryptionCipher.Aes256Gcm, Aes256Key);
+        using var encryption = new TursoEncryptionOptions(StorageCipher.Aes256Gcm, Aes256Key);
 
         using (SqlitePageStore.Create(fileSystem, "plaintext.db"))
         {
@@ -97,7 +98,7 @@ public class TursoEncryptedStorageTests
     public void OpensDeterministicRustAesGcmPageFixture()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var encryption = new TursoEncryptionOptions(TursoEncryptionCipher.Aes256Gcm, Aes256Key);
+        using var encryption = new TursoEncryptionOptions(StorageCipher.Aes256Gcm, Aes256Key);
         var plaintext = CreateFirstPage(SqlitePageSize.Default);
         var nonce = Convert.FromHexString("101112131415161718191A1B");
         var encrypted = CreateRustAes256PageFixture(plaintext, Aes256Key, nonce);
@@ -116,7 +117,7 @@ public class TursoEncryptedStorageTests
     public void PagerEncryptsWalFramesAndAuthenticatesTheirPageImages()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var encryption = new TursoEncryptionOptions(TursoEncryptionCipher.Aes128Gcm, Aes256Key.AsSpan()[..16]);
+        using var encryption = new TursoEncryptionOptions(StorageCipher.Aes128Gcm, Aes256Key.AsSpan()[..16]);
         var walHeader = SqliteWalHeader.Create(SqlitePageSize.Default, salt1: 1, salt2: 2);
         var page = CreatePlainPage(SqlitePageSize.Default, 0xB2);
 
@@ -149,7 +150,7 @@ public class TursoEncryptedStorageTests
         }
 
         using var wrongKey = new TursoEncryptionOptions(
-            TursoEncryptionCipher.Aes128Gcm,
+            StorageCipher.Aes128Gcm,
             Convert.FromHexString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"));
         using var wrongKeyWal = SqliteWalFile.Open(fileSystem, "encrypted.db-wal", encryption: wrongKey);
         var wrongKeyFailure = Assert.Throws<InvalidDataException>(
@@ -192,7 +193,7 @@ public class TursoEncryptedStorageTests
         var encrypted = new byte[plaintext.Length];
         "Turso"u8.CopyTo(encrypted);
         encrypted[5] = 0;
-        encrypted[6] = (byte)TursoEncryptionCipher.Aes256Gcm;
+        encrypted[6] = (byte)StorageCipher.Aes256Gcm;
         plaintext[16..sqliteHeaderSize].CopyTo(encrypted.AsSpan(16));
 
         var payloadLength = plaintext.Length - sqliteHeaderSize - metadataSize;

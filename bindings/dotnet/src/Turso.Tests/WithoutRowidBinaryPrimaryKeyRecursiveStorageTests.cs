@@ -109,8 +109,9 @@ public sealed class WithoutRowidBinaryPrimaryKeyRecursiveStorageTests
                 .AsText()
                 .Should()
                 .Be(BinaryPayload(DeepBinaryRowCount));
-            Assert.Throws<InvalidOperationException>(
-                () => Execute(connection, $"INSERT INTO entry VALUES ('blocked', '{BinaryKey(DeepBinaryRowCount + 1)}');"));
+            Assert.Throws<EmbeddedSqlException>(
+                () => Execute(connection, $"INSERT INTO entry VALUES ('blocked', '{BinaryKey(DeepBinaryRowCount + 1)}');"))!
+                .Message.Should().Be("attempt to write a readonly database");
         }
     }
 

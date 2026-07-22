@@ -7,6 +7,60 @@ namespace Turso.EntityFrameworkCore.Sqlite.Query.Internal;
 
 public sealed class TursoSqliteQuerySqlGenerator(QuerySqlGeneratorDependencies dependencies) : SqliteQuerySqlGenerator(dependencies)
 {
+    private string? _unaliasedDmlTargetTableAlias;
+
+    protected override Expression VisitDelete(DeleteExpression deleteExpression)
+    {
+        var previousAlias = _unaliasedDmlTargetTableAlias;
+        _unaliasedDmlTargetTableAlias = deleteExpression.Table.Alias;
+        try
+        {
+            return base.VisitDelete(deleteExpression);
+        }
+        finally
+        {
+            _unaliasedDmlTargetTableAlias = previousAlias;
+        }
+    }
+
+    protected override Expression VisitUpdate(UpdateExpression updateExpression)
+    {
+        var previousAlias = _unaliasedDmlTargetTableAlias;
+        _unaliasedDmlTargetTableAlias = updateExpression.SelectExpression.Tables.Count == 1
+            ? updateExpression.Table.Alias
+            : null;
+        try
+        {
+            return base.VisitUpdate(updateExpression);
+        }
+        finally
+        {
+            _unaliasedDmlTargetTableAlias = previousAlias;
+        }
+    }
+
+    protected override Expression VisitColumn(ColumnExpression columnExpression)
+    {
+        if (columnExpression.TableAlias == _unaliasedDmlTargetTableAlias)
+        {
+            Sql.Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(columnExpression.Name));
+            return columnExpression;
+        }
+
+        return base.VisitColumn(columnExpression);
+    }
+
+    protected override Expression VisitTable(TableExpression tableExpression)
+    {
+        if (tableExpression.Alias == _unaliasedDmlTargetTableAlias)
+        {
+            Sql.Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(tableExpression.Name, tableExpression.Schema));
+            return tableExpression;
+        }
+
+        return base.VisitTable(tableExpression);
+    }
+
     protected override Expression VisitOrdering(OrderingExpression orderingExpression)
     {
         if (ShouldUseDecimalCollation(orderingExpression.Expression))

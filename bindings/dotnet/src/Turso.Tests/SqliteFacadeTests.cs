@@ -130,9 +130,9 @@ public class SqliteFacadeTests
         connection.Open();
         connection.ExecuteNonQuery("CREATE TABLE Data(Id INTEGER PRIMARY KEY, Value TEXT); INSERT INTO Data VALUES (1, 'a');");
 
-        connection.ExecuteNonQuery("WITH Target AS (SELECT 1 AS Id) UPDATE Data SET Value = 'b' WHERE Id = (SELECT Id FROM Target);")
+        SqliteConnectionExtensions.ExecuteNonQuery(connection, "WITH Target AS (SELECT 1 AS Id) UPDATE Data SET Value = 'b' WHERE Id = (SELECT Id FROM Target);")
             .Should().Be(1);
-        connection.ExecuteNonQuery("UPDATE Data SET Value = 'c' WHERE Id = 1 RETURNING Id;")
+        SqliteConnectionExtensions.ExecuteNonQuery(connection, "UPDATE Data SET Value = 'c' WHERE Id = 1 RETURNING Id;")
             .Should().Be(1);
     }
 
@@ -226,7 +226,8 @@ public class SqliteFacadeTests
     [Test]
     public void SharedMemoryConnectionsUseSameBackingStore()
     {
-        var connectionString = "Data Source=turso-shared-test;Mode=Memory;Cache=Shared";
+        NativeProviderTestFixture.EnsureRegistered();
+        var connectionString = "Data Source=turso-shared-test;Mode=Memory;Cache=Shared;Local Provider=Native";
         using var first = new SqliteConnection(connectionString);
         using var second = new SqliteConnection(connectionString);
 
@@ -248,9 +249,26 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void ManagedFacadeRoutesSupportedRuntimeMetadataPragmasToCore()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+
+        connection.ExecuteScalar<long>("PRAGMA schema_version;").Should().Be(0);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        connection.ExecuteScalar<long>("PRAGMA schema_version;").Should().Be(1);
+        connection.ExecuteNonQuery("PRAGMA user_version = 456;");
+        connection.ExecuteNonQuery("PRAGMA application_id = 789;");
+
+        connection.ExecuteScalar<long>("PRAGMA user_version;").Should().Be(456);
+        connection.ExecuteScalar<long>("PRAGMA application_id;").Should().Be(789);
+        connection.ExecuteScalar<string>("PRAGMA journal_mode;").Should().Be("memory");
+    }
+
+    [Test]
     public void ReadUncommittedTransactionSetsAndResetsPragma()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:;Cache=Shared");
+        using var connection = CreateNativeConnection("Data Source=:memory:;Cache=Shared;Local Provider=Native");
         connection.Open();
 
         using (var transaction = connection.BeginTransaction(IsolationLevel.ReadUncommitted))
@@ -329,7 +347,7 @@ public class SqliteFacadeTests
     [Test]
     public void ReaderFieldTypeUsesExpressionAndDeclaredTypesBeforeRead()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
 
         using (var reader = connection.ExecuteReader("SELECT 1, 3.14, 'test', X'0102', NULL;"))
@@ -388,7 +406,7 @@ public class SqliteFacadeTests
     [Test]
     public void DataTableLoadHandlesNullsInAliasedJoinColumns()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.ExecuteNonQuery("""
             CREATE TABLE Member (
@@ -491,13 +509,16 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    public void ManagedProviderRejectsIncrementalBlobIo()
+    public void ManagedProviderSupportsIncrementalBlobIo()
     {
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value BLOB); INSERT INTO Data(rowid, Value) VALUES (1, X'0102');");
 
-        Assert.Throws<NotSupportedException>(() => new SqliteBlob(connection, "Data", "Value", 1))!
-            .Message.Should().Be(Data.Sqlite.Properties.Resources.ManagedIncrementalBlobNotSupported);
+        using (var blob = new SqliteBlob(connection, "Data", "Value", 1))
+            blob.Write([3], 0, 1);
+
+        connection.ExecuteScalar<byte[]>("SELECT Value FROM Data WHERE rowid = 1;").Should().Equal(3, 2);
     }
 
     [Test]
@@ -601,7 +622,7 @@ public class SqliteFacadeTests
     [Test]
     public void ScalarFunctionCanBeRemoved()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.CreateFunction("test", () => 1L);
         connection.ExecuteScalar<long>("SELECT test();").Should().Be(1);
@@ -677,7 +698,7 @@ public class SqliteFacadeTests
     [Test]
     public void AggregateFunctionCanBeRemoved()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.ExecuteNonQuery("CREATE TABLE Data(Value TEXT); INSERT INTO Data VALUES ('X');");
         connection.CreateAggregate("remove_test", (string? accumulator, string value) => accumulator + value);
@@ -716,7 +737,7 @@ public class SqliteFacadeTests
     [Test]
     public void CustomCollationCanBeUsedInExpressionsAndOrderingButNotSchema()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.CreateCollation("reverse_text", static (left, right) => -string.CompareOrdinal(left, right));
 
@@ -733,7 +754,7 @@ public class SqliteFacadeTests
     [Test]
     public void EnableExtensionsControlsSqlLoadExtension()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         var sql = "SELECT load_extension('unknown');";
 
@@ -763,7 +784,7 @@ public class SqliteFacadeTests
     [Test]
     public void LoadExtensionUsesNativeLoaderEvenWhenSqlFunctionDisabled()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.EnableExtensions(false);
         var disabled = Assert.Throws<SqliteException>(() => connection.ExecuteNonQuery("SELECT load_extension('unknown');"))!.Message;
@@ -776,7 +797,7 @@ public class SqliteFacadeTests
     [Test]
     public void LoadExtensionWhenClosedRunsOnNextOpen()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.LoadExtension("unknown");
 
         var exception = Assert.Throws<SqliteException>(connection.Open)!;
@@ -946,7 +967,7 @@ public class SqliteFacadeTests
     [Test]
     public void GetDataTypeNameWorksBeforeRead()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.ExecuteNonQuery("CREATE TABLE Person (Name nvarchar(4000));");
 
@@ -984,7 +1005,7 @@ public class SqliteFacadeTests
     [Test]
     public void GetSchemaTableReturnsSqliteColumnMetadata()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.ExecuteNonQuery(
             """
@@ -1014,7 +1035,7 @@ public class SqliteFacadeTests
     [Test]
     public void GetSchemaTableUnescapesQuotedBaseTableNames()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.ExecuteNonQuery(@"CREATE TABLE ""Bad""""Table""(Value);");
 
@@ -1027,7 +1048,7 @@ public class SqliteFacadeTests
     [Test]
     public void GetSchemaTableInfersTypeForTypelessColumns()
     {
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = CreateNativeConnection();
         connection.Open();
         connection.ExecuteNonQuery("CREATE TABLE Test(Value); INSERT INTO Test VALUES (NULL), ('A');");
 
@@ -1035,6 +1056,13 @@ public class SqliteFacadeTests
         var schema = reader.GetSchemaTable();
 
         schema.Rows[0][SchemaTableColumn.DataType].Should().Be(typeof(string));
+    }
+
+    private static SqliteConnection CreateNativeConnection(
+        string connectionString = "Data Source=:memory:;Local Provider=Native")
+    {
+        NativeProviderTestFixture.EnsureRegistered();
+        return new SqliteConnection(connectionString);
     }
 
     private sealed class TemporaryDirectory : IDisposable

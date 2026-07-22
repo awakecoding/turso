@@ -22,9 +22,13 @@ IOS_FRAMEWORK_NAME = libturso_sdk_kit
 IOS_DYLIB_FILE = libturso_sdk_kit.dylib
 IOS_FRAMEWORK_BUILD_DIR = ./rs_compiled/ios-frameworks
 IOS_XCFRAMEWORK_DIR = ./rs_compiled/ios-universal/native/$(IOS_FRAMEWORK_NAME).xcframework
+MANAGED_PACKAGE_VERSION ?=
+MANAGED_PACKAGE_OUTPUT ?= ./artifacts/managed-packages
+MANAGED_PACKAGE_OUTPUT_ARG = $(if $(MANAGED_PACKAGE_OUTPUT),--output "$(MANAGED_PACKAGE_OUTPUT)")
+MANAGED_PACKAGE_VERSION_ARG = $(if $(MANAGED_PACKAGE_VERSION),-p:PackageVersion=$(MANAGED_PACKAGE_VERSION))
 
 all:
-	echo "make [build|test|benchmark|build-production|restore-managed|build-managed|test-managed|pack-managed]"
+	echo "make [build|test|benchmark|build-production|restore-managed|build-managed|test-managed|pack-managed|validate-managed-package]"
 
 build-rust-windows64:
 	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
@@ -112,8 +116,8 @@ build-dotnet:
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
 
-# These targets exercise the opt-in managed provider; the native provider remains the default.
-.PHONY: restore-managed build-managed test-managed pack-managed
+# These targets do not invoke Cargo or require native runtime assets.
+.PHONY: restore-managed build-managed test-managed pack-managed validate-managed-package pack-native
 restore-managed:
 	dotnet restore ./src/Turso.Tests/Turso.Tests.csproj
 
@@ -125,9 +129,20 @@ build-managed: restore-managed
 test-managed: build-managed
 	dotnet test --no-build --no-restore -c Debug --filter "FullyQualifiedName~Managed" ./src/Turso.Tests/Turso.Tests.csproj
 
-pack-managed: build-managed
-	dotnet pack --no-build --no-restore -c Debug -p:RequireNativeAssetsForPack=false ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
-	dotnet pack --no-build --no-restore -c Debug -p:RequireNativeAssetsForPack=false ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+pack-managed: restore-managed
+	rm -rf "$(MANAGED_PACKAGE_OUTPUT)"
+	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
+	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+
+validate-managed-package:
+	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
+	dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --source "$(MANAGED_PACKAGE_OUTPUT)" -p:TursoPackageVersion=0.0.0-managed-local
+	dotnet run --no-restore --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
+
+pack-native:
+	dotnet restore ./src/Turso.Data.Native/Turso.Data.Native.csproj
+	dotnet pack --no-restore -c Release ./src/Turso.Raw/Turso.Raw.csproj
+	dotnet pack --no-restore -c Release ./src/Turso.Data.Native/Turso.Data.Native.csproj
 
 # Generate the Turso Platform API client from the pinned OpenAPI spec.
 generate-platform-client:
@@ -153,8 +168,8 @@ pack-nativeaot-static:
 	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=osx-arm64
 
 pack:
-	dotnet pack -c Release ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
-	dotnet pack -c Release ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	$(MAKE) pack-managed MANAGED_PACKAGE_OUTPUT= MANAGED_PACKAGE_VERSION=
+	$(MAKE) pack-native
 	$(MAKE) pack-nativeaot-static
 	dotnet pack -c Release ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
 	dotnet pack -c Release ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj

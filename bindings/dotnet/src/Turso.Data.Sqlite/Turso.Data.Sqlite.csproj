@@ -20,12 +20,14 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
-    <RequireNativeAssetsForPack>true</RequireNativeAssetsForPack>
+    <!-- The primary provider package is managed-only. Native assets ship in Turso.Data.Sqlite.Native. -->
+    <IncludeNativeAssetsInProviderPackage Condition="'$(IncludeNativeAssetsInProviderPackage)' == ''">false</IncludeNativeAssetsInProviderPackage>
+    <RequireNativeAssetsForPack Condition="'$(RequireNativeAssetsForPack)' == ''">true</RequireNativeAssetsForPack>
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);AddProjectReferencesToPackage</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\Turso.Core\Turso.Core.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" PrivateAssets="all" />
   </ItemGroup>
 
@@ -34,7 +36,7 @@
     <None Include="buildTransitive\Turso.Data.Sqlite.targets" Pack="true" PackagePath="buildTransitive\Turso.Data.Sqlite.targets" />
   </ItemGroup>
 
-  <ItemGroup Condition="'$(Configuration)'=='Release'">
+  <ItemGroup Condition="'$(Configuration)'=='Release' and '$(IncludeNativeAssetsInProviderPackage)'=='true'">
     <None Include="..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.dll"
           Visible="false"
           Condition="Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.dll')">
@@ -234,10 +236,6 @@
 
   <Target Name="AddProjectReferencesToPackage">
     <ItemGroup>
-      <BuildOutputInPackage Include="$(OutputPath)Turso.Raw.dll"
-                            Condition="Exists('$(OutputPath)Turso.Raw.dll')" />
-      <BuildOutputInPackage Include="$(OutputPath)Turso.Raw.xml"
-                            Condition="Exists('$(OutputPath)Turso.Raw.xml')" />
       <BuildOutputInPackage Include="$(OutputPath)Turso.Data.dll"
                             Condition="Exists('$(OutputPath)Turso.Data.dll')" />
       <BuildOutputInPackage Include="$(OutputPath)Turso.Data.xml"
@@ -250,7 +248,7 @@
   </Target>
 
   <Target Name="ValidateNativeAssetsForPack" BeforeTargets="Pack"
-          Condition="'$(Configuration)'=='Release' and '$(RequireNativeAssetsForPack)'=='true'">
+          Condition="'$(Configuration)'=='Release' and '$(IncludeNativeAssetsInProviderPackage)'=='true' and '$(RequireNativeAssetsForPack)'=='true'">
     <Error Condition="!Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_sdk_kit.dll') and !Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.dll')"
            Text="Missing win-x64 native asset. Build turso_sdk_kit.dll before packing Turso.Data.Sqlite." />
     <Error Condition="!Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release\turso_sdk_kit.dll') and !Exists('..\..\rs_compiled\aarch64-pc-windows-msvc\release-official\turso_sdk_kit.dll')"

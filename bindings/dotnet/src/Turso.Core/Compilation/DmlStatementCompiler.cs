@@ -54,6 +54,36 @@ public sealed record CompiledDml(
     IReadOnlyList<VdbeWriteTarget> WriteTargets);
 
 /// <summary>
+/// A DML scan filter over either declared row values alone or those values together with the
+/// hidden rowid. The two forms remain distinct so the executor never smuggles rowids into the
+/// declared-column tuple exposed to ordinary row predicates.
+/// </summary>
+internal sealed class DmlRowFilter
+{
+    private DmlRowFilter(VdbeRowPredicate? rowPredicate, VdbeRowIdPredicate? rowIdPredicate)
+    {
+        RowPredicate = rowPredicate;
+        RowIdPredicate = rowIdPredicate;
+    }
+
+    public VdbeRowPredicate? RowPredicate { get; }
+
+    public VdbeRowIdPredicate? RowIdPredicate { get; }
+
+    public static DmlRowFilter ForRow(VdbeRowPredicate predicate)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        return new DmlRowFilter(predicate, null);
+    }
+
+    public static DmlRowFilter ForRowId(VdbeRowIdPredicate predicate)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        return new DmlRowFilter(null, predicate);
+    }
+}
+
+/// <summary>
 /// Lowers a bounded subset of INSERT/UPDATE/DELETE into a <see cref="VdbeProgram"/>
 /// built from real cursor/mutation opcodes. Like <see cref="SelectStatementCompiler"/>
 /// the compiler owns only the program's control flow and jump layout: SQL semantics
@@ -65,7 +95,7 @@ public sealed record CompiledDml(
 /// <code>
 ///   0            OpenWriteCursor
 ///   1            Rewind        -> commitAddr (nothing to mutate)
-///   loopStart    [Filter       -> nextAddr]    (UPDATE/DELETE with WHERE)
+///   loopStart    [Filter|FilterRowId -> nextAddr] (UPDATE/DELETE with WHERE)
 ///   mutateAddr   Insert|Update|Delete
 ///                [projection block per RETURNING clause: Column/RowId/LoadConstant
 ///                 leaves and Arithmetic nodes computing into output registers r[0..R-1],
@@ -135,7 +165,30 @@ public static class DmlStatementCompiler
         if (kind == DmlKind.Insert && predicate is not null)
             throw new StatementCompilationException("INSERT programs do not filter rows.");
 
-        var program = BuildProgram(kind, tableName, columnCount, predicate, returning);
+        return CompileWithFilter(
+            kind,
+            tableName,
+            columnCount,
+            predicate is null ? null : DmlRowFilter.ForRow(predicate),
+            returning,
+            writeTarget);
+    }
+
+    internal static CompiledDml CompileWithFilter(
+        DmlKind kind,
+        string tableName,
+        int columnCount,
+        DmlRowFilter? filter,
+        IReadOnlyList<DmlReturningExpression> returning,
+        VdbeWriteTarget writeTarget)
+    {
+        ArgumentNullException.ThrowIfNull(tableName);
+        ArgumentNullException.ThrowIfNull(returning);
+        ArgumentNullException.ThrowIfNull(writeTarget);
+        if (kind == DmlKind.Insert && filter is not null)
+            throw new StatementCompilationException("INSERT programs do not filter rows.");
+
+        var program = BuildProgram(kind, tableName, columnCount, filter, returning);
         return new CompiledDml(program, [writeTarget]);
     }
 
@@ -143,11 +196,11 @@ public static class DmlStatementCompiler
         DmlKind kind,
         string tableName,
         int columnCount,
-        VdbeRowPredicate? predicate,
+        DmlRowFilter? filter,
         IReadOnlyList<DmlReturningExpression> returning)
     {
         var cursor = new Cursor(0);
-        var hasFilter = predicate is not null;
+        var hasFilter = filter is not null;
         var hasReturning = returning.Count > 0;
 
         // Lower the RETURNING projections into their (jump-free) instruction block up front so the loop's
@@ -177,13 +230,25 @@ public static class DmlStatementCompiler
             new RewindCursorInstruction(cursor, new ProgramCounter(commitAddr)),
         };
 
-        if (predicate is not null)
+        if (filter?.RowPredicate is { } rowPredicate)
         {
             instructions.Add(new FilterInstruction(
                 cursor,
-                predicate,
+                rowPredicate,
                 new ProgramCounter(nextAddr),
                 $"skip row when WHERE is false, goto {nextAddr}"));
+        }
+        else if (filter?.RowIdPredicate is { } rowIdPredicate)
+        {
+            instructions.Add(new FilterRowIdInstruction(
+                cursor,
+                rowIdPredicate,
+                new ProgramCounter(nextAddr),
+                $"skip row when WHERE is false, goto {nextAddr}"));
+        }
+        else if (filter is not null)
+        {
+            throw new StatementCompilationException("DML filter has no predicate.");
         }
 
         instructions.Add(kind switch
@@ -230,20 +295,20 @@ public static class DmlStatementCompiler
                 block.Add(new LoadConstantInstruction(destination, constant.Value));
                 break;
             case DmlArithmeticReturning arithmetic:
-            {
-                var arity = arithmetic.Operands.Count;
-                var frame = allocator.Enter();
-                var operandStart = allocator.Reserve(arity);
-                for (var index = 0; index < arity; index++)
-                    EmitExpression(cursor, arithmetic.Operands[index], new Register(operandStart + index), block, allocator);
+                {
+                    var arity = arithmetic.Operands.Count;
+                    var frame = allocator.Enter();
+                    var operandStart = allocator.Reserve(arity);
+                    for (var index = 0; index < arity; index++)
+                        EmitExpression(cursor, arithmetic.Operands[index], new Register(operandStart + index), block, allocator);
 
-                block.Add(new ArithmeticInstruction(
-                    destination,
-                    arithmetic.Operator,
-                    new RegisterRange(new Register(operandStart), arity)));
-                allocator.Leave(frame);
-                break;
-            }
+                    block.Add(new ArithmeticInstruction(
+                        destination,
+                        arithmetic.Operator,
+                        new RegisterRange(new Register(operandStart), arity)));
+                    allocator.Leave(frame);
+                    break;
+                }
 
             default:
                 throw new StatementCompilationException(

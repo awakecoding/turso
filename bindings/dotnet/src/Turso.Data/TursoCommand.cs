@@ -1,8 +1,7 @@
-﻿using System.Data;
+using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
-using Turso.Raw.Public;
-using Turso.Raw.Public.Handles;
+using Turso.Core;
 
 namespace Turso;
 
@@ -12,7 +11,8 @@ public class TursoCommand : DbCommand
     private readonly TursoParameterCollection _parameterCollection = new();
 
     private TursoTransaction? _transaction;
-    private TursoStatementHandle? _statement;
+    private TursoNativeStatement? _nativeStatement;
+    private IManagedStatementAdapter? _managedStatement;
     private int _commandTimeout = 30;
 
     public TursoCommand()
@@ -100,7 +100,8 @@ public class TursoCommand : DbCommand
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        _statement?.Dispose();
+        _nativeStatement?.Dispose();
+        _managedStatement?.Dispose();
     }
 
     public override void Cancel()
@@ -161,12 +162,39 @@ public class TursoCommand : DbCommand
         if (_connection.IsRemote)
             return;
 
-        TursoStatementHandle? preparedStatement = null;
+        if (_connection.IsManaged)
+        {
+            IManagedStatementAdapter? managedStatement = null;
+            try
+            {
+                var sql = RewriteFacadePragmas(CommandText, _connection);
+                managedStatement = _connection.ManagedConnection.Prepare(sql);
+                BindManagedParameters(managedStatement);
+                _ = managedStatement.ResultMetadata.ColumnCount;
+
+                _nativeStatement?.Dispose();
+                _nativeStatement = null;
+                _managedStatement?.Dispose();
+                _managedStatement = managedStatement;
+                managedStatement = null;
+                return;
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                throw TursoException.FromCorePreparation(exception);
+            }
+            finally
+            {
+                managedStatement?.Dispose();
+            }
+        }
+
+        TursoNativeStatement? preparedStatement = null;
         try
         {
             var sql = RewriteFacadePragmas(CommandText, _connection);
-            preparedStatement = TursoBindings.PrepareStatement(_connection.Turso, sql);
-            var parameterCount = TursoBindings.GetParameterCount(preparedStatement);
+            preparedStatement = _connection.NativeDatabase.PrepareStatement(sql);
+            var parameterCount = preparedStatement.ParameterCount;
             var boundParameters = new bool[parameterCount + 1];
 
             for (var i = 0; i < _parameterCollection.Count; i++)
@@ -177,7 +205,7 @@ public class TursoCommand : DbCommand
 
                 if (!string.IsNullOrEmpty(parameter.ParameterName))
                 {
-                    var parameterIndex = TursoBindings.BindNamedParameter(preparedStatement, parameter.ParameterName, parameter.ToValue());
+                    var parameterIndex = preparedStatement.BindNamedParameter(parameter.ParameterName, parameter.ToValue());
                     if (parameterIndex == 0)
                         throw new InvalidOperationException($"Parameter {parameter.ParameterName} was not found in the SQL statement.");
 
@@ -189,7 +217,7 @@ public class TursoCommand : DbCommand
                     if (parameterIndex > parameterCount)
                         throw new InvalidOperationException($"Parameter at position {parameterIndex} was not found in the SQL statement.");
 
-                    TursoBindings.BindParameter(preparedStatement, parameterIndex, parameter.ToValue());
+                    preparedStatement.BindParameter(parameterIndex, parameter.ToValue());
                     boundParameters[parameterIndex] = true;
                 }
             }
@@ -198,17 +226,19 @@ public class TursoCommand : DbCommand
             {
                 if (!boundParameters[i])
                 {
-                    var parameterName = TursoBindings.GetParameterName(preparedStatement, i);
+                    var parameterName = preparedStatement.GetParameterName(i);
                     throw new InvalidOperationException(
                         parameterName is null
-                            ? $"Missing value for parameter at position {i}."
+                            ? $"Missing value for parameter ?{i}."
                             : $"Missing value for parameter {parameterName}.");
                 }
             }
 
-            _statement?.Dispose();
-            _statement = preparedStatement;
+            _nativeStatement?.Dispose();
+            _nativeStatement = preparedStatement;
             preparedStatement = null;
+            _managedStatement?.Dispose();
+            _managedStatement = null;
         }
         finally
         {
@@ -277,10 +307,58 @@ public class TursoCommand : DbCommand
 
         Prepare();
 
-        var statement = _statement ?? throw new InvalidOperationException("Command was not prepared.");
-        _statement = null;
-        var reader = new TursoDataReader(this, statement, behavior);
+        var nativeStatement = _nativeStatement;
+        var managedStatement = _managedStatement;
+        if (managedStatement is null && nativeStatement is null)
+            throw new InvalidOperationException("Command was not prepared.");
+        _nativeStatement = null;
+        _managedStatement = null;
+        var reader = new TursoDataReader(this, nativeStatement, managedStatement, behavior);
         return reader;
+    }
+
+    private void BindManagedParameters(IManagedStatementAdapter statement)
+    {
+        var parameterMetadata = statement.ParameterMetadata;
+        var parameterCount = parameterMetadata.Count;
+        var boundParameters = new bool[parameterCount + 1];
+
+        for (var i = 0; i < _parameterCollection.Count; i++)
+        {
+            var parameter = _parameterCollection[i] as TursoParameter
+                ?? throw new ArgumentException("Parameter must be of type TursoParameter");
+
+            if (!string.IsNullOrEmpty(parameter.ParameterName))
+            {
+                var parameterIndex = parameterMetadata.GetParameterIndex(parameter.ParameterName);
+                if (parameterIndex == 0)
+                    throw new InvalidOperationException($"Parameter {parameter.ParameterName} was not found in the SQL statement.");
+
+                statement.Bind(parameterIndex, parameter.ToSqlValue());
+                boundParameters[parameterIndex] = true;
+            }
+            else
+            {
+                var parameterIndex = i + 1;
+                if (parameterIndex > parameterCount)
+                    throw new InvalidOperationException($"Parameter at position {parameterIndex} was not found in the SQL statement.");
+
+                statement.Bind(parameterIndex, parameter.ToSqlValue());
+                boundParameters[parameterIndex] = true;
+            }
+        }
+
+        for (var i = 1; i <= parameterCount; i++)
+        {
+            if (boundParameters[i])
+                continue;
+
+            var parameterName = parameterMetadata.GetParameter(i).Name;
+            throw new InvalidOperationException(
+                parameterName is null
+                    ? $"Missing value for parameter ?{i}."
+                    : $"Missing value for parameter {parameterName}.");
+        }
     }
 
     private async Task<DbDataReader> ExecuteRemoteAsync(CommandBehavior behavior, CancellationToken cancellationToken)

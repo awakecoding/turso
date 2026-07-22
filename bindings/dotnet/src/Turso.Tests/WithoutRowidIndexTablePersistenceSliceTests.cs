@@ -231,7 +231,8 @@ public sealed class WithoutRowidIndexTablePersistenceSliceTests
         {
             Scalar(connection, "SELECT value FROM entry WHERE code = 'key';").AsText().Should().Be("persisted");
             var write = () => Execute(connection, "INSERT INTO entry VALUES ('blocked', 'other');");
-            write.Should().Throw<InvalidOperationException>();
+            write.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("attempt to write a readonly database");
         }
 
         using var reopened = EmbeddedDatabase.OpenFile("without-rowid-encrypted.db", encryptedFileSystem);

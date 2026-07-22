@@ -27,6 +27,7 @@
         <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
         <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" />
         <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
+        <ProjectReference Include="..\Turso.Data.Native\Turso.Data.Native.csproj" />
         <ProjectReference Include="..\Turso.EntityFrameworkCore.Sqlite\Turso.EntityFrameworkCore.Sqlite.csproj" />
         <ProjectReference Include="..\Turso.Core\Turso.Core.csproj" />
         <ProjectReference Include="..\Turso.Platform.Client\Turso.Platform.Client.csproj" />

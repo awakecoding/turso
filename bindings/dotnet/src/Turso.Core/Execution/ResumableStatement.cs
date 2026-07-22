@@ -240,6 +240,17 @@ public sealed class ResumableStatement : IDisposable
 
                         break;
                     }
+                case FilterRowIdInstruction filterRowId:
+                    {
+                        var row = CurrentCursorRow(filterRowId.Cursor);
+                        var rowId = CurrentCursorRowId(filterRowId.Cursor);
+                        if (filterRowId.Predicate(row, rowId))
+                            AdvanceInstructionPointer();
+                        else
+                            _instructionPointer = filterRowId.FalseTarget;
+
+                        break;
+                    }
                 case FilterRegistersInstruction filterRegisters:
                     {
                         var row = ReadRegisters(filterRegisters.Row);

@@ -147,14 +147,163 @@ public sealed class ManagedPragmaRuntimeSliceTests
     }
 
     [Test]
+    public void RecursiveTriggersAreConnectionLocalAndAllowNonRecursiveTriggerChains()
+    {
+        using var database = new EmbeddedDatabase();
+        using var primary = database.Connect();
+        using var sibling = database.Connect();
+
+        ReadValue(primary, "PRAGMA recursive_triggers;").Should().Be(SqlValue.Integer(0));
+        Execute(primary, "PRAGMA recursive_triggers = ON;");
+        ReadValue(primary, "PRAGMA recursive_triggers;").Should().Be(SqlValue.Integer(1));
+        ReadValue(sibling, "PRAGMA recursive_triggers;").Should().Be(SqlValue.Integer(0));
+
+        Execute(primary, "BEGIN;");
+        Execute(primary, "PRAGMA recursive_triggers = OFF;");
+        Execute(primary, "ROLLBACK;");
+        ReadValue(primary, "PRAGMA recursive_triggers;").Should().Be(SqlValue.Integer(0));
+
+        Execute(primary, "CREATE TABLE source(value INTEGER);");
+        Execute(primary, "CREATE TABLE intermediate(value INTEGER);");
+        Execute(primary, "CREATE TABLE destination(value INTEGER);");
+        Execute(
+            primary,
+            "CREATE TRIGGER source_to_intermediate AFTER INSERT ON source BEGIN INSERT INTO intermediate VALUES (1); END;");
+        Execute(
+            primary,
+            "CREATE TRIGGER intermediate_to_destination AFTER INSERT ON intermediate BEGIN INSERT INTO destination VALUES (1); END;");
+        Execute(primary, "INSERT INTO source VALUES (1);");
+
+        ReadValue(primary, "SELECT COUNT(*) FROM intermediate;").Should().Be(SqlValue.Integer(1));
+        ReadValue(primary, "SELECT COUNT(*) FROM destination;").Should().Be(SqlValue.Integer(1));
+
+        Execute(primary, "CREATE TABLE self_referencing(value INTEGER);");
+        Execute(
+            primary,
+            "CREATE TRIGGER self_repeat AFTER INSERT ON self_referencing BEGIN INSERT INTO self_referencing VALUES (2); END;");
+        Execute(primary, "INSERT INTO self_referencing VALUES (1);");
+        ReadValue(primary, "SELECT COUNT(*) FROM self_referencing;").Should().Be(SqlValue.Integer(2));
+    }
+
+    [Test]
+    public void InMemoryHeaderPragmasAreTransactionalAndSchemaVersionTracksDdl()
+    {
+        using var database = new EmbeddedDatabase();
+        using var primary = database.Connect();
+        using var sibling = database.Connect();
+
+        ColumnNames(primary, "PRAGMA schema_version;").Should().Equal("schema_version");
+        ColumnNames(primary, "PRAGMA user_version;").Should().Equal("user_version");
+        ColumnNames(primary, "PRAGMA application_id;").Should().Equal("application_id");
+        ReadValue(primary, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(0));
+
+        Execute(primary, "CREATE TABLE initial(value INTEGER);");
+        ReadValue(primary, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(1));
+        Execute(primary, "PRAGMA user_version = 456;");
+        Execute(primary, "PRAGMA application_id(789);");
+        ReadValue(sibling, "PRAGMA user_version;").Should().Be(SqlValue.Integer(456));
+        ReadValue(sibling, "PRAGMA application_id;").Should().Be(SqlValue.Integer(789));
+
+        Execute(primary, "BEGIN;");
+        Execute(primary, "PRAGMA schema_version = 40;");
+        Execute(primary, "PRAGMA user_version = 457;");
+        Execute(primary, "CREATE TABLE committed(value INTEGER);");
+        Execute(primary, "SAVEPOINT pragma_headers;");
+        Execute(primary, "PRAGMA application_id = 790;");
+        Execute(primary, "PRAGMA user_version = 458;");
+        Execute(primary, "ROLLBACK TO pragma_headers;");
+        Execute(primary, "RELEASE pragma_headers;");
+        ReadValue(primary, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(41));
+        ReadValue(primary, "PRAGMA user_version;").Should().Be(SqlValue.Integer(457));
+        ReadValue(primary, "PRAGMA application_id;").Should().Be(SqlValue.Integer(789));
+        Execute(primary, "COMMIT;");
+
+        ReadValue(sibling, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(41));
+        ReadValue(sibling, "PRAGMA user_version;").Should().Be(SqlValue.Integer(457));
+        ReadValue(sibling, "PRAGMA application_id;").Should().Be(SqlValue.Integer(789));
+
+        Execute(primary, "PRAGMA query_only = ON;");
+        var writeWhileQueryOnly = () => Execute(primary, "PRAGMA user_version = 999;");
+        writeWhileQueryOnly.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("attempt to write a readonly database");
+        ReadValue(primary, "PRAGMA user_version;").Should().Be(SqlValue.Integer(457));
+    }
+
+    [Test]
+    public void JournalModeReportsTheFixedManagedModeAndUnsupportedRuntimePragmasDiagnoseClearly()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        ColumnNames(connection, "PRAGMA journal_mode;").Should().Equal("journal_mode");
+        ReadRows(connection, "PRAGMA journal_mode;").Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Text("memory"));
+        using (var setter = connection.Prepare("PRAGMA journal_mode = MEMORY;"))
+        {
+            setter.GetColumnCount().Should().Be(1);
+            setter.HasRows().Should().BeTrue();
+            setter.Step().Should().Be(StatementStepResult.Row);
+            setter.GetValue(0).Should().Be(SqlValue.Text("memory"));
+            setter.Step().Should().Be(StatementStepResult.Done);
+        }
+
+        var unsupportedMode = () => Execute(connection, "PRAGMA journal_mode = WAL;");
+        unsupportedMode.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("Managed PRAGMA journal_mode only supports the fixed MEMORY mode.");
+
+        ColumnNames(connection, "PRAGMA page_size;").Should().Equal("page_size");
+        ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(4_096));
+        Execute(connection, "PRAGMA page_size = 4096;");
+        var unsupportedPageSize = () => Execute(connection, "PRAGMA page_size = 8192;");
+        unsupportedPageSize.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("Managed PRAGMA page_size only supports the fixed 4096-byte page size.");
+
+        foreach (var pragma in new[] { "cache_size", "synchronous" })
+        {
+            var unsupported = () => connection.Prepare($"PRAGMA {pragma} = 1;");
+            unsupported.Should().Throw<EmbeddedSqlException>()
+                .WithMessage($"Unsupported PRAGMA {pragma}. At SQL offset *");
+        }
+    }
+
+    [Test]
+    public void FileBackedHeaderPragmaWritesRejectWithoutMutatingDurableMetadata()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile("pragma-header-writes.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE data(value INTEGER);");
+            ReadValue(connection, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(1));
+            ReadValue(connection, "PRAGMA user_version;").Should().Be(SqlValue.Integer(0));
+            ReadValue(connection, "PRAGMA application_id;").Should().Be(SqlValue.Integer(0));
+            ReadValue(connection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("wal"));
+
+            var unsupportedWrite = () => Execute(connection, "PRAGMA schema_version = 99;");
+            unsupportedWrite.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("Managed file-backed databases do not support writes to PRAGMA schema_version.");
+            ReadValue(connection, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(1));
+        }
+
+        using var readOnlyDatabase = EmbeddedDatabase.OpenFile(
+            "pragma-header-writes.db",
+            fileSystem,
+            readOnly: true);
+        using var readOnlyConnection = readOnlyDatabase.Connect();
+        var readOnlyWrite = () => Execute(readOnlyConnection, "PRAGMA user_version = 99;");
+        readOnlyWrite.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("attempt to write a readonly database");
+    }
+
+    [Test]
     public void UnsupportedPragmasAreRejectedByTheManagedParser()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
 
-        var unsupported = () => connection.Prepare("PRAGMA journal_mode = WAL;");
+        var unsupported = () => connection.Prepare("PRAGMA automatic_index;");
         unsupported.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Unsupported PRAGMA journal_mode. At SQL offset *");
+            .WithMessage("Unsupported PRAGMA automatic_index. At SQL offset *");
 
         var unsupportedSchema = () => connection.Prepare("PRAGMA temp.table_list;");
         unsupportedSchema.Should().Throw<EmbeddedSqlException>()
@@ -191,6 +340,15 @@ public sealed class ManagedPragmaRuntimeSliceTests
         }
 
         return rows;
+    }
+
+    private static SqlValue ReadValue(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        var value = statement.GetValue(0);
+        statement.Step().Should().Be(StatementStepResult.Done);
+        return value;
     }
 
     private static SqlValue[] FindCatalogEntry(IEnumerable<SqlValue[]> rows, string name)

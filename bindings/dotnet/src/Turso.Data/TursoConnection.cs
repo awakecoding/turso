@@ -1,16 +1,15 @@
-﻿using System.Data;
+using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using Turso.Core;
 using Turso.Core.Storage;
-using Turso.Raw.Public;
-using Turso.Raw.Public.Handles;
 
 namespace Turso;
 
 public class TursoConnection : DbConnection
 {
-    private TursoDatabaseHandle? _turso;
+    private TursoNativeDatabase? _nativeDatabase;
+    private IManagedDatabaseAdapter? _managedDatabase;
     private TursoRemoteClient? _remoteClient;
     private TursoConnectionOptions _connectionOptions;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
@@ -38,7 +37,7 @@ public class TursoConnection : DbConnection
 
     public override string ServerVersion => typeof(TursoConnection).Assembly.GetName().Version?.ToString() ?? "0.0.0";
 
-    public override ConnectionState State => _turso is not null || _remoteClient is not null
+    public override ConnectionState State => _nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null
         ? ConnectionState.Open
         : ConnectionState.Closed;
 
@@ -58,7 +57,7 @@ public class TursoConnection : DbConnection
     public override void Open()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_turso is not null || _remoteClient is not null)
+        if (_nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");
         if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
         {
@@ -97,14 +96,14 @@ public class TursoConnection : DbConnection
             if (string.IsNullOrWhiteSpace(hexkey))
                 throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
 
-            _turso = TursoBindings.OpenDatabaseWithEncryption(filename, cipher.Value, hexkey);
+            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher, hexkey);
         }
         else
         {
             if (!string.IsNullOrWhiteSpace(hexkey))
                 throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
 
-            _turso = TursoBindings.OpenDatabase(filename);
+            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher: null, encryptionKey: null);
         }
     }
 
@@ -125,19 +124,28 @@ public class TursoConnection : DbConnection
             return;
         }
 
-        var turso = _turso;
+        var nativeDatabase = _nativeDatabase;
+        var managedDatabase = _managedDatabase;
         var managedEncryptionFileSystem = _managedEncryptionFileSystem;
-        _turso = null;
+        _nativeDatabase = null;
+        _managedDatabase = null;
         _managedEncryptionFileSystem = null;
         try
         {
-            turso?.Dispose();
+            nativeDatabase?.Dispose();
         }
         finally
         {
-            managedEncryptionFileSystem?.Dispose();
-            _readUncommitted = false;
-            _managedReadOnly = false;
+            try
+            {
+                managedDatabase?.Dispose();
+            }
+            finally
+            {
+                managedEncryptionFileSystem?.Dispose();
+                _readUncommitted = false;
+                _managedReadOnly = false;
+            }
         }
     }
 
@@ -152,7 +160,7 @@ public class TursoConnection : DbConnection
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
-        if (_turso is null && _remoteClient is null)
+        if (_nativeDatabase is null && _managedDatabase is null && _remoteClient is null)
         {
             throw new InvalidOperationException("Turso database is closed.");
         }
@@ -210,13 +218,19 @@ public class TursoConnection : DbConnection
 
     internal bool IsManagedReadOnly => _managedReadOnly;
 
+    internal bool IsManaged => _managedDatabase is not null;
+
     internal bool ReadUncommitted
     {
         get => _readUncommitted;
         set => _readUncommitted = value;
     }
 
-    internal TursoDatabaseHandle Turso => _turso ?? throw new InvalidOperationException("Turso database is closed.");
+    internal TursoNativeDatabase NativeDatabase
+        => _nativeDatabase ?? throw new InvalidOperationException("Turso database is closed.");
+
+    internal IManagedConnectionAdapter ManagedConnection
+        => _managedDatabase?.Connection ?? throw new InvalidOperationException("Turso database is closed.");
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
         string sql,
@@ -389,11 +403,22 @@ public class TursoConnection : DbConnection
     {
         if (options.Encryption is null && !options.ReadOnly)
         {
-            _turso = TursoBindings.OpenManagedDatabase(options.DataSource);
+            var managedDatabase = ManagedDatabaseAdapter.Open(options.DataSource);
+            try
+            {
+                _ = managedDatabase.Connect();
+                _managedDatabase = managedDatabase;
+            }
+            catch
+            {
+                managedDatabase.Dispose();
+                throw;
+            }
         }
         else
         {
             TursoEncryptionFileSystem? managedEncryptionFileSystem = null;
+            IManagedDatabaseAdapter? managedDatabase = null;
             try
             {
                 IFileSystem fileSystem = PhysicalFileSystem.Instance;
@@ -405,24 +430,26 @@ public class TursoConnection : DbConnection
                     fileSystem = managedEncryptionFileSystem;
                 }
 
-                var database = EmbeddedDatabase.OpenFile(
+                managedDatabase = ManagedDatabaseAdapter.OpenFile(
                     options.DataSource,
                     fileSystem,
                     readOnly: options.ReadOnly);
                 try
                 {
-                    _turso = TursoDatabaseHandle.FromManaged(database.Connect(), database);
+                    _ = managedDatabase.Connect();
+                    _managedDatabase = managedDatabase;
+                    managedDatabase = null;
                     _managedEncryptionFileSystem = managedEncryptionFileSystem;
                     managedEncryptionFileSystem = null;
                 }
                 catch
                 {
-                    database.Dispose();
                     throw;
                 }
             }
             finally
             {
+                managedDatabase?.Dispose();
                 managedEncryptionFileSystem?.Dispose();
             }
         }

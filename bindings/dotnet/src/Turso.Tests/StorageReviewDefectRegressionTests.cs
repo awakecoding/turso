@@ -99,6 +99,8 @@ public sealed class StorageReviewDefectRegressionTests
                 var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
                 var freelist = SqliteFreelist.Read(header, pager.CommittedPageCount, pager.ReadCommittedPage);
                 freelist.PageNumbers.Should().NotContain(reusableFreelistLeaf);
+                var partition = new HashSet<uint>(freelist.PageNumbers) { 1U, reusableFreelistLeaf };
+                partition.Should().HaveCount(checked((int)pager.CommittedPageCount));
                 SqliteTableLeafPageView.Parse(
                     pager.ReadCommittedPage(reusableFreelistLeaf),
                     header.UsableSpace,

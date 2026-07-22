@@ -138,6 +138,7 @@ public enum VdbeOpcode
     Column,
     RowId,
     Filter,
+    FilterRowId,
     FilterRegisters,
     Next,
     Delete,
@@ -219,6 +220,12 @@ public enum WorkTableDedupMode
 /// semantics exactly rather than re-deriving comparison rules in the executor.
 /// </summary>
 public delegate bool VdbeRowPredicate(SqlValue[] row);
+
+/// <summary>
+/// Evaluates a scanned row together with its hidden rowid. This keeps rowid predicates on the
+/// cursor path without appending implementation-only values to the row's declared-column tuple.
+/// </summary>
+public delegate bool VdbeRowIdPredicate(SqlValue[] row, long rowId);
 
 /// <summary>
 /// Orders two materialized rows for a sorter. The compiler supplies the delegate so
@@ -686,6 +693,20 @@ public sealed record FilterInstruction(
     string Description) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.Filter;
+}
+
+/// <summary>
+/// Evaluates <paramref name="Predicate"/> against the current cursor row and its hidden rowid,
+/// jumping to <paramref name="FalseTarget"/> when false. It is the rowid-aware counterpart to
+/// <see cref="FilterInstruction"/> for rowid-table DML scans.
+/// </summary>
+public sealed record FilterRowIdInstruction(
+    Cursor Cursor,
+    VdbeRowIdPredicate Predicate,
+    ProgramCounter FalseTarget,
+    string Description) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.FilterRowId;
 }
 
 /// <summary>
@@ -1223,6 +1244,16 @@ public sealed class VdbeProgram
                     }
 
                     ValidateJumpTarget(filter.FalseTarget, instructionIndex);
+                    break;
+                case FilterRowIdInstruction filterRowId:
+                    ValidateOpenCursor(filterRowId.Cursor, openCursors, instructionIndex);
+                    if (filterRowId.Predicate is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} filters with a null rowid predicate.");
+                    }
+
+                    ValidateJumpTarget(filterRowId.FalseTarget, instructionIndex);
                     break;
                 case FilterRegistersInstruction filterRegisters:
                     if (filterRegisters.Predicate is null)

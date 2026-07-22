@@ -3,6 +3,9 @@ using System.Text;
 using Turso.Core;
 using Turso.Raw.Public.Handles;
 using Turso.Raw.Public.Value;
+using TursoEncryptionCipher = Turso.Raw.Public.Value.TursoEncryptionCipher;
+using TursoValue = Turso.Raw.Public.Value.TursoValue;
+using TursoValueType = Turso.Raw.Public.Value.TursoValueType;
 
 namespace Turso.Raw.Public;
 
@@ -17,15 +20,23 @@ public static class TursoBindings
     public static TursoDatabaseHandle OpenManagedDatabase(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
-        var database = ManagedDatabaseAdapter.Open(path);
+        IManagedDatabaseAdapter? database = null;
         try
         {
+            database = ManagedDatabaseAdapter.Open(path);
             database.Connect();
-            return TursoDatabaseHandle.FromManaged(database);
+            var handle = TursoDatabaseHandle.FromManaged(database);
+            database = null;
+            return handle;
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            database?.Dispose();
+            throw new global::Turso.TursoException(exception.Message);
         }
         catch
         {
-            database.Dispose();
+            database?.Dispose();
             throw;
         }
     }
@@ -37,12 +48,15 @@ public static class TursoBindings
     /// <param name="cipher">The encryption cipher to use.</param>
     /// <param name="hexkey">The hex-encoded encryption key.</param>
     /// <returns>A handle to the opened database.</returns>
-    public static TursoDatabaseHandle OpenDatabaseWithEncryption(string path, TursoEncryptionCipher cipher, string hexkey)
+    public static TursoDatabaseHandle OpenDatabaseWithEncryption(
+        string path,
+        global::Turso.Raw.Public.Value.TursoEncryptionCipher cipher,
+        string hexkey)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(hexkey);
 
-        return OpenDatabase(path, cipher.ToRustString(), hexkey);
+        return OpenDatabase(path, TursoEncryptionCipherExtensions.ToRustString(cipher), hexkey);
     }
 
     public static TursoStatementHandle PrepareStatement(TursoDatabaseHandle db, string sql)
@@ -266,7 +280,8 @@ public static class TursoBindings
             }
             catch (ArgumentOutOfRangeException ex) when (ex.ParamName == "index")
             {
-                ThrowIfError(TursoStatusCode.Misuse, IntPtr.Zero);
+                throw new global::Turso.TursoException(
+                    $"Turso native call failed with status {TursoStatusCode.Misuse}.");
             }
 
             return;
@@ -576,7 +591,7 @@ public static class TursoBindings
         }
         catch (EmbeddedSqlException ex)
         {
-            throw new TursoException(ex.Message);
+            throw new global::Turso.TursoException(ex.Message);
         }
     }
 
@@ -588,7 +603,7 @@ public static class TursoBindings
         }
         catch (EmbeddedSqlException ex)
         {
-            throw new TursoException(ex.Message);
+            throw new global::Turso.TursoException(ex.Message);
         }
     }
 

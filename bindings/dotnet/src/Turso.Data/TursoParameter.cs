@@ -2,38 +2,38 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
-using Turso.Raw.Public.Value;
+using Turso.Core;
 
 namespace Turso;
 
 public class TursoParameter : DbParameter
 {
     private int _size;
-    private static readonly Dictionary<Type, TursoValueType> TursoTypeMapping =
+    private static readonly Dictionary<Type, ParameterValueKind> ParameterTypeMapping =
         new()
         {
-            { typeof(bool), TursoValueType.Integer },
-            { typeof(byte), TursoValueType.Integer },
-            { typeof(byte[]), TursoValueType.Blob },
-            { typeof(char), TursoValueType.Text },
-            { typeof(DateTime), TursoValueType.Text },
-            { typeof(DateTimeOffset), TursoValueType.Text },
-            { typeof(DateOnly), TursoValueType.Text },
-            { typeof(TimeOnly), TursoValueType.Text },
-            { typeof(DBNull), TursoValueType.Null },
-            { typeof(decimal), TursoValueType.Text },
-            { typeof(double), TursoValueType.Real },
-            { typeof(float), TursoValueType.Real },
-            { typeof(Guid), TursoValueType.Text },
-            { typeof(int), TursoValueType.Integer },
-            { typeof(long), TursoValueType.Integer },
-            { typeof(sbyte), TursoValueType.Integer },
-            { typeof(short), TursoValueType.Integer },
-            { typeof(string), TursoValueType.Text },
-            { typeof(TimeSpan), TursoValueType.Text },
-            { typeof(uint), TursoValueType.Integer },
-            { typeof(ulong), TursoValueType.Integer },
-            { typeof(ushort), TursoValueType.Integer }
+            { typeof(bool), ParameterValueKind.Integer },
+            { typeof(byte), ParameterValueKind.Integer },
+            { typeof(byte[]), ParameterValueKind.Blob },
+            { typeof(char), ParameterValueKind.Text },
+            { typeof(DateTime), ParameterValueKind.Text },
+            { typeof(DateTimeOffset), ParameterValueKind.Text },
+            { typeof(DateOnly), ParameterValueKind.Text },
+            { typeof(TimeOnly), ParameterValueKind.Text },
+            { typeof(DBNull), ParameterValueKind.Null },
+            { typeof(decimal), ParameterValueKind.Text },
+            { typeof(double), ParameterValueKind.Real },
+            { typeof(float), ParameterValueKind.Real },
+            { typeof(Guid), ParameterValueKind.Text },
+            { typeof(int), ParameterValueKind.Integer },
+            { typeof(long), ParameterValueKind.Integer },
+            { typeof(sbyte), ParameterValueKind.Integer },
+            { typeof(short), ParameterValueKind.Integer },
+            { typeof(string), ParameterValueKind.Text },
+            { typeof(TimeSpan), ParameterValueKind.Text },
+            { typeof(uint), ParameterValueKind.Integer },
+            { typeof(ulong), ParameterValueKind.Integer },
+            { typeof(ushort), ParameterValueKind.Integer }
         };
 
     public TursoParameter()
@@ -91,12 +91,32 @@ public class TursoParameter : DbParameter
             return new TursoValue { ValueType = TursoValueType.Null };
 
         var valueType = Value.GetType();
-        if (!TursoTypeMapping.TryGetValue(valueType, out var tursoValueType))
+        if (!ParameterTypeMapping.TryGetValue(valueType, out var parameterValueKind))
         {
             throw new ArgumentException($"Parameter type {valueType} is not supported");
         }
 
-        return GetTursoValue(Value, tursoValueType);
+        return GetTursoValue(Value, parameterValueKind);
+    }
+
+    internal SqlValue ToSqlValue()
+    {
+        if (Value is null)
+            return SqlValue.Null;
+
+        var valueType = Value.GetType();
+        if (!ParameterTypeMapping.TryGetValue(valueType, out var parameterValueKind))
+            throw new ArgumentException($"Parameter type {valueType} is not supported");
+
+        return parameterValueKind switch
+        {
+            ParameterValueKind.Null => SqlValue.Null,
+            ParameterValueKind.Integer => SqlValue.Integer(Convert.ToInt64(Value, CultureInfo.InvariantCulture)),
+            ParameterValueKind.Real => SqlValue.Real(Convert.ToDouble(Value, CultureInfo.InvariantCulture)),
+            ParameterValueKind.Text => SqlValue.Text(ToInvariantString(Value)),
+            ParameterValueKind.Blob => SqlValue.Blob((byte[])Value),
+            _ => throw new ArgumentOutOfRangeException(nameof(parameterValueKind), parameterValueKind, null)
+        };
     }
 
     public override int Size
@@ -109,18 +129,26 @@ public class TursoParameter : DbParameter
         }
     }
 
-    private static TursoValue GetTursoValue(object value, TursoValueType tursoValueType)
+    private static TursoValue GetTursoValue(object value, ParameterValueKind parameterValueKind)
     {
-        return tursoValueType switch
+        return parameterValueKind switch
         {
-            TursoValueType.Empty => new TursoValue() { ValueType = TursoValueType.Empty },
-            TursoValueType.Null => new TursoValue() { ValueType = TursoValueType.Null },
-            TursoValueType.Integer => new TursoValue() { ValueType = TursoValueType.Integer, IntValue = Convert.ToInt64(value) },
-            TursoValueType.Real => new TursoValue() { ValueType = TursoValueType.Real, RealValue = Convert.ToDouble(value, CultureInfo.InvariantCulture) },
-            TursoValueType.Text => new TursoValue() { ValueType = TursoValueType.Text, StringValue = ToInvariantString(value) },
-            TursoValueType.Blob => new TursoValue() { ValueType = TursoValueType.Blob, BlobValue = (byte[])value },
-            _ => throw new ArgumentOutOfRangeException(nameof(tursoValueType), tursoValueType, null)
+            ParameterValueKind.Null => new TursoValue { ValueType = TursoValueType.Null },
+            ParameterValueKind.Integer => new TursoValue { ValueType = TursoValueType.Integer, IntValue = Convert.ToInt64(value) },
+            ParameterValueKind.Real => new TursoValue { ValueType = TursoValueType.Real, RealValue = Convert.ToDouble(value, CultureInfo.InvariantCulture) },
+            ParameterValueKind.Text => new TursoValue { ValueType = TursoValueType.Text, StringValue = ToInvariantString(value) },
+            ParameterValueKind.Blob => new TursoValue { ValueType = TursoValueType.Blob, BlobValue = (byte[])value },
+            _ => throw new ArgumentOutOfRangeException(nameof(parameterValueKind), parameterValueKind, null)
         };
+    }
+
+    private enum ParameterValueKind
+    {
+        Null,
+        Integer,
+        Real,
+        Text,
+        Blob,
     }
 
     private static string ToInvariantString(object value)

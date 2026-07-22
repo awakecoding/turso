@@ -3,15 +3,14 @@ using System.Collections.ObjectModel;
 namespace Turso.Core.Storage;
 
 /// <summary>
-/// An immutable, append-only B-tree split mutation staged against one committed
-/// pager view.
+/// An immutable B-tree mutation staged against one committed pager view.
 /// </summary>
 /// <remarks>
-/// The mutation writes every new page and the modified child before its
-/// root/parent image. The final root/parent WAL frame is therefore the commit
-/// frame, so an interrupted write cannot route readers to an absent child.
-/// This is limited to leaf splits with a parent that has room for one new
-/// separator; it does not rebalance interior pages or reclaim any page.
+/// The mutation writes every new page before every modified routing image. Its
+/// final image is the WAL commit frame, so callers must place the catalog or
+/// parent image that first exposes appended pages last. An interrupted write
+/// therefore cannot route readers to an absent child. It can replace existing
+/// pages or append new pages, but never shrinks, rebalances, or reclaims pages.
 /// </remarks>
 public sealed class SqliteBtreeSplitMutation
 {
@@ -27,11 +26,11 @@ public sealed class SqliteBtreeSplitMutation
     {
         if (sourceDatabaseSizeInPages == 0)
             throw new ArgumentOutOfRangeException(nameof(sourceDatabaseSizeInPages));
-        if (targetDatabaseSizeInPages <= sourceDatabaseSizeInPages)
+        if (targetDatabaseSizeInPages < sourceDatabaseSizeInPages)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(targetDatabaseSizeInPages),
-                "A split must materialize at least one appended page.");
+                "A B-tree mutation cannot reduce the committed database size.");
         }
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pageSize);
         ArgumentNullException.ThrowIfNull(sourcePages);
@@ -61,8 +60,8 @@ public sealed class SqliteBtreeSplitMutation
     public int PageSize { get; }
 
     /// <summary>
-    /// Ordered page writes. The final image is the modified root or parent and
-    /// therefore receives the WAL commit marker.
+    /// Ordered page writes. The final routing or catalog image receives the WAL
+    /// commit marker.
     /// </summary>
     public IReadOnlyList<SqlitePageImage> WriteImages { get; }
 
@@ -263,6 +262,203 @@ public sealed class SqliteBtreeSplitWriter
     }
 
     /// <summary>
+    /// Prepares a height-increasing split for a full table-interior root whose
+    /// right-most leaf receives one strictly larger rowid.
+    /// </summary>
+    /// <remarks>
+    /// The root page retains its page number. Its former leaf children are
+    /// partitioned between two newly appended interior children, and the
+    /// right-most source leaf is replaced by the left half of the leaf split.
+    /// The supplied page-one image is the final WAL frame, so it must contain
+    /// the target database page count and any caller-owned catalog stamps.
+    /// </remarks>
+    public SqliteBtreeSplitMutation PrepareTableInteriorRootRightmostLeafSplit(
+        uint rootPageNumber,
+        SqliteTableLeafCell appendedCell,
+        ReadOnlySpan<byte> finalPageOne)
+    {
+        ArgumentNullException.ThrowIfNull(appendedCell);
+        var (header, sourcePageCount) = ReadCommittedDatabaseState();
+        if (header.DatabaseSizeInPages != sourcePageCount)
+        {
+            throw new InvalidDataException(
+                "SQLite page-one database size does not match the committed pager view.");
+        }
+        if (sourcePageCount > uint.MaxValue - 3)
+        {
+            throw new InvalidOperationException(
+                "SQLite cannot append the three pages required to promote a table interior root.");
+        }
+        if (rootPageNumber == 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(rootPageNumber),
+                "SQLite page 1 is the sqlite_schema root and cannot be promoted as a user table root.");
+        }
+        if (finalPageOne.Length != _pager.PageSize)
+        {
+            throw new ArgumentException(
+                $"The final SQLite page-one image must be exactly {_pager.PageSize} bytes.",
+                nameof(finalPageOne));
+        }
+
+        ValidateExistingPageNumber(rootPageNumber, sourcePageCount, nameof(rootPageNumber));
+        var expectedTargetPageCount = checked(sourcePageCount + 3);
+        var targetHeader = SqliteDatabaseHeader.Parse(finalPageOne);
+        if (targetHeader.PageSize != _pager.PageSize
+            || targetHeader.DatabaseSizeInPages != expectedTargetPageCount)
+        {
+            throw new ArgumentException(
+                "The final SQLite page-one image must preserve the page size and publish the promoted page count.",
+                nameof(finalPageOne));
+        }
+
+        var rootImage = _pager.ReadCommittedPage(rootPageNumber);
+        var root = SqliteTableInteriorPageView.Parse(rootImage, header.UsableSpace);
+        var childPages = root.Cells
+            .Select(cell => cell.Cell.LeftChildPage)
+            .Append(root.Header.RightMostChildPage)
+            .ToArray();
+        if (childPages.Length < 2)
+        {
+            throw new InvalidDataException(
+                "SQLite table-interior root promotion requires at least two leaf children.");
+        }
+
+        var replacementChildren = new List<TableTreeChild>(childPages.Length + 1);
+        long? previousMaximumRowId = null;
+        byte[]? sourceRightLeafPage = null;
+        SqliteTableLeafPageView? sourceRightLeaf = null;
+        for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
+        {
+            var childPageNumber = childPages[childIndex];
+            if (childPageNumber == rootPageNumber)
+            {
+                throw new InvalidDataException(
+                    "SQLite table-interior root cannot reference itself as a child.");
+            }
+
+            ValidateExistingPageNumber(childPageNumber, sourcePageCount, nameof(rootPageNumber));
+            var childImage = _pager.ReadCommittedPage(childPageNumber);
+            if (SqliteBtreePageHeader.Parse(childImage).PageType != SqliteBtreePageType.TableLeaf)
+            {
+                throw new InvalidDataException(
+                    "SQLite table-interior root promotion supports only direct table-leaf children.");
+            }
+
+            var child = SqliteTableLeafPageView.Parse(childImage, header.UsableSpace);
+            if (child.Cells.Count == 0
+                || child.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
+                || (previousMaximumRowId is { } maximumRowId
+                    && child.Cells[0].Cell.RowId <= maximumRowId))
+            {
+                throw new InvalidDataException(
+                    "SQLite table-interior root has unsupported empty, overflow, or unordered leaf children.");
+            }
+
+            var childMaximumRowId = child.Cells[^1].Cell.RowId;
+            if (childIndex < root.Cells.Count
+                && root.Cells[childIndex].Cell.RowId != childMaximumRowId)
+            {
+                throw new InvalidDataException(
+                    "SQLite table-interior root separator does not match its left child's maximum rowid.");
+            }
+
+            replacementChildren.Add(new TableTreeChild(childPageNumber, childMaximumRowId));
+            previousMaximumRowId = childMaximumRowId;
+            if (childIndex == childPages.Length - 1)
+            {
+                sourceRightLeafPage = childImage;
+                sourceRightLeaf = child;
+            }
+        }
+
+        if (sourceRightLeafPage is null
+            || sourceRightLeaf is null
+            || appendedCell.RowId <= sourceRightLeaf.Cells[^1].Cell.RowId)
+        {
+            throw new InvalidOperationException(
+                "SQLite table-interior root promotion requires a strict right-most append.");
+        }
+
+        var targetLeafCells = new List<SqliteTableLeafCell>(sourceRightLeaf.Cells.Count + 1);
+        targetLeafCells.AddRange(sourceRightLeaf.Cells.Select(cell => cell.Cell));
+        targetLeafCells.Add(appendedCell);
+        if (TryBuildTableLeafPage(
+                targetLeafCells,
+                0,
+                targetLeafCells.Count,
+                _pager.PageSize,
+                header.UsableSpace,
+                out _)
+            || !TrySplitTableLeaf(
+                targetLeafCells,
+                _pager.PageSize,
+                header.UsableSpace,
+                out var leftLeafPage,
+                out var rightLeafPage,
+                out var separatorRowId))
+        {
+            throw new InvalidOperationException(
+                "SQLite table-interior root promotion requires an overflowing right-most leaf that can split.");
+        }
+
+        var appendedRightLeafPageNumber = checked(sourcePageCount + 1);
+        var appendedLeftInteriorPageNumber = checked(sourcePageCount + 2);
+        var appendedRightInteriorPageNumber = checked(sourcePageCount + 3);
+        replacementChildren[^1] = new TableTreeChild(
+            root.Header.RightMostChildPage,
+            separatorRowId);
+        replacementChildren.Add(new TableTreeChild(appendedRightLeafPageNumber, appendedCell.RowId));
+        if (TryBuildTableInteriorPage(
+                replacementChildren,
+                _pager.PageSize,
+                header.UsableSpace,
+                out _))
+        {
+            throw new InvalidOperationException(
+                "SQLite table-interior root still has room for the propagated leaf separator.");
+        }
+
+        if (!TrySplitTableInteriorRoot(
+                replacementChildren,
+                appendedLeftInteriorPageNumber,
+                appendedRightInteriorPageNumber,
+                rootImage,
+                _pager.PageSize,
+                header.UsableSpace,
+                out var leftInteriorPage,
+                out var rightInteriorPage,
+                out var replacementRootPage))
+        {
+            throw new InvalidOperationException(
+                "SQLite table-interior root cannot be partitioned into two non-empty child pages.");
+        }
+
+        var reservations = new AppendOnlyReservation(_allocator, sourcePageCount);
+        var appendedRightLeafPage = reservations.Reserve();
+        var appendedLeftInteriorPage = reservations.Reserve();
+        var appendedRightInteriorPage = reservations.Reserve();
+        return new SqliteBtreeSplitMutation(
+            sourcePageCount,
+            reservations.TargetPageCount,
+            _pager.PageSize,
+            [
+                new SqlitePageImage(1, _pager.ReadCommittedPage(1)),
+                new SqlitePageImage(rootPageNumber, rootImage),
+                new SqlitePageImage(root.Header.RightMostChildPage, sourceRightLeafPage),
+            ],
+            [
+                new SqlitePageImage(appendedRightLeafPage.PageNumber, rightLeafPage),
+                new SqlitePageImage(appendedLeftInteriorPage.PageNumber, leftInteriorPage),
+                new SqlitePageImage(appendedRightInteriorPage.PageNumber, rightInteriorPage),
+                new SqlitePageImage(root.Header.RightMostChildPage, leftLeafPage),
+                new SqlitePageImage(rootPageNumber, replacementRootPage),
+                new SqlitePageImage(1, finalPageOne),
+            ]);
+    }
+
+    /// <summary>
     /// Prepares an index-leaf split. Supply <paramref name="parentPageNumber"/>
     /// when the leaf has an index-interior parent; omit it when the leaf itself
     /// is the index root to replace that page with a new interior root.
@@ -452,6 +648,162 @@ public sealed class SqliteBtreeSplitWriter
         ValidateIndexParentChildren(parent, sourcePageCount);
         EnsureIndexParentContainsChild(parent, leafPageNumber);
         return parentImage;
+    }
+
+    private static bool TrySplitTableLeaf(
+        IReadOnlyList<SqliteTableLeafCell> cells,
+        int pageSize,
+        int usableSpace,
+        out byte[] leftPage,
+        out byte[] rightPage,
+        out long separatorRowId)
+    {
+        leftPage = null!;
+        rightPage = null!;
+        separatorRowId = 0;
+        if (cells.Count < 2)
+            return false;
+
+        for (var leftCellCount = 1; leftCellCount < cells.Count; leftCellCount++)
+        {
+            if (!TryBuildTableLeafPage(
+                    cells,
+                    0,
+                    leftCellCount,
+                    pageSize,
+                    usableSpace,
+                    out leftPage)
+                || !TryBuildTableLeafPage(
+                    cells,
+                    leftCellCount,
+                    cells.Count - leftCellCount,
+                    pageSize,
+                    usableSpace,
+                    out rightPage))
+            {
+                continue;
+            }
+
+            separatorRowId = cells[leftCellCount - 1].RowId;
+            return true;
+        }
+
+        leftPage = null!;
+        rightPage = null!;
+        return false;
+    }
+
+    private static bool TryBuildTableLeafPage(
+        IReadOnlyList<SqliteTableLeafCell> cells,
+        int start,
+        int count,
+        int pageSize,
+        int usableSpace,
+        out byte[] page)
+    {
+        try
+        {
+            var builder = new SqliteTableLeafPageBuilder(pageSize, usableSpace);
+            for (var index = start; index < start + count; index++)
+                builder.Append(cells[index]);
+
+            page = builder.Build();
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            page = null!;
+            return false;
+        }
+    }
+
+    private static bool TrySplitTableInteriorRoot(
+        IReadOnlyList<TableTreeChild> children,
+        uint leftInteriorPage,
+        uint rightInteriorPage,
+        ReadOnlySpan<byte> sourceRootPage,
+        int pageSize,
+        int usableSpace,
+        out byte[] leftPage,
+        out byte[] rightPage,
+        out byte[] replacementRootPage)
+    {
+        leftPage = null!;
+        rightPage = null!;
+        replacementRootPage = null!;
+        if (children.Count < 4)
+            return false;
+
+        var middle = children.Count / 2;
+        foreach (var splitIndex in Enumerable.Range(2, children.Count - 3)
+                     .OrderBy(index => Math.Abs(index - middle)))
+        {
+            var leftChildren = children.Take(splitIndex).ToArray();
+            var rightChildren = children.Skip(splitIndex).ToArray();
+            if (!TryBuildTableInteriorPage(leftChildren, pageSize, usableSpace, out leftPage)
+                || !TryBuildTableInteriorPage(rightChildren, pageSize, usableSpace, out rightPage))
+            {
+                continue;
+            }
+
+            try
+            {
+                var rootBuilder = new SqliteTableInteriorPageBuilder(
+                    pageSize,
+                    usableSpace,
+                    rightInteriorPage);
+                rootBuilder.Append(SqliteTableInteriorCell.Create(
+                    leftInteriorPage,
+                    leftChildren[^1].MaximumRowId));
+                replacementRootPage = sourceRootPage.ToArray();
+                rootBuilder.WriteTo(replacementRootPage);
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                leftPage = null!;
+                rightPage = null!;
+                replacementRootPage = null!;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryBuildTableInteriorPage(
+        IReadOnlyList<TableTreeChild> children,
+        int pageSize,
+        int usableSpace,
+        out byte[] page)
+    {
+        if (children.Count < 2)
+        {
+            page = null!;
+            return false;
+        }
+
+        try
+        {
+            var builder = new SqliteTableInteriorPageBuilder(
+                pageSize,
+                usableSpace,
+                children[^1].PageNumber);
+            for (var childIndex = 0; childIndex < children.Count - 1; childIndex++)
+            {
+                var child = children[childIndex];
+                builder.Append(SqliteTableInteriorCell.Create(
+                    child.PageNumber,
+                    child.MaximumRowId));
+            }
+
+            page = builder.Build();
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            page = null!;
+            return false;
+        }
     }
 
     private static byte[] BuildTableRootPage(
@@ -747,6 +1099,8 @@ public sealed class SqliteBtreeSplitWriter
 
         return -1;
     }
+
+    private sealed record TableTreeChild(uint PageNumber, long MaximumRowId);
 
     private sealed record MaterializedIndexSeparator(
         SqliteIndexInteriorCell Cell,

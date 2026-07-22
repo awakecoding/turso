@@ -35,6 +35,7 @@ public sealed class ManagedFreelistLeafReuseStorageTests
             freelist.LeafPageNumbers.Should().NotBeEmpty();
             foreach (var leafPage in freelist.LeafPageNumbers)
                 pager.ReadCommittedPage(leafPage).Should().OnlyContain(value => value == 0);
+            AssertExactSingleTablePagePartition(pager, freelist, reusableLeaf);
 
             var reusedPage = pager.ReadCommittedPage(reusableLeaf);
             SqliteTableLeafPageView.Parse(reusedPage, header.UsableSpace, isFirstPage: false)
@@ -101,6 +102,7 @@ public sealed class ManagedFreelistLeafReuseStorageTests
             freelist.LeafPageNumbers.Should().NotBeEmpty();
             foreach (var leafPage in freelist.LeafPageNumbers)
                 pager.ReadCommittedPage(leafPage).Should().OnlyContain(value => value == 0);
+            AssertExactSingleTablePagePartition(pager, freelist, reusableLeaf);
         }
 
         using var reopened = EmbeddedDatabase.OpenFile(DatabasePath, fileSystem);
@@ -174,5 +176,14 @@ public sealed class ManagedFreelistLeafReuseStorageTests
         using var statement = connection.Prepare(sql);
         statement.Step().Should().Be(StatementStepResult.Row);
         return statement.GetValue(0).AsText();
+    }
+
+    private static void AssertExactSingleTablePagePartition(
+        SqlitePager pager,
+        SqliteFreelist freelist,
+        uint tableRootPage)
+    {
+        var partition = new HashSet<uint>(freelist.PageNumbers) { 1U, tableRootPage };
+        partition.Should().HaveCount(checked((int)pager.CommittedPageCount));
     }
 }

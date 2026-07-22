@@ -74,6 +74,7 @@ public static class TursoDbContextOptionsBuilderExtensions
             .ReplaceService<IRelationalDatabaseCreator, TursoSqliteDatabaseCreator>()
             .ReplaceService<IQuerySqlGeneratorFactory, TursoSqliteQuerySqlGeneratorFactory>()
             .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, TursoSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
+            .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, TursoSqliteParameterBasedSqlProcessorFactory>()
             .ReplaceService<IUpdateSqlGenerator, TursoSqliteUpdateSqlGenerator>();
 
         return usesManagedLocalProvider
@@ -82,6 +83,23 @@ public static class TursoDbContextOptionsBuilderExtensions
     }
 
     private static bool UsesManagedLocalProvider(string? connectionString)
-        => connectionString is not null
-            && new TursoSqliteConnectionStringBuilder(connectionString).LocalProvider == TursoLocalProvider.Managed;
+    {
+        if (connectionString is null)
+            return false;
+
+        var connectionOptions = new TursoSqliteConnectionStringBuilder(connectionString);
+        return !IsRemoteTursoUrl(connectionOptions.DataSource)
+            && (!connectionOptions.IsLocalProviderConfigured
+                || connectionOptions.LocalProvider == TursoLocalProvider.Managed);
+    }
+
+    private static bool IsRemoteTursoUrl(string dataSource)
+    {
+        return Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
+            && (uri.Scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("ws", StringComparison.OrdinalIgnoreCase)
+                || uri.Scheme.Equals("wss", StringComparison.OrdinalIgnoreCase));
+    }
 }

@@ -199,8 +199,10 @@ public class ManagedProviderRoutingTests
     [Test]
     public void ManagedBackupRejectsMixedProvidersWithoutCopying()
     {
+        NativeProviderTestFixture.EnsureRegistered();
+
         using var managedSource = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
-        using var nativeDestination = new SqliteConnection("Data Source=:memory:");
+        using var nativeDestination = new SqliteConnection("Data Source=:memory:;Local Provider=Native");
         managedSource.Open();
         managedSource.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('managed');");
 
@@ -216,7 +218,9 @@ public class ManagedProviderRoutingTests
     [Test]
     public void NativeToManagedBackupRejectsMixedProvidersWithoutCopying()
     {
-        using var nativeSource = new SqliteConnection("Data Source=:memory:");
+        NativeProviderTestFixture.EnsureRegistered();
+
+        using var nativeSource = new SqliteConnection("Data Source=:memory:;Local Provider=Native");
         using var managedDestination = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         nativeSource.Open();
         nativeSource.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('native');");

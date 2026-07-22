@@ -33,6 +33,11 @@ public sealed class TursoEncryptionOptions : IDisposable
         _key = key.ToArray();
     }
 
+    public TursoEncryptionOptions(Enum cipher, ReadOnlySpan<byte> key)
+        : this(ConvertCipher(cipher), key)
+    {
+    }
+
     /// <summary>The page cipher that will be stored in the Turso encrypted header.</summary>
     public TursoEncryptionCipher Cipher { get; }
 
@@ -57,6 +62,12 @@ public sealed class TursoEncryptionOptions : IDisposable
         {
             throw new ArgumentException("Encryption keys must be hexadecimal.", nameof(hexKey), exception);
         }
+    }
+
+    public static TursoEncryptionOptions FromHex<TCipher>(TCipher cipher, string hexKey)
+        where TCipher : struct, Enum
+    {
+        return FromHex(ConvertCipher(cipher), hexKey);
     }
 
     /// <inheritdoc />
@@ -91,6 +102,20 @@ public sealed class TursoEncryptionOptions : IDisposable
                 cipher,
                 "The managed encrypted store supports only Turso AES-GCM cipher IDs 1 and 2."),
         };
+
+    private static TursoEncryptionCipher ConvertCipher(Enum cipher)
+    {
+        ArgumentNullException.ThrowIfNull(cipher);
+        return cipher.ToString() switch
+        {
+            nameof(TursoEncryptionCipher.Aes128Gcm) => TursoEncryptionCipher.Aes128Gcm,
+            nameof(TursoEncryptionCipher.Aes256Gcm) => TursoEncryptionCipher.Aes256Gcm,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(cipher),
+                cipher,
+                "The managed encrypted store supports only Turso AES-GCM cipher IDs 1 and 2."),
+        };
+    }
 }
 
 internal sealed class TursoPageEncryption : IDisposable

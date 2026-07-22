@@ -132,16 +132,25 @@ public class ManagedSqltestConformanceTests
     [TestCase("pragma_query_only.sqltest", "pragma-query-only-float-disable")]
     [TestCase("json/default.sqltest", "json_extract_number")]
     [TestCase("json/default.sqltest", "json_extract_number_type")]
+    [TestCase("json/default.sqltest", "json_extract_malformed_json_1")]
+    [TestCase("json/default.sqltest", "json_extract_null")]
     [TestCase("json/default.sqltest", "json_type_array")]
     [TestCase("json/default.sqltest", "json_type_true")]
+    [TestCase("json/default.sqltest", "json_type_null_arg")]
     [TestCase("json/default.sqltest", "json_valid_1")]
     [TestCase("json/default.sqltest", "json_valid_6")]
+    [TestCase("json/default.sqltest", "json_valid_blob_utf8_non_json_word")]
     [TestCase("json/default.sqltest", "json_array_nested")]
+    [TestCase("json/default.sqltest", "json_array_length_via_prop")]
+    [TestCase("json/default.sqltest", "json_array_length_via_bad_prop")]
     [TestCase("json/default.sqltest", "json_extract_object_1")]
     [TestCase("json/default.sqltest", "json_type_text")]
     [TestCase("json/default.sqltest", "json-patch-basic-1")]
     [TestCase("json/default.sqltest", "json-remove-3")]
+    [TestCase("json/default.sqltest", "json_remove_basic_1")]
+    [TestCase("json/default.sqltest", "json_quote_string_literal")]
     [TestCase("json/default.sqltest", "json_set_multiple_keys")]
+    [TestCase("json/default.sqltest", "json_set_add_array_in_nested_object")]
     [TestCase("returning.sqltest", "insert-returning-multiple-rows-expressions")]
     [TestCase("returning.sqltest", "update-returning-column-arithmetic")]
     [TestCase("returning.sqltest", "update-returning-multiple-rows")]
@@ -162,11 +171,24 @@ public class ManagedSqltestConformanceTests
     [TestCase("window/filter-over.sqltest", "filter-over-full-window-aggregate-matrix")]
     [TestCase("managed-recursive-cte-upstream.sqltest", "upstream-with2-8-2-union-distinct")]
     [TestCase("managed-recursive-cte-upstream.sqltest", "upstream-with1-6-4-linear-counter")]
+    [TestCase("on_conflict.sqltest", "insert-or-ignore-continue-after-skip")]
+    [TestCase("on_conflict.sqltest", "insert-or-replace-multiple-conflicts")]
+    [TestCase("insert-cte-compound.sqltest", "insert-cte-union-all-basic")]
+    [TestCase("insert-cte-compound.sqltest", "insert-cte-union-distinct")]
+    [TestCase("insert-cte-compound.sqltest", "insert-cte-except")]
+    [TestCase("insert-cte-compound.sqltest", "insert-cte-intersect")]
+    [TestCase("insert-cte-compound.sqltest", "insert-multiple-ctes-union-all")]
+    [TestCase("insert-cte-compound.sqltest", "insert-cte-from-table-union-all")]
+    [TestCase("foreign_keys.sqltest", "fk-basic-ok")]
+    [TestCase("foreign_keys.sqltest", "fk-delete-parent-blocked")]
+    [TestCase("window/memory.sqltest", "window-same-window-fn-used-multiple-times")]
+    [TestCase("window/memory.sqltest", "window-order-by-position-references-window-fn")]
     public void ExistingSqltestCaseRunsAgainstManagedCore(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);
-        var database = new EmbeddedDatabase();
+        using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
+        AssertManagedCoreRoute(database, connection);
 
         if (testCase.ExpectedError is { } expectedError)
         {
@@ -175,7 +197,8 @@ public class ManagedSqltestConformanceTests
                 ExecuteScript(connection, testCase.SetupSql, null);
                 ExecuteScript(connection, testCase.Sql, null);
             });
-            exception!.Message.Should().MatchRegex(expectedError);
+            if (!string.IsNullOrEmpty(expectedError))
+                exception!.Message.Should().MatchRegex(expectedError);
             return;
         }
 
@@ -185,6 +208,12 @@ public class ManagedSqltestConformanceTests
         ExecuteScript(connection, testCase.Sql, rows);
 
         string.Join('\n', rows).Should().Be(testCase.Expected);
+    }
+
+    private static void AssertManagedCoreRoute(EmbeddedDatabase database, EmbeddedConnection connection)
+    {
+        Assert.That(database.GetType().Assembly, Is.SameAs(typeof(EmbeddedDatabase).Assembly));
+        Assert.That(connection.GetType().Assembly, Is.SameAs(typeof(EmbeddedDatabase).Assembly));
     }
 
     private static void ExecuteScript(EmbeddedConnection connection, string sql, List<string>? rows)
@@ -234,7 +263,7 @@ public class ManagedSqltestConformanceTests
     {
         public static SqltestCase Load(string fileName, string testName)
         {
-            var path = Path.Combine(TestContext.CurrentContext.TestDirectory, "Conformance", fileName);
+            var path = ResolvePath(fileName);
             var source = File.ReadAllText(path).ReplaceLineEndings("\n");
             var pattern = $@"(?ms)^test\s+{Regex.Escape(testName)}\s*\{{\s*(?<sql>.*?)^\s*\}}\s*\nexpect(?<error>\s+error)?\s*\{{\s*(?<expected>.*?)^\s*\}}";
             var match = Regex.Match(source, pattern);
@@ -248,6 +277,40 @@ public class ManagedSqltestConformanceTests
                 match.Groups["error"].Success
                     ? match.Groups["expected"].Value.Trim()
                     : null);
+        }
+
+        private static string ResolvePath(string fileName)
+        {
+            var copiedPath = Path.Combine(TestContext.CurrentContext.TestDirectory, "Conformance", fileName);
+            if (File.Exists(copiedPath))
+                return copiedPath;
+
+            foreach (var root in Ancestors(TestContext.CurrentContext.TestDirectory)
+                         .Concat(Ancestors(Directory.GetCurrentDirectory())))
+            {
+                var sourcePath = Path.Combine(
+                    root.FullName,
+                    "sqlite",
+                    "conformance",
+                    "sqlite-sqltests",
+                    fileName);
+                if (File.Exists(sourcePath))
+                    return sourcePath;
+            }
+
+            throw new FileNotFoundException(
+                $"Could not find conformance fixture {fileName} in the test output or repository checkout.",
+                fileName);
+        }
+
+        private static IEnumerable<DirectoryInfo> Ancestors(string path)
+        {
+            for (DirectoryInfo? directory = new DirectoryInfo(path);
+                 directory is not null;
+                 directory = directory.Parent)
+            {
+                yield return directory;
+            }
         }
 
         private static string LoadSetup(string source, string fileName, int testIndex)

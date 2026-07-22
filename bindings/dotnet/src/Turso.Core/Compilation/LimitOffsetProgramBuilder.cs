@@ -193,6 +193,7 @@ public static class LimitOffsetProgramBuilder
         {
             RewindCursorInstruction x => new RewindCursorInstruction(x.Cursor, Pc(x.EmptyTarget)),
             FilterInstruction x => new FilterInstruction(x.Cursor, x.Predicate, Pc(x.FalseTarget), x.Description),
+            FilterRowIdInstruction x => new FilterRowIdInstruction(x.Cursor, x.Predicate, Pc(x.FalseTarget), x.Description),
             FilterRegistersInstruction x => new FilterRegistersInstruction(x.Row, x.Predicate, Pc(x.FalseTarget), x.Description),
             NextInstruction x => new NextInstruction(x.Cursor, Pc(x.LoopTarget)),
             SorterSortInstruction x => new SorterSortInstruction(x.Sorter, Pc(x.EmptyTarget)),

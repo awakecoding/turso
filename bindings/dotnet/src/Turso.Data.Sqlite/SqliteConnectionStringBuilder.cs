@@ -176,6 +176,12 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         set => this["Local Provider"] = value;
     }
 
+    public bool IsLocalProviderConfigured => base.ContainsKey("Local Provider");
+
+    internal TursoLocalProvider EffectiveLocalProvider => IsLocalProviderConfigured
+        ? LocalProvider
+        : TursoLocalProvider.Managed;
+
     public override ICollection Keys => new ReadOnlyCollection<string>(CanonicalKeywords);
 
     public override ICollection Values => new ReadOnlyCollection<object?>(CanonicalKeywords.Select(GetValueOrDefault).ToArray());
@@ -262,8 +268,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 
         return cipher.ToLowerInvariant() switch
         {
-            "aes128gcm" => TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes128Gcm, key),
-            "aes256gcm" => TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes256Gcm, key),
+            "aes128gcm" => TursoEncryptionOptions.FromHex(Turso.Core.Storage.TursoEncryptionCipher.Aes128Gcm, key),
+            "aes256gcm" => TursoEncryptionOptions.FromHex(Turso.Core.Storage.TursoEncryptionCipher.Aes256Gcm, key),
             _ => throw new NotSupportedException(
                 "Local Provider=Managed supports only AES128GCM and AES256GCM encryption ciphers."),
         };

@@ -65,6 +65,62 @@ public class ManagedJsonConstructionMutationSliceTests
         unsupported!.Message.Should().Be("no such function: JSONB_ARRAY");
     }
 
+    [Test]
+    public void CoreJsonSubsetPreservesNullPathAndReturnTypeSemantics()
+    {
+        AssertInteger("json_array_length('[1,2,3]')", 3);
+        AssertInteger("json_array_length('{\"a\":1}')", 0);
+        AssertNull("json_array_length('{\"a\":1}', '$.missing')");
+        AssertNull("json_array_length(NULL)");
+
+        AssertText("json_quote(NULL)", "null");
+        AssertText(
+            "json_quote(json_extract('{\"value\":{\"nested\":1}}', '$.value'))",
+            "{\"nested\":1}");
+        AssertText(
+            "json_quote(json_extract('{\"value\":\"{}\"}', '$.value'))",
+            "\"{}\"");
+        AssertText("json_set('{}', NULL, 1)", "{}");
+        AssertNull("json_set(NULL, '$.a', 1)");
+        AssertText(
+            "json_set('{}', '$.value', json_extract('{\"nested\":[1,2]}', '$.nested'))",
+            "{\"value\":[1,2]}");
+        AssertText("json_remove('{\"a\":1,\"b\":2}', '$.a')", "{\"b\":2}");
+        AssertNull("json_remove('{\"a\":1}', '$')");
+        AssertNull("json_remove(NULL, '$.a')");
+
+        Assert.Throws<EmbeddedSqlException>(() => Scalar("json_array_length('not json')"));
+        Assert.Throws<EmbeddedSqlException>(() => Scalar("json_valid('[1,]', 2)"));
+    }
+
+    [Test]
+    public void JsonSubtypeDoesNotCrossBindingOrStorageBoundaries()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        using var extract = connection.Prepare("SELECT json_extract('{\"value\":[1,2]}', '$.value');");
+        extract.Step().Should().Be(StatementStepResult.Row);
+
+        using var boundQuote = connection.Prepare("SELECT json_quote(?1);");
+        boundQuote.Bind(1, extract.GetValue(0));
+        boundQuote.Step().Should().Be(StatementStepResult.Row);
+        boundQuote.GetValue(0).Should().Be(SqlValue.Text("\"[1,2]\""));
+
+        foreach (var statement in connection.PrepareScript("""
+            CREATE TABLE json_subtype_boundary(value TEXT);
+            INSERT INTO json_subtype_boundary
+            VALUES(json_extract('{"value":[1,2]}', '$.value'));
+            """))
+        {
+            using (statement)
+                statement.Step().Should().Be(StatementStepResult.Done);
+        }
+
+        using var select = connection.Prepare("SELECT json_quote(value) FROM json_subtype_boundary;");
+        select.Step().Should().Be(StatementStepResult.Row);
+        select.GetValue(0).Should().Be(SqlValue.Text("\"[1,2]\""));
+    }
+
     private static SqlValue Scalar(string expression, params SqlValue[] parameters)
     {
         var database = new EmbeddedDatabase();

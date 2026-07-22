@@ -1211,6 +1211,51 @@ public class TursoRemoteTests
         server.Completion.IsCompletedSuccessfully.Should().BeTrue();
     }
 
+    [Test]
+    public async Task TestRemoteServerRepeatedDisposalQuiescesAcceptedClientIo()
+    {
+        for (var iteration = 0; iteration < 256; iteration++)
+        {
+            var server = new TestRemoteServer("{}");
+            using var client = new TcpClient();
+            try
+            {
+                await client.ConnectAsync(server.Url.Host, server.Url.Port);
+                await server.ClientIoStarted;
+            }
+            finally
+            {
+                server.Dispose();
+            }
+
+            server.Completion.IsCompletedSuccessfully.Should().BeTrue();
+        }
+    }
+
+    [Test]
+    public async Task TestRemoteServerRepeatedHttpClientRequestsQuiesceIo()
+    {
+        using var client = new HttpClient();
+        for (var iteration = 0; iteration < 128; iteration++)
+        {
+            var server = new TestRemoteServer("{}");
+            try
+            {
+                using var response = await client.PostAsync(
+                    server.Url,
+                    new StringContent("{}", Encoding.UTF8, "application/json"));
+                response.EnsureSuccessStatusCode();
+                (await response.Content.ReadAsStringAsync()).Should().Be("{}");
+            }
+            finally
+            {
+                server.Dispose();
+            }
+
+            server.Completion.IsCompletedSuccessfully.Should().BeTrue();
+        }
+    }
+
     private sealed class TestRemoteServer : IDisposable
     {
         private readonly CancellationTokenSource _cancellation = new();
@@ -1246,14 +1291,13 @@ public class TursoRemoteTests
 
         public void Dispose()
         {
-            _cancellation.Cancel();
             try
             {
+                _cancellation.CancelAsync().GetAwaiter().GetResult();
                 _serverTask.GetAwaiter().GetResult();
             }
             finally
             {
-                // The listener socket is closed only after its canceled accept has completed.
                 _listener.Stop();
                 _cancellation.Dispose();
             }

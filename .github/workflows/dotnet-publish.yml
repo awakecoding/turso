@@ -310,7 +310,7 @@ jobs:
           path: ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.xcframework/**
           retention-days: 1
 
-  # Debug-only managed-provider packages; the native provider remains the default.
+  # This validates the managed-only package without restoring Rust or downloading native artifacts.
   package-managed:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -333,16 +333,16 @@ jobs:
             9.0.x
             10.0.x
 
-      - name: Build and pack managed provider artifacts
-        run: make pack-managed
+      - name: Pack and consume managed provider artifacts
+        run: make validate-managed-package
 
       - name: Upload managed provider packages
         uses: actions/upload-artifact@v6
         with:
-          name: managed-provider-debug-packages
+          name: managed-provider-packages
           path: |
-            ${{ env.working-directory }}/src/Turso.Data.Sqlite/bin/Debug/Turso.Data.Sqlite.*.nupkg
-            ${{ env.working-directory }}/src/Turso.EntityFrameworkCore.Sqlite/bin/Debug/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-packages/Turso.Data.Sqlite.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-packages/Turso.EntityFrameworkCore.Sqlite.*.nupkg
           if-no-files-found: error
           retention-days: 7
 
@@ -381,7 +381,7 @@ jobs:
         run:
           make pack
 
-      - name: Verify NuGet native assets
+      - name: Verify NuGet package contents
         shell: bash
         run: |
           set -euo pipefail
@@ -393,13 +393,9 @@ jobs:
           unzip -Z1 "$package" > package-files.txt
           required_files=(
             "buildTransitive/Turso.Data.Sqlite.targets"
-            "runtimes/android-arm64/native/libturso_sdk_kit.so"
-            "runtimes/android-arm/native/libturso_sdk_kit.so"
-            "runtimes/android-x64/native/libturso_sdk_kit.so"
-            "runtimes/android-x86/native/libturso_sdk_kit.so"
-            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/Info.plist"
-            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/libturso_sdk_kit"
-            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/libturso_sdk_kit"
+            "lib/net8.0/Turso.Data.Sqlite.dll"
+            "lib/net9.0/Turso.Data.Sqlite.dll"
+            "lib/net10.0/Turso.Data.Sqlite.dll"
           )
           for required_file in "${required_files[@]}"; do
             if ! grep -Fxq "$required_file" package-files.txt; then
@@ -408,15 +404,74 @@ jobs:
             fi
           done
 
-          max_package_bytes=250000000
-          package_size=$(stat -c%s "$package")
-          if [ "$package_size" -gt "$max_package_bytes" ]; then
-            echo "$package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+          if grep -Eq '(^runtimes/|turso_sdk_kit|Turso\.Raw\.)' package-files.txt; then
+            echo "$package must remain managed-only"
             exit 1
           fi
 
-          if grep -Eq '^buildTransitive/native/(win|linux|osx)-' package-files.txt; then
-            echo "Static NativeAOT assets must stay in RID-specific companion packages, not $package"
+          if unzip -p "$package" '*.nuspec' | grep -Fq 'id="Turso.Raw"'; then
+            echo "$package must not declare a Turso.Raw package dependency"
+            exit 1
+          fi
+
+          native_package=$(find src/Turso.Data.Native/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.Native.*.nupkg' | head -n 1)
+          if [ -z "$native_package" ]; then
+            echo "No Turso.Data.Sqlite.Native NuGet package found"
+            exit 1
+          fi
+          unzip -Z1 "$native_package" > native-package-files.txt
+          native_required_files=(
+            "lib/net8.0/Turso.Data.Native.dll"
+            "lib/net9.0/Turso.Data.Native.dll"
+            "lib/net10.0/Turso.Data.Native.dll"
+          )
+          for required_file in "${native_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" native-package-files.txt; then
+              echo "Missing $required_file in $native_package"
+              exit 1
+            fi
+          done
+
+          if ! unzip -p "$native_package" '*.nuspec' | grep -Fq 'id="Turso.Raw"'; then
+            echo "$native_package must declare its intentional Turso.Raw dependency"
+            exit 1
+          fi
+
+          raw_package=$(find src/Turso.Raw/bin/Release -maxdepth 1 -name 'Turso.Raw.*.nupkg' | head -n 1)
+          if [ -z "$raw_package" ]; then
+            echo "No Turso.Raw NuGet package found"
+            exit 1
+          fi
+          unzip -Z1 "$raw_package" > raw-package-files.txt
+          raw_required_files=(
+            "buildTransitive/Turso.Raw.targets"
+            "lib/net8.0/Turso.Raw.dll"
+            "lib/net9.0/Turso.Raw.dll"
+            "lib/net10.0/Turso.Raw.dll"
+            "runtimes/android-arm64/native/libturso_sdk_kit.so"
+            "runtimes/android-arm/native/libturso_sdk_kit.so"
+            "runtimes/android-x64/native/libturso_sdk_kit.so"
+            "runtimes/android-x86/native/libturso_sdk_kit.so"
+            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/Info.plist"
+            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/libturso_sdk_kit"
+            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/libturso_sdk_kit"
+          )
+          for required_file in "${raw_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" raw-package-files.txt; then
+              echo "Missing $required_file in $raw_package"
+              exit 1
+            fi
+          done
+
+          max_package_bytes=250000000
+          package_size=$(stat -c%s "$raw_package")
+          if [ "$package_size" -gt "$max_package_bytes" ]; then
+            echo "$raw_package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+            exit 1
+          fi
+
+          if grep -Eq '^buildTransitive/native/(win|linux|osx)-' raw-package-files.txt; then
+            echo "Static NativeAOT assets must stay in RID-specific companion packages, not $raw_package"
             exit 1
           fi
 
@@ -469,6 +524,8 @@ jobs:
           mkdir -p artifacts/nuget-packages
           files=(
             src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
+            src/Turso.Data.Native/bin/Release/Turso.Data.Sqlite.Native.*.nupkg
+            src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg
             src/Turso.EntityFrameworkCore.Sqlite/bin/Release/Turso.EntityFrameworkCore.Sqlite.*.nupkg
             src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
             src/Turso.Platform.Client/bin/Release/Turso.Platform.Client.*.nupkg

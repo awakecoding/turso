@@ -537,6 +537,7 @@ public static class CompoundProgramBuilder
             UpdateInstruction x => new UpdateInstruction(Cur(x.Cursor)),
             CommitInstruction x => new CommitInstruction(Cur(x.Cursor)),
             FilterInstruction x => new FilterInstruction(Cur(x.Cursor), x.Predicate, Pc(x.FalseTarget), x.Description),
+            FilterRowIdInstruction x => new FilterRowIdInstruction(Cur(x.Cursor), x.Predicate, Pc(x.FalseTarget), x.Description),
             FilterRegistersInstruction x => new FilterRegistersInstruction(Range(x.Row), x.Predicate, Pc(x.FalseTarget), x.Description),
             NextInstruction x => new NextInstruction(Cur(x.Cursor), Pc(x.LoopTarget)),
             YieldInstruction => instruction,

@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TursoPackageVersion Condition="'$(TursoPackageVersion)' == ''">0.0.0-managed-local</TursoPackageVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Turso.Data.Sqlite" Version="$(TursoPackageVersion)" />
+  </ItemGroup>
+</Project>

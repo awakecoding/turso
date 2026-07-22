@@ -57,7 +57,7 @@ public class TursoDatabaseHandle() : SafeHandle(IntPtr.Zero, true)
     }
 
     public static TursoDatabaseHandle FromManaged(EmbeddedConnection connection)
-        => FromManaged(connection, owner: null);
+        => FromManaged(ManagedDatabaseAdapter.FromConnection(connection));
 
     public static TursoDatabaseHandle FromManaged(EmbeddedConnection connection, EmbeddedDatabase? owner)
         => FromManaged(ManagedDatabaseAdapter.FromConnection(connection, owner));

@@ -1,6 +1,5 @@
 using System.Data;
 using System.Data.Common;
-using Turso.Raw.Public;
 
 namespace Turso;
 

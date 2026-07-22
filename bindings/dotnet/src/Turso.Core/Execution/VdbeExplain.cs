@@ -115,6 +115,12 @@ public static class VdbeExplain
                 0,
                 null,
                 filter.Description),
+            FilterRowIdInstruction filterRowId => (
+                filterRowId.Cursor.Index,
+                filterRowId.FalseTarget.Offset,
+                0,
+                null,
+                filterRowId.Description),
             FilterRegistersInstruction filterRegisters => (
                 filterRegisters.Row.Start.Index,
                 filterRegisters.FalseTarget.Offset,

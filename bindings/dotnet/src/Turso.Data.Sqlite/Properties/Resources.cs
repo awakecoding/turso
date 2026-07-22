@@ -22,8 +22,6 @@ public static class Resources
 
     public static string SqlBlobRequiresOpenConnection => "SqliteBlob requires an open connection.";
 
-    public static string ManagedIncrementalBlobNotSupported => "Incremental blob I/O is not supported when Local Provider=Managed because the managed SQL path cannot preserve SQLite blob-handle lifecycle semantics.";
-
     public static string ManagedExtensionsNotSupported => "SQLite extension loading is not supported when Local Provider=Managed because extensions require the native SQLite loader.";
 
     public static string ManagedSharedCacheNotSupported => "Cache=Shared is not supported when Local Provider=Managed because managed connections do not share page caches.";

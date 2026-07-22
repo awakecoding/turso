@@ -3,8 +3,8 @@ using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text.RegularExpressions;
-using Turso.Raw.Public;
-using Turso.Raw.Public.Handles;
+using Turso;
+using Turso.Core;
 
 namespace Turso.Data.Sqlite;
 
@@ -12,7 +12,7 @@ public class SqliteCommand : DbCommand
 {
     private SqliteConnection? _connection;
     private SqliteTransaction? _transaction;
-    private TursoStatementHandle? _statement;
+    private SqliteStatementAdapter? _statement;
     private string _commandText = string.Empty;
     private int _commandTimeout = 30;
     private bool _hasOpenReader;
@@ -163,7 +163,7 @@ public class SqliteCommand : DbCommand
             return;
         }
 
-        TursoStatementHandle? preparedStatement = null;
+        SqliteStatementAdapter? preparedStatement = null;
         try
         {
             preparedStatement = PrepareSingleStatement(statements[0]);
@@ -171,7 +171,7 @@ public class SqliteCommand : DbCommand
             _statement = preparedStatement;
             preparedStatement = null;
         }
-        catch (TursoException ex)
+        catch (Exception ex) when (ex is TursoException or EmbeddedSqlException)
         {
             throw ToSqliteException(ex);
         }
@@ -243,23 +243,23 @@ public class SqliteCommand : DbCommand
                     continue;
 
                 var statement = PrepareSingleStatement(sql);
-                if (TursoBindings.GetFieldCount(statement) > 0)
+                if (statement.ColumnCount > 0)
                 {
                     _hasOpenReader = true;
                     Connection?.ReaderOpened();
                     return new SqliteDataReader(this, statement, statements[i], statements.Skip(i + 1).ToList(), recordsAffected, behavior, CloseReader);
                 }
 
-                while (TursoBindings.Read(statement))
+                while (statement.Read())
                 {
                 }
 
                 if (CountsRowsAffected(statements[i]))
-                    recordsAffected += TursoBindings.RowsAffected(statement);
+                    recordsAffected += statement.RowsAffected;
                 statement.Dispose();
             }
         }
-        catch (TursoException ex)
+        catch (Exception ex) when (ex is TursoException or EmbeddedSqlException)
         {
             throw ToSqliteException(ex);
         }
@@ -301,43 +301,56 @@ public class SqliteCommand : DbCommand
         Connection?.ReaderClosed();
     }
 
-    internal TursoStatementHandle PrepareSingleStatement(string sql)
+    internal SqliteStatementAdapter PrepareSingleStatement(string sql)
     {
         var connection = Connection!;
         if (connection.IsManagedReadOnly)
             ManagedReadOnlySqlGuard.ThrowIfQueryOnlyIsDisabled(sql);
         sql = RewriteFacadeStatement(sql, connection);
-        TursoStatementHandle statement;
+        if (connection.IsManagedConnection)
+        {
+            IManagedStatementAdapter? managedStatement = null;
+            try
+            {
+                managedStatement = connection.ManagedConnection.Prepare(sql);
+                BindManagedParameters(managedStatement);
+
+                var statement = SqliteStatementAdapter.FromManaged(managedStatement);
+                managedStatement = null;
+                return statement;
+            }
+            catch (EmbeddedSqlException ex)
+            {
+                throw ToSqliteException(ex, sql);
+            }
+            finally
+            {
+                managedStatement?.Dispose();
+            }
+        }
+
+        SqliteStatementAdapter? nativeStatement = null;
         try
         {
-            statement = TursoBindings.PrepareStatement(connection.DatabaseHandle, sql);
+            nativeStatement = SqliteStatementAdapter.FromNative(connection.NativeDatabase.PrepareStatement(sql));
+            BindNativeParameters(nativeStatement);
+            var statement = nativeStatement;
+            nativeStatement = null;
+            return statement;
         }
         catch (TursoException ex)
         {
             throw ToSqliteException(ex, sql);
         }
-
-        try
+        finally
         {
-            BindParameters(statement);
-            return statement;
-        }
-        catch
-        {
-            statement.Dispose();
-            throw;
+            nativeStatement?.Dispose();
         }
     }
 
-    private void BindParameters(TursoStatementHandle statement)
+    private void BindNativeParameters(SqliteStatementAdapter statement)
     {
-        if (Connection!.DatabaseHandle.IsManaged)
-        {
-            BindManagedParameters(statement);
-            return;
-        }
-
-        var parameterCount = TursoBindings.GetParameterCount(statement);
+        var parameterCount = statement.NativeParameterCount;
         var boundParameters = new bool[parameterCount + 1];
 
         for (var i = 0; i < Parameters.Count; i++)
@@ -348,11 +361,11 @@ public class SqliteCommand : DbCommand
             if (!parameter.HasValue)
                 throw new InvalidOperationException(Properties.Resources.RequiresSet(nameof(parameter.Value)));
 
-            var parameterIndex = FindParameterIndex(statement, parameter.ParameterName, parameterCount);
+            var parameterIndex = FindNativeParameterIndex(statement, parameter.ParameterName, parameterCount);
             if (parameterIndex == 0)
                 continue;
 
-            TursoBindings.BindParameter(statement, parameterIndex, parameter.ToTursoValue());
+            statement.BindNative(parameterIndex, parameter.ToNativeValue());
             boundParameters[parameterIndex] = true;
         }
 
@@ -360,7 +373,7 @@ public class SqliteCommand : DbCommand
         {
             if (!boundParameters[i])
             {
-                var parameterName = TursoBindings.GetParameterName(statement, i);
+                var parameterName = statement.GetNativeParameterName(i);
                 throw new InvalidOperationException(
                     parameterName is null
                         ? Properties.Resources.MissingParameters(i)
@@ -369,15 +382,16 @@ public class SqliteCommand : DbCommand
         }
     }
 
-    private void BindManagedParameters(TursoStatementHandle statement)
+    private void BindManagedParameters(IManagedStatementAdapter statement)
     {
-        var parameterCount = TursoBindings.GetParameterCount(statement);
+        var parameterMetadata = statement.ParameterMetadata;
+        var parameterCount = parameterMetadata.Count;
         var boundParameters = new bool[parameterCount + 1];
         var statementParameterNames = new string?[parameterCount + 1];
         var highestNumberedParameterIndex = 0;
         for (var i = 1; i <= parameterCount; i++)
         {
-            var parameterName = TursoBindings.GetParameterName(statement, i);
+            var parameterName = parameterMetadata.GetParameter(i).Name;
             statementParameterNames[i] = parameterName;
             if (IsNumberedParameterName(parameterName, i))
                 highestNumberedParameterIndex = i;
@@ -407,13 +421,12 @@ public class SqliteCommand : DbCommand
             }
 
             var parameterIndex = IsNumberedParameterName(parameter.ParameterName)
-                ? TursoBindings.BindNamedParameter(statement, parameter.ParameterName, parameter.ToTursoValue())
-                : FindParameterIndex(statement, parameter.ParameterName, parameterCount);
+                ? parameterMetadata.GetParameterIndex(parameter.ParameterName)
+                : FindManagedParameterIndex(parameterMetadata, parameter.ParameterName);
             if (parameterIndex == 0)
                 continue;
 
-            if (!IsNumberedParameterName(parameter.ParameterName))
-                TursoBindings.BindParameter(statement, parameterIndex, parameter.ToTursoValue());
+            statement.Bind(parameterIndex, parameter.ToSqlValue());
             boundParameters[parameterIndex] = true;
         }
 
@@ -426,7 +439,7 @@ public class SqliteCommand : DbCommand
                 continue;
 
             var parameter = positionalParameters[positionalParameterIndex++];
-            TursoBindings.BindParameter(statement, statementParameterIndex, parameter.ToTursoValue());
+            statement.Bind(statementParameterIndex, parameter.ToSqlValue());
             boundParameters[statementParameterIndex] = true;
         }
 
@@ -892,7 +905,7 @@ public class SqliteCommand : DbCommand
 
     private readonly record struct ScriptToken(ScriptTokenKind Kind, int Offset, int Length);
 
-    internal static SqliteException ToSqliteException(TursoException ex, string? sql = null)
+    internal static SqliteException ToSqliteException(Exception ex, string? sql = null)
     {
         var message = ex.Message;
         foreach (var prefix in new[] { "Unable to prepare statement: Parse error: ", "Parse error: " })
@@ -942,15 +955,15 @@ public class SqliteCommand : DbCommand
         return message;
     }
 
-    private static int FindParameterIndex(TursoStatementHandle statement, string parameterName, int parameterCount)
+    private static int FindNativeParameterIndex(SqliteStatementAdapter statement, string parameterName, int parameterCount)
     {
-        var index = FindExactParameterIndex(statement, parameterName, parameterCount);
+        var index = FindExactNativeParameterIndex(statement, parameterName, parameterCount);
         if (index != 0 || IsPrefixed(parameterName))
             return index;
 
         foreach (var prefix in new[] { '@', '$', ':' })
         {
-            var prefixedIndex = FindExactParameterIndex(statement, prefix + parameterName, parameterCount);
+            var prefixedIndex = FindExactNativeParameterIndex(statement, prefix + parameterName, parameterCount);
             if (prefixedIndex == 0)
                 continue;
 
@@ -963,11 +976,43 @@ public class SqliteCommand : DbCommand
         return index;
     }
 
-    private static int FindExactParameterIndex(TursoStatementHandle statement, string parameterName, int parameterCount)
+    private static int FindExactNativeParameterIndex(SqliteStatementAdapter statement, string parameterName, int parameterCount)
     {
         for (var i = 1; i <= parameterCount; i++)
         {
-            if (string.Equals(TursoBindings.GetParameterName(statement, i), parameterName, StringComparison.Ordinal))
+            if (string.Equals(statement.GetNativeParameterName(i), parameterName, StringComparison.Ordinal))
+                return i;
+        }
+
+        return 0;
+    }
+
+    private static int FindManagedParameterIndex(ManagedParameterMetadata parameterMetadata, string parameterName)
+    {
+        var index = FindExactManagedParameterIndex(parameterMetadata, parameterName);
+        if (index != 0 || IsPrefixed(parameterName))
+            return index;
+
+        foreach (var prefix in new[] { '@', '$', ':' })
+        {
+            var prefixedIndex = FindExactManagedParameterIndex(parameterMetadata, prefix + parameterName);
+            if (prefixedIndex == 0)
+                continue;
+
+            if (index != 0)
+                throw new InvalidOperationException(Properties.Resources.AmbiguousParameterName(parameterName));
+
+            index = prefixedIndex;
+        }
+
+        return index;
+    }
+
+    private static int FindExactManagedParameterIndex(ManagedParameterMetadata parameterMetadata, string parameterName)
+    {
+        for (var i = 1; i <= parameterMetadata.Count; i++)
+        {
+            if (string.Equals(parameterMetadata.GetParameter(i).Name, parameterName, StringComparison.Ordinal))
                 return i;
         }
 

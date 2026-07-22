@@ -41,4 +41,24 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                 operation.SetAnnotation(legacyAutoincrement.Name, legacyAutoincrement.Value);
         }
     }
+
+    protected override void ForeignKeyConstraint(
+        AddForeignKeyOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
+    {
+        var onDelete = operation.OnDelete;
+        var onUpdate = operation.OnUpdate;
+        operation.OnDelete = ReferentialAction.NoAction;
+        operation.OnUpdate = ReferentialAction.NoAction;
+        try
+        {
+            base.ForeignKeyConstraint(operation, model, builder);
+        }
+        finally
+        {
+            operation.OnDelete = onDelete;
+            operation.OnUpdate = onUpdate;
+        }
+    }
 }

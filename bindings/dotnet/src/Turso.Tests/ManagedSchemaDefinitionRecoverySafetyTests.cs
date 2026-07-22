@@ -113,7 +113,8 @@ public sealed class ManagedSchemaDefinitionRecoverySafetyTests
         using var reopenedConnection = reopened.Connect();
         Scalar(reopenedConnection, "SELECT note FROM audit;").Should().Be("created");
 
-        Assert.Throws<InvalidOperationException>(() => Execute(reopenedConnection, "INSERT INTO events VALUES (2);"));
+        Assert.Throws<EmbeddedSqlException>(() => Execute(reopenedConnection, "INSERT INTO events VALUES (2);"))!
+            .Message.Should().Be("attempt to write a readonly database");
         ScalarInteger(reopenedConnection, "SELECT COUNT(*) FROM events;").Should().Be(1);
     }
 

@@ -70,6 +70,13 @@ public class TursoSqliteRelationalConnection : SqliteRelationalConnection
                 : Regex.IsMatch(input, pattern, RegexOptions.None, TimeSpan.FromMilliseconds(1000)),
             isDeterministic: true);
 
+        connection.CreateFunction<string, string, long?>(
+            "instr",
+            (input, value) => input is null || value is null
+                ? null
+                : input.IndexOf(value, StringComparison.Ordinal) + 1,
+            isDeterministic: true);
+
         connection.CreateFunction(
             "ef_mod",
             (decimal? dividend, decimal? divisor) => divisor == 0m ? null : dividend % divisor,
@@ -102,6 +109,62 @@ public class TursoSqliteRelationalConnection : SqliteRelationalConnection
             (decimal? value) => -value,
             isDeterministic: true);
 
+        RegisterDecimalAggregates(connection);
+
+        connection.CreateCollation(
+            "EF_DECIMAL",
+            (left, right) => decimal.Compare(
+                decimal.Parse(left, NumberStyles.Number, CultureInfo.InvariantCulture),
+                decimal.Parse(right, NumberStyles.Number, CultureInfo.InvariantCulture)));
+    }
+
+    private static decimal? ToDecimal(object? value)
+        => value switch
+        {
+            null => null,
+            decimal decimalValue => decimalValue,
+            string text => decimal.Parse(text, NumberStyles.Number, CultureInfo.InvariantCulture),
+            _ => Convert.ToDecimal(value, CultureInfo.InvariantCulture)
+        };
+
+    private static void RegisterDecimalAggregates(TursoSqliteConnection connection)
+    {
+        var connectionOptions = new TursoSqliteConnectionStringBuilder(connection.ConnectionString);
+        if (connectionOptions.IsLocalProviderConfigured
+            && connectionOptions.LocalProvider != Turso.TursoLocalProvider.Managed)
+        {
+            RegisterNativeDecimalAggregates(connection);
+            return;
+        }
+
+        connection.CreateAggregate(
+            "ef_avg",
+            seed: "0|0",
+            AddToAverage,
+            GetAverage,
+            isDeterministic: true);
+
+        connection.CreateAggregate<string?>(
+            "ef_max",
+            seed: null,
+            GetMaximum,
+            isDeterministic: true);
+
+        connection.CreateAggregate<string?>(
+            "ef_min",
+            seed: null,
+            GetMinimum,
+            isDeterministic: true);
+
+        connection.CreateAggregate(
+            "ef_sum",
+            seed: "0",
+            AddToSum,
+            isDeterministic: true);
+    }
+
+    private static void RegisterNativeDecimalAggregates(TursoSqliteConnection connection)
+    {
         connection.CreateAggregate(
             "ef_avg",
             seed: (0m, 0ul),
@@ -142,11 +205,52 @@ public class TursoSqliteRelationalConnection : SqliteRelationalConnection
                     ? value
                     : sum.Value + value.Value,
             isDeterministic: true);
-
-        connection.CreateCollation(
-            "EF_DECIMAL",
-            (left, right) => decimal.Compare(
-                decimal.Parse(left, NumberStyles.Number, CultureInfo.InvariantCulture),
-                decimal.Parse(right, NumberStyles.Number, CultureInfo.InvariantCulture)));
     }
+
+    private static string AddToSum(string accumulator, object?[] values)
+        => ToDecimal(values[0]) is not { } value
+            ? accumulator
+            : FormatDecimal(ParseDecimal(accumulator) + value);
+
+    private static string AddToAverage(string accumulator, object?[] values)
+    {
+        if (ToDecimal(values[0]) is not { } value)
+            return accumulator;
+
+        var separator = accumulator.IndexOf('|');
+        var sum = ParseDecimal(accumulator[..separator]) + value;
+        var count = ulong.Parse(accumulator[(separator + 1)..], CultureInfo.InvariantCulture) + 1;
+        return $"{FormatDecimal(sum)}|{count.ToString(CultureInfo.InvariantCulture)}";
+    }
+
+    private static decimal? GetAverage(string accumulator)
+    {
+        var separator = accumulator.IndexOf('|');
+        var count = ulong.Parse(accumulator[(separator + 1)..], CultureInfo.InvariantCulture);
+        return count == 0
+            ? null
+            : ParseDecimal(accumulator[..separator]) / count;
+    }
+
+    private static string? GetMaximum(string? accumulator, object?[] values)
+        => SelectBound(accumulator, values[0], decimal.Max);
+
+    private static string? GetMinimum(string? accumulator, object?[] values)
+        => SelectBound(accumulator, values[0], decimal.Min);
+
+    private static string? SelectBound(string? accumulator, object? value, Func<decimal, decimal, decimal> selector)
+    {
+        if (ToDecimal(value) is not { } decimalValue)
+            return accumulator;
+
+        return accumulator is null
+            ? FormatDecimal(decimalValue)
+            : FormatDecimal(selector(ParseDecimal(accumulator), decimalValue));
+    }
+
+    private static decimal ParseDecimal(string value)
+        => decimal.Parse(value, NumberStyles.Number, CultureInfo.InvariantCulture);
+
+    private static string FormatDecimal(decimal value)
+        => value.ToString(CultureInfo.InvariantCulture);
 }

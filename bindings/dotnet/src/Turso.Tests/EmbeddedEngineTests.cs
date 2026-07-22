@@ -1988,6 +1988,7 @@ public class EmbeddedEngineTests
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER);");
         Execute(connection, "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO t VALUES (99); END;");
+        Execute(connection, "PRAGMA recursive_triggers = ON;");
 
         Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "INSERT INTO t VALUES (1);"));
         AssertCount(connection, "SELECT COUNT(*) FROM t;", 0);

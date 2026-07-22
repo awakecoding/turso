@@ -1,0 +1,123 @@
+using System.Reflection;
+using AwesomeAssertions;
+using Turso.Core;
+using Turso.Data.Sqlite;
+
+namespace Turso.Tests;
+
+public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
+{
+    [Test]
+    public void ManagedBackupUsesCoreSnapshotAdaptersWithoutRawHandles()
+    {
+        typeof(IManagedConnectionAdapter).Assembly.GetReferencedAssemblies()
+            .Select(reference => reference.Name)
+            .Should()
+            .NotContain("Turso.Raw");
+
+        using var source = OpenManagedConnection();
+        using var destination = OpenManagedConnection();
+        source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
+
+        GetPrivateField(source, "_database").Should().BeNull();
+        GetPrivateField(destination, "_database").Should().BeNull();
+
+        source.BackupDatabase(destination);
+
+        GetPrivateField(source, "_database").Should().BeNull();
+        GetPrivateField(destination, "_database").Should().BeNull();
+        destination.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("source");
+    }
+
+    [Test]
+    public void CoreSnapshotCopyReleasesSourceAndDestinationAdaptersAfterSuccess()
+    {
+        using var sourceDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var destinationDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var source = sourceDatabase.Connect();
+        using var destination = destinationDatabase.Connect();
+        Execute(source, "CREATE TABLE source_data(value TEXT);");
+        Execute(source, "INSERT INTO source_data VALUES ('before');");
+
+        source.CopySnapshotTo(destination);
+
+        Execute(source, "BEGIN;");
+        Execute(source, "ROLLBACK;");
+        Execute(destination, "INSERT INTO source_data VALUES ('after');");
+        Scalar(destination, "SELECT COUNT(*) FROM source_data;").Should().Be(2);
+        Scalar(source, "SELECT COUNT(*) FROM source_data;").Should().Be(1);
+    }
+
+    [Test]
+    public void CoreSnapshotCopyRollsBackDestinationAndReleasesSourceAfterFailure()
+    {
+        using var sourceDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var destinationDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var source = sourceDatabase.Connect();
+        using var destination = destinationDatabase.Connect();
+        Execute(source, "CREATE TABLE copied_data(value TEXT);");
+        Execute(source, "INSERT INTO copied_data VALUES ('source');");
+        Execute(source, "CREATE TABLE inaccessible_rowid(rowid TEXT, _rowid_ TEXT, oid TEXT);");
+        Execute(source, "INSERT INTO inaccessible_rowid VALUES ('a', 'b', 'c');");
+
+        var exception = Assert.Throws<ManagedSnapshotException>(() => source.CopySnapshotTo(destination));
+
+        exception!.Failure.Should().Be(ManagedSnapshotFailure.RowidNotAccessible);
+        exception.ObjectName.Should().Be("inaccessible_rowid");
+        Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+        Execute(source, "BEGIN;");
+        Execute(source, "ROLLBACK;");
+        Execute(destination, "CREATE TABLE destination_still_usable(value TEXT);");
+        Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(1);
+    }
+
+    [Test]
+    public void CoreSnapshotCopyDoesNotRollBackAnExistingSourceTransaction()
+    {
+        using var sourceDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var destinationDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var source = sourceDatabase.Connect();
+        using var destination = destinationDatabase.Connect();
+        Execute(source, "CREATE TABLE source_data(value TEXT);");
+        Execute(source, "BEGIN;");
+        Execute(source, "INSERT INTO source_data VALUES ('uncommitted');");
+
+        Action copy = () => source.CopySnapshotTo(destination);
+
+        copy.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("cannot start a transaction within a transaction");
+        Scalar(source, "SELECT COUNT(*) FROM source_data;").Should().Be(1);
+        Execute(source, "COMMIT;");
+        Scalar(source, "SELECT COUNT(*) FROM source_data;").Should().Be(1);
+        Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+    }
+
+    private static SqliteConnection OpenManagedConnection()
+    {
+        var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        return connection;
+    }
+
+    private static void Execute(IManagedConnectionAdapter connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        while (statement.Step() == StatementStepResult.Row)
+        {
+        }
+    }
+
+    private static long Scalar(IManagedConnectionAdapter connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        return statement.GetValue(0).AsInteger();
+    }
+
+    private static object? GetPrivateField(object instance, string fieldName)
+    {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"Expected {instance.GetType().Name}.{fieldName}.");
+        return field.GetValue(instance);
+    }
+}

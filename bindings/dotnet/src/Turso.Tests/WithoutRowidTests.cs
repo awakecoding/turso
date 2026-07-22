@@ -154,6 +154,17 @@ public class WithoutRowidTests
     }
 
     [Test]
+    public void UpdatingToDuplicatePrimaryKeyIsRejected()
+    {
+        AssertErrorMatchesSqlite(
+            [
+                "CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID",
+                "INSERT INTO t(k, v) VALUES (1, 'a'), (2, 'b')",
+            ],
+            "UPDATE t SET k = 1 WHERE k = 2");
+    }
+
+    [Test]
     public void DuplicateCompositePrimaryKeyIsRejectedWithKeyColumnOrder()
     {
         AssertErrorMatchesSqlite(

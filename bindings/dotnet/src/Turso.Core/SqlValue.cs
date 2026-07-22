@@ -15,32 +15,51 @@ public readonly struct SqlValue : IEquatable<SqlValue>
     private readonly double _real;
     private readonly string? _text;
     private readonly ReadOnlyMemory<byte> _blob;
+    private readonly bool _isJson;
 
-    private SqlValue(SqlValueKind kind, long integer, double real, string? text, ReadOnlyMemory<byte> blob)
+    private SqlValue(
+        SqlValueKind kind,
+        long integer,
+        double real,
+        string? text,
+        ReadOnlyMemory<byte> blob,
+        bool isJson)
     {
         Kind = kind;
         _integer = integer;
         _real = real;
         _text = text;
         _blob = blob;
+        _isJson = isJson;
     }
 
     public SqlValueKind Kind { get; }
 
     public static SqlValue Null => default;
 
-    public static SqlValue Integer(long value) => new(SqlValueKind.Integer, value, default, null, default);
+    public static SqlValue Integer(long value) => new(SqlValueKind.Integer, value, default, null, default, false);
 
-    public static SqlValue Real(double value) => new(SqlValueKind.Real, default, value, null, default);
+    public static SqlValue Real(double value) => new(SqlValueKind.Real, default, value, null, default, false);
 
     public static SqlValue Text(string value)
     {
         ArgumentNullException.ThrowIfNull(value);
-        return new(SqlValueKind.Text, default, default, value, default);
+        return new(SqlValueKind.Text, default, default, value, default, false);
+    }
+
+    internal static SqlValue JsonText(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        return new(SqlValueKind.Text, default, default, value, default, true);
     }
 
     public static SqlValue Blob(ReadOnlySpan<byte> value)
-        => new(SqlValueKind.Blob, default, default, null, value.ToArray());
+        => new(SqlValueKind.Blob, default, default, null, value.ToArray(), false);
+
+    internal bool IsJson => _isJson;
+
+    internal SqlValue WithoutJsonSubtype()
+        => _isJson ? Text(_text!) : this;
 
     public long AsInteger()
         => Kind == SqlValueKind.Integer

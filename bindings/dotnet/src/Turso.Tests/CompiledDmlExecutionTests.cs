@@ -147,10 +147,9 @@ public class CompiledDmlExecutionTests
         Assert.Throws<EmbeddedSqlException>(
             () => ReadRows(connection, "EXPLAIN UPDATE t SET value = 1 WHERE value IN (SELECT 1);"));
 
-        // A rowid reference on a hidden-rowid table needs the scanned row's rowid, which the
-        // compiled filter lacks, so it stays on the evaluator.
+        // A subquery needs more than the scanned row and its rowid, so it remains evaluator-backed.
         Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN DELETE FROM t WHERE rowid = 1;"));
+            () => ReadRows(connection, "EXPLAIN DELETE FROM t WHERE rowid IN (SELECT 1);"));
     }
 
     [Test]

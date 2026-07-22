@@ -12,7 +12,20 @@ dotnet add package Turso.Data.Sqlite
 
 Application code only needs to reference `Turso.Data.Sqlite`.
 
-The package targets `net8.0`, `net9.0`, and `net10.0`. It includes native runtime assets for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices.
+The package targets `net8.0`, `net9.0`, and `net10.0`. It is managed-only: local connections use the managed provider by default and no Rust toolchain or native runtime asset is needed to restore, build, or run it.
+
+## Dynamic native compatibility
+
+Applications that intentionally select `Local Provider=Native` can reference the matching-version `Turso.Data.Sqlite.Native` companion package:
+
+```xml
+<ItemGroup>
+  <PackageReference Include="Turso.Data.Sqlite" Version="0.7.0-pre.18" />
+  <PackageReference Include="Turso.Data.Sqlite.Native" Version="0.7.0-pre.18" />
+</ItemGroup>
+```
+
+`Turso.Data.Sqlite.Native` activates the native provider and resolves its `Turso.Raw` runtime companion for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices. Remote Turso/libSQL connections use the managed HTTP client and do not require either native package.
 
 ## NativeAOT static linking
 
@@ -41,7 +54,7 @@ Publish with a supported runtime identifier, for example:
 dotnet publish -c Release -r win-x64
 ```
 
-Static native packages are published for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`. The dynamic native assets remain the default for non-AOT apps and for mobile targets. See `samples/NativeAot` for a complete executable sample.
+Static native packages are published for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`. See `samples/NativeAot` for a complete executable sample.
 
 ## Getting started
 
@@ -154,6 +167,7 @@ Supported common connection string keywords include:
 | `Mode` | Parsed and preserved for compatibility. |
 | `Cache` | Parsed and preserved for compatibility. |
 | `Foreign Keys` | Parsed and preserved for compatibility. |
+| `Local Provider` | `Managed` is the default for local databases. Set `Native` only when `Turso.Data.Sqlite.Native` is referenced. |
 | `Recursive Triggers` | Parsed and preserved for compatibility. |
 | `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
 | `Pooling` | Parsed and preserved for compatibility. |

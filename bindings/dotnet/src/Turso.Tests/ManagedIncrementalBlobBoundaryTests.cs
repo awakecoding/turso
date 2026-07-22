@@ -1,3 +1,5 @@
+using AwesomeAssertions;
+using System.Reflection;
 using Turso.Data.Sqlite;
 
 namespace Turso.Tests;
@@ -5,14 +7,124 @@ namespace Turso.Tests;
 public sealed class ManagedIncrementalBlobBoundaryTests
 {
     [Test]
-    public void ManagedBlobConstructionRejectsBeforeTableLookupOrNativeInterop()
+    public void ManagedBlobUsesTheCoreAdapterAndPersistsBoundedWrites()
     {
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE data(value BLOB); INSERT INTO data(rowid, value) VALUES (1, X'010203');");
 
-        var exception = Assert.Throws<NotSupportedException>(
-            () => new SqliteBlob(connection, "missing_table", "missing_column", long.MinValue));
+        GetPrivateField(connection, "_database").Should().BeNull();
+        ((object?)connection.Handle).Should().BeNull();
 
-        Assert.That(exception!.Message, Is.EqualTo(Data.Sqlite.Properties.Resources.ManagedIncrementalBlobNotSupported));
+        using var blob = new SqliteBlob(connection, "data", "value", 1);
+        blob.Length.Should().Be(3);
+
+        var read = new byte[4];
+        blob.Read(read, 1, 2).Should().Be(2);
+        read.Should().Equal(0, 1, 2, 0);
+        blob.Seek(-1, SeekOrigin.Current).Should().Be(1);
+
+        var source = new byte[] { 9, 8 };
+        blob.Write(source, 0, source.Length);
+        source[0] = 0;
+
+        blob.Position = 0;
+        blob.Read(read, 0, 3).Should().Be(3);
+        read.Take(3).Should().Equal(1, 9, 8);
+        connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE rowid = 1;").Should().Equal(1, 9, 8);
+    }
+
+    [Test]
+    public void ManagedBlobMapsOpenAndInvalidationFailuresWithoutChangingStoredValues()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            "CREATE TABLE data(value BLOB, text_value TEXT);"
+            + "INSERT INTO data(rowid, value, text_value) VALUES (1, X'0102', 'text');");
+
+        var missingTable = Assert.Throws<SqliteException>(() => new SqliteBlob(connection, "missing", "value", 1));
+        missingTable!.SqliteErrorCode.Should().Be(1);
+        missingTable.Message.Should().Contain("no such table: missing");
+
+        var missing = Assert.Throws<SqliteException>(() => new SqliteBlob(connection, "data", "value", 2));
+        missing!.SqliteErrorCode.Should().Be(1);
+        missing.Message.Should().Contain("no such rowid: 2");
+
+        var nonBlob = Assert.Throws<SqliteException>(() => new SqliteBlob(connection, "data", "text_value", 1));
+        nonBlob!.SqliteErrorCode.Should().Be(1);
+        connection.ExecuteScalar<string>("SELECT text_value FROM data WHERE rowid = 1;").Should().Be("text");
+
+        using var blob = new SqliteBlob(connection, "data", "value", 1);
+        connection.ExecuteNonQuery("DELETE FROM data WHERE rowid = 1;");
+
+        var aborted = Assert.Throws<SqliteException>(() => blob.Write([3], 0, 1));
+        aborted!.SqliteErrorCode.Should().Be(4);
+        connection.ExecuteScalar<long>("SELECT COUNT(*) FROM data;").Should().Be(0);
+    }
+
+    [Test]
+    public void ManagedBlobInvalidatesWhenAnotherColumnOfItsRowChanges()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            "CREATE TABLE data(value BLOB, revision INTEGER);"
+            + "INSERT INTO data(rowid, value, revision) VALUES (1, X'0102', 0);");
+        using var blob = new SqliteBlob(connection, "data", "value", 1);
+
+        connection.ExecuteNonQuery("UPDATE data SET revision = 1 WHERE rowid = 1;");
+
+        var aborted = Assert.Throws<SqliteException>(() =>
+        {
+            blob.Read(new byte[1], 0, 1).Should().Be(1);
+        });
+        aborted!.SqliteErrorCode.Should().Be(4);
+        connection.ExecuteScalar<long>("SELECT revision FROM data WHERE rowid = 1;").Should().Be(1);
+        connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE rowid = 1;").Should().Equal(1, 2);
+    }
+
+    [Test]
+    public void ManagedBlobParticipatesInTransactionsAndHonorsReadOnlyBlobs()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE data(value BLOB); INSERT INTO data(rowid, value) VALUES (1, X'0102');");
+
+        using (var transaction = connection.BeginTransaction())
+        {
+            using var blob = new SqliteBlob(connection, "data", "value", 1);
+            blob.Write([3], 0, 1);
+            connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE rowid = 1;").Should().Equal(3, 2);
+            transaction.Rollback();
+        }
+
+        connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE rowid = 1;").Should().Equal(1, 2);
+
+        using var readOnlyBlob = new SqliteBlob(connection, "data", "value", 1, readOnly: true);
+        readOnlyBlob.CanWrite.Should().BeFalse();
+        Assert.Throws<NotSupportedException>(() => readOnlyBlob.Write([3], 0, 1))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.WriteNotSupported);
+    }
+
+    [Test]
+    public void ManagedBlobDisposalClosesTheStreamingAdapter()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE data(value BLOB); INSERT INTO data(rowid, value) VALUES (1, X'01');");
+
+        var blob = new SqliteBlob(connection, "data", "value", 1);
+        blob.Dispose();
+
+        blob.CanRead.Should().BeFalse();
+        Assert.Throws<ObjectDisposedException>(() => _ = blob.Length);
+    }
+
+    private static object? GetPrivateField(object instance, string fieldName)
+    {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"Expected {instance.GetType().Name}.{fieldName}.");
+        return field.GetValue(instance);
     }
 }

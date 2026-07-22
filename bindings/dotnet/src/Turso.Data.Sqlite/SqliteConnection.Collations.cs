@@ -1,12 +1,9 @@
-using System.Runtime.InteropServices;
-using System.Text;
-using Turso.Raw.Public;
+using Turso.Core;
 
 namespace Turso.Data.Sqlite;
 
 public partial class SqliteConnection
 {
-    private static readonly TursoCollationCallback CollationCallback = InvokeCollation;
     private readonly Dictionary<string, CollationRegistration> _collations = new(StringComparer.OrdinalIgnoreCase);
 
     private void RegisterCollation(string name, Func<string, string, int>? comparison)
@@ -15,81 +12,59 @@ public partial class SqliteConnection
         if (comparison is null)
         {
             _collations.Remove(name);
-            if (_database is not null)
-                TursoBindings.UnregisterCollation(DatabaseHandle, name);
+            if (IsManagedConnection)
+                ManagedConnection.UnregisterCollation(name);
+            else if (_database is not null)
+                SqliteNativeProvider.Current.UnregisterCollation(NativeDatabase, name);
             return;
         }
 
         var registration = new CollationRegistration(name, comparison);
         _collations[name] = registration;
-        if (_database is not null)
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+        if (IsManagedConnection)
+            registration.RegisterManaged(ManagedConnection);
+        else if (_database is not null)
+            registration.RegisterNative(NativeDatabase);
     }
 
     private void RegisterCollations()
     {
+        if (IsManagedConnection)
+        {
+            foreach (var registration in _collations.Values)
+                registration.RegisterManaged(ManagedConnection);
+            return;
+        }
+
         foreach (var registration in _collations.Values)
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
-    }
-
-    private static int InvokeCollation(IntPtr context, IntPtr leftPtr, UIntPtr leftLen, IntPtr rightPtr, UIntPtr rightLen)
-    {
-        var registration = (CollationRegistration?)GCHandle.FromIntPtr(context).Target
-            ?? throw new ObjectDisposedException(nameof(CollationRegistration));
-        return registration.Compare(ReadUtf8(leftPtr, checked((int)leftLen)), ReadUtf8(rightPtr, checked((int)rightLen)));
-    }
-
-    private static string ReadUtf8(IntPtr ptr, int length)
-    {
-        if (ptr == IntPtr.Zero || length == 0)
-            return string.Empty;
-
-        var bytes = new byte[length];
-        Marshal.Copy(ptr, bytes, 0, bytes.Length);
-        return Encoding.UTF8.GetString(bytes);
+            registration.RegisterNative(NativeDatabase);
     }
 
     private sealed class CollationRegistration(string name, Func<string, string, int> compare)
     {
         public int Compare(string left, string right) => compare(left, right);
 
-        public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
+        public void RegisterManaged(IManagedConnectionAdapter connection)
         {
-            var handle = GCHandle.Alloc(this);
+            ArgumentNullException.ThrowIfNull(connection);
+            connection.RegisterCollation(name, InvokeManaged);
+        }
+
+        public void RegisterNative(TursoNativeDatabase database)
+        {
+            ArgumentNullException.ThrowIfNull(database);
+            SqliteNativeProvider.Current.RegisterCollation(database, name, Compare);
+        }
+
+        private int InvokeManaged(string left, string right)
+        {
             try
             {
-                if (database.IsManaged)
-                {
-                    TursoBindings.RegisterManagedCollation(database, name, InvokeManaged);
-                }
-                else
-                {
-                    TursoBindings.RegisterCollation(
-                        database,
-                        name,
-                        GCHandle.ToIntPtr(handle),
-                        CollationCallback,
-                        ContextDestructorCallback);
-                }
-
-                return handle;
+                return Compare(left, right);
             }
-            catch
+            catch (Exception ex)
             {
-                handle.Free();
-                throw;
-            }
-
-            int InvokeManaged(string left, string right)
-            {
-                try
-                {
-                    return Compare(left, right);
-                }
-                catch (Exception ex)
-                {
-                    throw ToTursoCallbackException(ex);
-                }
+                throw ToManagedCallbackException(ex);
             }
         }
     }

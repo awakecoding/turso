@@ -1,4 +1,5 @@
 using AwesomeAssertions;
+using MsData = Microsoft.Data.Sqlite;
 using Turso.Core;
 using Turso.Core.Storage;
 
@@ -35,8 +36,8 @@ public class SqliteBtreeSplitStorageTests
             root.SearchChild(3).ChildPage.Should().Be(2);
             root.SearchChild(4).ChildPage.Should().Be(3);
             root.SearchChild(7).ChildPage.Should().Be(3);
-            ReadTableRowIds(pager, 2).Should().Equal(1, 3);
-            ReadTableRowIds(pager, 3).Should().Equal(5, 7);
+            ReadLeafRowIds(pager, 2).Should().Equal(1, 3);
+            ReadLeafRowIds(pager, 3).Should().Equal(5, 7);
 
             pager.CheckpointToMainStore().DatabaseSizeInPages.Should().Be(3);
         }
@@ -79,9 +80,185 @@ public class SqliteBtreeSplitStorageTests
         root.SearchChild(2).ChildPage.Should().Be(4);
         root.SearchChild(3).ChildPage.Should().Be(4);
         root.SearchChild(4).ChildPage.Should().Be(3);
-        ReadTableRowIds(pager, 2).Should().Equal(1);
-        ReadTableRowIds(pager, 4).Should().Equal(3);
-        ReadTableRowIds(pager, 3).Should().Equal(5, 7);
+        ReadLeafRowIds(pager, 2).Should().Equal(1);
+        ReadLeafRowIds(pager, 4).Should().Equal(3);
+        ReadLeafRowIds(pager, 3).Should().Equal(5, 7);
+    }
+
+    [Test]
+    public void FullTableInteriorRootPromotionReopensAndPassesExternalSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("interior-root-promotion");
+        try
+        {
+            int expectedRowCount;
+            using (var pager = CreatePagerAtPath(PhysicalFileSystem.Instance, path))
+            {
+                var seed = SeedFullTableInteriorRoot(pager);
+                expectedRowCount = seed.RowCount + 1;
+                var mutation = PrepareTableInteriorRootPromotion(pager, seed);
+
+                mutation.WriteImages.Select(image => image.PageNumber).Should().Equal(
+                    seed.SourcePageCount + 1,
+                    seed.SourcePageCount + 2,
+                    seed.SourcePageCount + 3,
+                    seed.RightMostLeafPage,
+                    seed.RootPage,
+                    1);
+                mutation.CommitTo(pager);
+                AssertPromotedTable(pager, seed.RootPage, expectedRowCount);
+                pager.CheckpointToMainStore();
+            }
+
+            using (var reopened = SqlitePager.Open(
+                       PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                AssertPromotedTable(reopened, rootPage: 2, expectedRowCount);
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+            sqlite.Open();
+            using (var integrity = sqlite.CreateCommand())
+            {
+                integrity.CommandText = "PRAGMA integrity_check;";
+                integrity.ExecuteScalar().Should().Be("ok");
+            }
+
+            using var count = sqlite.CreateCommand();
+            count.CommandText = "SELECT COUNT(*) FROM t;";
+            Convert.ToInt32(count.ExecuteScalar()).Should().Be(expectedRowCount);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void EveryInterruptedFullTableInteriorRootPromotionRecoversThePriorTree()
+    {
+        for (var failedFrame = 1; failedFrame <= 6; failedFrame++)
+        {
+            var faults = new DeterministicFaultInjector();
+            var fileSystem = new InMemoryFileSystem(faults);
+            var path = $"full-interior-root-promotion-{failedFrame}.db";
+            int expectedRowCount;
+            using (var pager = CreatePagerAtPath(fileSystem, path))
+            {
+                var seed = SeedFullTableInteriorRoot(pager);
+                expectedRowCount = seed.RowCount;
+                var mutation = PrepareTableInteriorRootPromotion(pager, seed);
+                faults.FailOnOccurrence(
+                    FileSystemOperation.Write,
+                    faults.GetOperationCount(FileSystemOperation.Write) + failedFrame);
+
+                Assert.Throws<IOException>(() => mutation.CommitTo(pager));
+                pager.State.Should().Be(SqlitePagerState.Faulted);
+            }
+
+            using var recovered = SqlitePager.Open(fileSystem, path, path + "-wal");
+            recovered.CommittedPageCount.Should().BeLessThan(uint.MaxValue);
+            AssertUnpromotedTable(recovered, rootPage: 2, expectedRowCount);
+        }
+    }
+
+    [Test]
+    public void EncryptedFullTableInteriorRootPromotionReopensReadOnly()
+    {
+        using var encryption = TursoEncryptionOptions.FromHex(
+            TursoEncryptionCipher.Aes256Gcm,
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
+        var fileSystem = new TursoEncryptionFileSystem(new InMemoryFileSystem(), encryption);
+        const string path = "encrypted-full-interior-root-promotion.db";
+
+        int expectedRowCount;
+        using (var pager = CreatePagerAtPath(fileSystem, path))
+        {
+            var seed = SeedFullTableInteriorRoot(pager);
+            expectedRowCount = seed.RowCount + 1;
+            PrepareTableInteriorRootPromotion(pager, seed).CommitTo(pager);
+        }
+
+        using var reopened = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        AssertPromotedTable(reopened, rootPage: 2, expectedRowCount);
+    }
+
+    [Test]
+    public void FullTableInteriorRootPromotionCannotBypassReadOnlyPager()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "readonly-full-interior-root-promotion.db";
+        int expectedRowCount;
+        using (var pager = CreatePagerAtPath(fileSystem, path))
+        {
+            var seed = SeedFullTableInteriorRoot(pager);
+            expectedRowCount = seed.RowCount;
+        }
+
+        var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
+        using (var readOnly = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true))
+        {
+            var seed = ReadFullTableInteriorRootSeed(readOnly);
+            var mutation = PrepareTableInteriorRootPromotion(readOnly, seed);
+            Assert.Throws<InvalidOperationException>(() => mutation.CommitTo(readOnly));
+        }
+
+        faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBefore);
+        using var reopened = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        AssertUnpromotedTable(reopened, rootPage: 2, expectedRowCount);
+    }
+
+    [Test]
+    public void CorruptFullTableInteriorRootIsRejectedBeforePromotionWrites()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "corrupt-full-interior-root-promotion.db";
+        SqliteDatabaseHeader header;
+        using (var pager = CreatePagerAtPath(fileSystem, path))
+        {
+            _ = SeedFullTableInteriorRoot(pager);
+            header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+            pager.CheckpointToMainStore();
+        }
+
+        using (var store = SqlitePageStore.Open(fileSystem, path))
+        {
+            var rootPage = store.ReadPage(2);
+            var root = SqliteTableInteriorPageView.Parse(rootPage, header.UsableSpace);
+            rootPage[root.CellPointers[0] + sizeof(uint)] = 0;
+            store.WritePage(2, rootPage);
+            store.Flush();
+        }
+
+        fileSystem.DeleteFile(path + "-wal");
+        using (SqliteWalFile.Create(
+                   fileSystem,
+                   path + "-wal",
+                   SqliteWalHeader.Create(header.PageSize, salt1: 31, salt2: 37)))
+        {
+        }
+
+        var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
+        using (var pager = SqlitePager.Open(fileSystem, path, path + "-wal"))
+        {
+            var finalPageOne = CreateFinalPageOne(pager);
+            Assert.Throws<InvalidDataException>(() =>
+                new SqliteBtreeSplitWriter(
+                    pager,
+                    new SqliteAppendOnlyPageAllocator(pager.CommittedPageCount))
+                .PrepareTableInteriorRootRightmostLeafSplit(
+                    rootPageNumber: 2,
+                    SqliteTableLeafCell.Create(999_999, DataRecord(), header.UsableSpace),
+                    finalPageOne));
+        }
+
+        faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBefore);
     }
 
     [Test]
@@ -208,21 +385,297 @@ public class SqliteBtreeSplitStorageTests
             root.Header.RightMostChildPage.Should().Be(3);
             root.SearchChild(3).ChildPage.Should().Be(2);
             root.SearchChild(4).ChildPage.Should().Be(3);
-            ReadTableRowIds(recovered, 2).Should().Equal(1, 3);
+            ReadLeafRowIds(recovered, 2).Should().Equal(1, 3);
         }
     }
 
     private static SqlitePager CreatePager(IFileSystem fileSystem, string name)
+        => CreatePagerAtPath(fileSystem, $"{name}.db");
+
+    private static SqlitePager CreatePagerAtPath(IFileSystem fileSystem, string databasePath)
         => SqlitePager.Create(
             fileSystem,
-            $"{name}.db",
-            $"{name}.db-wal",
+            databasePath,
+            databasePath + "-wal",
             SqliteWalHeader.Create(
                 SqlitePageSize.Minimum,
                 salt1: 0x1020_3040,
                 salt2: 0x5060_7080,
                 checkpointSequence: 1),
             SqliteDatabaseHeader.CreateDefault() with { PageSize = SqlitePageSize.Minimum });
+
+    private static BoundedTableRootSeed SeedFullTableInteriorRoot(SqlitePager pager)
+    {
+        const uint rootPage = 2;
+        var pageOne = pager.ReadCommittedPage(1);
+        var header = SqliteDatabaseHeader.Parse(pageOne);
+        var childCount = FindMaximumTableInteriorChildCount(pager.PageSize, header.UsableSpace);
+        childCount.Should().BeGreaterThanOrEqualTo(4);
+
+        var rightLeafCells = new List<SqliteTableLeafCell>();
+        var nextRowId = childCount;
+        SqliteTableLeafCell appendedCell;
+        while (true)
+        {
+            var candidate = SqliteTableLeafCell.Create(nextRowId, DataRecord(), header.UsableSpace);
+            if (CanBuildTableLeaf(rightLeafCells.Append(candidate), pager.PageSize, header.UsableSpace))
+            {
+                rightLeafCells.Add(candidate);
+                nextRowId++;
+                continue;
+            }
+
+            appendedCell = candidate;
+            break;
+        }
+
+        rightLeafCells.Should().HaveCountGreaterThan(1);
+        var rightMostLeafPage = checked(rootPage + (uint)childCount);
+        var root = new SqliteTableInteriorPageBuilder(
+            pager.PageSize,
+            header.UsableSpace,
+            rightMostLeafPage);
+        var pages = new List<SqlitePageImage>(childCount + 1);
+        for (var childIndex = 0; childIndex < childCount - 1; childIndex++)
+        {
+            var rowId = childIndex + 1L;
+            var pageNumber = checked(3U + (uint)childIndex);
+            root.Append(SqliteTableInteriorCell.Create(pageNumber, rowId));
+            pages.Add(new SqlitePageImage(
+                pageNumber,
+                BuildTableLeaf(
+                    pager.PageSize,
+                    header.UsableSpace,
+                    [SqliteTableLeafCell.Create(rowId, DataRecord(), header.UsableSpace)])));
+        }
+
+        pages.Add(new SqlitePageImage(
+            rightMostLeafPage,
+            BuildTableLeaf(pager.PageSize, header.UsableSpace, rightLeafCells)));
+        pages.Add(new SqlitePageImage(rootPage, root.Build()));
+
+        var sourcePageCount = rightMostLeafPage;
+        var seededHeader = header with
+        {
+            DatabaseSizeInPages = sourcePageCount,
+            VersionValidFor = header.ChangeCounter,
+        };
+        seededHeader.WriteTo(pageOne);
+        var schema = new SqliteTableLeafPageBuilder(
+            pager.PageSize,
+            header.UsableSpace,
+            isFirstPage: true);
+        schema.Append(SqliteTableLeafCell.Create(
+            rowId: 1,
+            Record(
+                SqlValue.Text("table"),
+                SqlValue.Text("t"),
+                SqlValue.Text("t"),
+                SqlValue.Integer(rootPage),
+                SqlValue.Text("CREATE TABLE t(value BLOB)")),
+            header.UsableSpace));
+        schema.WriteTo(pageOne);
+        pages.Add(new SqlitePageImage(1, pageOne));
+        CommitPages(pager, sourcePageCount, pages);
+
+        return new BoundedTableRootSeed(
+            RootPage: rootPage,
+            SourcePageCount: sourcePageCount,
+            RightMostLeafPage: rightMostLeafPage,
+            AppendedCell: appendedCell,
+            RowCount: (childCount - 1) + rightLeafCells.Count);
+    }
+
+    private static BoundedTableRootSeed ReadFullTableInteriorRootSeed(SqlitePager pager)
+    {
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        const uint rootPage = 2;
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(rootPage),
+            header.UsableSpace);
+        var rightLeaf = SqliteTableLeafPageView.Parse(
+            pager.ReadCommittedPage(root.Header.RightMostChildPage),
+            header.UsableSpace);
+        var rowIds = ReadTableRowIds(pager, rootPage);
+        return new BoundedTableRootSeed(
+            RootPage: rootPage,
+            SourcePageCount: pager.CommittedPageCount,
+            RightMostLeafPage: root.Header.RightMostChildPage,
+            AppendedCell: SqliteTableLeafCell.Create(
+                rightLeaf.Cells[^1].Cell.RowId + 1,
+                DataRecord(),
+                header.UsableSpace),
+            RowCount: rowIds.Length);
+    }
+
+    private static SqliteBtreeSplitMutation PrepareTableInteriorRootPromotion(
+        SqlitePager pager,
+        BoundedTableRootSeed seed)
+        => new SqliteBtreeSplitWriter(
+                pager,
+                new SqliteAppendOnlyPageAllocator(pager.CommittedPageCount))
+            .PrepareTableInteriorRootRightmostLeafSplit(
+                seed.RootPage,
+                seed.AppendedCell,
+                CreateFinalPageOne(pager));
+
+    private static byte[] CreateFinalPageOne(SqlitePager pager)
+    {
+        var pageOne = pager.ReadCommittedPage(1);
+        var header = SqliteDatabaseHeader.Parse(pageOne);
+        var newChangeCounter = header.ChangeCounter + 1;
+        (header with
+        {
+            ChangeCounter = newChangeCounter,
+            DatabaseSizeInPages = checked(pager.CommittedPageCount + 3),
+            VersionValidFor = newChangeCounter,
+        }).WriteTo(pageOne);
+        return pageOne;
+    }
+
+    private static int FindMaximumTableInteriorChildCount(int pageSize, int usableSpace)
+    {
+        var childCount = 2;
+        while (true)
+        {
+            try
+            {
+                var builder = new SqliteTableInteriorPageBuilder(
+                    pageSize,
+                    usableSpace,
+                    checked(2U + (uint)childCount));
+                for (var childIndex = 0; childIndex < childCount - 1; childIndex++)
+                {
+                    builder.Append(SqliteTableInteriorCell.Create(
+                        checked(3U + (uint)childIndex),
+                        childIndex + 1));
+                }
+
+                _ = builder.Build();
+                childCount++;
+            }
+            catch (InvalidOperationException)
+            {
+                return childCount - 1;
+            }
+        }
+    }
+
+    private static bool CanBuildTableLeaf(
+        IEnumerable<SqliteTableLeafCell> cells,
+        int pageSize,
+        int usableSpace)
+    {
+        try
+        {
+            var builder = new SqliteTableLeafPageBuilder(pageSize, usableSpace);
+            foreach (var cell in cells)
+                builder.Append(cell);
+            _ = builder.Build();
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static byte[] BuildTableLeaf(
+        int pageSize,
+        int usableSpace,
+        IReadOnlyList<SqliteTableLeafCell> cells)
+    {
+        var builder = new SqliteTableLeafPageBuilder(pageSize, usableSpace);
+        foreach (var cell in cells)
+            builder.Append(cell);
+        return builder.Build();
+    }
+
+    private static void AssertPromotedTable(
+        SqlitePager pager,
+        uint rootPage,
+        int expectedRowCount)
+    {
+        ReadTableHeight(pager, rootPage).Should().Be(3);
+        ReadTableRowIds(pager, rootPage)
+            .Should()
+            .Equal(Enumerable.Range(1, expectedRowCount).Select(value => (long)value));
+    }
+
+    private static void AssertUnpromotedTable(
+        SqlitePager pager,
+        uint rootPage,
+        int expectedRowCount)
+    {
+        ReadTableHeight(pager, rootPage).Should().Be(2);
+        ReadTableRowIds(pager, rootPage)
+            .Should()
+            .Equal(Enumerable.Range(1, expectedRowCount).Select(value => (long)value));
+    }
+
+    private static int ReadTableHeight(SqlitePager pager, uint pageNumber)
+    {
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var page = pager.ReadCommittedPage(pageNumber);
+        return SqliteBtreePageHeader.Parse(page).PageType switch
+        {
+            SqliteBtreePageType.TableLeaf => 1,
+            SqliteBtreePageType.TableInterior => ReadTableInteriorHeight(
+                pager,
+                SqliteTableInteriorPageView.Parse(page, header.UsableSpace)),
+            var pageType => throw new InvalidDataException(
+                $"Expected a SQLite table b-tree page but found {pageType}."),
+        };
+    }
+
+    private static int ReadTableInteriorHeight(
+        SqlitePager pager,
+        SqliteTableInteriorPageView interior)
+    {
+        var childHeights = interior.Cells
+            .Select(cell => ReadTableHeight(pager, cell.Cell.LeftChildPage))
+            .Append(ReadTableHeight(pager, interior.Header.RightMostChildPage))
+            .ToArray();
+        childHeights.Should().OnlyContain(height => height == childHeights[0]);
+        return childHeights[0] + 1;
+    }
+
+    private static long[] ReadTableRowIds(SqlitePager pager, uint rootPage)
+    {
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var rowIds = new List<long>();
+        AppendTableRowIds(pager, rootPage, header.UsableSpace, rowIds);
+        return rowIds.ToArray();
+    }
+
+    private static void AppendTableRowIds(
+        SqlitePager pager,
+        uint pageNumber,
+        int usableSpace,
+        ICollection<long> rowIds)
+    {
+        var page = pager.ReadCommittedPage(pageNumber);
+        switch (SqliteBtreePageHeader.Parse(page).PageType)
+        {
+            case SqliteBtreePageType.TableLeaf:
+                foreach (var cell in SqliteTableLeafPageView.Parse(page, usableSpace).Cells)
+                    rowIds.Add(cell.Cell.RowId);
+                return;
+            case SqliteBtreePageType.TableInterior:
+            {
+                var interior = SqliteTableInteriorPageView.Parse(page, usableSpace);
+                foreach (var cell in interior.Cells)
+                    AppendTableRowIds(pager, cell.Cell.LeftChildPage, usableSpace, rowIds);
+                AppendTableRowIds(pager, interior.Header.RightMostChildPage, usableSpace, rowIds);
+                return;
+            }
+            default:
+                throw new InvalidDataException("Expected a SQLite table b-tree page.");
+        }
+    }
+
+    private static byte[] DataRecord()
+        => Record(SqlValue.Blob(Enumerable.Repeat((byte)0xA5, 72).ToArray()));
 
     private static void SeedTableRoot(SqlitePager pager, params long[] rowIds)
     {
@@ -294,7 +747,7 @@ public class SqliteBtreeSplitStorageTests
         transaction.Commit();
     }
 
-    private static long[] ReadTableRowIds(SqlitePager pager, uint pageNumber)
+    private static long[] ReadLeafRowIds(SqlitePager pager, uint pageNumber)
     {
         var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
         return SqliteTableLeafPageView.Parse(pager.ReadCommittedPage(pageNumber), header.UsableSpace)
@@ -324,6 +777,32 @@ public class SqliteBtreeSplitStorageTests
             VersionValidFor = header.ChangeCounter,
         }).WriteTo(page);
     }
+
+    private static string CreateDatabasePath(string name)
+    {
+        var directory = Path.Combine(
+            AppContext.BaseDirectory,
+            "sqlite-btree-split-storage-tests");
+        Directory.CreateDirectory(directory);
+        return Path.Combine(directory, $"{name}-{Guid.NewGuid():N}.db");
+    }
+
+    private static void DeleteDatabase(string path)
+    {
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+        {
+            var candidate = path + suffix;
+            if (File.Exists(candidate))
+                File.Delete(candidate);
+        }
+    }
+
+    private sealed record BoundedTableRootSeed(
+        uint RootPage,
+        uint SourcePageCount,
+        uint RightMostLeafPage,
+        SqliteTableLeafCell AppendedCell,
+        int RowCount);
 
     private static byte[] Record(params SqlValue[] values) => SqliteRecordCodec.Encode(values);
 }

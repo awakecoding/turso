@@ -1,5 +1,4 @@
-﻿using System.Globalization;
-using Turso.Raw.Public.Value;
+using System.Globalization;
 using ManagedEncryptionOptions = Turso.Core.Storage.TursoEncryptionOptions;
 
 namespace Turso;
@@ -39,7 +38,11 @@ public class TursoConnectionOptions
 
     public bool? Tls => _builder.Tls;
 
-    public TursoLocalProvider LocalProvider => _builder.LocalProvider;
+    public TursoLocalProvider LocalProvider => _builder.IsLocalProviderConfigured
+        ? _builder.LocalProvider
+        : IsRemote
+            ? TursoLocalProvider.Native
+            : TursoLocalProvider.Managed;
 
     public bool IsRemote => IsRemoteDataSource(DataSource);
 
