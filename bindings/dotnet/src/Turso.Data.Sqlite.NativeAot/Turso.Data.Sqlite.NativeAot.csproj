@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net8.0</TargetFrameworks>
+    <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
@@ -16,7 +16,6 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <IncludeBuildOutput>false</IncludeBuildOutput>
-    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
     <RequireNativeAssetsForPack>true</RequireNativeAssetsForPack>
   </PropertyGroup>
 
@@ -38,7 +37,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Turso.Data.Native\Turso.Data.Native.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
+    <PackageReference Include="Turso.Data.Sqlite" Version="$(PackageVersion)" />
     <None Include="..\..\Readme.md" Pack="true" PackagePath="README.md" />
+    <None Include="..\Turso.Data.Native\bin\$(Configuration)\$(TargetFramework)\Turso.Data.Native.dll"
+          Pack="true"
+          PackagePath="lib\$(TargetFramework)\Turso.Data.Native.dll" />
   </ItemGroup>
 
   <ItemGroup>
@@ -70,9 +75,12 @@
            Text="NativeAotRid is required when packing Turso.Data.Sqlite.NativeAot." />
     <Error Condition="'$(NativeAotTarget)' == ''"
            Text="Unsupported NativeAotRid '$(NativeAotRid)'." />
+    <Error Condition="!Exists('..\Turso.Data.Native\bin\$(Configuration)\$(TargetFramework)\Turso.Data.Native.dll')"
+           Text="Missing the static NativeAOT provider assembly. Build Turso.Data.Native before packing $(PackageId)." />
     <Error Condition="'$(_NativeAotLibraryPath)' == '' or !Exists('$(_NativeAotLibraryPath)')"
            Text="Missing $(NativeAotRid) static native asset. Build $(NativeAotLibraryFile) before packing $(PackageId)." />
     <Error Condition="('$(NativeAotRid)' == 'win-x64' or '$(NativeAotRid)' == 'win-arm64') and '@(_NativeAotWindowsDependencies)' == ''"
            Text="Missing $(NativeAotRid) static native dependency assets. Collect windows*.lib before packing $(PackageId)." />
   </Target>
+
 </Project>

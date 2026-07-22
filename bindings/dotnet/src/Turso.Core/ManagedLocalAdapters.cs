@@ -394,6 +394,21 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         return GetConnection().Prepare(sql);
     }
 
+    internal IDisposable OpenBlobMutationLease(string tableName, long rowId)
+    {
+        return GetConnection().OpenBlobMutationLease(tableName, rowId);
+    }
+
+    internal long GetBlobMutationGeneration(string tableName, long rowId)
+    {
+        return GetConnection().GetBlobMutationGeneration(tableName, rowId);
+    }
+
+    internal bool HasUpdateTrigger(string tableName)
+    {
+        return GetConnection().HasUpdateTrigger(tableName);
+    }
+
     private EmbeddedConnection GetConnection()
     {
         lock (_gate)
@@ -598,12 +613,19 @@ internal static class ManagedSnapshot
     {
         EnsureEmpty(destination);
         var sourceTransactionStarted = false;
+        var destinationTransactionStarted = false;
+        var destinationForeignKeysDisabled = false;
         try
         {
             Execute(source, "BEGIN;");
             sourceTransactionStarted = true;
             var schema = ReadSchema(source);
-            var destinationTransactionStarted = false;
+            if (ForeignKeysEnabled(destination))
+            {
+                Execute(destination, "PRAGMA foreign_keys = OFF;");
+                destinationForeignKeysDisabled = !ForeignKeysEnabled(destination);
+            }
+
             try
             {
                 Execute(destination, "BEGIN;");
@@ -627,12 +649,18 @@ internal static class ManagedSnapshot
             catch
             {
                 if (destinationTransactionStarted)
+                {
                     Execute(destination, "ROLLBACK;");
+                    destinationTransactionStarted = false;
+                }
+
                 throw;
             }
         }
         finally
         {
+            if (destinationForeignKeysDisabled && !destinationTransactionStarted)
+                Execute(destination, "PRAGMA foreign_keys = ON;");
             if (sourceTransactionStarted)
                 Execute(source, "ROLLBACK;");
         }
@@ -831,6 +859,15 @@ internal static class ManagedSnapshot
         while (statement.Step() == StatementStepResult.Row)
         {
         }
+    }
+
+    private static bool ForeignKeysEnabled(IManagedConnectionAdapter connection)
+    {
+        using var statement = connection.Prepare("PRAGMA foreign_keys;");
+        if (statement.Step() != StatementStepResult.Row)
+            throw new InvalidOperationException("PRAGMA foreign_keys did not return a value.");
+
+        return statement.GetValue(0).AsInteger() != 0;
     }
 
     private static string QuoteIdentifier(string identifier)

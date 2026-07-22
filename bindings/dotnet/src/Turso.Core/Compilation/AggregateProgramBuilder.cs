@@ -76,6 +76,16 @@ public sealed record AggregateFunctionSpec(VdbeAggregate Aggregate, IReadOnlyLis
 }
 
 /// <summary>
+/// A post-aggregation filter evaluated from a materialized tuple of group-key, aggregate, or
+/// constant values. It models <c>HAVING</c>: every accumulator is finalized before the predicate
+/// runs, and a false predicate skips only that result row.
+/// </summary>
+public sealed record AggregateHavingFilter(
+    IReadOnlyList<AggregateOutput> Inputs,
+    VdbeRowPredicate Predicate,
+    string Description);
+
+/// <summary>
 /// Lowers whole-table (scalar) and <c>GROUP BY</c> aggregations into runnable
 /// <see cref="VdbeProgram"/>s built from the aggregate opcode family (<c>AggReset</c>,
 /// <c>AggStep</c>, <c>AggFinalize</c>) plus, for grouping, the sorter opcodes and
@@ -108,6 +118,7 @@ public static class AggregateProgramBuilder
     ///   closeAddr    CloseCursor
     ///                AggFinalize (per accumulator) -> aggOut
     ///                Copy/LoadConstant per output register
+    ///                [Copy HAVING inputs; FilterRegisters -> Halt]
     ///                ResultRow
     ///                Halt
     /// </code>
@@ -117,7 +128,8 @@ public static class AggregateProgramBuilder
         int tableColumnCount,
         IReadOnlyList<AggregateFunctionSpec> aggregates,
         IReadOnlyList<AggregateOutput> outputs,
-        VdbeRowPredicate? predicate = null)
+        VdbeRowPredicate? predicate = null,
+        AggregateHavingFilter? having = null)
     {
         ValidateCommon(tableName, tableColumnCount, aggregates, outputs);
         foreach (var output in outputs)
@@ -132,11 +144,14 @@ public static class AggregateProgramBuilder
             ValidateAggregateOutput(output, aggregates.Count, groupKeyCount: 0);
         }
 
+        ValidateHaving(having, aggregates.Count, groupKeyCount: 0);
+
         var argOffsets = ComputeArgOffsets(aggregates, out var totalArgs);
         var argBase = 0;
         var aggOutBase = totalArgs;
         var outBase = totalArgs + aggregates.Count;
-        var registerCount = totalArgs + aggregates.Count + outputs.Count;
+        var havingBase = outBase + outputs.Count;
+        var registerCount = havingBase + (having?.Inputs.Count ?? 0);
 
         var cursor = new Cursor(0);
         var ins = new List<VdbeInstruction>
@@ -165,7 +180,7 @@ public static class AggregateProgramBuilder
 
         var closeAddr = ins.Count;
         ins.Add(new CloseCursorInstruction(cursor));
-        EmitFinalizeAndOutput(ins, aggregates, outputs, aggOutBase, outBase, savedKeyBase: 0);
+        EmitFinalizeAndOutput(ins, aggregates, outputs, aggOutBase, outBase, savedKeyBase: 0, having, havingBase);
         ins.Add(new HaltInstruction());
 
         ins[rewindIndex] = new RewindCursorInstruction(cursor, new ProgramCounter(closeAddr));
@@ -203,7 +218,7 @@ public static class AggregateProgramBuilder
     ///                 Goto       -> finalizeLast        (single-row group)
     ///   drainLoop     SorterData; load current key
     ///                 SameGroup -> sameStep             (still the same group)
-    ///                 AggFinalize*; output; ResultRow; AggReset*; save new key
+    ///                 AggFinalize*; output; [FilterRegisters]; ResultRow; AggReset*; save new key
     ///   sameStep      AggStep*
     ///                 SorterNext -> drainLoop
     ///   finalizeLast  AggFinalize*; output; ResultRow  (last group)
@@ -218,7 +233,8 @@ public static class AggregateProgramBuilder
         IReadOnlyList<AggregateOutput> outputs,
         VdbeRowComparer groupOrderComparer,
         VdbeGroupComparer groupComparer,
-        VdbeRowPredicate? predicate = null)
+        VdbeRowPredicate? predicate = null,
+        AggregateHavingFilter? having = null)
     {
         ValidateCommon(tableName, tableColumnCount, aggregates, outputs);
         ArgumentNullException.ThrowIfNull(groupKeyColumns);
@@ -239,6 +255,7 @@ public static class AggregateProgramBuilder
 
         foreach (var output in outputs)
             ValidateAggregateOutput(output, aggregates.Count, groupKeyColumns.Count);
+        ValidateHaving(having, aggregates.Count, groupKeyColumns.Count);
 
         var group = groupKeyColumns.Count;
         var argOffsets = ComputeArgOffsets(aggregates, out var totalArgs);
@@ -248,7 +265,8 @@ public static class AggregateProgramBuilder
         var argBase = tableColumnCount + (2 * group);
         var aggOutBase = argBase + totalArgs;
         var outBase = aggOutBase + aggregates.Count;
-        var registerCount = outBase + outputs.Count;
+        var havingBase = outBase + outputs.Count;
+        var registerCount = havingBase + (having?.Inputs.Count ?? 0);
 
         var cursor = new Cursor(0);
         var sorter = new Sorter(0);
@@ -320,7 +338,7 @@ public static class AggregateProgramBuilder
         ins.Add(new SameGroupInstruction(currentKeyRange, savedKeyRange, groupComparer, new ProgramCounter(0)));
 
         // New group boundary: finalize and emit the previous group, then start a new one.
-        EmitFinalizeAndOutput(ins, aggregates, outputs, aggOutBase, outBase, savedKeyBase);
+        EmitFinalizeAndOutput(ins, aggregates, outputs, aggOutBase, outBase, savedKeyBase, having, havingBase);
         for (var i = 0; i < aggregates.Count; i++)
             ins.Add(new AggResetInstruction(new Accumulator(i)));
         for (var j = 0; j < group; j++)
@@ -331,7 +349,7 @@ public static class AggregateProgramBuilder
         ins.Add(new SorterNextInstruction(sorter, new ProgramCounter(drainLoop)));
 
         var finalizeLast = ins.Count;
-        EmitFinalizeAndOutput(ins, aggregates, outputs, aggOutBase, outBase, savedKeyBase);
+        EmitFinalizeAndOutput(ins, aggregates, outputs, aggOutBase, outBase, savedKeyBase, having, havingBase);
 
         var closeAddr = ins.Count;
         ins.Add(new CloseSorterInstruction(sorter));
@@ -407,7 +425,9 @@ public static class AggregateProgramBuilder
         IReadOnlyList<AggregateOutput> outputs,
         int aggOutBase,
         int outBase,
-        int savedKeyBase)
+        int savedKeyBase,
+        AggregateHavingFilter? having,
+        int havingBase)
     {
         for (var i = 0; i < aggregates.Count; i++)
         {
@@ -421,15 +441,44 @@ public static class AggregateProgramBuilder
         {
             var output = outputs[o];
             var destination = new Register(outBase + o);
-            ins.Add(output.Kind switch
+            ins.Add(EmitOutput(output, destination, aggOutBase, savedKeyBase));
+        }
+
+        if (having is not null)
+        {
+            for (var input = 0; input < having.Inputs.Count; input++)
             {
-                AggregateOutputKind.GroupKey => new CopyInstruction(new Register(savedKeyBase + output.Index), destination),
-                AggregateOutputKind.Aggregate => new CopyInstruction(new Register(aggOutBase + output.Index), destination),
-                _ => new LoadConstantInstruction(destination, output.Constant),
-            });
+                ins.Add(EmitOutput(
+                    having.Inputs[input],
+                    new Register(havingBase + input),
+                    aggOutBase,
+                    savedKeyBase));
+            }
+
+            var filterAddress = ins.Count;
+            ins.Add(new FilterRegistersInstruction(
+                new RegisterRange(new Register(havingBase), having.Inputs.Count),
+                having.Predicate,
+                new ProgramCounter(filterAddress + 2),
+                having.Description));
         }
 
         ins.Add(new ResultRowInstruction(new RegisterRange(new Register(outBase), outputs.Count)));
+    }
+
+    private static VdbeInstruction EmitOutput(
+        AggregateOutput output,
+        Register destination,
+        int aggOutBase,
+        int savedKeyBase)
+    {
+        return output.Kind switch
+        {
+            AggregateOutputKind.GroupKey => new CopyInstruction(new Register(savedKeyBase + output.Index), destination),
+            AggregateOutputKind.Aggregate => new CopyInstruction(new Register(aggOutBase + output.Index), destination),
+            AggregateOutputKind.Constant => new LoadConstantInstruction(destination, output.Constant),
+            _ => throw new ArgumentOutOfRangeException(nameof(output), "Unknown aggregate output kind."),
+        };
     }
 
     private static int[] ComputeArgOffsets(IReadOnlyList<AggregateFunctionSpec> aggregates, out int totalArgs)
@@ -497,5 +546,17 @@ public static class AggregateProgramBuilder
             default:
                 break;
         }
+    }
+
+    private static void ValidateHaving(AggregateHavingFilter? having, int aggregateCount, int groupKeyCount)
+    {
+        if (having is null)
+            return;
+
+        ArgumentNullException.ThrowIfNull(having.Inputs);
+        ArgumentNullException.ThrowIfNull(having.Predicate);
+        ArgumentNullException.ThrowIfNull(having.Description);
+        foreach (var input in having.Inputs)
+            ValidateAggregateOutput(input, aggregateCount, groupKeyCount);
     }
 }

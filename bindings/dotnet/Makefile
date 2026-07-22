@@ -28,7 +28,7 @@ MANAGED_PACKAGE_OUTPUT_ARG = $(if $(MANAGED_PACKAGE_OUTPUT),--output "$(MANAGED_
 MANAGED_PACKAGE_VERSION_ARG = $(if $(MANAGED_PACKAGE_VERSION),-p:PackageVersion=$(MANAGED_PACKAGE_VERSION))
 
 all:
-	echo "make [build|test|benchmark|build-production|restore-managed|build-managed|test-managed|pack-managed|validate-managed-package]"
+	echo "make [restore|build|test|pack|validate-managed-package|build-native|test-native|pack-native|pack-nativeaot-static|pack-release|benchmark]"
 
 build-rust-windows64:
 	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
@@ -116,8 +116,12 @@ build-dotnet:
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
 
-# These targets do not invoke Cargo or require native runtime assets.
-.PHONY: restore-managed build-managed test-managed pack-managed validate-managed-package pack-native
+# The default restore/build/test/pack path is managed-only: it neither invokes
+# Cargo nor requires rs_compiled native runtime assets. Native distribution
+# targets remain explicit below.
+.PHONY: restore build test pack restore-managed build-managed test-managed pack-managed validate-managed-package build-native test-native pack-native pack-nativeaot-static pack-release
+restore: restore-managed
+
 restore-managed:
 	dotnet restore ./src/Turso.Tests/Turso.Tests.csproj
 
@@ -127,16 +131,19 @@ build-managed: restore-managed
 	dotnet build --no-restore -c Debug ./src/Turso.Tests/Turso.Tests.csproj
 
 test-managed: build-managed
-	dotnet test --no-build --no-restore -c Debug --filter "FullyQualifiedName~Managed" ./src/Turso.Tests/Turso.Tests.csproj
+	dotnet test --no-build --no-restore -c Debug --filter "FullyQualifiedName~Managed&FullyQualifiedName!~Native&FullyQualifiedName!~MixedProviders" ./src/Turso.Tests/Turso.Tests.csproj
 
 pack-managed: restore-managed
 	rm -rf "$(MANAGED_PACKAGE_OUTPUT)"
 	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
 	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
+	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
 
 validate-managed-package:
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
-	dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --source "$(MANAGED_PACKAGE_OUTPUT)" -p:TursoPackageVersion=0.0.0-managed-local
+	rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj
+	dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --source "$(MANAGED_PACKAGE_OUTPUT)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local
 	dotnet run --no-restore --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
 
 pack-native:
@@ -148,12 +155,16 @@ pack-native:
 generate-platform-client:
 	dotnet build ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
 
-build: build-rust build-dotnet
+build: build-managed
 
 build-production:
-	$(MAKE) build RUST_RELEASE_OPT='--release' DOTNET_RELEASE_OPT='-c Release'
+	$(MAKE) build-native RUST_RELEASE_OPT='--release' DOTNET_RELEASE_OPT='-c Release'
 
-test: build
+build-native: build-rust build-dotnet
+
+test: test-managed
+
+test-native: build-native
 	dotnet test ./src/Turso.Tests/Turso.Tests.csproj
 
 benchmark: build-production
@@ -168,8 +179,9 @@ pack-nativeaot-static:
 	dotnet pack -c Release ./src/Turso.Data.Sqlite.NativeAot/Turso.Data.Sqlite.NativeAot.csproj -p:NativeAotRid=osx-arm64
 
 pack:
+	$(MAKE) pack-managed
+
+pack-release:
 	$(MAKE) pack-managed MANAGED_PACKAGE_OUTPUT= MANAGED_PACKAGE_VERSION=
 	$(MAKE) pack-native
 	$(MAKE) pack-nativeaot-static
-	dotnet pack -c Release ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
-	dotnet pack -c Release ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj

@@ -1,5 +1,9 @@
 using AwesomeAssertions;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Migrations.Operations;
 using System.Text.RegularExpressions;
 using Turso.Data.Sqlite;
 
@@ -308,6 +312,157 @@ public class TursoEfCoreTests
         File.Exists(shmPath).Should().BeFalse();
     }
 
+    [Test]
+    [NonParallelizable]
+    public async Task EnsureDeletedResolvesRelativeDataSourceFromAppBaseDirectory()
+    {
+        var fileName = $"ensure-deleted-{Guid.NewGuid():N}.db";
+        var databasePath = Path.Combine(AppContext.BaseDirectory, fileName);
+        var workingDirectory = Path.Combine(AppContext.BaseDirectory, $"ensure-deleted-{Guid.NewGuid():N}");
+        var siblingPath = Path.Combine(workingDirectory, fileName);
+        var originalWorkingDirectory = Directory.GetCurrentDirectory();
+        Directory.CreateDirectory(workingDirectory);
+        Directory.SetCurrentDirectory(workingDirectory);
+
+        try
+        {
+            await using var context = CreateManagedContext($"Data Source={fileName};Local Provider=Managed");
+            (await context.Database.EnsureCreatedAsync()).Should().BeTrue();
+            File.Exists(databasePath).Should().BeTrue();
+
+            await File.WriteAllTextAsync(siblingPath, "must not be deleted");
+
+            (await context.Database.EnsureDeletedAsync()).Should().BeTrue();
+
+            File.Exists(databasePath).Should().BeFalse();
+            File.ReadAllText(siblingPath).Should().Be("must not be deleted");
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(originalWorkingDirectory);
+            DeleteDatabaseFiles(databasePath);
+            if (Directory.Exists(workingDirectory))
+                Directory.Delete(workingDirectory, recursive: true);
+        }
+    }
+
+    [Test]
+    [TestCase(ReferentialAction.Cascade, ReferentialAction.NoAction)]
+    [TestCase(ReferentialAction.SetNull, ReferentialAction.NoAction)]
+    [TestCase(ReferentialAction.NoAction, ReferentialAction.Cascade)]
+    public void ManagedMigrationsRejectUnsupportedReferentialActions(
+        ReferentialAction onDelete,
+        ReferentialAction onUpdate)
+    {
+        using var context = CreateManagedContext("Data Source=:memory:;Local Provider=Managed");
+        var operation = CreateTableWithForeignKey(onDelete, onUpdate);
+
+        var generate = () => context.GetService<IMigrationsSqlGenerator>().Generate([operation]);
+
+        generate.Should().Throw<NotSupportedException>()
+            .WithMessage($"*ON DELETE {onDelete}*ON UPDATE {onUpdate}*");
+    }
+
+    [Test]
+    public void ManagedMigrationsRejectUnsupportedReferentialActionsDuringTableRebuild()
+    {
+        var options = new DbContextOptionsBuilder<CascadeContext>()
+            .UseTurso("Data Source=:memory:;Local Provider=Managed")
+            .Options;
+        using var context = new CascadeContext(options);
+        var operation = new AlterColumnOperation
+        {
+            Table = "Children",
+            Name = "ParentId",
+            ClrType = typeof(long),
+            ColumnType = "INTEGER",
+            IsNullable = false,
+            OldColumn = new AddColumnOperation
+            {
+                Table = "Children",
+                Name = "ParentId",
+                ClrType = typeof(long),
+                ColumnType = "INTEGER",
+                IsNullable = false
+            }
+        };
+
+        var model = context.GetService<IDesignTimeModel>().Model;
+        var generate = () => context.GetService<IMigrationsSqlGenerator>().Generate([operation], model);
+
+        generate.Should().Throw<NotSupportedException>()
+            .WithMessage("*ON DELETE Cascade*ON UPDATE NoAction*");
+    }
+
+    [Test]
+    public void NativeMigrationsKeepSupportedReferentialActions()
+    {
+        using var context = CreateContext("Data Source=:memory:;Local Provider=Native");
+        var operation = CreateTableWithForeignKey(ReferentialAction.Cascade, ReferentialAction.Cascade);
+
+        var commands = context.GetService<IMigrationsSqlGenerator>().Generate([operation]);
+        var sql = string.Concat(commands.Select(command => command.CommandText));
+
+        sql.Should().Contain("ON UPDATE CASCADE ON DELETE CASCADE");
+    }
+
+    [Test]
+    public async Task ManagedEnsureCreatedRejectsCascadeBeforeSchemaMutation()
+    {
+        using var database = TemporaryDatabase.Create();
+        var options = new DbContextOptionsBuilder<CascadeContext>()
+            .UseTurso(database.ConnectionString + ";Local Provider=Managed")
+            .Options;
+        await using var context = new CascadeContext(options);
+
+        var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
+
+        await ensureCreated.Should().ThrowAsync<NotSupportedException>();
+
+        await using var connection = new SqliteConnection(database.ConnectionString + ";Local Provider=Managed");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table';";
+
+        (await command.ExecuteScalarAsync()).Should().Be(0L);
+    }
+
+    [Test]
+    public async Task EmptyDecimalSumReturnsZeroForManagedProvider()
+    {
+        using var database = TemporaryDatabase.Create();
+        await using var context = CreateContext(
+            database.ConnectionString + ";Local Provider=Managed");
+        await context.Database.EnsureCreatedAsync();
+
+        (await context.Orders.SumAsync(order => order.Total)).Should().Be(0m);
+    }
+
+    [Test]
+    public async Task EmptyDecimalSumReturnsZeroForNativeProvider()
+    {
+        using var database = TemporaryDatabase.Create();
+        NativeProviderTestFixture.EnsureRegistered();
+
+        await using var context = CreateContext(database.ConnectionString + ";Local Provider=Native");
+        await context.Database.EnsureCreatedAsync();
+
+        (await context.Orders.SumAsync(order => order.Total)).Should().Be(0m);
+    }
+
+    [Test]
+    public void NativeDecimalSumKeepsEmptySetCoalesce()
+    {
+        using var context = CreateContext("Data Source=:memory:;Local Provider=Native");
+
+        var sql = context.Orders
+            .GroupBy(_ => 1)
+            .Select(group => group.Sum(order => order.Total))
+            .ToQueryString();
+
+        sql.Should().Contain("COALESCE(ef_sum");
+    }
+
     private static TestDbContext CreateContext(string connectionString)
     {
         var options = new DbContextOptionsBuilder<TestDbContext>()
@@ -353,6 +508,43 @@ public class TursoEfCoreTests
         await context.SaveChangesAsync();
     }
 
+    private static void DeleteDatabaseFiles(string path)
+    {
+        File.Delete(path);
+        File.Delete(path + "-wal");
+        File.Delete(path + "-shm");
+    }
+
+    private static CreateTableOperation CreateTableWithForeignKey(
+        ReferentialAction onDelete,
+        ReferentialAction onUpdate)
+    {
+        var operation = new CreateTableOperation
+        {
+            Name = "Children"
+        };
+        operation.Columns.Add(new AddColumnOperation
+        {
+            Table = "Children",
+            Name = "ParentId",
+            ClrType = typeof(long),
+            ColumnType = "INTEGER",
+            IsNullable = false
+        });
+        operation.ForeignKeys.Add(new AddForeignKeyOperation
+        {
+            Name = "FK_Children_Parents",
+            Table = "Children",
+            Columns = ["ParentId"],
+            PrincipalTable = "Parents",
+            PrincipalColumns = ["Id"],
+            OnDelete = onDelete,
+            OnUpdate = onUpdate
+        });
+
+        return operation;
+    }
+
     private sealed class TestDbContext(DbContextOptions<TestDbContext> options) : DbContext(options)
     {
         public DbSet<Customer> Customers => Set<Customer>();
@@ -369,7 +561,8 @@ public class TursoEfCoreTests
                 entity.Property(customer => customer.Email).IsRequired();
                 entity.HasMany(customer => customer.Orders)
                     .WithOne(order => order.Customer)
-                    .HasForeignKey(order => order.CustomerId);
+                    .HasForeignKey(order => order.CustomerId)
+                    .OnDelete(DeleteBehavior.NoAction);
             });
 
             modelBuilder.Entity<Order>(entity =>
@@ -397,6 +590,38 @@ public class TursoEfCoreTests
         public long Id { get; set; }
 
         public string Name { get; set; } = "";
+    }
+
+    private sealed class CascadeContext(DbContextOptions<CascadeContext> options) : DbContext(options)
+    {
+        public DbSet<CascadeParent> Parents => Set<CascadeParent>();
+
+        public DbSet<CascadeChild> Children => Set<CascadeChild>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<CascadeParent>()
+                .HasMany(parent => parent.Children)
+                .WithOne(child => child.Parent)
+                .HasForeignKey(child => child.ParentId)
+                .OnDelete(DeleteBehavior.Cascade);
+        }
+    }
+
+    private sealed class CascadeParent
+    {
+        public long Id { get; set; }
+
+        public List<CascadeChild> Children { get; set; } = [];
+    }
+
+    private sealed class CascadeChild
+    {
+        public long Id { get; set; }
+
+        public long ParentId { get; set; }
+
+        public CascadeParent Parent { get; set; } = null!;
     }
 
     private sealed class Customer

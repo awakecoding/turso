@@ -26,22 +26,26 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
     private const int SqliteAbort = 4;
 
     private readonly object _gate = new();
-    private readonly IManagedConnectionAdapter _connection;
+    private readonly ManagedConnectionAdapter _connection;
     private readonly string _tableName;
     private readonly string _columnName;
     private readonly long _rowId;
     private readonly bool _readOnly;
     private byte[] _value;
     private SqlValue[] _rowSnapshot;
+    private readonly IDisposable _mutationLease;
+    private long _mutationGeneration;
     private bool _disposed;
 
     private ManagedIncrementalBlobAdapter(
-        IManagedConnectionAdapter connection,
+        ManagedConnectionAdapter connection,
         string tableName,
         string columnName,
         long rowId,
         bool readOnly,
-        BlobSnapshot snapshot)
+        BlobSnapshot snapshot,
+        IDisposable mutationLease,
+        long mutationGeneration)
     {
         _connection = connection;
         _tableName = tableName;
@@ -50,10 +54,12 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
         _readOnly = readOnly;
         _value = snapshot.Value;
         _rowSnapshot = snapshot.Row;
+        _mutationLease = mutationLease;
+        _mutationGeneration = mutationGeneration;
     }
 
     public static IManagedIncrementalBlobAdapter Open(
-        IManagedConnectionAdapter connection,
+        ManagedConnectionAdapter connection,
         string databaseName,
         string tableName,
         string columnName,
@@ -69,14 +75,30 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             throw new ManagedBlobException(SqliteError, $"unknown database: {databaseName}");
 
         EnsureTable(connection, tableName);
-        var snapshot = ReadSnapshot(connection, tableName, columnName, rowId, missingIsAbort: false);
-        return new ManagedIncrementalBlobAdapter(
-            connection,
-            tableName,
-            columnName,
-            rowId,
-            readOnly,
-            snapshot);
+        var mutationLease = connection.OpenBlobMutationLease(tableName, rowId);
+        try
+        {
+            var generationBeforeRead = connection.GetBlobMutationGeneration(tableName, rowId);
+            var snapshot = ReadSnapshot(connection, tableName, columnName, rowId, missingIsAbort: false);
+            var generationAfterRead = connection.GetBlobMutationGeneration(tableName, rowId);
+            if (generationBeforeRead != generationAfterRead)
+                throw Aborted();
+
+            return new ManagedIncrementalBlobAdapter(
+                connection,
+                tableName,
+                columnName,
+                rowId,
+                readOnly,
+                snapshot,
+                mutationLease,
+                generationAfterRead);
+        }
+        catch
+        {
+            mutationLease.Dispose();
+            throw;
+        }
     }
 
     public long Length
@@ -123,6 +145,14 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             if (source.IsEmpty)
                 return;
 
+            EnsureCurrent();
+            if (_connection.HasUpdateTrigger(_tableName))
+            {
+                throw new ManagedBlobException(
+                    SqliteError,
+                    "cannot write to an incremental blob on a table with UPDATE triggers");
+            }
+
             var updated = _value.ToArray();
             source.CopyTo(updated.AsSpan((int)offset, source.Length));
 
@@ -141,6 +171,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             var snapshot = ReadSnapshot(_connection, _tableName, _columnName, _rowId, missingIsAbort: true);
             _value = snapshot.Value;
             _rowSnapshot = snapshot.Row;
+            _mutationGeneration = _connection.GetBlobMutationGeneration(_tableName, _rowId);
         }
     }
 
@@ -153,14 +184,21 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
 
             _disposed = true;
             _value = [];
+            _mutationLease.Dispose();
         }
     }
 
     private void EnsureCurrent()
     {
+        var generationBeforeRead = _connection.GetBlobMutationGeneration(_tableName, _rowId);
         var snapshot = ReadSnapshot(_connection, _tableName, _columnName, _rowId, missingIsAbort: true);
-        if (!RowsEqual(snapshot.Row, _rowSnapshot))
+        var generationAfterRead = _connection.GetBlobMutationGeneration(_tableName, _rowId);
+        if (generationBeforeRead != generationAfterRead
+            || generationAfterRead != _mutationGeneration
+            || !RowsEqual(snapshot.Row, _rowSnapshot))
+        {
             throw Aborted();
+        }
     }
 
     private static BlobSnapshot ReadSnapshot(

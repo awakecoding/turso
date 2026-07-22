@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore.Sqlite.Storage.Internal;
 using Microsoft.EntityFrameworkCore.Storage;
 using TursoSqliteConnection = Turso.Data.Sqlite.SqliteConnection;
 using TursoSqliteConnectionStringBuilder = Turso.Data.Sqlite.SqliteConnectionStringBuilder;
+using TursoSqliteCacheMode = Turso.Data.Sqlite.SqliteCacheMode;
 using TursoSqliteException = Turso.Data.Sqlite.SqliteException;
 using TursoSqliteOpenMode = Turso.Data.Sqlite.SqliteOpenMode;
 
@@ -55,7 +56,8 @@ public class TursoSqliteDatabaseCreator(
 
         if ((!connectionOptions.IsLocalProviderConfigured
                 || connectionOptions.LocalProvider == Turso.TursoLocalProvider.Managed)
-            && File.Exists(connectionOptions.DataSource))
+            && !IsRemoteTursoUrl(connectionOptions.DataSource)
+            && File.Exists(ResolveDatabasePath(connectionOptions)))
         {
             return true;
         }
@@ -97,28 +99,18 @@ public class TursoSqliteDatabaseCreator(
     {
         var dbConnection = Dependencies.Connection.DbConnection;
         var wasOpen = dbConnection.State == ConnectionState.Open;
-        var path = dbConnection.DataSource;
         var connectionOptions = new TursoSqliteConnectionStringBuilder(connection.ConnectionString);
+        var path = wasOpen
+            ? dbConnection.DataSource
+            : ResolveDatabasePath(connectionOptions);
 
-        if (!wasOpen
-            && UsesManagedLocalProvider(connectionOptions)
-            && !IsRemoteTursoUrl(connectionOptions.DataSource)
-            && !string.IsNullOrEmpty(path)
-            && !path.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
-        {
-            TursoSqliteConnection.ClearAllPools();
-            File.Delete(path);
-            File.Delete(path + "-wal");
-            File.Delete(path + "-shm");
+        if (IsRemoteTursoUrl(connectionOptions.DataSource))
             return;
-        }
 
-        if (!wasOpen)
-            Dependencies.Connection.Open();
+        if (wasOpen)
+            Dependencies.Connection.Close();
 
-        Dependencies.Connection.Close();
-
-        if (!string.IsNullOrEmpty(path) && !path.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
+        if (!path.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
         {
             TursoSqliteConnection.ClearAllPools();
             File.Delete(path);
@@ -134,10 +126,6 @@ public class TursoSqliteDatabaseCreator(
             Dependencies.Connection.Open();
     }
 
-    private static bool UsesManagedLocalProvider(TursoSqliteConnectionStringBuilder connectionOptions)
-        => !connectionOptions.IsLocalProviderConfigured
-            || connectionOptions.LocalProvider == Turso.TursoLocalProvider.Managed;
-
     private static bool IsRemoteTursoUrl(string dataSource)
         => Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
             && (uri.Scheme.Equals("libsql", StringComparison.OrdinalIgnoreCase)
@@ -145,4 +133,67 @@ public class TursoSqliteDatabaseCreator(
                 || uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
                 || uri.Scheme.Equals("ws", StringComparison.OrdinalIgnoreCase)
                 || uri.Scheme.Equals("wss", StringComparison.OrdinalIgnoreCase));
+
+    private static string ResolveDatabasePath(TursoSqliteConnectionStringBuilder connectionOptions)
+    {
+        var dataSource = connectionOptions.DataSource;
+        if (string.IsNullOrEmpty(dataSource) || dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
+            return ":memory:";
+
+        if (connectionOptions.Mode == TursoSqliteOpenMode.Memory)
+        {
+            return connectionOptions.Cache == TursoSqliteCacheMode.Shared
+                ? GetSharedMemoryFile(dataSource)
+                : ":memory:";
+        }
+
+        if (dataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+            return ResolveUriDatabasePath(dataSource);
+
+        const string dataDirectory = "|DataDirectory|";
+        if (dataSource.StartsWith(dataDirectory, StringComparison.OrdinalIgnoreCase))
+        {
+            var baseDirectory = AppDomain.CurrentDomain.GetData("DataDirectory") as string
+                                ?? AppContext.BaseDirectory;
+            dataSource = Path.Combine(
+                baseDirectory,
+                dataSource[dataDirectory.Length..].TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        }
+
+        return Path.IsPathRooted(dataSource)
+            ? dataSource
+            : Path.Combine(AppContext.BaseDirectory, dataSource);
+    }
+
+    private static string ResolveUriDatabasePath(string dataSource)
+    {
+        var queryStart = dataSource.IndexOf('?', StringComparison.Ordinal);
+        var path = queryStart < 0 ? dataSource[5..] : dataSource[5..queryStart];
+        var query = queryStart < 0 ? string.Empty : dataSource[(queryStart + 1)..];
+        foreach (var part in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var pieces = part.Split('=', 2);
+            if (pieces[0].Equals("mode", StringComparison.OrdinalIgnoreCase)
+                && pieces.Length == 2
+                && pieces[1].Equals("memory", StringComparison.OrdinalIgnoreCase))
+            {
+                return ":memory:";
+            }
+        }
+
+        return Path.IsPathRooted(path)
+            ? path
+            : Path.Combine(AppContext.BaseDirectory, path);
+    }
+
+    private static string GetSharedMemoryFile(string dataSource)
+    {
+        var sanitized = string.Join(
+            "_",
+            dataSource.Split(Path.GetInvalidFileNameChars(), StringSplitOptions.RemoveEmptyEntries));
+        if (sanitized.Length == 0)
+            sanitized = Math.Abs(dataSource.GetHashCode(StringComparison.Ordinal)).ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        return Path.Combine(Path.GetTempPath(), "turso-dotnet-shared-" + sanitized + ".db");
+    }
 }

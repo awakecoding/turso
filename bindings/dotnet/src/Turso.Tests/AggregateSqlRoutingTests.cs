@@ -252,19 +252,67 @@ public class AggregateSqlRoutingTests
     }
 
     [Test]
-    public void HavingFallsBackToEvaluator()
+    public void GroupedAggregateHavingWithBoundedWindowRoutesThroughTheVdbe()
     {
         using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(k INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1), (1), (2);");
+        Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (2, 20), (1, 10), (2, 5), (1, 7), (3, 9);");
 
-        var rows = ReadRows(connection, "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) >= 2;");
+        const string sql =
+            "SELECT k AS group_key, count(*) AS n, sum(v) AS total FROM t " +
+            "GROUP BY k HAVING count(*) >= ?1 LIMIT ?2 OFFSET ?3;";
+        using var statement = connection.Prepare(sql);
+        statement.Bind(1, SqlValue.Integer(2));
+        statement.Bind(2, SqlValue.Integer(2));
+        statement.Bind(3, SqlValue.Integer(1));
+
+        statement.GetColumnName(0).Should().Be("group_key");
+        statement.GetColumnName(1).Should().Be("n");
+        statement.GetColumnName(2).Should().Be("total");
+        var initialRows = DrainRows(statement);
+        initialRows.Should().ContainSingle();
+        initialRows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2), SqlValue.Integer(17));
+
+        statement.Reset();
+        statement.Bind(1, SqlValue.Integer(1));
+        statement.Bind(2, SqlValue.Integer(3));
+        statement.Bind(3, SqlValue.Integer(0));
+        var reboundRows = DrainRows(statement);
+        reboundRows.Should().HaveCount(3);
+        reboundRows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2), SqlValue.Integer(25));
+        reboundRows[1].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2), SqlValue.Integer(17));
+        reboundRows[2].Should().Equal(SqlValue.Integer(3), SqlValue.Integer(1), SqlValue.Integer(9));
+
+        using var initialExplain = connection.Prepare("EXPLAIN " + sql);
+        initialExplain.Bind(1, SqlValue.Integer(2));
+        initialExplain.Bind(2, SqlValue.Integer(2));
+        initialExplain.Bind(3, SqlValue.Integer(1));
+        Opcodes(DrainRows(initialExplain))
+            .Should().Contain("AggFinalize").And.Contain("FilterRegisters")
+            .And.Contain("OffsetGate").And.Contain("LimitGate");
+
+        using var reboundExplain = connection.Prepare("EXPLAIN " + sql);
+        reboundExplain.Bind(1, SqlValue.Integer(1));
+        reboundExplain.Bind(2, SqlValue.Integer(3));
+        reboundExplain.Bind(3, SqlValue.Integer(0));
+        Opcodes(DrainRows(reboundExplain))
+            .Should().Contain("AggFinalize").And.Contain("FilterRegisters")
+            .And.Contain("LimitGate").And.NotContain("OffsetGate");
+    }
+
+    [Test]
+    public void AggregateHavingPreservesNullTruthSemantics()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, NULL), (1, NULL), (2, 4), (2, NULL);");
+
+        var rows = ReadRows(connection, "SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v) IS NULL;");
+
         rows.Should().ContainSingle();
-        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
-
-        // HAVING is a deliberate fallback boundary: EXPLAIN cannot describe an un-lowered plan.
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT k, count(*) FROM t GROUP BY k HAVING count(*) >= 2;"));
+        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Null);
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v) IS NULL;"))
+            .Should().Contain("FilterRegisters");
     }
 
     [Test]
@@ -274,11 +322,45 @@ public class AggregateSqlRoutingTests
         Execute(connection, "CREATE TABLE t(k INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1), (2), (2), (3), (3), (3);");
 
-        var rows = ReadRows(connection, "SELECT k, count(*) FROM t GROUP BY k ORDER BY count(*) DESC;");
+        var rows = ReadRows(connection, "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) >= 1 ORDER BY count(*) DESC;");
         rows.Select(row => row[0]).Should().Equal(SqlValue.Integer(3), SqlValue.Integer(2), SqlValue.Integer(1));
 
         Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT k, count(*) FROM t GROUP BY k ORDER BY count(*) DESC;"));
+            () => ReadRows(connection, "EXPLAIN SELECT k, count(*) FROM t GROUP BY k HAVING count(*) >= 1 ORDER BY count(*) DESC;"));
+    }
+
+    [Test]
+    public void HavingWithNonBareAggregateArgumentFallsBackAfterLowerableProjection()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 1), (1, 2), (2, 1);");
+
+        var rows = ReadRows(connection, "SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v + 1) >= 5;");
+
+        rows.Should().ContainSingle();
+        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(3));
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v + 1) >= 5;"));
+    }
+
+    [Test]
+    public void RejectedHavingErrorLeavesTheTransactionAvailableForRollback()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(k INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1);");
+        Execute(connection, "BEGIN;");
+        Execute(connection, "INSERT INTO t VALUES (2);");
+
+        var error = Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > missing;"))!;
+        error.Message.Should().Be("no such column: missing");
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "EXPLAIN SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > missing;"));
+
+        Execute(connection, "ROLLBACK;");
+        ReadRows(connection, "SELECT count(*) FROM t;")[0][0].Should().Be(SqlValue.Integer(1));
     }
 
     [Test]
@@ -357,6 +439,21 @@ public class AggregateSqlRoutingTests
         var rows = new List<(SqlValue, SqlValue, SqlValue)>();
         while (statement.Step() == StatementStepResult.Row)
             rows.Add((statement.GetValue(0), statement.GetValue(1), statement.GetValue(2)));
+
+        return rows;
+    }
+
+    private static List<SqlValue[]> DrainRows(EmbeddedStatement statement)
+    {
+        var rows = new List<SqlValue[]>();
+        while (statement.Step() == StatementStepResult.Row)
+        {
+            var values = new SqlValue[statement.GetColumnCount()];
+            for (var ordinal = 0; ordinal < values.Length; ordinal++)
+                values[ordinal] = statement.GetValue(ordinal);
+
+            rows.Add(values);
+        }
 
         return rows;
     }

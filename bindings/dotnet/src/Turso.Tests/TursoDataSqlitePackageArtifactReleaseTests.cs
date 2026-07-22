@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.Loader;
+using System.Text.Json;
+using System.Xml.Linq;
 using AwesomeAssertions;
 
 namespace Turso.Tests;
@@ -83,6 +85,68 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         }
     }
 
+    [Test]
+    public void NativeAotStaticPackageDeclaresManagedFacadeAndRestoresClosure()
+    {
+        var packageDirectory = Path.Combine(AppContext.BaseDirectory, $"turso-nativeaot-package-validation-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(packageDirectory);
+
+        try
+        {
+            var packageVersion = $"0.0.0-nativeaot-package-validation-{Guid.NewGuid():N}";
+            var sqliteProjectPath = FindProjectPath();
+            var projectDirectory = Path.GetDirectoryName(sqliteProjectPath)!;
+            var nativeAotProjectPath = Path.Combine(
+                projectDirectory,
+                "..",
+                "Turso.Data.Sqlite.NativeAot",
+                "Turso.Data.Sqlite.NativeAot.csproj");
+            var rawProjectPath = Path.Combine(projectDirectory, "..", "Turso.Raw", "Turso.Raw.csproj");
+
+            BuildForPackage(sqliteProjectPath, "net8.0");
+            BuildForPackage(rawProjectPath, "net8.0");
+            Pack(sqliteProjectPath, packageDirectory, packageVersion, "net8.0");
+            Pack(rawProjectPath, packageDirectory, packageVersion, "net8.0");
+            Restore(nativeAotProjectPath, packageDirectory, packageVersion);
+            BuildNativeAotPackage(nativeAotProjectPath, packageVersion);
+            PackNativeAotPackage(nativeAotProjectPath, packageDirectory, packageVersion);
+
+            var packagePath = Path.Combine(
+                packageDirectory,
+                $"Turso.Data.Sqlite.NativeAot.win-x64.{packageVersion}.nupkg");
+            File.Exists(packagePath).Should().BeTrue();
+
+            using (var archive = ZipFile.OpenRead(packagePath))
+            {
+                archive.Entries.Should().NotContain(entry =>
+                    entry.FullName.StartsWith("runtimes/", StringComparison.OrdinalIgnoreCase) ||
+                    entry.FullName.EndsWith("Turso.Raw.dll", StringComparison.OrdinalIgnoreCase),
+                    "the static NativeAOT package must not duplicate dynamic native assets");
+
+                var nuspecEntry = archive.Entries.Single(entry =>
+                    entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase));
+                using var nuspecStream = nuspecEntry.Open();
+                var nuspec = XDocument.Load(nuspecStream);
+                var dependencies = nuspec
+                    .Descendants()
+                    .Where(element => element.Name.LocalName == "dependency")
+                    .ToDictionary(
+                        element => element.Attribute("id")!.Value,
+                        element => element.Attribute("version")!.Value,
+                        StringComparer.Ordinal);
+
+                dependencies["Turso.Data.Sqlite"].Should().Be(packageVersion);
+                dependencies["Turso.Raw"].Should().Be(packageVersion);
+            }
+
+            RestoreNativeAotPackageConsumer(packageDirectory, packageVersion);
+        }
+        finally
+        {
+            Directory.Delete(packageDirectory, recursive: true);
+        }
+    }
+
     private static WeakReference LoadManagedConnection(string libraryDirectory)
     {
         var loadContext = new AssemblyLoadContext("turso-package-validation", isCollectible: true);
@@ -123,7 +187,11 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         Assert.That(loadContextReference.IsAlive, Is.False, "The package validation AssemblyLoadContext did not unload.");
     }
 
-    private static void Pack(string projectPath, string packageDirectory, string packageVersion)
+    private static void Pack(
+        string projectPath,
+        string packageDirectory,
+        string packageVersion,
+        string targetFrameworks = "net9.0")
     {
         using var process = new Process
         {
@@ -144,7 +212,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         process.StartInfo.ArgumentList.Add("--no-restore");
         process.StartInfo.ArgumentList.Add("--output");
         process.StartInfo.ArgumentList.Add(packageDirectory);
-        process.StartInfo.ArgumentList.Add("-p:TursoTargetFrameworks=net9.0");
+        process.StartInfo.ArgumentList.Add($"-p:TursoTargetFrameworks={targetFrameworks}");
         process.StartInfo.ArgumentList.Add($"-p:PackageVersion={packageVersion}");
 
         process.Start();
@@ -155,8 +223,33 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         Assert.That(process.ExitCode, Is.EqualTo(0), output.Result + Environment.NewLine + error.Result);
     }
 
-    private static void Restore(string projectPath)
-        => RunDotnet(Path.GetDirectoryName(projectPath)!, "restore", projectPath);
+    private static void BuildForPackage(string projectPath, string targetFrameworks)
+        => RunDotnet(
+            Path.GetDirectoryName(projectPath)!,
+            "build",
+            projectPath,
+            "--configuration",
+            "Debug",
+            "--no-restore",
+            $"-p:TursoTargetFrameworks={targetFrameworks}");
+
+    private static void Restore(
+        string projectPath,
+        string? packageSource = null,
+        string? packageVersion = null)
+    {
+        var arguments = new List<string> { "restore", projectPath };
+        if (packageSource is not null)
+        {
+            arguments.Add("--source");
+            arguments.Add(packageSource);
+        }
+
+        if (packageVersion is not null)
+            arguments.Add($"-p:PackageVersion={packageVersion}");
+
+        RunDotnet(Path.GetDirectoryName(projectPath)!, arguments.ToArray());
+    }
 
     private static void BuildNativeCompanion(string projectPath)
         => RunDotnet(
@@ -168,6 +261,36 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             "--no-restore",
             "--no-dependencies",
             "-p:TursoTargetFrameworks=net9.0");
+
+    private static void BuildNativeAotPackage(string projectPath, string packageVersion)
+        => RunDotnet(
+            Path.GetDirectoryName(projectPath)!,
+            "build",
+            projectPath,
+            "--configuration",
+            "Debug",
+            "--no-restore",
+            "-p:NativeAotRid=win-x64",
+            "-p:RequireNativeAssetsForPack=false",
+            $"-p:PackageVersion={packageVersion}");
+
+    private static void PackNativeAotPackage(
+        string projectPath,
+        string packageDirectory,
+        string packageVersion)
+        => RunDotnet(
+            Path.GetDirectoryName(projectPath)!,
+            "pack",
+            projectPath,
+            "--configuration",
+            "Debug",
+            "--no-build",
+            "--no-restore",
+            "--output",
+            packageDirectory,
+            "-p:NativeAotRid=win-x64",
+            "-p:RequireNativeAssetsForPack=false",
+            $"-p:PackageVersion={packageVersion}");
 
     private static void RunNativePackageConsumer(string packageDirectory, string packageVersion)
     {
@@ -204,6 +327,41 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
         RunDotnet(consumerDirectory, "restore", projectPath, "--source", packageDirectory);
         RunDotnet(consumerDirectory, "run", "--no-restore", "--project", projectPath);
+    }
+
+    private static void RestoreNativeAotPackageConsumer(string packageDirectory, string packageVersion)
+    {
+        var consumerDirectory = Path.Combine(packageDirectory, "nativeaot-consumer");
+        Directory.CreateDirectory(consumerDirectory);
+        var projectPath = Path.Combine(consumerDirectory, "NativeAotConsumer.csproj");
+        File.WriteAllText(
+            projectPath,
+            $$"""
+              <Project Sdk="Microsoft.NET.Sdk">
+                <PropertyGroup>
+                  <TargetFramework>net8.0</TargetFramework>
+                </PropertyGroup>
+                <ItemGroup>
+                  <PackageReference Include="Turso.Data.Sqlite.NativeAot.win-x64" Version="{{packageVersion}}" />
+                </ItemGroup>
+              </Project>
+              """);
+
+        RunDotnet(consumerDirectory, "restore", projectPath, "--source", packageDirectory);
+
+        using var assetsStream = File.OpenRead(Path.Combine(consumerDirectory, "obj", "project.assets.json"));
+        using var assets = JsonDocument.Parse(assetsStream);
+        var libraries = assets.RootElement.GetProperty("libraries");
+        foreach (var packageId in new[]
+                 {
+                     "Turso.Data.Sqlite.NativeAot.win-x64",
+                     "Turso.Data.Sqlite",
+                     "Turso.Raw",
+                 })
+        {
+            libraries.TryGetProperty($"{packageId}/{packageVersion}", out _).Should().BeTrue(
+                $"{packageId} must be restored through the NativeAOT package closure");
+        }
     }
 
     private static void RunManagedPackageConsumer(string packageDirectory, string packageVersion)

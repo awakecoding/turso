@@ -55,6 +55,7 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
         using var destinationDatabase = ManagedDatabaseAdapter.Open(":memory:");
         using var source = sourceDatabase.Connect();
         using var destination = destinationDatabase.Connect();
+        Execute(destination, "PRAGMA foreign_keys = ON;");
         Execute(source, "CREATE TABLE copied_data(value TEXT);");
         Execute(source, "INSERT INTO copied_data VALUES ('source');");
         Execute(source, "CREATE TABLE inaccessible_rowid(rowid TEXT, _rowid_ TEXT, oid TEXT);");
@@ -65,10 +66,32 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
         exception!.Failure.Should().Be(ManagedSnapshotFailure.RowidNotAccessible);
         exception.ObjectName.Should().Be("inaccessible_rowid");
         Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+        Scalar(destination, "PRAGMA foreign_keys;").Should().Be(1);
         Execute(source, "BEGIN;");
         Execute(source, "ROLLBACK;");
         Execute(destination, "CREATE TABLE destination_still_usable(value TEXT);");
         Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(1);
+    }
+
+    [Test]
+    public void CoreSnapshotCopyRestoresDestinationForeignKeysForChildFirstSchemas()
+    {
+        using var sourceDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var destinationDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var source = sourceDatabase.Connect();
+        using var destination = destinationDatabase.Connect();
+        Execute(source, "CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));");
+        Execute(source, "CREATE TABLE parent(id INTEGER PRIMARY KEY);");
+        Execute(source, "INSERT INTO parent VALUES (1);");
+        Execute(source, "INSERT INTO child VALUES (1);");
+        Execute(destination, "PRAGMA foreign_keys = ON;");
+
+        source.CopySnapshotTo(destination);
+
+        Scalar(destination, "PRAGMA foreign_keys;").Should().Be(1);
+        Scalar(destination, "SELECT COUNT(*) FROM child;").Should().Be(1);
+        Action invalidChild = () => Execute(destination, "INSERT INTO child VALUES (2);");
+        invalidChild.Should().Throw<EmbeddedSqlException>().WithMessage("FOREIGN KEY constraint failed");
     }
 
     [Test]

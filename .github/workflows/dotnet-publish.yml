@@ -333,21 +333,86 @@ jobs:
             9.0.x
             10.0.x
 
-      - name: Pack and consume managed provider artifacts
+      - name: Validate managed provider artifacts
         run: make validate-managed-package
 
-      - name: Upload managed provider packages
+      # Validation packages deliberately use a local prerelease version so the
+      # sample cannot accidentally restore an already-published package. Build
+      # a second, release-versioned artifact for later publishing.
+      - name: Pack release-versioned managed provider artifacts
+        run: make pack-managed MANAGED_PACKAGE_OUTPUT=./artifacts/managed-release-packages
+
+      - name: Verify source-free managed packages and documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          managed_packages=(
+            artifacts/managed-release-packages/Turso.Data.Sqlite.*.nupkg
+            artifacts/managed-release-packages/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+          )
+          for package in "${managed_packages[@]}"; do
+            if [ ! -f "$package" ]; then
+              echo "No managed NuGet package found at $package"
+              exit 1
+            fi
+
+            case "$package" in
+              *Turso.Data.Sqlite.*)
+                required_files=(
+                  "README.md"
+                  "lib/net8.0/Turso.Data.Sqlite.dll"
+                  "lib/net9.0/Turso.Data.Sqlite.dll"
+                  "lib/net10.0/Turso.Data.Sqlite.dll"
+                )
+                ;;
+              *)
+                required_files=(
+                  "README.md"
+                  "lib/net8.0/Turso.EntityFrameworkCore.Sqlite.dll"
+                  "lib/net9.0/Turso.EntityFrameworkCore.Sqlite.dll"
+                  "lib/net10.0/Turso.EntityFrameworkCore.Sqlite.dll"
+                )
+                ;;
+            esac
+            for required_file in "${required_files[@]}"; do
+              if ! unzip -Z1 "$package" | grep -Fxq "$required_file"; then
+                echo "Missing $required_file in $package"
+                exit 1
+              fi
+            done
+
+            if unzip -Z1 "$package" | grep -Eq '(^runtimes/|^buildTransitive/|turso_sdk_kit|Turso\.Raw\.|\.(cs|fs|vb)$)'; then
+              echo "$package must remain source-free and managed-only"
+              exit 1
+            fi
+            if unzip -p "$package" '*.nuspec' | grep -Eq 'id="Turso\.(Raw|Data\.Sqlite\.Native)"'; then
+              echo "$package must not declare an optional-native package dependency"
+              exit 1
+            fi
+            if ! unzip -p "$package" README.md | grep -Fq 'managed-only'; then
+              echo "$package README must document the managed-only distribution"
+              exit 1
+            fi
+            if ! unzip -p "$package" README.md | grep -Fq 'Turso.Data.Sqlite.Native'; then
+              echo "$package README must document the optional native companion"
+              exit 1
+            fi
+          done
+
+      - name: Upload managed .NET packages
         uses: actions/upload-artifact@v6
         with:
-          name: managed-provider-packages
+          name: managed-nuget-packages
           path: |
-            ${{ env.working-directory }}/artifacts/managed-packages/Turso.Data.Sqlite.*.nupkg
-            ${{ env.working-directory }}/artifacts/managed-packages/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-release-packages/Turso.Data.Sqlite.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-release-packages/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-release-packages/Turso.Platform.Client.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-release-packages/Turso.Serverless.Client.*.nupkg
           if-no-files-found: error
           retention-days: 7
 
-  # Create NuGet packages; publish is opt-in
-  publish:
+  # Build only packages that intentionally contain or configure native assets.
+  package-native-companions:
     needs: [build-natives, package-ios-framework]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -377,43 +442,15 @@ jobs:
           path: ${{ env.working-directory }}/rs_compiled
           merge-multiple: true
 
-      - name: Build and pack 
-        run:
-          make pack
+      - name: Pack native companions
+        run: |
+          make pack-native
+          make pack-nativeaot-static
 
-      - name: Verify NuGet package contents
+      - name: Verify optional-native package contents
         shell: bash
         run: |
           set -euo pipefail
-          package=$(find src/Turso.Data.Sqlite/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.*.nupkg' | head -n 1)
-          if [ -z "$package" ]; then
-            echo "No Turso.Data.Sqlite NuGet package found"
-            exit 1
-          fi
-          unzip -Z1 "$package" > package-files.txt
-          required_files=(
-            "buildTransitive/Turso.Data.Sqlite.targets"
-            "lib/net8.0/Turso.Data.Sqlite.dll"
-            "lib/net9.0/Turso.Data.Sqlite.dll"
-            "lib/net10.0/Turso.Data.Sqlite.dll"
-          )
-          for required_file in "${required_files[@]}"; do
-            if ! grep -Fxq "$required_file" package-files.txt; then
-              echo "Missing $required_file in $package"
-              exit 1
-            fi
-          done
-
-          if grep -Eq '(^runtimes/|turso_sdk_kit|Turso\.Raw\.)' package-files.txt; then
-            echo "$package must remain managed-only"
-            exit 1
-          fi
-
-          if unzip -p "$package" '*.nuspec' | grep -Fq 'id="Turso.Raw"'; then
-            echo "$package must not declare a Turso.Raw package dependency"
-            exit 1
-          fi
-
           native_package=$(find src/Turso.Data.Native/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.Native.*.nupkg' | head -n 1)
           if [ -z "$native_package" ]; then
             echo "No Turso.Data.Sqlite.Native NuGet package found"
@@ -448,6 +485,12 @@ jobs:
             "lib/net8.0/Turso.Raw.dll"
             "lib/net9.0/Turso.Raw.dll"
             "lib/net10.0/Turso.Raw.dll"
+            "runtimes/win-x64/native/turso_sdk_kit.dll"
+            "runtimes/win-arm64/native/turso_sdk_kit.dll"
+            "runtimes/linux-x64/native/libturso_sdk_kit.so"
+            "runtimes/linux-arm64/native/libturso_sdk_kit.so"
+            "runtimes/osx-x64/native/libturso_sdk_kit.dylib"
+            "runtimes/osx-arm64/native/libturso_sdk_kit.dylib"
             "runtimes/android-arm64/native/libturso_sdk_kit.so"
             "runtimes/android-arm/native/libturso_sdk_kit.so"
             "runtimes/android-x64/native/libturso_sdk_kit.so"
@@ -502,6 +545,7 @@ jobs:
             required_static_files=(
               "buildTransitive/Turso.Data.Sqlite.NativeAot.${rid}.targets"
               "buildTransitive/native/${rid}/${library}"
+              "lib/net8.0/Turso.Data.Native.dll"
             )
             for required_static_file in "${required_static_files[@]}"; do
               if ! grep -Fxq "$required_static_file" "package-files-${rid}.txt"; then
@@ -509,6 +553,21 @@ jobs:
                 exit 1
               fi
             done
+
+            if ! unzip -p "$static_package" '*.nuspec' | grep -Fq 'id="Turso.Raw"'; then
+              echo "$static_package must resolve Turso.Raw for its carried native provider assembly"
+              exit 1
+            fi
+
+            if unzip -p "$static_package" '*.nuspec' | grep -Fq 'id="Turso.Data.Sqlite.Native"'; then
+              echo "$static_package must carry Turso.Data.Native rather than depend on the dynamic companion package"
+              exit 1
+            fi
+
+            if grep -Eq '^(runtimes/|lib/.*/Turso\.Raw\.dll)' "package-files-${rid}.txt"; then
+              echo "$static_package must not carry dynamic Raw runtime assets"
+              exit 1
+            fi
 
             if [[ "$rid" == win-* ]] && ! grep -Eq "^buildTransitive/native/${rid}/windows.*\\.lib$" "package-files-${rid}.txt"; then
               echo "Missing Windows static dependency libraries in $static_package"
@@ -520,32 +579,28 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          rm -rf artifacts/nuget-packages
-          mkdir -p artifacts/nuget-packages
+          rm -rf artifacts/native-nuget-packages
+          mkdir -p artifacts/native-nuget-packages
           files=(
-            src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
             src/Turso.Data.Native/bin/Release/Turso.Data.Sqlite.Native.*.nupkg
             src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg
-            src/Turso.EntityFrameworkCore.Sqlite/bin/Release/Turso.EntityFrameworkCore.Sqlite.*.nupkg
             src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
-            src/Turso.Platform.Client/bin/Release/Turso.Platform.Client.*.nupkg
-            src/Turso.Serverless.Client/bin/Release/Turso.Serverless.Client.*.nupkg
           )
           if [ ${#files[@]} -eq 0 ]; then
             echo "No NuGet packages found to upload"
             exit 1
           fi
-          cp "${files[@]}" artifacts/nuget-packages/
+          cp "${files[@]}" artifacts/native-nuget-packages/
 
-      - name: Upload NuGet packages to artifacts
+      - name: Upload optional-native packages
         uses: actions/upload-artifact@v6
         with:
-          name: nuget-packages
-          path: ${{ env.working-directory }}/artifacts/nuget-packages/*.nupkg
+          name: native-companion-nuget-packages
+          path: ${{ env.working-directory }}/artifacts/native-nuget-packages/*.nupkg
           retention-days: 7
 
   validate-nativeaot-static-package:
-    needs: publish
+    needs: [package-managed, package-native-companions]
     strategy:
       fail-fast: false
       matrix:
@@ -598,10 +653,16 @@ jobs:
             exit 1
           fi
 
-      - name: Download NuGet packages
+      - name: Download managed NuGet packages
         uses: actions/download-artifact@v7
         with:
-          name: nuget-packages
+          name: managed-nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Download native companion NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: native-companion-nuget-packages
           path: ${{ env.working-directory }}/artifacts/nuget-packages
 
       - name: Publish NativeAOT sample from package
@@ -624,6 +685,7 @@ jobs:
               <packageSource key="local">
                 <package pattern="Turso.Data.Sqlite" />
                 <package pattern="Turso.Data.Sqlite.NativeAot.*" />
+                <package pattern="Turso.Raw" />
               </packageSource>
               <packageSource key="nuget.org">
                 <package pattern="*" />
@@ -665,8 +727,8 @@ jobs:
             throw "Unexpected NativeAOT sample output: $output"
           }
 
-  publish-to-nuget:
-    needs: validate-nativeaot-static-package
+  publish-managed-to-nuget:
+    needs: [package-managed, validate-nativeaot-static-package]
     if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -679,15 +741,42 @@ jobs:
         with:
           dotnet-version: 9.0.x
 
-      - name: Download NuGet packages
+      - name: Download managed NuGet packages
         uses: actions/download-artifact@v7
         with:
-          name: nuget-packages
-          path: nuget-packages
+          name: managed-nuget-packages
+          path: managed-nuget-packages
 
       # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
-      - name: Publish to nuget
+      - name: Publish managed packages to nuget
         run: |
-          for package in nuget-packages/*.nupkg; do
+          for package in managed-nuget-packages/*.nupkg; do
+            dotnet nuget push "$package" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done
+
+  publish-native-companions-to-nuget:
+    needs: [publish-managed-to-nuget, validate-nativeaot-static-package]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run && needs.publish-managed-to-nuget.result == 'success' && needs.validate-nativeaot-static-package.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Download native companion NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: native-companion-nuget-packages
+          path: native-companion-nuget-packages
+
+      # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
+      - name: Publish native companion packages to nuget
+        run: |
+          for package in native-companion-nuget-packages/*.nupkg; do
             dotnet nuget push "$package" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
           done

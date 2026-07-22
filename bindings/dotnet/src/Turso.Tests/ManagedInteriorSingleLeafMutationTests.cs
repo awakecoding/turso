@@ -154,6 +154,199 @@ public sealed class ManagedInteriorSingleLeafMutationTests
         Integer(reopenedConnection, $"SELECT COUNT(*) FROM target WHERE id = {deletedId};").Should().Be(0);
     }
 
+    [Test]
+    public void TwoChildRootDeleteUnderMinimumPagePressureCollapsesAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("collapse-integrity");
+        try
+        {
+            CreateMinimumPageDatabase(PhysicalFileSystem.Instance, path);
+            CollapseTopology before;
+            long deletedId;
+            long expectedCount;
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                _ = SeedUntilTwoChildInteriorRoot(connection, PhysicalFileSystem.Instance, path);
+                before = ReadCollapseTopology(PhysicalFileSystem.Instance, path);
+                deletedId = Integer(connection, "SELECT max(id) FROM target;");
+                expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;") - 1;
+
+                Execute(connection, $"DELETE FROM target WHERE id = {deletedId};");
+            }
+
+            var after = ReadCollapseTopology(PhysicalFileSystem.Instance, path);
+            after.RootPage.Should().Be(before.RootPage);
+            after.PageCount.Should().Be(before.PageCount);
+            after.RootType.Should().Be(SqliteBtreePageType.TableLeaf);
+            after.Header.FreelistPageCount.Should().Be(2);
+            after.FreelistPages.Should().Equal(before.ChildPages.Order());
+            after.FreelistTrunkPages.Should().ContainSingle();
+            after.FreelistLeafPages.Should().ContainSingle();
+            using (var pager = SqlitePager.Open(
+                       PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                SqliteTableLeafPageView.Parse(
+                    pager.ReadCommittedPage(after.RootPage),
+                    after.Header.UsableSpace).Cells.Should().HaveCount(checked((int)expectedCount));
+                foreach (var leafPage in after.FreelistLeafPages)
+                    pager.ReadCommittedPage(leafPage).Should().OnlyContain(value => value == 0);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Integer(connection, $"SELECT COUNT(*) FROM target WHERE id = {deletedId};").Should().Be(0);
+                Integer(connection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
+            }
+
+            VerifyCollapsedWithSqlite(path, expectedCount, after.Header.FreelistPageCount);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void EveryInterruptedTwoChildRootCollapseFrameRecoversThePriorInteriorRoot()
+    {
+        for (var failedFrame = 1; failedFrame <= 4; failedFrame++)
+        {
+            var faults = new DeterministicFaultInjector();
+            var fileSystem = new InMemoryFileSystem(faults);
+            var path = $"two-child-root-collapse-wal-{failedFrame}.db";
+            CreateMinimumPageDatabase(fileSystem, path);
+            CollapseTopology before;
+            long deletedId;
+            long expectedCount;
+
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                _ = SeedUntilTwoChildInteriorRoot(connection, fileSystem, path);
+                before = ReadCollapseTopology(fileSystem, path);
+                deletedId = Integer(connection, "SELECT max(id) FROM target;");
+                expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;");
+
+                faults.FailOnOccurrence(
+                    FileSystemOperation.Write,
+                    faults.GetOperationCount(FileSystemOperation.Write) + failedFrame);
+                Assert.Throws<IOException>(() => Execute(connection, $"DELETE FROM target WHERE id = {deletedId};"));
+            }
+
+            using (var recovered = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = recovered.Connect())
+            {
+                Integer(connection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
+                Integer(connection, $"SELECT COUNT(*) FROM target WHERE id = {deletedId};").Should().Be(1);
+            }
+
+            var recoveredTopology = ReadCollapseTopology(fileSystem, path);
+            recoveredTopology.RootPage.Should().Be(before.RootPage);
+            recoveredTopology.PageCount.Should().Be(before.PageCount);
+            recoveredTopology.RootType.Should().Be(SqliteBtreePageType.TableInterior);
+            recoveredTopology.ChildPages.Should().Equal(before.ChildPages);
+            recoveredTopology.Header.FreelistPageCount.Should().Be(0);
+            recoveredTopology.FreelistPages.Should().BeEmpty();
+        }
+    }
+
+    [Test]
+    public void EncryptedTwoChildRootCollapseReopensReadOnly()
+    {
+        using var encryption = TursoEncryptionOptions.FromHex(
+            TursoEncryptionCipher.Aes256Gcm,
+            EncryptionKey);
+        var fileSystem = new TursoEncryptionFileSystem(new InMemoryFileSystem(), encryption);
+        const string path = "encrypted-two-child-root-collapse.db";
+        CreateMinimumPageDatabase(fileSystem, path);
+        long deletedId;
+        long expectedCount;
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            _ = SeedUntilTwoChildInteriorRoot(connection, fileSystem, path);
+            deletedId = Integer(connection, "SELECT max(id) FROM target;");
+            expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;") - 1;
+            Execute(connection, $"DELETE FROM target WHERE id = {deletedId};");
+        }
+
+        var collapsed = ReadCollapseTopology(fileSystem, path);
+        collapsed.RootType.Should().Be(SqliteBtreePageType.TableLeaf);
+        collapsed.Header.FreelistPageCount.Should().Be(2);
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true);
+        using var readOnlyConnection = reopened.Connect();
+        Integer(readOnlyConnection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
+        Integer(readOnlyConnection, $"SELECT COUNT(*) FROM target WHERE id = {deletedId};").Should().Be(0);
+    }
+
+    [Test]
+    public void TwoChildRootCollapseCannotBypassReadOnlyPager()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "two-child-root-collapse-read-only.db";
+        CreateMinimumPageDatabase(fileSystem, path);
+        long deletedId;
+        long expectedCount;
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            _ = SeedUntilTwoChildInteriorRoot(connection, fileSystem, path);
+            deletedId = Integer(connection, "SELECT max(id) FROM target;");
+            expectedCount = Integer(connection, "SELECT COUNT(*) FROM target;");
+        }
+
+        var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
+        using (var readOnly = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true))
+        using (var connection = readOnly.Connect())
+        {
+            Assert.Throws<EmbeddedSqlException>(() =>
+                Execute(connection, $"DELETE FROM target WHERE id = {deletedId};"));
+        }
+
+        faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBefore);
+        var unchanged = ReadCollapseTopology(fileSystem, path);
+        unchanged.RootType.Should().Be(SqliteBtreePageType.TableInterior);
+        unchanged.Header.FreelistPageCount.Should().Be(0);
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Integer(reopenedConnection, "SELECT COUNT(*) FROM target;").Should().Be(expectedCount);
+    }
+
+    [Test]
+    public void CorruptTwoChildRootCollapseChildIsRejectedBeforeAnyMutationWrites()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "two-child-root-collapse-corruption.db";
+        CreateMinimumPageDatabase(fileSystem, path);
+        Topology topology;
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+            topology = SeedUntilTwoChildInteriorRoot(connection, fileSystem, path);
+
+        using (var store = SqlitePageStore.Open(fileSystem, path))
+        {
+            var page = store.ReadPage(topology.ChildPages[0]);
+            page[0] = (byte)SqliteBtreePageType.IndexLeaf;
+            store.WritePage(topology.ChildPages[0], page);
+            store.Flush();
+        }
+
+        var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
+        Assert.Throws<EmbeddedSqlException>(() => EmbeddedDatabase.OpenFile(path, fileSystem));
+        faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBefore);
+    }
+
     private static Topology SeedUntilOneLevelInteriorRoot(
         EmbeddedConnection connection,
         IFileSystem fileSystem,
@@ -169,6 +362,27 @@ public sealed class ManagedInteriorSingleLeafMutationTests
         }
 
         return topology;
+    }
+
+    private static Topology SeedUntilTwoChildInteriorRoot(
+        EmbeddedConnection connection,
+        IFileSystem fileSystem,
+        string path)
+    {
+        Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, payload TEXT);");
+        for (var id = 1; id <= 128; id++)
+        {
+            Execute(connection, InsertStatement(id));
+            var topology = ReadTopology(fileSystem, path);
+            if (topology.RootType == SqliteBtreePageType.TableInterior
+                && topology.Separators.Count == 1
+                && topology.ChildPages.Count == 2)
+            {
+                return topology;
+            }
+        }
+
+        throw new InvalidOperationException("Unable to create a two-child table-interior root.");
     }
 
     private static void CreateMinimumPageDatabase(IFileSystem fileSystem, string path)
@@ -254,6 +468,71 @@ public sealed class ManagedInteriorSingleLeafMutationTests
         }
     }
 
+    private static CollapseTopology ReadCollapseTopology(IFileSystem fileSystem, string path)
+    {
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var rootPage = FindRootPage(pager, header);
+        var root = SqliteBtreePageHeader.Parse(pager.ReadCommittedPage(rootPage));
+        uint[] childPages;
+        if (root.PageType == SqliteBtreePageType.TableInterior)
+        {
+            var interior = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(rootPage),
+                header.UsableSpace);
+            childPages = interior.Cells
+                .Select(cell => cell.Cell.LeftChildPage)
+                .Append(interior.Header.RightMostChildPage)
+                .ToArray();
+        }
+        else
+        {
+            childPages = [];
+        }
+
+        var freelist = SqliteFreelist.Read(header, pager.CommittedPageCount, pager.ReadCommittedPage);
+        return new CollapseTopology(
+            pager.CommittedPageCount,
+            rootPage,
+            root.PageType,
+            header,
+            childPages,
+            freelist.PageNumbers.ToArray(),
+            freelist.TrunkPageNumbers.ToArray(),
+            freelist.LeafPageNumbers.ToArray());
+    }
+
+    private static void VerifyCollapsedWithSqlite(string path, long expectedCount, uint expectedFreelistCount)
+    {
+        var verificationPath = CreateDatabasePath("collapse-integrity");
+        try
+        {
+            File.Copy(path, verificationPath, overwrite: true);
+            using var sqlite = new MsData.SqliteConnection($"Data Source={verificationPath}");
+            sqlite.Open();
+            using (var integrity = sqlite.CreateCommand())
+            {
+                integrity.CommandText = "PRAGMA integrity_check;";
+                integrity.ExecuteScalar().Should().Be("ok");
+            }
+
+            using (var count = sqlite.CreateCommand())
+            {
+                count.CommandText = "SELECT COUNT(*) FROM target;";
+                Convert.ToInt64(count.ExecuteScalar()).Should().Be(expectedCount);
+            }
+
+            using var freelistCount = sqlite.CreateCommand();
+            freelistCount.CommandText = "PRAGMA freelist_count;";
+            Convert.ToUInt32(freelistCount.ExecuteScalar()).Should().Be(expectedFreelistCount);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(verificationPath);
+        }
+    }
+
     private static string InsertStatement(int id)
         => $"INSERT INTO target VALUES ({id}, 'payload-{id:D3}-{new string('x', PayloadLength)}');";
 
@@ -305,4 +584,14 @@ public sealed class ManagedInteriorSingleLeafMutationTests
         SqliteBtreePageType RootType,
         IReadOnlyList<long> Separators,
         IReadOnlyList<uint> ChildPages);
+
+    private sealed record CollapseTopology(
+        uint PageCount,
+        uint RootPage,
+        SqliteBtreePageType RootType,
+        SqliteDatabaseHeader Header,
+        IReadOnlyList<uint> ChildPages,
+        IReadOnlyList<uint> FreelistPages,
+        IReadOnlyList<uint> FreelistTrunkPages,
+        IReadOnlyList<uint> FreelistLeafPages);
 }

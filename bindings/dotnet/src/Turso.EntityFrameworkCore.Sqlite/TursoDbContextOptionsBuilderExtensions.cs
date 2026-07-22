@@ -74,11 +74,12 @@ public static class TursoDbContextOptionsBuilderExtensions
             .ReplaceService<IRelationalDatabaseCreator, TursoSqliteDatabaseCreator>()
             .ReplaceService<IQuerySqlGeneratorFactory, TursoSqliteQuerySqlGeneratorFactory>()
             .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, TursoSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
-            .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, TursoSqliteParameterBasedSqlProcessorFactory>()
             .ReplaceService<IUpdateSqlGenerator, TursoSqliteUpdateSqlGenerator>();
 
         return usesManagedLocalProvider
-            ? configuredOptions.ReplaceService<IMigrationsSqlGenerator, TursoManagedSqliteMigrationsSqlGenerator>()
+            ? configuredOptions
+                .ReplaceService<IMigrationsSqlGenerator, TursoManagedSqliteMigrationsSqlGenerator>()
+                .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, TursoSqliteParameterBasedSqlProcessorFactory>()
             : configuredOptions;
     }
 

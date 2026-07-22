@@ -121,6 +121,42 @@ public class ManagedJsonConstructionMutationSliceTests
         select.GetValue(0).Should().Be(SqlValue.Text("\"[1,2]\""));
     }
 
+    [Test]
+    public void JsonSubtypeDoesNotCrossQueryMaterializationBoundaries()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        AssertText(
+            connection,
+            "SELECT json_array(value) FROM (SELECT json('[1,2]') AS value);",
+            "[\"[1,2]\"]");
+        AssertText(
+            connection,
+            "WITH boundary(value) AS (SELECT json('[1,2]')) SELECT json_array(value) FROM boundary;",
+            "[\"[1,2]\"]");
+
+        Execute(connection, "CREATE VIEW json_boundary AS SELECT json('[1,2]') AS value;");
+        AssertText(connection, "SELECT json_array(value) FROM json_boundary;", "[\"[1,2]\"]");
+        AssertText(
+            connection,
+            "SELECT json_array(value) FROM (SELECT json('[1,2]') AS value UNION ALL SELECT json('[3,4]'));",
+            "[\"[1,2]\"]",
+            "[\"[3,4]\"]");
+        AssertText(
+            connection,
+            """
+            WITH RECURSIVE boundary(value, depth) AS (
+                SELECT json('[1,2]'), 1
+                UNION ALL
+                SELECT value, depth + 1 FROM boundary WHERE depth < 2
+            )
+            SELECT json_array(value) FROM boundary ORDER BY depth;
+            """,
+            "[\"[1,2]\"]",
+            "[\"[1,2]\"]");
+    }
+
     private static SqlValue Scalar(string expression, params SqlValue[] parameters)
     {
         var database = new EmbeddedDatabase();
@@ -134,6 +170,22 @@ public class ManagedJsonConstructionMutationSliceTests
 
     private static void AssertText(string expression, string expected, params SqlValue[] parameters)
         => Scalar(expression, parameters).Should().Be(SqlValue.Text(expected), because: expression);
+
+    private static void AssertText(EmbeddedConnection connection, string sql, params string[] expected)
+    {
+        using var statement = connection.Prepare(sql);
+        var values = new List<SqlValue>();
+        while (statement.Step() == StatementStepResult.Row)
+            values.Add(statement.GetValue(0));
+
+        values.Should().Equal(expected.Select(SqlValue.Text), because: sql);
+    }
+
+    private static void Execute(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Done);
+    }
 
     private static void AssertInteger(string expression, long expected)
         => Scalar(expression).Should().Be(SqlValue.Integer(expected), because: expression);

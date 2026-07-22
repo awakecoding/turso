@@ -131,6 +131,97 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
         writeAttached.Should().Throw<EmbeddedSqlException>().WithMessage("attempt to write a readonly database");
     }
 
+    [Test]
+    public void DirectManagedAttachKeepsQueryOnlyDynamicAndSharesConnectionRegistries()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var main = EmbeddedDatabase.OpenFile("attach-runtime-main.db", fileSystem))
+        using (var connection = main.Connect())
+        {
+            connection.RegisterScalarFunction(
+                "managed_double",
+                1,
+                values => SqlValue.Integer(values[0].AsInteger() * 2));
+            connection.RegisterAggregateFunction(
+                "managed_product",
+                1,
+                SqlValue.Integer(1),
+                (aggregate, values) => SqlValue.Integer(aggregate.AsInteger() * values[0].AsInteger()),
+                aggregate => aggregate);
+            connection.RegisterCollation(
+                "managed_reverse",
+                (left, right) => string.CompareOrdinal(right, left));
+
+            Execute(connection, "PRAGMA query_only = ON;");
+            Execute(connection, "ATTACH DATABASE 'attach-runtime-existing.db' AS existing;");
+            var blocked = () => Execute(connection, "CREATE TABLE existing.items(value INTEGER);");
+            blocked.Should().Throw<EmbeddedSqlException>().WithMessage("attempt to write a readonly database");
+
+            Execute(connection, "PRAGMA query_only = OFF;");
+            Execute(connection, "CREATE TABLE existing.items(value INTEGER);");
+            Execute(connection, "INSERT INTO existing.items VALUES (1), (2), (3);");
+            Execute(connection, "CREATE TABLE existing.names(value TEXT);");
+            Execute(connection, "INSERT INTO existing.names VALUES ('a'), ('b'), ('c');");
+            AssertRows(
+                ReadRows(connection, "SELECT managed_double(value) FROM existing.items ORDER BY value;"),
+                [SqlValue.Integer(2)],
+                [SqlValue.Integer(4)],
+                [SqlValue.Integer(6)]);
+            ReadRows(connection, "SELECT managed_product(value) FROM existing.items;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(6));
+            AssertRows(
+                ReadRows(connection, "SELECT value FROM existing.names ORDER BY value COLLATE managed_reverse;"),
+                [SqlValue.Text("c")],
+                [SqlValue.Text("b")],
+                [SqlValue.Text("a")]);
+
+            connection.RegisterScalarFunction(
+                "managed_triple",
+                1,
+                values => SqlValue.Integer(values[0].AsInteger() * 3));
+            connection.RegisterCollation(
+                "managed_nocase_reverse",
+                (left, right) => string.CompareOrdinal(right, left));
+            AssertRows(
+                ReadRows(connection, "SELECT managed_triple(value) FROM existing.items ORDER BY value;"),
+                [SqlValue.Integer(3)],
+                [SqlValue.Integer(6)],
+                [SqlValue.Integer(9)]);
+            AssertRows(
+                ReadRows(connection, "SELECT value FROM existing.names ORDER BY value COLLATE managed_nocase_reverse;"),
+                [SqlValue.Text("c")],
+                [SqlValue.Text("b")],
+                [SqlValue.Text("a")]);
+
+            Execute(connection, "ATTACH DATABASE 'attach-runtime-future.db' AS future;");
+            Execute(connection, "CREATE TABLE future.items(value INTEGER);");
+            Execute(connection, "INSERT INTO future.items VALUES (1), (2);");
+            Execute(connection, "CREATE TABLE future.names(value TEXT);");
+            Execute(connection, "INSERT INTO future.names VALUES ('a'), ('b');");
+            AssertRows(
+                ReadRows(connection, "SELECT managed_double(value), managed_triple(value) FROM future.items ORDER BY value;"),
+                [SqlValue.Integer(2), SqlValue.Integer(3)],
+                [SqlValue.Integer(4), SqlValue.Integer(6)]);
+            ReadRows(connection, "SELECT managed_product(value) FROM future.items;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(2));
+            AssertRows(
+                ReadRows(connection, "SELECT value FROM future.names ORDER BY value COLLATE managed_nocase_reverse;"),
+                [SqlValue.Text("b")],
+                [SqlValue.Text("a")]);
+
+            Execute(connection, "DETACH existing;");
+            Execute(connection, "DETACH future;");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile("attach-runtime-existing.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        AssertRows(
+            ReadRows(reopenedConnection, "SELECT value FROM items ORDER BY value;"),
+            [SqlValue.Integer(1)],
+            [SqlValue.Integer(2)],
+            [SqlValue.Integer(3)]);
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);
@@ -150,5 +241,16 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
         }
 
         return rows;
+    }
+
+    private static void AssertRows(IReadOnlyList<SqlValue[]> actual, params SqlValue[][] expected)
+    {
+        actual.Count.Should().Be(expected.Length);
+        for (var rowIndex = 0; rowIndex < expected.Length; rowIndex++)
+        {
+            actual[rowIndex].Length.Should().Be(expected[rowIndex].Length);
+            for (var columnIndex = 0; columnIndex < expected[rowIndex].Length; columnIndex++)
+                actual[rowIndex][columnIndex].Should().Be(expected[rowIndex][columnIndex]);
+        }
     }
 }

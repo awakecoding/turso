@@ -47,18 +47,21 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
         IModel? model,
         MigrationCommandListBuilder builder)
     {
-        var onDelete = operation.OnDelete;
-        var onUpdate = operation.OnUpdate;
-        operation.OnDelete = ReferentialAction.NoAction;
-        operation.OnUpdate = ReferentialAction.NoAction;
-        try
+        ValidateReferentialActions(operation);
+        base.ForeignKeyConstraint(operation, model, builder);
+    }
+
+    private static void ValidateReferentialActions(AddForeignKeyOperation operation)
+    {
+        if (operation.OnDelete == ReferentialAction.NoAction
+            && operation.OnUpdate == ReferentialAction.NoAction)
         {
-            base.ForeignKeyConstraint(operation, model, builder);
+            return;
         }
-        finally
-        {
-            operation.OnDelete = onDelete;
-            operation.OnUpdate = onUpdate;
-        }
+
+        throw new NotSupportedException(
+            $"The managed local provider does not support foreign key referential actions for '{operation.Name}' " +
+            $"on '{operation.Table}' (ON DELETE {operation.OnDelete}, ON UPDATE {operation.OnUpdate}). " +
+            "Configure both actions as NoAction.");
     }
 }

@@ -455,6 +455,34 @@ public class AggregateProgramBuilderTests
     }
 
     [Test]
+    public void GroupedHavingFiltersFinalizedGroupsAndContinuesToTheNextGroup()
+    {
+        var program = AggregateProgramBuilder.BuildGrouped(
+            "t",
+            tableColumnCount: 2,
+            groupKeyColumns: [0],
+            aggregates: [CountStar()],
+            outputs: [AggregateOutput.ForGroupKey(0), AggregateOutput.ForAggregate(0)],
+            groupOrderComparer: AggregateTestSupport.OrderByColumns(0),
+            groupComparer: AggregateTestSupport.GroupKeysEqual(),
+            having: new AggregateHavingFilter(
+                [AggregateOutput.ForAggregate(0)],
+                values => values[0].AsInteger() >= 2,
+                "skip group with fewer than two rows"));
+
+        var filters = program.Instructions
+            .OfType<FilterRegistersInstruction>()
+            .ToArray();
+        filters.Should().HaveCount(2);
+        filters.Should().OnlyContain(filter => filter.Row.Count == 1);
+
+        var rows = Run(program, Rows([1, 10], [2, 20], [2, 30], [3, 40]));
+
+        rows.Should().ContainSingle();
+        rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2));
+    }
+
+    [Test]
     public void GroupedProgramReplaysAfterReset()
     {
         var program = BuildGroupedSum();

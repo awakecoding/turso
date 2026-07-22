@@ -12,7 +12,7 @@ dotnet add package Turso.Data.Sqlite
 
 Application code only needs to reference `Turso.Data.Sqlite`.
 
-The package targets `net8.0`, `net9.0`, and `net10.0`. It is managed-only: local connections use the managed provider by default and no Rust toolchain or native runtime asset is needed to restore, build, or run it.
+The package targets `net8.0`, `net9.0`, and `net10.0`. It is managed-only: local connections use the managed provider by default and no Rust toolchain or native runtime asset is needed to restore, build, pack, or run it. Its package contains no `runtimes/` assets, `Turso.Raw` dependency, or native build target.
 
 ## Dynamic native compatibility
 
@@ -25,7 +25,7 @@ Applications that intentionally select `Local Provider=Native` can reference the
 </ItemGroup>
 ```
 
-`Turso.Data.Sqlite.Native` activates the native provider and resolves its `Turso.Raw` runtime companion for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices. Remote Turso/libSQL connections use the managed HTTP client and do not require either native package.
+`Turso.Data.Sqlite.Native` activates the native provider and resolves its `Turso.Raw` runtime companion for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices. These are optional companion packages with their own native-asset validation; they are not restored or packed by the managed release path. Remote Turso/libSQL connections use the managed HTTP client and do not require either native package.
 
 ## NativeAOT static linking
 
@@ -55,6 +55,14 @@ dotnet publish -c Release -r win-x64
 ```
 
 Static native packages are published for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`. See `samples/NativeAot` for a complete executable sample.
+
+The RID-specific package carries the matching `Turso.Data.Native` provider assembly required by `Local Provider=Native` and resolves `Turso.Raw` for its bindings; do not add the dynamic companion separately. The static build target removes the dynamic runtime sidecar before publishing.
+
+## Maintainer packaging
+
+`make restore`, `make build`, `make test`, and `make pack` use the managed-only release path. `make validate-managed-package` additionally restores and runs the packaged provider from the source-free `ManagedPackageConsumer` sample.
+
+Native distribution is intentionally explicit: `make pack-native` creates the dynamic native companion packages after their runtime assets have been built, and `make pack-nativeaot-static` creates the RID-specific static-linking companions. `make pack-release` combines those optional companion steps with the managed packages for a full distribution cut.
 
 ## Getting started
 
@@ -167,7 +175,7 @@ Supported common connection string keywords include:
 | `Mode` | Parsed and preserved for compatibility. |
 | `Cache` | Parsed and preserved for compatibility. |
 | `Foreign Keys` | Parsed and preserved for compatibility. |
-| `Local Provider` | `Managed` is the default for local databases. Set `Native` only when `Turso.Data.Sqlite.Native` is referenced. |
+| `Local Provider` | `Managed` is the default for local databases. Set `Native` when `Turso.Data.Sqlite.Native` or a RID-specific `Turso.Data.Sqlite.NativeAot.*` companion is referenced. |
 | `Recursive Triggers` | Parsed and preserved for compatibility. |
 | `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
 | `Pooling` | Parsed and preserved for compatibility. |

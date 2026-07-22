@@ -1260,9 +1260,12 @@ public class TursoRemoteTests
     {
         private readonly CancellationTokenSource _cancellation = new();
         private readonly TaskCompletionSource _clientIoStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly object _clientSync = new();
         private readonly TcpListener _listener;
         private readonly Queue<string> _responseJson;
         private readonly Task _serverTask;
+        private TcpClient? _currentClient;
+        private Task? _currentClientTask;
 
         public TestRemoteServer(params string[] responseJson)
         {
@@ -1293,88 +1296,148 @@ public class TursoRemoteTests
         {
             try
             {
-                _cancellation.CancelAsync().GetAwaiter().GetResult();
-                _serverTask.GetAwaiter().GetResult();
+                _cancellation.Cancel();
+                _listener.Stop();
+
+                TcpClient? client;
+                Task? clientTask;
+                lock (_clientSync)
+                {
+                    client = _currentClient;
+                    clientTask = _currentClientTask;
+                }
+
+                client?.Dispose();
+                Task.WhenAll(_serverTask, clientTask ?? Task.CompletedTask).GetAwaiter().GetResult();
             }
             finally
             {
-                _listener.Stop();
                 _cancellation.Dispose();
             }
         }
 
         private async Task AcceptLoopAsync()
         {
-            try
+            while (true)
             {
-                while (true)
+                TcpClient client;
+                try
                 {
-                    using var client = await _listener.AcceptTcpClientAsync(_cancellation.Token);
-                    await HandleClientAsync(client);
+                    client = await _listener.AcceptTcpClientAsync(_cancellation.Token);
                 }
-            }
-            catch (OperationCanceledException) when (_cancellation.IsCancellationRequested)
-            {
+                catch (OperationCanceledException) when (_cancellation.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (InvalidOperationException) when (_cancellation.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception exception) when (IsCancellationCausedTransportAbort(exception))
+                {
+                    return;
+                }
+
+                Task clientTask;
+                lock (_clientSync)
+                {
+                    _currentClient = client;
+                    _currentClientTask = clientTask = HandleClientAsync(client);
+                }
+
+                try
+                {
+                    await clientTask;
+                }
+                finally
+                {
+                    client.Dispose();
+                    lock (_clientSync)
+                    {
+                        if (ReferenceEquals(_currentClient, client))
+                        {
+                            _currentClient = null;
+                            _currentClientTask = null;
+                        }
+                    }
+                }
             }
         }
 
         private async Task HandleClientAsync(TcpClient client)
         {
-            if (_responseJson.Count == 0)
-                throw new InvalidOperationException("No fake HTTP response is available.");
-
-            await using var stream = client.GetStream();
-            using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
-
-            _clientIoStarted.TrySetResult();
-            var requestLine = await reader.ReadLineAsync(_cancellation.Token)
-                              ?? throw new InvalidOperationException("HTTP request did not include a request line.");
-            var requestParts = requestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (requestParts.Length < 2)
-                throw new InvalidOperationException($"Invalid HTTP request line: {requestLine}");
-
-            var contentLength = 0;
-            while (await reader.ReadLineAsync(_cancellation.Token) is { Length: > 0 } headerLine)
+            try
             {
-                var separatorIndex = headerLine.IndexOf(':', StringComparison.Ordinal);
-                if (separatorIndex < 0)
-                    continue;
+                if (_responseJson.Count == 0)
+                    throw new InvalidOperationException("No fake HTTP response is available.");
 
-                var name = headerLine[..separatorIndex];
-                var value = headerLine[(separatorIndex + 1)..].Trim();
-                if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
-                    contentLength = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
-                else if (name.Equals("Authorization", StringComparison.OrdinalIgnoreCase))
-                    Authorization = value;
-                else if (name.Equals("Host", StringComparison.OrdinalIgnoreCase))
-                    RequestUri = new Uri($"{Url.Scheme}://{value}{requestParts[1]}");
-            }
+                await using var stream = client.GetStream();
+                using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
 
-            if (RequestUri is null)
-                RequestUri = new Uri(Url, requestParts[1]);
+                _clientIoStarted.TrySetResult();
+                var requestLine = await reader.ReadLineAsync(_cancellation.Token)
+                                  ?? throw new InvalidOperationException("HTTP request did not include a request line.");
+                var requestParts = requestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (requestParts.Length < 2)
+                    throw new InvalidOperationException($"Invalid HTTP request line: {requestLine}");
 
-            if (contentLength > 0)
-            {
-                var buffer = new char[contentLength];
-                var read = 0;
-                while (read < buffer.Length)
+                var contentLength = 0;
+                while (await reader.ReadLineAsync(_cancellation.Token) is { Length: > 0 } headerLine)
                 {
-                    var count = await reader.ReadAsync(buffer.AsMemory(read, buffer.Length - read), _cancellation.Token);
-                    if (count == 0)
-                        break;
+                    var separatorIndex = headerLine.IndexOf(':', StringComparison.Ordinal);
+                    if (separatorIndex < 0)
+                        continue;
 
-                    read += count;
+                    var name = headerLine[..separatorIndex];
+                    var value = headerLine[(separatorIndex + 1)..].Trim();
+                    if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                        contentLength = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+                    else if (name.Equals("Authorization", StringComparison.OrdinalIgnoreCase))
+                        Authorization = value;
+                    else if (name.Equals("Host", StringComparison.OrdinalIgnoreCase))
+                        RequestUri = new Uri($"{Url.Scheme}://{value}{requestParts[1]}");
                 }
 
-                RequestBody = new string(buffer, 0, read);
-            }
-            RequestBodies.Add(RequestBody);
+                if (RequestUri is null)
+                    RequestUri = new Uri(Url, requestParts[1]);
 
-            var body = Encoding.UTF8.GetBytes(_responseJson.Dequeue());
-            var headers = Encoding.ASCII.GetBytes(
-                $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
-            await stream.WriteAsync(headers, _cancellation.Token);
-            await stream.WriteAsync(body, _cancellation.Token);
+                if (contentLength > 0)
+                {
+                    var buffer = new char[contentLength];
+                    var read = 0;
+                    while (read < buffer.Length)
+                    {
+                        var count = await reader.ReadAsync(buffer.AsMemory(read, buffer.Length - read), _cancellation.Token);
+                        if (count == 0)
+                            break;
+
+                        read += count;
+                    }
+
+                    RequestBody = new string(buffer, 0, read);
+                }
+                RequestBodies.Add(RequestBody);
+
+                var body = Encoding.UTF8.GetBytes(_responseJson.Dequeue());
+                var headers = Encoding.ASCII.GetBytes(
+                    $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(headers, _cancellation.Token);
+                await stream.WriteAsync(body, _cancellation.Token);
+            }
+            catch (OperationCanceledException) when (_cancellation.IsCancellationRequested)
+            {
+            }
+            catch (Exception exception) when (IsCancellationCausedTransportAbort(exception))
+            {
+            }
+        }
+
+        private bool IsCancellationCausedTransportAbort(Exception exception)
+        {
+            return _cancellation.IsCancellationRequested
+                   && exception is SocketException
+                       or ObjectDisposedException
+                       or IOException { InnerException: SocketException };
         }
     }
 }

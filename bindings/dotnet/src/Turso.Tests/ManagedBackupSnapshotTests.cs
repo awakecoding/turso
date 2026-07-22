@@ -89,12 +89,14 @@ public sealed class ManagedBackupSnapshotTests
         using var source = OpenManagedConnection();
         using var destination = OpenManagedConnection();
         source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
+        destination.ExecuteNonQuery("PRAGMA foreign_keys = ON;");
 
         using var transaction = destination.BeginTransaction();
         var exception = Assert.Throws<SqliteException>(() => source.BackupDatabase(destination));
 
         exception!.SqliteErrorCode.Should().Be(5);
         destination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+        destination.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(1);
         transaction.Rollback();
     }
 

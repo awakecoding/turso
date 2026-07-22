@@ -39,6 +39,17 @@ internal sealed class EmbeddedConflictRollbackException : EmbeddedSqlException
     }
 }
 
+internal sealed class EmbeddedConflictFailException : EmbeddedSqlException
+{
+    public EmbeddedConflictFailException(EmbeddedSqlException conflict, long lastInsertRowId)
+        : base(conflict.Message, conflict)
+    {
+        LastInsertRowId = lastInsertRowId;
+    }
+
+    public long LastInsertRowId { get; }
+}
+
 /// <summary>
 /// Reports that a catalog mutation reached its durable WAL commit marker, but
 /// subsequent checkpoint maintenance failed. Retrying the mutation would apply
@@ -78,6 +89,9 @@ public sealed class EmbeddedDatabase : IDisposable
     private FileCatalogVersion _fileCatalogVersion;
     private PragmaHeaderMetadata _inMemoryPragmaHeader;
     private long _version;
+    private readonly Dictionary<BlobMutationIdentity, int> _activeBlobMutations = new();
+    private readonly Dictionary<BlobMutationIdentity, long> _blobMutationGenerations = new();
+    private long _nextBlobMutationGeneration;
 
     public EmbeddedDatabase()
     {
@@ -219,6 +233,28 @@ public sealed class EmbeddedDatabase : IDisposable
 
     public EmbeddedConnection Connect() => new(this);
 
+    internal void CopyFunctionAndCollationRegistriesTo(EmbeddedDatabase target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+
+        KeyValuePair<(string Name, int Arity), Func<IReadOnlyList<SqlValue>, SqlValue>>[] scalarFunctions;
+        KeyValuePair<(string Name, int Arity), ManagedAggregateFunction>[] aggregateFunctions;
+        KeyValuePair<string, Func<string, string, int>>[] collations;
+        lock (_gate)
+        {
+            scalarFunctions = _scalarFunctions.ToArray();
+            aggregateFunctions = _aggregateFunctions.ToArray();
+            collations = _collations.ToArray();
+        }
+
+        foreach (var ((name, arity), function) in scalarFunctions)
+            target.RegisterScalarFunction(name, arity, function);
+        foreach (var ((name, arity), function) in aggregateFunctions)
+            target.RegisterAggregateFunction(name, arity, function.Seed, function.Step, function.Finalize);
+        foreach (var (name, compare) in collations)
+            target.RegisterCollation(name, compare);
+    }
+
     public void RegisterScalarFunction(string name, int arity, Func<IReadOnlyList<SqlValue>, SqlValue> function)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
@@ -329,13 +365,22 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             if (_fileStore is null)
             {
-                var inMemoryResult = Execute(
-                    statement,
-                    parameters,
-                    new SchemaCatalog(_tables, _views, _triggers),
-                    lastInsertRowId,
-                    foreignKeysEnabled,
-                    recursiveTriggersEnabled);
+                ExecutionResult inMemoryResult;
+                try
+                {
+                    inMemoryResult = Execute(
+                        statement,
+                        parameters,
+                        new SchemaCatalog(_tables, _views, _triggers),
+                        lastInsertRowId,
+                        foreignKeysEnabled,
+                        recursiveTriggersEnabled);
+                }
+                catch (EmbeddedConflictFailException)
+                {
+                    _version++;
+                    throw;
+                }
                 if (inMemoryResult.Changed)
                 {
                     if (MayChangeSchema(statement))
@@ -363,13 +408,22 @@ public sealed class EmbeddedDatabase : IDisposable
                     recursiveTriggersEnabled);
 
             var working = new SchemaCatalog(_tables, _views, _triggers).Clone();
-            var result = Execute(
-                statement,
-                parameters,
-                working,
-                lastInsertRowId,
-                foreignKeysEnabled,
-                recursiveTriggersEnabled);
+            ExecutionResult result;
+            try
+            {
+                result = Execute(
+                    statement,
+                    parameters,
+                    working,
+                    lastInsertRowId,
+                    foreignKeysEnabled,
+                    recursiveTriggersEnabled);
+            }
+            catch (EmbeddedConflictFailException)
+            {
+                PersistFileCatalog(working);
+                throw;
+            }
             if (result.Changed)
                 PersistFileCatalog(working);
 
@@ -496,6 +550,70 @@ public sealed class EmbeddedDatabase : IDisposable
                     unchecked((int)_fileCatalogVersion.SchemaCookie),
                     _fileCatalogVersion.UserVersion,
                     _fileCatalogVersion.ApplicationId);
+        }
+    }
+
+    internal IDisposable OpenBlobMutationLease(string tableName, long rowId)
+    {
+        lock (_gate)
+        {
+            var identity = new BlobMutationIdentity(tableName, rowId);
+            _activeBlobMutations.TryGetValue(identity, out var handles);
+            _activeBlobMutations[identity] = checked(handles + 1);
+            return new BlobMutationLease(this, identity);
+        }
+    }
+
+    internal long GetBlobMutationGeneration(string tableName, long rowId)
+    {
+        lock (_gate)
+        {
+            return _blobMutationGenerations.GetValueOrDefault(new BlobMutationIdentity(tableName, rowId));
+        }
+    }
+
+    internal bool HasOpenBlobHandles
+    {
+        get
+        {
+            lock (_gate)
+                return _activeBlobMutations.Count > 0;
+        }
+    }
+
+    internal bool HasUpdateTrigger(string tableName)
+    {
+        lock (_gate)
+        {
+            return _triggers.Values.Any(trigger =>
+                trigger.Event == TriggerEvent.Update
+                && string.Equals(trigger.TableName, tableName, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    internal void RecordBlobMutation(string tableName, long rowId)
+    {
+        lock (_gate)
+        {
+            var identity = new BlobMutationIdentity(tableName, rowId);
+            if (_activeBlobMutations.ContainsKey(identity))
+                _blobMutationGenerations[identity] = checked(++_nextBlobMutationGeneration);
+        }
+    }
+
+    internal void ReleaseBlobMutationLease(BlobMutationIdentity identity)
+    {
+        lock (_gate)
+        {
+            var handles = _activeBlobMutations[identity] - 1;
+            if (handles == 0)
+            {
+                _activeBlobMutations.Remove(identity);
+                _blobMutationGenerations.Remove(identity);
+                return;
+            }
+
+            _activeBlobMutations[identity] = handles;
         }
     }
 
@@ -1237,7 +1355,8 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException(
                 "Managed INSERT OR conflict resolution does not support CHECK constraints.");
         }
-        if (GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert).Count > 0)
+        if (algorithm != InsertConflictAlgorithm.Replace
+            && GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert).Count > 0)
         {
             throw new EmbeddedSqlException(
                 "Managed INSERT OR conflict resolution does not support target tables with INSERT triggers.");
@@ -1350,6 +1469,9 @@ public sealed class EmbeddedDatabase : IDisposable
         catch (EmbeddedSqlException exception) when (
             algorithm == InsertConflictAlgorithm.Fail && IsConflictAlgorithmConstraint(exception))
         {
+            if (insertedRows.Count > 0)
+                throw new EmbeddedConflictFailException(exception, insertedRowIds[^1]);
+
             throw;
         }
         catch
@@ -1416,6 +1538,10 @@ public sealed class EmbeddedDatabase : IDisposable
         var backup = CloneTables(context.Tables);
         var insertedRows = new List<SqlValue[]>();
         var insertedRowIds = new List<long>();
+        var deleteTriggers = context.RecursiveTriggersEnabled
+            ? GetMatchingTriggers(context, statement.TableName, TriggerEvent.Delete)
+            : Array.Empty<TriggerDefinition>();
+        var insertTriggers = GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert);
         try
         {
             if (sourceRows is not null)
@@ -1430,7 +1556,7 @@ public sealed class EmbeddedDatabase : IDisposable
             }
 
             var lastInsertRowId = insertedRowIds.Count > 0 ? insertedRowIds[^1] : (long?)null;
-            return BuildConflictInsertResult(
+            var result = BuildConflictInsertResult(
                 statement,
                 table,
                 insertedRows,
@@ -1438,6 +1564,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 parameters,
                 context,
                 lastInsertRowId);
+
+            return result;
         }
         catch
         {
@@ -1456,7 +1584,14 @@ public sealed class EmbeddedDatabase : IDisposable
                 parameters,
                 context,
                 allowExistingRowid: true);
-            CommitReplacement(context, statement.TableName, table, row, rowId);
+            CommitReplacement(
+                context,
+                statement.TableName,
+                table,
+                row,
+                rowId,
+                deleteTriggers,
+                insertTriggers);
             insertedRows.Add(row);
             insertedRowIds.Add(rowId);
         }
@@ -1472,7 +1607,14 @@ public sealed class EmbeddedDatabase : IDisposable
                 parameters,
                 context,
                 allowExistingRowid: true);
-            CommitReplacement(context, statement.TableName, table, row, rowId);
+            CommitReplacement(
+                context,
+                statement.TableName,
+                table,
+                row,
+                rowId,
+                deleteTriggers,
+                insertTriggers);
             insertedRows.Add(row);
             insertedRowIds.Add(rowId);
         }
@@ -1513,9 +1655,14 @@ public sealed class EmbeddedDatabase : IDisposable
         string tableName,
         EmbeddedTable table,
         SqlValue[] candidate,
-        long candidateRowId)
+        long candidateRowId,
+        IReadOnlyList<TriggerDefinition> deleteTriggers,
+        IReadOnlyList<TriggerDefinition> insertTriggers)
     {
         var conflicts = FindReplacementConflicts(table, candidate, candidateRowId);
+        var conflictedRowIds = table.HasRowid
+            ? conflicts.OrderBy(index => index).Select(index => table.RowIds[index]).ToArray()
+            : [];
         var rows = new List<SqlValue[]>(table.Rows.Count - conflicts.Count + 1);
         var rowIds = new List<long>(table.RowIds.Count - conflicts.Count + 1);
         for (var index = 0; index < table.Rows.Count; index++)
@@ -1535,7 +1682,23 @@ public sealed class EmbeddedDatabase : IDisposable
         ValidatePrimaryKey(tableName, table, rows);
         ValidateUniqueIndexes(tableName, table, rows);
         ValidateForeignKeysAfterInsert(context, tableName, table, [candidate], rows);
-        ApplyUpsertRows(table, rows, rowIds);
+
+        foreach (var conflictedRowId in conflictedRowIds)
+        {
+            var conflictIndex = table.RowIds.IndexOf(conflictedRowId);
+            if (conflictIndex < 0)
+                continue;
+
+            table.Rows.RemoveAt(conflictIndex);
+            table.RowIds.RemoveAt(conflictIndex);
+            RecordBlobMutation(tableName, conflictedRowId);
+            if (deleteTriggers.Count > 0)
+                FireTriggers(deleteTriggers, context);
+        }
+
+        CommitInserts(context, tableName, table, [candidate], [candidateRowId]);
+        if (insertTriggers.Count > 0)
+            FireTriggers(insertTriggers, context);
     }
 
     private HashSet<int> FindReplacementConflicts(
@@ -2234,7 +2397,7 @@ public sealed class EmbeddedDatabase : IDisposable
     // to both paths identically.
     private ExecutionResult PerformInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
-        if (!context.ForeignKeysEnabled
+        if (CanCompileDml(context)
             && TryCompileInsert(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning);
 
@@ -2452,6 +2615,11 @@ public sealed class EmbeddedDatabase : IDisposable
         table.Rows.AddRange(rowsToInsert);
         table.RowIds.AddRange(insertedRowIds);
         SortWithoutRowid(table);
+        if (table.HasRowid)
+        {
+            foreach (var rowId in insertedRowIds)
+                RecordBlobMutation(tableName, rowId);
+        }
     }
 
     // Mutable per-statement INSERT plan: the resolved column targets plus the rowid
@@ -2502,7 +2670,7 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        if (!context.ForeignKeysEnabled
+        if (CanCompileDml(context)
             && TryCompileUpdate(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning);
 
@@ -2670,11 +2838,23 @@ public sealed class EmbeddedDatabase : IDisposable
             rows,
             plan,
             updatedPositions);
+        var originalRowIds = table.HasRowid
+            ? updatedPositions.Select(position => table.RowIds[position]).ToArray()
+            : [];
         table.Rows.Clear();
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
         table.RowIds.AddRange(rowIds);
         SortWithoutRowid(table);
+        if (table.HasRowid)
+        {
+            for (var index = 0; index < updatedPositions.Count; index++)
+            {
+                var position = updatedPositions[index];
+                RecordBlobMutation(tableName, originalRowIds[index]);
+                RecordBlobMutation(tableName, rowIds[position]);
+            }
+        }
     }
 
     // Foreign-key checks run against the complete post-statement image, but only inspect
@@ -3068,12 +3248,17 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        if (!context.ForeignKeysEnabled
+        if (CanCompileDml(context)
             && TryCompileDelete(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning);
 
         return PerformDeleteEvaluated(statement, parameters, context);
     }
+
+    // Compiled DML reports only an aggregate affected-row count; live blob handles need
+    // the evaluator's matched rowids to expire only when their own row is mutated.
+    private bool CanCompileDml(QueryContext context)
+        => !context.ForeignKeysEnabled && !HasOpenBlobHandles;
 
     private ExecutionResult PerformDeleteEvaluated(
         DeleteStatement statement,
@@ -3116,6 +3301,11 @@ public sealed class EmbeddedDatabase : IDisposable
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
         table.RowIds.AddRange(rowIds);
+        if (table.HasRowid)
+        {
+            foreach (var rowId in deletedRowIds)
+                RecordBlobMutation(statement.TableName, rowId);
+        }
         if (statement.Returning is not null)
         {
             return BuildReturningResult(
@@ -3322,6 +3512,30 @@ public sealed class EmbeddedDatabase : IDisposable
             WithSelectStatement with => ExecuteWithSelect(with, parameters, context, outerRow),
             ValuesClause values => ExecuteValues(values, parameters, context, outerRow),
             _ => throw new EmbeddedSqlException($"Unsupported query type {statement.GetType().Name}."),
+        };
+    }
+
+    private static SqlValue[] MaterializeQueryRow(IReadOnlyList<SqlValue> row)
+    {
+        var materialized = new SqlValue[row.Count];
+        for (var index = 0; index < row.Count; index++)
+            materialized[index] = row[index].WithoutJsonSubtype();
+
+        return materialized;
+    }
+
+    private static ExecutionResult MaterializeQueryResult(ExecutionResult result)
+    {
+        if (!result.Rows.Any(row => row.Any(value => value.IsJson)))
+            return result;
+
+        return new ExecutionResult(
+            result.Columns,
+            result.Rows.Select(MaterializeQueryRow).ToArray(),
+            result.RowsAffected,
+            result.Changed)
+        {
+            LastInsertRowId = result.LastInsertRowId,
         };
     }
 
@@ -4356,15 +4570,15 @@ public sealed class EmbeddedDatabase : IDisposable
     // sorter and SameGroup/Goto control flow for grouping), or returns false so the
     // evaluator keeps ownership of shapes the aggregate route cannot preserve exactly.
     //
-    // Supported (routed to the VDBE): a single real base table; an optional row-at-a-time
-    // WHERE; and projections that are each a supported built-in or registered aggregate call
-    // over bare, backed columns (COUNT(*)/COUNT()/COUNT(col)/SUM/TOTAL/AVG/MIN/MAX/
-    // GROUP_CONCAT(col)), a bare-column GROUP BY key (grouped only), or a folded constant
-    // that is also an aggregate expression. Accumulation, empty-input identities, group
-    // ordering (first-seen), and group equality all reuse the evaluator's own helpers, so a
-    // routed result row is byte-identical to the evaluator's.
+    // Supported (routed to the VDBE): a single real base table; optional row-at-a-time
+    // WHERE and aggregate-only HAVING predicates; and projections that are each a supported
+    // built-in or registered aggregate call over bare, backed columns (COUNT(*)/COUNT()/
+    // COUNT(col)/SUM/TOTAL/AVG/MIN/MAX/GROUP_CONCAT(col)), a bare-column GROUP BY key
+    // (grouped only), or a folded constant that is also an aggregate expression.
+    // Accumulation, empty-input identities, group ordering (first-seen), and group equality all
+    // reuse the evaluator's own helpers, so a routed result row is byte-identical to the evaluator's.
     //
-    // Deliberately excluded (kept on the evaluator): DISTINCT, HAVING, LIMIT/OFFSET, ORDER
+    // Deliberately excluded (kept on the evaluator): DISTINCT, ORDER
     // BY, window functions, DISTINCT/FILTER aggregate modifiers, aggregate arguments that
     // are not bare columns (e.g. sum(x+1), group_concat(x,'-')), composite aggregate
     // expressions (e.g. sum(x)+1), non-aggregate/non-constant projections that force the
@@ -4381,7 +4595,6 @@ public sealed class EmbeddedDatabase : IDisposable
         compiled = null!;
 
         if (select.Distinct
-            || select.Having is not null
             || select.Limit is not null
             || select.Offset is not null
             || select.OrderBy.Count != 0
@@ -4452,6 +4665,20 @@ public sealed class EmbeddedDatabase : IDisposable
         if (aggregates.Count == 0)
             return false;
 
+        AggregateHavingFilter? having = null;
+        if (select.Having is not null
+            && !TryCompileAggregateHaving(
+                select.Having,
+                target,
+                parameters,
+                context,
+                outerRow,
+                aggregates,
+                out having))
+        {
+            return false;
+        }
+
         VdbeRowPredicate? predicate = null;
         if (select.Where is not null)
         {
@@ -4473,7 +4700,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 outputs,
                 orderComparer,
                 groupComparer,
-                predicate);
+                predicate,
+                having);
         }
         else
         {
@@ -4482,11 +4710,157 @@ public sealed class EmbeddedDatabase : IDisposable
                 target.Columns.Length,
                 aggregates,
                 outputs,
-                predicate);
+                predicate,
+                having);
         }
 
         compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows)]);
         return true;
+    }
+
+    // Rewrites an aggregate-only HAVING expression into a predicate over finalized aggregate
+    // registers. This keeps comparison, NULL, affinity, and parameter semantics in Evaluate while
+    // the VDBE owns the group finalization and conditional result emission.
+    private bool TryCompileAggregateHaving(
+        Expression expression,
+        ScanTarget target,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        List<AggregateFunctionSpec> aggregates,
+        out AggregateHavingFilter having)
+    {
+        var inputs = new List<AggregateOutput>();
+        var inputNames = new List<string>();
+        if (!TryRewriteAggregateHaving(
+                expression,
+                target,
+                parameters,
+                context,
+                outerRow,
+                aggregates,
+                inputs,
+                inputNames,
+                out var rewritten))
+        {
+            having = null!;
+            return false;
+        }
+
+        var names = inputNames.ToArray();
+        having = new AggregateHavingFilter(
+            inputs,
+            values => IsTrue(Evaluate(
+                rewritten,
+                parameters,
+                new SourceRow(names, values, Parent: outerRow),
+                context)),
+            "skip aggregate result when HAVING is false");
+        return true;
+    }
+
+    // The VDBE filter receives only a fixed register tuple. Restrict HAVING to aggregate calls
+    // and scalar syntax whose remaining leaves are parameters or literals, so no representative-row,
+    // subquery, collation-state, or non-deterministic function dependency can leak into the route.
+    private bool TryRewriteAggregateHaving(
+        Expression expression,
+        ScanTarget target,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        List<AggregateFunctionSpec> aggregates,
+        List<AggregateOutput> inputs,
+        List<string> inputNames,
+        out Expression rewritten)
+    {
+        switch (expression)
+        {
+            case LiteralExpression or ParameterExpression:
+                rewritten = expression;
+                return true;
+            case FunctionExpression function:
+                if (!TryClassifyAggregateCall(
+                        function,
+                        target,
+                        parameters,
+                        context,
+                        outerRow,
+                        aggregates,
+                        out var output))
+                {
+                    rewritten = null!;
+                    return false;
+                }
+
+                var inputIndex = inputs.Count;
+                inputs.Add(output);
+                var inputName = $"__turso_having_aggregate_{inputIndex}__";
+                inputNames.Add(inputName);
+                rewritten = new ColumnExpression(inputName);
+                return true;
+            case UnaryExpression unary when TryRewriteAggregateHaving(
+                    unary.Operand,
+                    target,
+                    parameters,
+                    context,
+                    outerRow,
+                    aggregates,
+                    inputs,
+                    inputNames,
+                    out var operand):
+                rewritten = unary with { Operand = operand };
+                return true;
+            case BinaryExpression binary
+                when TryRewriteAggregateHaving(
+                        binary.Left,
+                        target,
+                        parameters,
+                        context,
+                        outerRow,
+                        aggregates,
+                        inputs,
+                        inputNames,
+                        out var left)
+                    && TryRewriteAggregateHaving(
+                        binary.Right,
+                        target,
+                        parameters,
+                        context,
+                        outerRow,
+                        aggregates,
+                        inputs,
+                        inputNames,
+                        out var right):
+                rewritten = binary with { Left = left, Right = right };
+                return true;
+            case CastExpression cast when TryRewriteAggregateHaving(
+                    cast.Expression,
+                    target,
+                    parameters,
+                    context,
+                    outerRow,
+                    aggregates,
+                    inputs,
+                    inputNames,
+                    out var castInput):
+                rewritten = cast with { Expression = castInput };
+                return true;
+            case CollationExpression collation when TryRewriteAggregateHaving(
+                    collation.Expression,
+                    target,
+                    parameters,
+                    context,
+                    outerRow,
+                    aggregates,
+                    inputs,
+                    inputNames,
+                    out var collationInput):
+                rewritten = collation with { Expression = collationInput };
+                return true;
+            default:
+                rewritten = null!;
+                return false;
+        }
     }
 
     // Lowers the largest window subset that WindowProgramBuilder can run with EXACT running-frame
@@ -6773,7 +7147,8 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext cteContext,
         SourceRow? outerRow)
     {
-        var result = ExecuteQuery(commonTableExpression.Query, parameters, cteContext, outerRow);
+        var result = MaterializeQueryResult(
+            ExecuteQuery(commonTableExpression.Query, parameters, cteContext, outerRow));
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, result.Columns);
         return new SourceData(
             columns,
@@ -6834,7 +7209,8 @@ public sealed class EmbeddedDatabase : IDisposable
             recursiveTerms.Add(term);
         }
 
-        var anchor = EvaluateRecursiveAnchor(compound, firstRecursiveIndex, parameters, cteContext, outerRow);
+        var anchor = MaterializeQueryResult(
+            EvaluateRecursiveAnchor(compound, firstRecursiveIndex, parameters, cteContext, outerRow));
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, anchor.Columns);
         var deduplicate = recursiveOperator == CompoundOperator.Union;
 
@@ -6887,7 +7263,8 @@ public sealed class EmbeddedDatabase : IDisposable
             var produced = new List<SourceRow>();
             foreach (var term in recursiveTerms)
             {
-                var termResult = ExecuteSelect(term, parameters, iterationContext, outerRow);
+                var termResult = MaterializeQueryResult(
+                    ExecuteSelect(term, parameters, iterationContext, outerRow));
                 if (termResult.Columns.Length != columns.Length)
                     throw new EmbeddedSqlException("SELECTs to the left and right of a compound operator do not have the same number of result columns");
 
@@ -6952,7 +7329,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 switch (runtime.StepResumable())
                 {
                     case ResumableStatementStepResult.Row:
-                        rows.Add(new SourceRow(columns, [.. runtime.CurrentRow!]));
+                        rows.Add(new SourceRow(columns, MaterializeQueryRow(runtime.CurrentRow!)));
                         break;
                     case ResumableStatementStepResult.Done:
                         return new SourceData(columns, rows);
@@ -7003,7 +7380,8 @@ public sealed class EmbeddedDatabase : IDisposable
         IReadOnlyList<SqlValue[]> Transform(SqlValue[] frontierRow)
         {
             iterationTables[name] = new SourceData(columns, [new SourceRow(columns, frontierRow)]);
-            var termResult = ExecuteSelect(recursiveTerm, parameters, iterationContext, outerRow);
+            var termResult = MaterializeQueryResult(
+                ExecuteSelect(recursiveTerm, parameters, iterationContext, outerRow));
             if (termResult.Columns.Length != width)
             {
                 throw new EmbeddedSqlException(
@@ -7012,7 +7390,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
             var children = new SqlValue[termResult.Rows.Count][];
             for (var index = 0; index < termResult.Rows.Count; index++)
-                children[index] = [.. termResult.Rows[index]];
+                children[index] = MaterializeQueryRow(termResult.Rows[index]);
 
             return children;
         }
@@ -8133,7 +8511,8 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         var viewContext = EnterView(context, view.Name);
-        var result = ExecuteQuery(view.Query, parameters, viewContext, outerRow);
+        var result = MaterializeQueryResult(
+            ExecuteQuery(view.Query, parameters, viewContext, outerRow));
         var columns = ApplyViewColumnNames(view, result.Columns);
         var rows = result.Rows.AsEnumerable();
         if (maximumRows is { } maximum && maximum < result.Rows.Count)
@@ -8205,7 +8584,8 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow,
         long? maximumRows)
     {
-        var result = ExecuteQuery(source.Query, parameters, context, outerRow);
+        var result = MaterializeQueryResult(
+            ExecuteQuery(source.Query, parameters, context, outerRow));
         var rows = result.Rows.AsEnumerable();
         if (maximumRows is { } maximum && maximum < result.Rows.Count)
             rows = rows.Take((int)maximum);
@@ -13667,18 +14047,28 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         _database.RegisterScalarFunction(name, arity, function);
+        foreach (var attachment in _attachedDatabases.Values)
+            attachment.Database.RegisterScalarFunction(name, arity, function);
     }
 
     public bool UnregisterScalarFunction(string name, int arity)
     {
         ThrowIfDisposed();
-        return _database.UnregisterScalarFunction(name, arity);
+        var removed = _database.UnregisterScalarFunction(name, arity);
+        foreach (var attachment in _attachedDatabases.Values)
+            attachment.Database.UnregisterScalarFunction(name, arity);
+
+        return removed;
     }
 
     public int UnregisterScalarFunctions(string name)
     {
         ThrowIfDisposed();
-        return _database.UnregisterScalarFunctions(name);
+        var removed = _database.UnregisterScalarFunctions(name);
+        foreach (var attachment in _attachedDatabases.Values)
+            attachment.Database.UnregisterScalarFunctions(name);
+
+        return removed;
     }
 
     public void RegisterAggregateFunction(
@@ -13690,24 +14080,59 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         _database.RegisterAggregateFunction(name, arity, seed, step, finalize);
+        foreach (var attachment in _attachedDatabases.Values)
+            attachment.Database.RegisterAggregateFunction(name, arity, seed, step, finalize);
     }
 
     public int UnregisterAggregateFunctions(string name)
     {
         ThrowIfDisposed();
-        return _database.UnregisterAggregateFunctions(name);
+        var removed = _database.UnregisterAggregateFunctions(name);
+        foreach (var attachment in _attachedDatabases.Values)
+            attachment.Database.UnregisterAggregateFunctions(name);
+
+        return removed;
     }
 
     public void RegisterCollation(string name, Func<string, string, int> compare)
     {
         ThrowIfDisposed();
         _database.RegisterCollation(name, compare);
+        foreach (var attachment in _attachedDatabases.Values)
+            attachment.Database.RegisterCollation(name, compare);
     }
 
     public bool UnregisterCollation(string name)
     {
         ThrowIfDisposed();
-        return _database.UnregisterCollation(name);
+        var removed = _database.UnregisterCollation(name);
+        foreach (var attachment in _attachedDatabases.Values)
+            attachment.Database.UnregisterCollation(name);
+
+        return removed;
+    }
+
+    internal IDisposable OpenBlobMutationLease(string tableName, long rowId)
+    {
+        ThrowIfDisposed();
+        return _database.OpenBlobMutationLease(tableName, rowId);
+    }
+
+    internal long GetBlobMutationGeneration(string tableName, long rowId)
+    {
+        ThrowIfDisposed();
+        return _database.GetBlobMutationGeneration(tableName, rowId);
+    }
+
+    internal bool HasUpdateTrigger(string tableName)
+    {
+        ThrowIfDisposed();
+        var catalog = _transactionCatalog;
+        return catalog is null
+            ? _database.HasUpdateTrigger(tableName)
+            : catalog.Triggers.Values.Any(trigger =>
+                trigger.Event == TriggerEvent.Update
+                && string.Equals(trigger.TableName, tableName, StringComparison.OrdinalIgnoreCase));
     }
 
     public void Dispose()
@@ -13845,6 +14270,14 @@ public sealed class EmbeddedConnection : IDisposable
 
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
+                catch (EmbeddedConflictFailException exception)
+                {
+                    _lastInsertRowId = exception.LastInsertRowId;
+                    if (_transactionCatalog is not null)
+                        _transactionHasChanges = true;
+
+                    throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
+                }
         }
     }
 
@@ -13885,10 +14318,11 @@ public sealed class EmbeddedConnection : IDisposable
             throw new EmbeddedSqlException("database file is already attached");
         }
 
-        var readOnly = _database.IsReadOnly || _queryOnly;
+        var readOnly = _database.IsReadOnly;
         var attached = EmbeddedDatabase.OpenFile(statement.Path, _database.FileSystem, readOnly);
         try
         {
+            _database.CopyFunctionAndCollationRegistriesTo(attached);
             _attachedDatabases.Add(
                 statement.Alias,
                 new AttachedDatabase(statement.Path, pathIdentity, attached, _nextAttachedDatabaseSequence++));
@@ -15567,6 +16001,30 @@ internal sealed record ExecutionResult(
     // the owning connection can answer last_insert_rowid(). Null for statements that did
     // not insert a row.
     public long? LastInsertRowId { get; init; }
+}
+
+internal readonly record struct BlobMutationIdentity
+{
+    public BlobMutationIdentity(string tableName, long rowId)
+    {
+        TableName = tableName.ToUpperInvariant();
+        RowId = rowId;
+    }
+
+    public string TableName { get; }
+
+    public long RowId { get; }
+}
+
+internal sealed class BlobMutationLease(EmbeddedDatabase database, BlobMutationIdentity identity) : IDisposable
+{
+    private EmbeddedDatabase? _database = database;
+
+    public void Dispose()
+    {
+        var database = System.Threading.Interlocked.Exchange(ref _database, null);
+        database?.ReleaseBlobMutationLease(identity);
+    }
 }
 
 internal sealed record OutputColumn(string? Qualifier, string Name, int Index, int? CoalesceIndex = null);

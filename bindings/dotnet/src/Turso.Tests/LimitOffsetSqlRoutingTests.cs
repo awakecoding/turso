@@ -10,8 +10,9 @@ namespace Turso.Tests;
 // while every deliberate fallback shape throws because EXPLAIN only describes lowered programs.
 //
 // Routable subset (the base with LIMIT/OFFSET stripped must itself lower): a direct single-table
-// scan, a source-less constant projection, and scalar/grouped aggregates (no ORDER BY, DISTINCT,
-// join, or compound). Deliberate fallbacks keep the evaluator's exact rows AND error timing:
+// scan, a source-less constant projection, and scalar/grouped aggregates with an aggregate-only HAVING
+// predicate (no ORDER BY, DISTINCT, join, or compound). Deliberate fallbacks keep the evaluator's
+// exact rows AND error timing:
 // LIMIT 0 (validate-then-skip-the-scan), ORDER BY + LIMIT, JOIN + LIMIT, DISTINCT + LIMIT,
 // compound + LIMIT, and non-integer LIMIT/OFFSET ("datatype mismatch").
 public class LimitOffsetSqlRoutingTests
