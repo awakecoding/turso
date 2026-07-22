@@ -7,5 +7,10 @@
     <Nullable>enable</Nullable>
     <RootNamespace>Turso.Platform.Client.Tools</RootNamespace>
     <IsPackable>false</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+  </ItemGroup>
 </Project>

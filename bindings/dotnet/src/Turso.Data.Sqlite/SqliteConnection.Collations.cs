@@ -58,18 +58,38 @@ public partial class SqliteConnection
             var handle = GCHandle.Alloc(this);
             try
             {
-                TursoBindings.RegisterCollation(
-                    database,
-                    name,
-                    GCHandle.ToIntPtr(handle),
-                    CollationCallback,
-                    ContextDestructorCallback);
+                if (database.IsManaged)
+                {
+                    TursoBindings.RegisterManagedCollation(database, name, InvokeManaged);
+                }
+                else
+                {
+                    TursoBindings.RegisterCollation(
+                        database,
+                        name,
+                        GCHandle.ToIntPtr(handle),
+                        CollationCallback,
+                        ContextDestructorCallback);
+                }
+
                 return handle;
             }
             catch
             {
                 handle.Free();
                 throw;
+            }
+
+            int InvokeManaged(string left, string right)
+            {
+                try
+                {
+                    return Compare(left, right);
+                }
+                catch (Exception ex)
+                {
+                    throw ToTursoCallbackException(ex);
+                }
             }
         }
     }

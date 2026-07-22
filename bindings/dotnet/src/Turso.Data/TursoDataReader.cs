@@ -3,7 +3,6 @@ using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
 using System.Globalization;
-using System.Runtime.CompilerServices;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
 using Turso.Raw.Public.Value;
@@ -16,6 +15,7 @@ public class TursoDataReader : DbDataReader
     private readonly TursoStatementHandle _statement;
     private readonly CommandBehavior _behavior;
     private bool _isClosed;
+    private bool _hasCurrentRow;
 
     public TursoDataReader(TursoCommand command, TursoStatementHandle statement, CommandBehavior behavior)
     {
@@ -36,7 +36,8 @@ public class TursoDataReader : DbDataReader
 
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
-        return GetArray(ordinal, dataOffset, buffer, bufferOffset, length);
+        EnsureOpen();
+        return CopyValue(GetBlobValue(ordinal), dataOffset, buffer, bufferOffset, length);
     }
 
     public override char GetChar(int ordinal)
@@ -52,7 +53,20 @@ public class TursoDataReader : DbDataReader
 
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
     {
-        return GetArray(ordinal, dataOffset, buffer, bufferOffset, length);
+        EnsureOpen();
+        return CopyValue(GetTextValue(ordinal).ToCharArray(), dataOffset, buffer, bufferOffset, length);
+    }
+
+    public override Stream GetStream(int ordinal)
+    {
+        EnsureOpen();
+        return new MemoryStream(GetBlobValue(ordinal).ToArray(), writable: false);
+    }
+
+    public override TextReader GetTextReader(int ordinal)
+    {
+        EnsureOpen();
+        return new StringReader(GetTextValue(ordinal));
     }
 
     public override string GetDataTypeName(int ordinal)
@@ -160,13 +174,14 @@ public class TursoDataReader : DbDataReader
 
     public override int GetValues(object[] values)
     {
-        var i = 0;
-        for (; i < FieldCount; i++)
+        ArgumentNullException.ThrowIfNull(values);
+        var count = Math.Min(values.Length, FieldCount);
+        for (var i = 0; i < count; i++)
         {
             values[i] = GetValue(i)!;
         }
 
-        return i;
+        return count;
     }
 
     public override bool IsDBNull(int ordinal)
@@ -199,6 +214,7 @@ public class TursoDataReader : DbDataReader
         {
         }
 
+        _hasCurrentRow = false;
         return false;
     }
 
@@ -218,7 +234,8 @@ public class TursoDataReader : DbDataReader
     public override bool Read()
     {
         EnsureOpen();
-        return TursoBindings.Read(_statement);
+        _hasCurrentRow = TursoBindings.Read(_statement);
+        return _hasCurrentRow;
     }
 
     public override int Depth => 0;
@@ -228,25 +245,54 @@ public class TursoDataReader : DbDataReader
         return new DbEnumerator(this, closeReader: false);
     }
 
-    private long GetArray<T>(int ordinal, long dataOffset, T[]? buffer, int bufferOffset, int length)
-        where T : struct
+    private static long CopyValue<T>(T[] source, long dataOffset, T[]? buffer, int bufferOffset, int length)
     {
-        var bytes = TursoBindings.GetValue(_statement, ordinal).BlobValue;
+        if (dataOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(dataOffset), dataOffset, message: null);
         if (buffer is null)
-        {
-            return Math.Min(bytes.Length - dataOffset, length);
-        }
+            return source.LongLength;
+        if (bufferOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(bufferOffset), bufferOffset, message: null);
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length), length, message: null);
+        if (bufferOffset > buffer.Length - length)
+            throw new ArgumentException("Offset and length must refer to a location within the buffer.");
+        if (dataOffset >= source.LongLength)
+            return 0;
 
-        var position = 0;
-        for (; position < length; position++)
-        {
-            if (bufferOffset + position >= buffer.Length || position + dataOffset >= bytes.Length)
-                break;
+        var count = (int)Math.Min(length, source.LongLength - dataOffset);
+        Array.Copy(source, (int)dataOffset, buffer, bufferOffset, count);
+        return count;
+    }
 
-            buffer[bufferOffset + position] = Unsafe.As<byte, T>(ref bytes[position + dataOffset]);
-        }
+    private byte[] GetBlobValue(int ordinal)
+    {
+        var value = GetTypedValue(ordinal);
+        return value.ValueType == TursoValueType.Blob
+            ? value.BlobValue
+            : throw new InvalidCastException("The requested value is not a BLOB.");
+    }
 
-        return position;
+    private string GetTextValue(int ordinal)
+    {
+        var value = GetTypedValue(ordinal);
+        return value.ValueType == TursoValueType.Text
+            ? value.StringValue
+            : throw new InvalidCastException("The requested value is not TEXT.");
+    }
+
+    private TursoValue GetTypedValue(int ordinal)
+    {
+        if (!_hasCurrentRow)
+            throw new InvalidOperationException("No data exists for the row/column.");
+        if (ordinal < 0 || ordinal >= FieldCount)
+            throw new ArgumentOutOfRangeException(nameof(ordinal), ordinal, message: null);
+
+        var value = TursoBindings.GetValue(_statement, ordinal);
+        if (value.ValueType is TursoValueType.Null or TursoValueType.Empty)
+            throw new InvalidOperationException("The data is Null. This method or property cannot be called on Null values.");
+
+        return value;
     }
 
     private static string GetTypeName(TursoValueType valueType)

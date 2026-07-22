@@ -169,6 +169,9 @@ internal static class TursoInterop
     [DllImport(DllName, EntryPoint = "turso_statement_run_io", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoStatusCode StatementRunIo(TursoStatementHandle statement, out IntPtr errorPtr);
 
+    [DllImport(DllName, EntryPoint = "turso_statement_reset", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode StatementReset(TursoStatementHandle statement, out IntPtr errorPtr);
+
     [DllImport(DllName, EntryPoint = "turso_statement_n_change", CallingConvention = CallingConvention.Cdecl)]
     public static extern long StatementRowsAffected(TursoStatementHandle statement);
 

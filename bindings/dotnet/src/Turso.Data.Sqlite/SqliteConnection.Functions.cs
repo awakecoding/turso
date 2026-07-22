@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 using Turso.Raw.Public;
+using Turso.Raw.Public.Value;
 
 namespace Turso.Data.Sqlite;
 
@@ -10,7 +11,7 @@ public partial class SqliteConnection
     private static readonly TursoScalarFunctionCallback ScalarFunctionCallback = InvokeScalarFunction;
     private static readonly TursoContextDestructorCallback ContextDestructorCallback = NoopContextDestructor;
     private static readonly TursoValueDestructorCallback ValueDestructorCallback = DestroyFunctionValue;
-    private readonly Dictionary<string, ScalarFunctionRegistration> _scalarFunctions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<FunctionSignature, ScalarFunctionRegistration> _scalarFunctions = new(FunctionSignatureComparer.Instance);
     private readonly List<GCHandle> _nativeFunctionContexts = [];
 
     private void RegisterScalarFunction(string name, int argc, bool isDeterministic, Func<object?[], object?>? function)
@@ -18,22 +19,37 @@ public partial class SqliteConnection
         ArgumentNullException.ThrowIfNull(name);
         if (function is null)
         {
-            _scalarFunctions.Remove(name);
+            RemoveFunctionRegistrations(_scalarFunctions, name);
             if (_database is not null)
                 TursoBindings.UnregisterFunction(DatabaseHandle, name);
             return;
         }
 
         var registration = new ScalarFunctionRegistration(name, argc, isDeterministic, function);
-        _scalarFunctions[name] = registration;
+        _scalarFunctions[new FunctionSignature(name, argc)] = registration;
         if (_database is not null)
             _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
     }
 
     private void RegisterScalarFunctions()
     {
-        foreach (var registration in _scalarFunctions.Values)
+        foreach (var registration in IsManagedProvider
+            ? _scalarFunctions.Values
+            : _scalarFunctions
+                .GroupBy(static pair => pair.Key.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(static group => group.Last().Value))
             _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+    }
+
+    private static void RemoveFunctionRegistrations<TRegistration>(
+        Dictionary<FunctionSignature, TRegistration> registrations,
+        string name)
+    {
+        var matchingSignatures = registrations.Keys
+            .Where(signature => string.Equals(signature.Name, name, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        foreach (var signature in matchingSignatures)
+            registrations.Remove(signature);
     }
 
     private void FreeNativeFunctionContexts()
@@ -47,6 +63,51 @@ public partial class SqliteConnection
         }
 
         _nativeFunctionContexts.Clear();
+    }
+
+    private static object? ToManagedObject(TursoValue value)
+    {
+        return value.ValueType switch
+        {
+            TursoValueType.Empty or TursoValueType.Null => null,
+            TursoValueType.Integer => value.IntValue,
+            TursoValueType.Real => value.RealValue,
+            TursoValueType.Text => value.StringValue,
+            TursoValueType.Blob => value.BlobValue,
+            _ => throw new ArgumentOutOfRangeException(nameof(value)),
+        };
+    }
+
+    private static object?[] ToManagedObjects(IReadOnlyList<TursoValue> values)
+    {
+        var result = new object?[values.Count];
+        for (var index = 0; index < values.Count; index++)
+            result[index] = ToManagedObject(values[index]);
+
+        return result;
+    }
+
+    private static TursoValue ToManagedTursoValue(object? value)
+    {
+        if (value is null or DBNull)
+            return TursoValue.Null();
+
+        return value switch
+        {
+            bool boolValue => TursoValue.Int(boolValue ? 1 : 0),
+            byte byteValue => TursoValue.Int(byteValue),
+            sbyte sbyteValue => TursoValue.Int(sbyteValue),
+            short shortValue => TursoValue.Int(shortValue),
+            ushort ushortValue => TursoValue.Int(ushortValue),
+            int intValue => TursoValue.Int(intValue),
+            uint uintValue => TursoValue.Int(uintValue),
+            long longValue => TursoValue.Int(longValue),
+            float floatValue => TursoValue.Real(floatValue),
+            double doubleValue => TursoValue.Real(doubleValue),
+            decimal decimalValue => TursoValue.String(decimalValue.ToString(CultureInfo.InvariantCulture)),
+            byte[] bytes => TursoValue.Blob(bytes),
+            _ => TursoValue.String(Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty),
+        };
     }
 
     private static object? InvokeTypedFunction<T1, TResult>(string name, Func<T1, TResult> function, object?[] args)
@@ -71,7 +132,7 @@ public partial class SqliteConnection
             if (!typeof(T).IsValueType || Nullable.GetUnderlyingType(typeof(T)) is not null)
                 return default!;
 
-            throw new InvalidOperationException(Properties.Resources.UDFCalledWithNull(functionName, ordinal));
+            throw new SqliteException(Properties.Resources.UDFCalledWithNull(functionName, ordinal), 1);
         }
 
         var targetType = Nullable.GetUnderlyingType(typeof(T)) ?? typeof(T);
@@ -293,15 +354,23 @@ public partial class SqliteConnection
             var handle = GCHandle.Alloc(this);
             try
             {
-                TursoBindings.RegisterScalarFunction(
-                    database,
-                    name,
-                    argc,
-                    isDeterministic,
-                    GCHandle.ToIntPtr(handle),
-                    ScalarFunctionCallback,
-                    ContextDestructorCallback,
-                    ValueDestructorCallback);
+                if (database.IsManaged)
+                {
+                    TursoBindings.RegisterManagedScalarFunction(database, name, argc, InvokeManaged);
+                }
+                else
+                {
+                    TursoBindings.RegisterScalarFunction(
+                        database,
+                        name,
+                        argc,
+                        isDeterministic,
+                        GCHandle.ToIntPtr(handle),
+                        ScalarFunctionCallback,
+                        ContextDestructorCallback,
+                        ValueDestructorCallback);
+                }
+
                 return handle;
             }
             catch
@@ -310,6 +379,37 @@ public partial class SqliteConnection
                 throw;
             }
         }
+
+        private TursoValue InvokeManaged(IReadOnlyList<TursoValue> arguments)
+        {
+            try
+            {
+                return ToManagedTursoValue(Invoke(ToManagedObjects(arguments)));
+            }
+            catch (Exception ex)
+            {
+                throw ToTursoCallbackException(ex);
+            }
+        }
+    }
+
+    private static TursoException ToTursoCallbackException(Exception exception)
+        => exception is SqliteException sqliteException
+            ? new($"__turso_sqlite_error__:{sqliteException.SqliteErrorCode.ToString(CultureInfo.InvariantCulture)}:{sqliteException.Message}")
+            : new(exception.Message);
+
+    private readonly record struct FunctionSignature(string Name, int Arity);
+
+    private sealed class FunctionSignatureComparer : IEqualityComparer<FunctionSignature>
+    {
+        public static readonly FunctionSignatureComparer Instance = new();
+
+        public bool Equals(FunctionSignature left, FunctionSignature right)
+            => left.Arity == right.Arity
+                && string.Equals(left.Name, right.Name, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode(FunctionSignature signature)
+            => HashCode.Combine(StringComparer.OrdinalIgnoreCase.GetHashCode(signature.Name), signature.Arity);
     }
 
     [StructLayout(LayoutKind.Sequential)]

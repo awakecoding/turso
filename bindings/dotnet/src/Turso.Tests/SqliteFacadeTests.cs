@@ -491,6 +491,16 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void ManagedProviderRejectsIncrementalBlobIo()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+
+        Assert.Throws<NotSupportedException>(() => new SqliteBlob(connection, "Data", "Value", 1))!
+            .Message.Should().Be(Data.Sqlite.Properties.Resources.ManagedIncrementalBlobNotSupported);
+    }
+
+    [Test]
     public void AdvancedApisValidateNames()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");

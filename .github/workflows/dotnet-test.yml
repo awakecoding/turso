@@ -20,6 +20,29 @@ env:
   CARGO_NET_RETRY: 10
 
 jobs:
+  managed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Run managed-only tests
+        run: make test-managed
+
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30

@@ -242,6 +242,10 @@
                             Condition="Exists('$(OutputPath)Turso.Data.dll')" />
       <BuildOutputInPackage Include="$(OutputPath)Turso.Data.xml"
                             Condition="Exists('$(OutputPath)Turso.Data.xml')" />
+      <BuildOutputInPackage Include="$(OutputPath)Turso.Core.dll"
+                            Condition="Exists('$(OutputPath)Turso.Core.dll')" />
+      <BuildOutputInPackage Include="$(OutputPath)Turso.Core.xml"
+                            Condition="Exists('$(OutputPath)Turso.Core.xml')" />
     </ItemGroup>
   </Target>
 

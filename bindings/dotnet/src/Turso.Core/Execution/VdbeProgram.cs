@@ -1,0 +1,1676 @@
+using System.Collections.ObjectModel;
+
+namespace Turso.Core.Execution;
+
+public readonly record struct Register
+{
+    public Register(int index)
+    {
+        if (index < 0)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        Index = index;
+    }
+
+    public int Index { get; }
+}
+
+public readonly record struct Cursor
+{
+    public Cursor(int index)
+    {
+        if (index < 0)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        Index = index;
+    }
+
+    public int Index { get; }
+}
+
+public readonly record struct Sorter
+{
+    public Sorter(int index)
+    {
+        if (index < 0)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        Index = index;
+    }
+
+    public int Index { get; }
+}
+
+public readonly record struct Accumulator
+{
+    public Accumulator(int index)
+    {
+        if (index < 0)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        Index = index;
+    }
+
+    public int Index { get; }
+}
+
+/// <summary>
+/// A recursive worktable resource: the FIFO frontier plus optional de-duplication set that drives a
+/// bounded recursive CTE evaluation. It is the recursion analogue of <see cref="Sorter"/> — an index into
+/// a fixed-width table of runtime state the interpreter owns — except its buffer is a queue the program
+/// both seeds and drains, and the drain step re-feeds the queue through a caller-supplied transform. A
+/// program declaring <see cref="VdbeProgram.WorkTableCount"/> = N has worktables <c>0..N-1</c>.
+/// </summary>
+public readonly record struct WorkTable
+{
+    public WorkTable(int index)
+    {
+        if (index < 0)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        Index = index;
+    }
+
+    public int Index { get; }
+}
+
+public readonly record struct ProgramCounter
+{
+    public ProgramCounter(int offset)
+    {
+        if (offset < 0)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+
+        Offset = offset;
+    }
+
+    public int Offset { get; }
+}
+
+public readonly record struct RegisterRange
+{
+    public RegisterRange(Register start, int count)
+    {
+        if (count < 0)
+            throw new ArgumentOutOfRangeException(nameof(count));
+
+        Start = start;
+        Count = count;
+    }
+
+    public Register Start { get; }
+
+    public int Count { get; }
+}
+
+/// <summary>
+/// A late-bound parameter position in a program's parameter space, the operand a
+/// <see cref="LoadParameterInstruction"/> reads from the statement's
+/// <see cref="VdbeParameterBinding"/> at execution time. Slots are zero-based and dense within a
+/// program: a program declaring <see cref="VdbeProgram.ParameterSlotCount"/> = N has slots
+/// <c>0..N-1</c>, and every binding must supply a value for each of them. It is the parameter-space
+/// analogue of <see cref="Register"/>: an index into a fixed-width table the interpreter fills, except
+/// its contents come from the caller's binding rather than from executed instructions.
+/// </summary>
+public readonly record struct ParameterSlot
+{
+    public ParameterSlot(int index)
+    {
+        if (index < 0)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        Index = index;
+    }
+
+    public int Index { get; }
+}
+
+public enum VdbeOpcode
+{
+    LoadConstant,
+    LoadParameter,
+    Copy,
+    Function,
+    Arithmetic,
+    OpenReadCursor,
+    OpenWriteCursor,
+    Rewind,
+    Column,
+    RowId,
+    Filter,
+    FilterRegisters,
+    Next,
+    Delete,
+    Insert,
+    Update,
+    Commit,
+    CloseCursor,
+    OpenSorter,
+    SorterInsert,
+    SorterSort,
+    SorterData,
+    SorterNext,
+    CloseSorter,
+    Goto,
+    JumpIf,
+    AggReset,
+    AggStep,
+    AggFinalize,
+    SameGroup,
+    Yield,
+    ResultRow,
+    DistinctResultRow,
+    RowSetInsert,
+    CompoundResultRow,
+    OffsetGate,
+    LimitGate,
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
+    Savepoint,
+    ReleaseSavepoint,
+    RollbackToSavepoint,
+    OpenWorkTable,
+    SeedWorkTable,
+    WorkTableStep,
+    WorkTableExpand,
+    CloseWorkTable,
+    Halt,
+}
+
+/// <summary>
+/// The membership condition a <see cref="CompoundResultRowInstruction"/> requires of a candidate row
+/// against its probe sets, which is what distinguishes the two multi-term compound set operations.
+/// </summary>
+public enum CompoundMembershipMode
+{
+    /// <summary>The candidate must be present in every probe set to be emitted — <c>INTERSECT</c>
+    /// semantics, where a distinct primary-term row survives only if it also appears in each of the
+    /// other terms.</summary>
+    PresentInAll,
+
+    /// <summary>The candidate must be absent from every probe set to be emitted — <c>EXCEPT</c>
+    /// semantics, where a distinct primary-term row survives only if it appears in none of the other
+    /// terms (equivalently, is not in their union).</summary>
+    AbsentFromAll,
+}
+
+/// <summary>
+/// How a recursive worktable treats a row that duplicates one already admitted, which is what
+/// distinguishes the two supported recursive compound operators.
+/// </summary>
+public enum WorkTableDedupMode
+{
+    /// <summary>Every produced row is admitted and later emitted — <c>UNION ALL</c> semantics. The
+    /// worktable performs no de-duplication, so termination relies entirely on the depth and row guards
+    /// (or on the recursive transform eventually producing no rows).</summary>
+    KeepAll,
+
+    /// <summary>Only the first occurrence of each distinct row is admitted — <c>UNION</c>/<c>DISTINCT</c>
+    /// semantics. A row equal (under the worktable's <see cref="VdbeRowEquality"/>) to any previously
+    /// admitted row — seed or descendant — is dropped, which also breaks cycles so the recursion
+    /// terminates naturally on a finite reachable set.</summary>
+    Distinct,
+}
+
+/// <summary>
+/// Evaluates a single scanned row against a compiled predicate. The compiler
+/// supplies the delegate so the emitted program matches the evaluator's SQL
+/// semantics exactly rather than re-deriving comparison rules in the executor.
+/// </summary>
+public delegate bool VdbeRowPredicate(SqlValue[] row);
+
+/// <summary>
+/// Orders two materialized rows for a sorter. The compiler supplies the delegate so
+/// the emitted <c>SorterSort</c> uses the evaluator's ORDER BY semantics (key
+/// extraction, collation, direction, and NULL ordering) rather than re-deriving them
+/// in the executor. It must return a negative, zero, or positive value when
+/// <paramref name="left"/> sorts before, equal to, or after <paramref name="right"/>.
+/// Equal-key rows keep their insertion order, so the sort is stable.
+/// </summary>
+public delegate int VdbeRowComparer(SqlValue[] left, SqlValue[] right);
+
+/// <summary>
+/// Decides whether two group-key tuples belong to the same aggregate group. The
+/// compiler supplies the delegate so the emitted <c>SameGroup</c> uses the evaluator's
+/// grouping equality (affinity, collation, and the rule that NULL keys group together)
+/// rather than re-deriving them in the executor. It returns <see langword="true"/> when
+/// <paramref name="left"/> and <paramref name="right"/> fall in the same group.
+/// </summary>
+/// <remarks>
+/// The comparer must be consistent with the <see cref="VdbeRowComparer"/> used to order
+/// the sorter that feeds a grouped aggregation: rows of one group must sort adjacently
+/// so a single linear pass sees each group as a contiguous run.
+/// </remarks>
+public delegate bool VdbeGroupComparer(SqlValue[] left, SqlValue[] right);
+
+/// <summary>
+/// Decides whether two result-row tuples are duplicates for compound-select de-duplication
+/// (<c>UNION</c>/<c>DISTINCT</c>). The compiler supplies the delegate so the emitted
+/// <c>DistinctResultRow</c> uses the evaluator's row-equality contract exactly — the rule that
+/// two NULLs are equal and that other values compare under their column's affinity and collation —
+/// rather than re-deriving comparison rules in the executor. It returns <see langword="true"/>
+/// when <paramref name="left"/> and <paramref name="right"/> are the same row and so only one of
+/// them should be emitted.
+/// </summary>
+/// <remarks>
+/// The delegate must be a consistent equivalence relation (reflexive, symmetric, transitive) over
+/// the emitted result rows, which all share one fixed column count. It is the compound analogue of
+/// <see cref="VdbeGroupComparer"/>: where that groups adjacent sorted rows, this recognizes a
+/// previously emitted row anywhere in the stream so duplicates are dropped while first occurrences
+/// are preserved in arrival order.
+/// </remarks>
+public delegate bool VdbeRowEquality(SqlValue[] left, SqlValue[] right);
+
+/// <summary>
+/// Expands one recursive-worktable frontier row into its immediate descendant rows. The compiler supplies
+/// the delegate so a <see cref="WorkTableExpandInstruction"/> reuses the evaluator's exact recursive-term
+/// semantics — projecting, filtering, and computing the next generation from a single working-set row —
+/// rather than the executor re-deriving them. It models one linear recursive term evaluated with the CTE
+/// bound to the single supplied row: given that row it returns zero or more child rows, each of the
+/// worktable's fixed column width, in the order they should enter the queue.
+/// </summary>
+/// <remarks>
+/// The delegate is a leaf, exactly like <see cref="VdbeRowPredicate"/> or <see cref="VdbeAggregate"/>: it
+/// computes one generation from one row and knows nothing of the queue, the de-duplication set, the depth,
+/// or the guards. The recursion itself — seeding the frontier, dequeuing in FIFO (breadth-first) order,
+/// re-feeding descendants, de-duplicating, bounding depth, and capping total rows — is performed by the
+/// interpreter's observable instruction loop over <see cref="WorkTableStepInstruction"/> /
+/// <see cref="WorkTableExpandInstruction"/>, not by this delegate. Returning an empty list ends a branch;
+/// a row whose width differs from the worktable's column count is a hard error.
+/// </remarks>
+public delegate IReadOnlyList<SqlValue[]> VdbeRecursiveTransform(SqlValue[] frontierRow);
+
+/// <summary>
+/// A single aggregate function expressed as the three lifecycle operations the
+/// aggregate opcodes drive: create a fresh accumulator context, fold one argument
+/// tuple into it, and finalize it into a result value. The caller supplies the
+/// delegates so the emitted program reuses the evaluator's exact accumulation and
+/// null/type semantics (e.g. <c>COUNT</c> ignoring NULLs, <c>SUM</c> of no rows being
+/// NULL) rather than re-deriving them in the executor.
+/// </summary>
+/// <remarks>
+/// The context is an opaque <see cref="object"/> owned entirely by the delegates; the
+/// executor only threads it through the accumulator's lifecycle. <see cref="Finalize"/>
+/// runs against a context returned by <see cref="CreateContext"/> even when
+/// <see cref="Accumulate"/> was never called, which is how empty input yields the
+/// aggregate's identity value (COUNT → 0, SUM → NULL).
+/// </remarks>
+public sealed class VdbeAggregate
+{
+    /// <summary>The function name surfaced by <c>EXPLAIN</c>, e.g. <c>"count"</c>.</summary>
+    public required string Name { get; init; }
+
+    /// <summary>Produces a fresh accumulator context for a new group.</summary>
+    public required Func<object?> CreateContext { get; init; }
+
+    /// <summary>Folds one argument tuple into the accumulator, returning the next context.</summary>
+    public required Func<object?, SqlValue[], object?> Accumulate { get; init; }
+
+    /// <summary>Produces the group's result value from its accumulator context.</summary>
+    public required Func<object?, SqlValue> Finalize { get; init; }
+}
+
+/// <summary>
+/// A single scalar SQL function expressed as a pure mapping from an argument tuple to one result value.
+/// The caller supplies the delegate so a compiled program reuses the evaluator's exact per-function
+/// semantics (NULL propagation, affinity, text/blob rules) rather than the executor re-deriving them. It
+/// is the stateless, one-step sibling of <see cref="VdbeAggregate"/>: where an aggregate folds many
+/// argument tuples into a running context, a scalar function maps exactly one argument tuple to exactly
+/// one value with no cross-invocation state, which is why the same descriptor serves both user-defined
+/// functions and builtins such as <c>abs</c>, <c>upper</c>, or <c>coalesce</c>.
+/// </summary>
+/// <remarks>
+/// A <see cref="FunctionInstruction"/> hands <see cref="Invoke"/> a private copy of its argument
+/// registers, so the delegate can neither observe a later register write nor mutate the interpreter's
+/// register file; the returned <see cref="SqlValue"/> is itself immutable (text is an immutable string, a
+/// blob is copied on construction), so writing it into the destination register shares no mutable storage.
+/// The delegate owns SQL semantics entirely: it decides how NULL arguments propagate and may throw — for
+/// example a <see cref="VdbeFunctionException"/> — to raise a function error, which the executor surfaces
+/// to the caller of the step rather than swallowing.
+/// </remarks>
+public sealed class VdbeScalarFunction
+{
+    /// <summary>The function name surfaced by <c>EXPLAIN</c>, e.g. <c>"abs"</c>.</summary>
+    public required string Name { get; init; }
+
+    /// <summary>The exact number of arguments the function accepts, or <see langword="null"/> for a
+    /// variadic function (e.g. <c>coalesce</c>) that accepts any argument count. When set, a
+    /// <see cref="FunctionInstruction"/> whose argument range width differs from this arity is rejected at
+    /// program-construction time, so an arity error can never reach execution as a silently truncated or
+    /// padded argument tuple.</summary>
+    public int? Arity { get; init; }
+
+    /// <summary>Maps one argument tuple to the function's result value. The tuple is a fresh copy of the
+    /// argument registers in argument order, so the delegate may read (and even scribble over) it freely
+    /// without disturbing the register file.</summary>
+    public required Func<SqlValue[], SqlValue> Invoke { get; init; }
+}
+
+/// <summary>
+/// Raised by a scalar-function delegate to signal a function-level error (a domain error, an argument-type
+/// error, an overflow, and so on), the managed analogue of a SQLite function raising an error through
+/// <c>sqlite3_result_error</c>. The executor does not catch it: invoking a <see cref="FunctionInstruction"/>
+/// whose delegate throws propagates the exception out of the step with the register file left as it was
+/// before the destination write, so a failed function never publishes a half-computed result. Callers may
+/// also let any other exception escape a delegate; this type merely gives function errors a single,
+/// catchable shape.
+/// </summary>
+public sealed class VdbeFunctionException : InvalidOperationException
+{
+    public VdbeFunctionException(string message) : base(message)
+    {
+    }
+
+    public VdbeFunctionException(string message, Exception innerException) : base(message, innerException)
+    {
+    }
+}
+
+/// <summary>
+/// Binds a read cursor to the concrete rows it iterates at execution time. The
+/// program references the cursor by index; the row source is supplied to the
+/// <see cref="ResumableStatement"/> so the bytecode stays free of live data.
+/// </summary>
+public sealed class VdbeCursorSource
+{
+    public VdbeCursorSource(IReadOnlyList<SqlValue[]> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        Rows = rows;
+    }
+
+    public IReadOnlyList<SqlValue[]> Rows { get; }
+}
+
+/// <summary>
+/// The row and rowid a mutation opcode (<c>Insert</c>/<c>Update</c>) materializes
+/// for its cursor, so a following <c>Column</c>/<c>RowId</c> observes the written
+/// values rather than the pre-mutation source row.
+/// </summary>
+public readonly record struct VdbeRowMutation(SqlValue[] Row, long RowId);
+
+/// <summary>
+/// Binds a write cursor to the concrete rows an INSERT/UPDATE/DELETE program
+/// touches at execution time. The program references the cursor by index and
+/// invokes these delegates through the mutation opcodes; the executor stays free
+/// of catalog types so the emitted bytecode owns only control flow.
+/// </summary>
+/// <remarks>
+/// The caller supplies the delegates so the compiled write path reuses the exact
+/// row-building, constraint, and commit logic the tree-walking evaluator uses.
+/// <see cref="GetRow"/>/<see cref="GetRowId"/> expose the pre-mutation scan rows
+/// (UPDATE/DELETE); INSERT never scans, so they may be <see langword="null"/>.
+/// </remarks>
+public sealed class VdbeWriteTarget
+{
+    /// <summary>The catalog name of the mutated table, surfaced for EXPLAIN.</summary>
+    public required string TableName { get; init; }
+
+    /// <summary>The number of rows the cursor iterates: scanned rows for
+    /// UPDATE/DELETE, or the count of inserted rows for INSERT.</summary>
+    public required int RowCount { get; init; }
+
+    /// <summary>Reads the pre-mutation row at a scan position (UPDATE/DELETE).</summary>
+    public Func<int, SqlValue[]>? GetRow { get; init; }
+
+    /// <summary>Reads the pre-mutation rowid at a scan position (UPDATE/DELETE).</summary>
+    public Func<int, long>? GetRowId { get; init; }
+
+    /// <summary>Marks the scan row at a position for deletion (DELETE).</summary>
+    public Action<int>? DeleteRow { get; init; }
+
+    /// <summary>Builds and records the new row for a position, returning the values
+    /// a following <c>Column</c>/<c>RowId</c> should observe (INSERT/UPDATE).</summary>
+    public Func<int, VdbeRowMutation>? MutateRow { get; init; }
+
+    /// <summary>Applies all buffered mutations to the table under the statement's
+    /// constraints, returning the last inserted rowid (INSERT) or
+    /// <see langword="null"/> (UPDATE/DELETE).</summary>
+    public required Func<long?> Commit { get; init; }
+}
+
+public abstract record VdbeInstruction
+{
+    public abstract VdbeOpcode Opcode { get; }
+}
+
+public sealed record LoadConstantInstruction(Register Destination, SqlValue Value) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.LoadConstant;
+}
+
+/// <summary>
+/// Loads the late-bound value of parameter slot <paramref name="Slot"/> into
+/// <paramref name="Destination"/>. It is the late-binding sibling of <see cref="LoadConstantInstruction"/>:
+/// where <c>LoadConstant</c> bakes a fixed <see cref="SqlValue"/> into the program, this defers the value
+/// to execution time and reads it from the <see cref="VdbeParameterBinding"/> supplied to the
+/// <see cref="ResumableStatement"/>. One compiled program can therefore be re-executed with different
+/// bindings — e.g. a prepared <c>VALUES (?1, ?2)</c> re-run with fresh parameters after a
+/// <see cref="ResumableStatement.Reset"/>/<see cref="ResumableStatement.Rebind"/> — without being rebuilt.
+/// </summary>
+/// <remarks>
+/// The instruction carries only the slot index; it never inspects SQL types, so the value's kind
+/// (integer, real, text, blob, null) is whatever the binding holds. Executing it without a bound
+/// statement, or against a binding whose width does not match the program's
+/// <see cref="VdbeProgram.ParameterSlotCount"/>, is a hard error rather than a silent NULL, so a missing
+/// binding can never be mistaken for a bound NULL.
+/// </remarks>
+public sealed record LoadParameterInstruction(Register Destination, ParameterSlot Slot) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.LoadParameter;
+}
+
+public sealed record CopyInstruction(Register Source, Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Copy;
+}
+
+/// <summary>
+/// Applies scalar function <paramref name="Function"/> to the argument tuple held in the register block
+/// <paramref name="Arguments"/> and writes its single result into <paramref name="Destination"/>. It is the
+/// scalar analogue of <see cref="AggStepInstruction"/>: where <c>AggStep</c> folds one argument tuple into a
+/// running accumulator, this maps one argument tuple to one value in a single step with no cross-row state,
+/// which is what evaluating a function call inside a projection or predicate needs. The interpreter copies
+/// the argument registers before the call and writes the result only on success, so the delegate cannot
+/// disturb the register file and a throwing delegate leaves the destination untouched. A zero-width
+/// argument range invokes a nullary function.
+/// </summary>
+/// <remarks>
+/// The destination may lie inside, overlap, or sit outside the argument range: because the arguments are
+/// snapshotted into a fresh tuple before the delegate runs, overwriting an argument register with the
+/// result (the common single-register <c>r[i]=f(r[i])</c> shape) is well defined. The instruction carries
+/// no SQL types; argument count, NULL handling, and the result kind are entirely the delegate's contract.
+/// </remarks>
+public sealed record FunctionInstruction(
+    Register Destination,
+    VdbeScalarFunction Function,
+    RegisterRange Arguments) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Function;
+}
+
+/// <summary>
+/// Applies arithmetic operator <paramref name="Operator"/> to the operand tuple held in the register block
+/// <paramref name="Operands"/> and writes its single result into <paramref name="Destination"/>. It is the
+/// arithmetic sibling of <see cref="FunctionInstruction"/>: where <c>Function</c> maps an argument tuple
+/// through a caller-supplied delegate, this maps an operand tuple through the fixed
+/// <see cref="VdbeArithmetic"/> value semantics — NULL propagation, integer/real typing, overflow-to-real,
+/// division/modulo by zero yielding NULL, and a type error on a non-numeric operand. The binary operators
+/// read a two-register operand block and the unary sign operators a one-register block; the program
+/// validator pins the block width against <see cref="VdbeArithmetic.Arity"/> so an arity mismatch can never
+/// reach execution. The interpreter snapshots the operand registers before computing and writes the result
+/// only on success, so the destination may overlap an operand (the common single-register
+/// <c>r[i]=-r[i]</c> shape) and a throwing evaluation leaves the register file untouched.
+/// </summary>
+/// <remarks>
+/// The instruction owns no SQL affinity: text and blob operands are type errors rather than being coerced to
+/// numbers, so a compiler routing SQL arithmetic through this opcode must materialize numeric operands (or a
+/// coercion step) itself. Every other value decision — result kind, overflow behavior, by-zero handling —
+/// lives entirely in <see cref="VdbeArithmetic.Evaluate"/>, exactly as the scan, join, and aggregate
+/// families delegate their value semantics.
+/// </remarks>
+public sealed record ArithmeticInstruction(
+    Register Destination,
+    ArithmeticOperator Operator,
+    RegisterRange Operands) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Arithmetic;
+}
+
+public sealed record OpenReadCursorInstruction(Cursor Cursor, string? TableName = null, int ColumnCount = 0)
+    : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenReadCursor;
+}
+
+public sealed record OpenWriteCursorInstruction(Cursor Cursor, string TableName, int ColumnCount)
+    : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenWriteCursor;
+}
+
+public sealed record CloseCursorInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.CloseCursor;
+}
+
+/// <summary>Opens an in-memory sorter that materializes rows and orders them with
+/// <paramref name="Comparer"/> when <c>SorterSort</c> runs. <paramref name="ColumnCount"/>
+/// is the fixed width of every record the sorter stores.</summary>
+public sealed record OpenSorterInstruction(Sorter Sorter, VdbeRowComparer Comparer, int ColumnCount)
+    : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenSorter;
+}
+
+/// <summary>Appends a snapshot of the registers in <paramref name="Record"/> to the
+/// sorter. The values are copied, so later writes to those registers do not disturb
+/// rows already stored.</summary>
+public sealed record SorterInsertInstruction(Sorter Sorter, RegisterRange Record) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SorterInsert;
+}
+
+/// <summary>Stably sorts the accumulated records and positions the sorter on the first
+/// one. Jumps to <paramref name="EmptyTarget"/> when the sorter holds no rows.</summary>
+public sealed record SorterSortInstruction(Sorter Sorter, ProgramCounter EmptyTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SorterSort;
+}
+
+/// <summary>Copies the sorter's current record into the contiguous register block that
+/// <paramref name="Destination"/> spans. The range width must equal the sorter's
+/// column count.</summary>
+public sealed record SorterDataInstruction(Sorter Sorter, RegisterRange Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SorterData;
+}
+
+/// <summary>Advances the sorter to the next ordered record, jumping to
+/// <paramref name="LoopTarget"/> while more rows remain and falling through once the
+/// sorter is drained.</summary>
+public sealed record SorterNextInstruction(Sorter Sorter, ProgramCounter LoopTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SorterNext;
+}
+
+/// <summary>Releases the sorter's buffered rows.</summary>
+public sealed record CloseSorterInstruction(Sorter Sorter) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.CloseSorter;
+}
+
+/// <summary>Unconditionally transfers control to <paramref name="Target"/>.</summary>
+public sealed record GotoInstruction(ProgramCounter Target) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Goto;
+}
+
+/// <summary>
+/// Transfers control to <paramref name="Target"/> when <paramref name="Register"/> holds a
+/// truthy value — a non-zero <see cref="SqlValueKind.Integer"/> — and falls through otherwise
+/// (including <c>Integer(0)</c>, NULL, and every non-integer kind). It is a pure control-flow
+/// primitive that branches on a boolean flag the program itself maintains with
+/// <c>LoadConstant</c>; it never interprets SQL truthiness of arbitrary values. The LEFT OUTER
+/// join uses it to branch on its per-outer-row "a right row matched" flag.
+/// </summary>
+public sealed record JumpIfInstruction(Register Register, ProgramCounter Target) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.JumpIf;
+}
+
+/// <summary>Resets an aggregate accumulator to its uninitialized state so the next
+/// <c>AggStep</c> starts a fresh group. A following <c>AggFinalize</c> on an accumulator
+/// that was reset but never stepped yields the aggregate's empty-input value.</summary>
+public sealed record AggResetInstruction(Accumulator Accumulator) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AggReset;
+}
+
+/// <summary>Folds the argument tuple in <paramref name="Arguments"/> into
+/// <paramref name="Accumulator"/> using <paramref name="Aggregate"/>. The accumulator's
+/// context is created lazily on the first step after a reset. A zero-width range steps a
+/// nullary aggregate such as <c>COUNT(*)</c>.</summary>
+public sealed record AggStepInstruction(
+    Accumulator Accumulator,
+    VdbeAggregate Aggregate,
+    RegisterRange Arguments) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AggStep;
+}
+
+/// <summary>Finalizes <paramref name="Accumulator"/> with <paramref name="Aggregate"/>
+/// and writes the result into <paramref name="Destination"/>. It does not reset the
+/// accumulator; grouped programs emit an explicit <c>AggReset</c> before the next group.</summary>
+public sealed record AggFinalizeInstruction(
+    Accumulator Accumulator,
+    VdbeAggregate Aggregate,
+    Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.AggFinalize;
+}
+
+/// <summary>Compares the group-key tuple in <paramref name="CurrentKey"/> against the
+/// saved tuple in <paramref name="SavedKey"/> with <paramref name="Comparer"/> and jumps
+/// to <paramref name="SameGroupTarget"/> when they fall in the same group, falling through
+/// otherwise (a new group boundary). The two ranges must be the same width.</summary>
+public sealed record SameGroupInstruction(
+    RegisterRange CurrentKey,
+    RegisterRange SavedKey,
+    VdbeGroupComparer Comparer,
+    ProgramCounter SameGroupTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SameGroup;
+}
+
+public sealed record RewindCursorInstruction(Cursor Cursor, ProgramCounter EmptyTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Rewind;
+}
+
+public sealed record ColumnInstruction(Cursor Cursor, int ColumnIndex, Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Column;
+}
+
+public sealed record RowIdInstruction(Cursor Cursor, Register Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RowId;
+}
+
+public sealed record DeleteInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Delete;
+}
+
+public sealed record InsertInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Insert;
+}
+
+public sealed record UpdateInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Update;
+}
+
+public sealed record CommitInstruction(Cursor Cursor) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Commit;
+}
+
+public sealed record FilterInstruction(
+    Cursor Cursor,
+    VdbeRowPredicate Predicate,
+    ProgramCounter FalseTarget,
+    string Description) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Filter;
+}
+
+/// <summary>
+/// Evaluates <paramref name="Predicate"/> against the tuple held in the register block
+/// <paramref name="Row"/> and jumps to <paramref name="FalseTarget"/> when it is false,
+/// falling through otherwise. It is the register-range analogue of <see cref="FilterInstruction"/>:
+/// where <c>Filter</c> tests a single cursor's current row, this tests a materialized tuple
+/// assembled in registers, which is what a join predicate over the combined
+/// <c>(left columns, right columns)</c> row needs. The compiler supplies the delegate so the
+/// emitted program matches the evaluator's SQL comparison semantics exactly.
+/// </summary>
+public sealed record FilterRegistersInstruction(
+    RegisterRange Row,
+    VdbeRowPredicate Predicate,
+    ProgramCounter FalseTarget,
+    string Description) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.FilterRegisters;
+}
+
+public sealed record NextInstruction(Cursor Cursor, ProgramCounter LoopTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Next;
+}
+
+public sealed record YieldInstruction : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Yield;
+}
+
+public sealed record ResultRowInstruction(RegisterRange Values) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ResultRow;
+}
+
+/// <summary>
+/// Emits the tuple held in the register block <paramref name="Values"/> as a result row, but only
+/// the first time an equal tuple is seen: it tests the tuple against the running set of rows already
+/// emitted through distinct set <paramref name="DistinctSetIndex"/> using <paramref name="Equality"/>,
+/// records and yields novel rows, and silently skips duplicates (advancing without producing a row).
+/// It is the compound-select de-duplication primitive: replacing a term's <see cref="ResultRowInstruction"/>
+/// with this opcode against a shared distinct set turns <c>UNION ALL</c> sequencing into <c>UNION</c>/<c>DISTINCT</c>.
+/// The compiler supplies the equality delegate so the emitted program matches the evaluator's row-equality
+/// semantics (NULL==NULL, affinity, and collation) exactly.
+/// </summary>
+public sealed record DistinctResultRowInstruction(
+    RegisterRange Values,
+    VdbeRowEquality Equality,
+    int DistinctSetIndex) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DistinctResultRow;
+}
+
+/// <summary>
+/// Records the tuple held in the register block <paramref name="Values"/> into row set
+/// <paramref name="RowSetIndex"/> for later membership tests, without ever producing a result row.
+/// The set holds one representative per distinct tuple: an equal tuple already recorded through
+/// <paramref name="Equality"/> is not stored again. It is the compound set-operation primitive that
+/// materializes a non-primary term (the right-hand operand of <c>INTERSECT</c>/<c>EXCEPT</c>) into a
+/// probe set that a following <see cref="CompoundResultRowInstruction"/> tests the primary term's rows
+/// against. It reuses the same row-set resource pool as <see cref="DistinctResultRowInstruction"/>
+/// (<see cref="VdbeProgram.DistinctSetCount"/>), so <c>Reset</c>/<c>Dispose</c> clear it identically.
+/// The compiler supplies the equality delegate so membership matches the evaluator's row-equality
+/// contract (NULL==NULL together with affinity- and collation-aware comparison) exactly.
+/// </summary>
+public sealed record RowSetInsertInstruction(
+    RegisterRange Values,
+    VdbeRowEquality Equality,
+    int RowSetIndex) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RowSetInsert;
+}
+
+/// <summary>
+/// Emits the tuple held in the register block <paramref name="Values"/> as a result row for a compound
+/// set operation, but only the first time an equal tuple both satisfies the membership condition
+/// <paramref name="Mode"/> against the probe sets <paramref name="MembershipSetIndices"/> and is novel to
+/// the output set <paramref name="OutputSetIndex"/>:
+/// <see cref="CompoundMembershipMode.PresentInAll"/> (<c>INTERSECT</c>) requires the tuple to be present
+/// in every probe set; <see cref="CompoundMembershipMode.AbsentFromAll"/> (<c>EXCEPT</c>) requires it to
+/// be present in none. A tuple that fails the condition, or that duplicates a row already emitted through
+/// the output set, advances without producing a row. It is the primary-term emit of a compound set
+/// operation: the probe sets are built by <see cref="RowSetInsertInstruction"/> over the non-primary
+/// terms before the primary term runs, so the primary term streams in its own cursor order and the output
+/// preserves first-term first-occurrence order. Every probe set, plus the output set, is drawn from the
+/// shared row-set pool (<see cref="VdbeProgram.DistinctSetCount"/>). The compiler supplies the equality
+/// delegate so every membership and de-duplication comparison uses the evaluator's row-equality contract
+/// (NULL==NULL together with affinity- and collation-aware comparison) exactly.
+/// </summary>
+/// <remarks>
+/// The output set must be disjoint from every probe set; an empty <paramref name="MembershipSetIndices"/>
+/// makes the condition vacuously true, degenerating to plain distinct output.
+/// </remarks>
+public sealed record CompoundResultRowInstruction(
+    RegisterRange Values,
+    VdbeRowEquality Equality,
+    int OutputSetIndex,
+    IReadOnlyList<int> MembershipSetIndices,
+    CompoundMembershipMode Mode) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.CompoundResultRow;
+}
+
+/// <summary>
+/// Skips the first N candidate result rows of a LIMIT/OFFSET pipeline. When <paramref name="Counter"/>
+/// holds a positive <see cref="SqlValueKind.Integer"/>, it decrements the counter and jumps to
+/// <paramref name="SkipTarget"/> — the loop-advance instruction that immediately follows the gated
+/// result row — so the candidate is discarded without being emitted; once the counter reaches zero it
+/// falls through and the row is emitted. It is the OFFSET half of the limit/offset family: the counter
+/// is a register seeded with the resolved non-negative offset, so the first <c>offset</c> candidates
+/// that reach the gate are skipped. Skipped candidates never reach the following
+/// <see cref="LimitGateInstruction"/>, so an OFFSET row is never counted against LIMIT — preserving the
+/// evaluator's OFFSET-then-LIMIT order.
+/// </summary>
+public sealed record OffsetGateInstruction(Register Counter, ProgramCounter SkipTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OffsetGate;
+}
+
+/// <summary>
+/// Stops a LIMIT/OFFSET pipeline once it has emitted its allowance. When <paramref name="Counter"/>
+/// holds a positive <see cref="SqlValueKind.Integer"/>, it decrements the counter and falls through so
+/// the gated result row is emitted; when the counter is zero (or non-positive) it jumps to
+/// <paramref name="DoneTarget"/> — the program's terminating <c>Halt</c> — so no further rows are
+/// produced. It is the LIMIT half of the limit/offset family: the counter is a register seeded with the
+/// resolved non-negative limit, so exactly that many rows survive the gate. A seed of zero (LIMIT 0)
+/// jumps on the very first candidate and emits nothing; an unbounded or negative limit is lowered by
+/// simply omitting this gate, so every row surviving OFFSET is emitted.
+/// </summary>
+public sealed record LimitGateInstruction(Register Counter, ProgramCounter DoneTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.LimitGate;
+}
+
+public sealed record HaltInstruction : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Halt;
+}
+
+/// <summary>
+/// Opens the statement's outermost transaction over the interpreter's mutable register state,
+/// snapshotting the register file so a later <see cref="RollbackTransactionInstruction"/> can restore
+/// it. It fails at run time when a transaction is already open, mirroring SQLite's "cannot start a
+/// transaction within a transaction". This transacts only the interpreter's own scalar registers; it
+/// makes no claim on database durability and never touches storage.
+/// </summary>
+public sealed record BeginTransactionInstruction : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.BeginTransaction;
+}
+
+/// <summary>
+/// Ends the active transaction by discarding every savepoint snapshot and keeping the current register
+/// values — the committed state. It fails at run time when no transaction is active. Like the whole
+/// family it commits only the interpreter's in-memory register state, not any durable store.
+/// </summary>
+public sealed record CommitTransactionInstruction : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.CommitTransaction;
+}
+
+/// <summary>
+/// Ends the active transaction by restoring the register file to the snapshot taken when the outermost
+/// transaction was opened and discarding every savepoint. It fails at run time when no transaction is
+/// active. The rollback is observable purely through the restored register values; no storage is involved.
+/// </summary>
+public sealed record RollbackTransactionInstruction : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RollbackTransaction;
+}
+
+/// <summary>
+/// Opens a named savepoint, pushing a register-file snapshot onto the savepoint stack. A savepoint may be
+/// opened outside a transaction, in which case it implicitly opens one (matching SQLite). Names are matched
+/// with ordinal (case-sensitive, exact) comparison and must be non-empty.
+/// </summary>
+public sealed record SavepointInstruction(string Name) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Savepoint;
+}
+
+/// <summary>
+/// Releases the named savepoint and every savepoint opened after it, discarding their snapshots without
+/// restoring any register values — the nested savepoints are folded into the enclosing scope. It fails at
+/// run time when no savepoint with <paramref name="Name"/> is open. Releasing the savepoint that opened the
+/// transaction ends the transaction.
+/// </summary>
+public sealed record ReleaseSavepointInstruction(string Name) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ReleaseSavepoint;
+}
+
+/// <summary>
+/// Restores the register file to the snapshot taken at the named savepoint and cancels every savepoint
+/// opened after it, but keeps the named savepoint itself so it can be rolled back to again. It fails at run
+/// time when no savepoint with <paramref name="Name"/> is open. The transaction stays open.
+/// </summary>
+public sealed record RollbackToSavepointInstruction(string Name) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RollbackToSavepoint;
+}
+
+/// <summary>
+/// Opens recursive worktable <paramref name="WorkTable"/>: a FIFO frontier queue of
+/// <paramref name="ColumnCount"/>-wide rows that a <see cref="SeedWorkTableInstruction"/> fills with the
+/// anchor generation and a <see cref="WorkTableStepInstruction"/>/<see cref="WorkTableExpandInstruction"/>
+/// loop drains and re-feeds. It is the recursive-CTE analogue of <see cref="OpenSorterInstruction"/>: it
+/// allocates the runtime buffer and fixes its shape and safety bounds up front.
+/// </summary>
+/// <remarks>
+/// <para><paramref name="Mode"/> selects <c>UNION ALL</c> (<see cref="WorkTableDedupMode.KeepAll"/>) or
+/// <c>UNION</c>/<c>DISTINCT</c> (<see cref="WorkTableDedupMode.Distinct"/>) de-duplication. A distinct
+/// worktable requires a non-null <paramref name="Equality"/>, which owns the row-equality contract
+/// (NULL==NULL, affinity, collation) exactly as the compound opcodes do; a keep-all worktable must carry
+/// no equality.</para>
+/// <para>The two guards make the recursion safe by construction. <paramref name="MaxRows"/> (which must be
+/// positive) is a hard cap on the number of rows admitted to the worktable — seeds plus descendants,
+/// counting only admitted (non-duplicate) rows; admitting one more throws a
+/// <see cref="RecursiveWorkTableOverflowException"/>, which is how an unbounded <c>UNION ALL</c> recursion
+/// fails loudly instead of looping forever. <paramref name="MaxDepth"/> (which must be non-negative) bounds
+/// the recursion depth: a frontier row at depth <c>d</c> is expanded only while <c>d &lt; MaxDepth</c>, so
+/// seeds are depth 0, their descendants depth 1, and the deepest emitted rows sit at depth
+/// <c>MaxDepth</c>. <c>MaxDepth</c> = 0 emits only the anchor generation; a very large value defers
+/// termination to the row guard or to the transform running dry.</para>
+/// </remarks>
+public sealed record OpenWorkTableInstruction(
+    WorkTable WorkTable,
+    int ColumnCount,
+    WorkTableDedupMode Mode,
+    int MaxRows,
+    int MaxDepth,
+    VdbeRowEquality? Equality = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenWorkTable;
+}
+
+/// <summary>
+/// Admits the tuple held in the register block <paramref name="Row"/> to worktable
+/// <paramref name="WorkTable"/> as a depth-0 (anchor/seed) frontier row. The values are snapshotted, so a
+/// later reload of those registers cannot disturb a queued row. Under
+/// <see cref="WorkTableDedupMode.Distinct"/> a seed equal to one already admitted is silently dropped;
+/// otherwise the seed counts against the worktable's row guard and enqueues for later draining. Seeds do
+/// not themselves produce a result row — the drain loop emits every admitted row exactly once, so anchor
+/// rows surface first in seed order (breadth-first).
+/// </summary>
+public sealed record SeedWorkTableInstruction(WorkTable WorkTable, RegisterRange Row) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SeedWorkTable;
+}
+
+/// <summary>
+/// Dequeues the next frontier row of worktable <paramref name="WorkTable"/> into the register block
+/// <paramref name="Destination"/> and records it as the worktable's current frontier row (establishing the
+/// depth a following <see cref="WorkTableExpandInstruction"/> expands from), then falls through. When the
+/// frontier is empty it jumps to <paramref name="DoneTarget"/> instead, ending the drain loop. It is the
+/// head of the recursive loop and the recursion analogue of <c>SorterSort</c>/<c>Next</c>: the FIFO order
+/// is what makes the emitted stream breadth-first (an entire generation before the next), matching the
+/// evaluator's level-by-level working-set iteration for a linear recursive term.
+/// </summary>
+public sealed record WorkTableStepInstruction(
+    WorkTable WorkTable,
+    RegisterRange Destination,
+    ProgramCounter DoneTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.WorkTableStep;
+}
+
+/// <summary>
+/// Expands the worktable's current frontier row — the tuple held in the register block
+/// <paramref name="Source"/>, which the preceding <see cref="WorkTableStepInstruction"/> dequeued — into
+/// its descendants by invoking <paramref name="Transform"/>, and enqueues each descendant one depth deeper,
+/// subject to the worktable's de-duplication and guards. When the current row is already at the depth guard
+/// (<c>depth &gt;= MaxDepth</c>) the transform is not invoked, bounding the recursion. Each admitted
+/// descendant that would exceed the row guard throws a <see cref="RecursiveWorkTableOverflowException"/>;
+/// each duplicate (under <see cref="WorkTableDedupMode.Distinct"/>) is dropped. It never produces a result
+/// row itself — the loop's <c>ResultRow</c> emits the dequeued row and this opcode only grows the frontier,
+/// so the recursion unfolds observably one <c>Step</c>/<c>Expand</c> generation at a time.
+/// </summary>
+public sealed record WorkTableExpandInstruction(
+    WorkTable WorkTable,
+    VdbeRecursiveTransform Transform,
+    RegisterRange Source) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.WorkTableExpand;
+}
+
+/// <summary>Releases worktable <paramref name="WorkTable"/>'s frontier and de-duplication buffers.</summary>
+public sealed record CloseWorkTableInstruction(WorkTable WorkTable) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.CloseWorkTable;
+}
+
+/// <summary>
+/// Thrown when a recursive worktable would admit more rows than its <see cref="OpenWorkTableInstruction.MaxRows"/>
+/// guard allows. It is the loud, bounded failure that keeps a runaway (or genuinely non-terminating)
+/// <c>UNION ALL</c> recursion from exhausting memory, mirroring the tree-walking evaluator's recursive-row cap.
+/// </summary>
+public sealed class RecursiveWorkTableOverflowException : InvalidOperationException
+{
+    public RecursiveWorkTableOverflowException(int maxRows)
+        : base($"Recursive work table exceeded its row guard of {maxRows} rows.")
+    {
+        MaxRows = maxRows;
+    }
+
+    /// <summary>The row guard that was exceeded.</summary>
+    public int MaxRows { get; }
+}
+
+public sealed class VdbeProgramValidationException : InvalidOperationException
+{
+    public VdbeProgramValidationException(string message) : base(message)
+    {
+    }
+}
+
+public sealed class VdbeProgram
+{
+    private readonly ReadOnlyCollection<VdbeInstruction> _instructions;
+
+    public VdbeProgram(
+        int registerCount,
+        int cursorCount,
+        IEnumerable<VdbeInstruction> instructions,
+        int sorterCount = 0,
+        int accumulatorCount = 0,
+        int distinctSetCount = 0,
+        int parameterSlotCount = 0,
+        int workTableCount = 0)
+    {
+        if (registerCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(registerCount));
+        if (cursorCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(cursorCount));
+        if (sorterCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(sorterCount));
+        if (accumulatorCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(accumulatorCount));
+        if (distinctSetCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(distinctSetCount));
+        if (parameterSlotCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(parameterSlotCount));
+        if (workTableCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(workTableCount));
+        ArgumentNullException.ThrowIfNull(instructions);
+
+        RegisterCount = registerCount;
+        CursorCount = cursorCount;
+        SorterCount = sorterCount;
+        AccumulatorCount = accumulatorCount;
+        DistinctSetCount = distinctSetCount;
+        ParameterSlotCount = parameterSlotCount;
+        WorkTableCount = workTableCount;
+        _instructions = Array.AsReadOnly(instructions.ToArray());
+        Validate();
+    }
+
+    public int RegisterCount { get; }
+
+    public int CursorCount { get; }
+
+    public int SorterCount { get; }
+
+    public int AccumulatorCount { get; }
+
+    public int DistinctSetCount { get; }
+
+    /// <summary>The number of late-bound parameter slots the program reads, i.e. the width of the
+    /// <see cref="VdbeParameterBinding"/> a <see cref="ResumableStatement"/> must supply. Zero for a
+    /// fully constant program that references no parameters.</summary>
+    public int ParameterSlotCount { get; }
+
+    /// <summary>The number of recursive worktables the program opens, i.e. the width of the frontier/queue
+    /// resource pool a <see cref="ResumableStatement"/> allocates. Zero for a program that drives no
+    /// recursive-CTE evaluation.</summary>
+    public int WorkTableCount { get; }
+
+    public IReadOnlyList<VdbeInstruction> Instructions => _instructions;
+
+    public void Validate()
+    {
+        if (_instructions.Count == 0)
+            throw new VdbeProgramValidationException("A VDBE program must contain a halt instruction.");
+        if (_instructions[^1] is not HaltInstruction)
+            throw new VdbeProgramValidationException("A VDBE program must end with a halt instruction.");
+
+        var openCursors = new bool[CursorCount];
+        var cursorColumnCounts = new int[CursorCount];
+        var openSorters = new bool[SorterCount];
+        var sorterColumnCounts = new int[SorterCount];
+        var openWorkTables = new bool[WorkTableCount];
+        var workTableColumnCounts = new int[WorkTableCount];
+        for (var instructionIndex = 0; instructionIndex < _instructions.Count; instructionIndex++)
+        {
+            var instruction = _instructions[instructionIndex]
+                ?? throw new VdbeProgramValidationException(
+                    $"VDBE instruction {instructionIndex} must not be null.");
+
+            switch (instruction)
+            {
+                case LoadConstantInstruction loadConstant:
+                    ValidateRegister(loadConstant.Destination, instructionIndex);
+                    break;
+                case LoadParameterInstruction loadParameter:
+                    ValidateRegister(loadParameter.Destination, instructionIndex);
+                    ValidateParameterSlot(loadParameter.Slot, instructionIndex);
+                    break;
+                case CopyInstruction copy:
+                    ValidateRegister(copy.Source, instructionIndex);
+                    ValidateRegister(copy.Destination, instructionIndex);
+                    break;
+                case FunctionInstruction function:
+                    ValidateRegister(function.Destination, instructionIndex);
+                    if (function.Function is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies a null scalar function.");
+                    }
+
+                    if (function.Function.Invoke is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies scalar function '{function.Function.Name}' with a null invoke delegate.");
+                    }
+
+                    ValidateRegisterRange(function.Arguments, instructionIndex);
+                    if (function.Function.Arity is { } arity)
+                    {
+                        if (arity < 0)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} applies scalar function '{function.Function.Name}' declaring a negative arity {arity}.");
+                        }
+
+                        if (function.Arguments.Count != arity)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} applies scalar function '{function.Function.Name}' of arity {arity} to {function.Arguments.Count} argument(s).");
+                        }
+                    }
+
+                    break;
+                case ArithmeticInstruction arithmetic:
+                    ValidateRegister(arithmetic.Destination, instructionIndex);
+                    if (!Enum.IsDefined(arithmetic.Operator))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies an undefined arithmetic operator.");
+                    }
+
+                    ValidateRegisterRange(arithmetic.Operands, instructionIndex);
+                    var arithmeticArity = VdbeArithmetic.Arity(arithmetic.Operator);
+                    if (arithmetic.Operands.Count != arithmeticArity)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies arithmetic operator '{VdbeArithmetic.Symbol(arithmetic.Operator)}' of arity {arithmeticArity} to {arithmetic.Operands.Count} operand(s).");
+                    }
+
+                    break;
+                case OpenReadCursorInstruction open:
+                    ValidateCursor(open.Cursor, instructionIndex);
+                    if (openCursors[open.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {open.Cursor.Index} twice.");
+                    }
+
+                    if (open.ColumnCount < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {open.Cursor.Index} with a negative column count.");
+                    }
+
+                    openCursors[open.Cursor.Index] = true;
+                    cursorColumnCounts[open.Cursor.Index] = open.ColumnCount;
+                    break;
+                case OpenWriteCursorInstruction openWrite:
+                    ValidateCursor(openWrite.Cursor, instructionIndex);
+                    if (openCursors[openWrite.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {openWrite.Cursor.Index} twice.");
+                    }
+
+                    if (openWrite.ColumnCount < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {openWrite.Cursor.Index} with a negative column count.");
+                    }
+
+                    openCursors[openWrite.Cursor.Index] = true;
+                    cursorColumnCounts[openWrite.Cursor.Index] = openWrite.ColumnCount;
+                    break;
+                case CloseCursorInstruction close:
+                    ValidateCursor(close.Cursor, instructionIndex);
+                    if (!openCursors[close.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} closes cursor {close.Cursor.Index} before opening it.");
+                    }
+
+                    openCursors[close.Cursor.Index] = false;
+                    break;
+                case RewindCursorInstruction rewind:
+                    ValidateOpenCursor(rewind.Cursor, openCursors, instructionIndex);
+                    ValidateJumpTarget(rewind.EmptyTarget, instructionIndex);
+                    break;
+                case ColumnInstruction column:
+                    ValidateOpenCursor(column.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(column.Destination, instructionIndex);
+                    ValidateColumnIndex(column, cursorColumnCounts[column.Cursor.Index], instructionIndex);
+                    break;
+                case RowIdInstruction rowId:
+                    ValidateOpenCursor(rowId.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(rowId.Destination, instructionIndex);
+                    break;
+                case DeleteInstruction delete:
+                    ValidateOpenCursor(delete.Cursor, openCursors, instructionIndex);
+                    break;
+                case InsertInstruction insert:
+                    ValidateOpenCursor(insert.Cursor, openCursors, instructionIndex);
+                    break;
+                case UpdateInstruction update:
+                    ValidateOpenCursor(update.Cursor, openCursors, instructionIndex);
+                    break;
+                case CommitInstruction commit:
+                    ValidateOpenCursor(commit.Cursor, openCursors, instructionIndex);
+                    break;
+                case FilterInstruction filter:
+                    ValidateOpenCursor(filter.Cursor, openCursors, instructionIndex);
+                    if (filter.Predicate is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} filters with a null predicate.");
+                    }
+
+                    ValidateJumpTarget(filter.FalseTarget, instructionIndex);
+                    break;
+                case FilterRegistersInstruction filterRegisters:
+                    if (filterRegisters.Predicate is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} filters with a null predicate.");
+                    }
+
+                    ValidateRegisterRange(filterRegisters.Row, instructionIndex);
+                    ValidateJumpTarget(filterRegisters.FalseTarget, instructionIndex);
+                    break;
+                case NextInstruction next:
+                    ValidateOpenCursor(next.Cursor, openCursors, instructionIndex);
+                    ValidateJumpTarget(next.LoopTarget, instructionIndex);
+                    break;
+                case OpenSorterInstruction openSorter:
+                    ValidateSorter(openSorter.Sorter, instructionIndex);
+                    if (openSorters[openSorter.Sorter.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens sorter {openSorter.Sorter.Index} twice.");
+                    }
+
+                    if (openSorter.Comparer is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens sorter {openSorter.Sorter.Index} with a null comparer.");
+                    }
+
+                    if (openSorter.ColumnCount <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens sorter {openSorter.Sorter.Index} with a non-positive column count.");
+                    }
+
+                    openSorters[openSorter.Sorter.Index] = true;
+                    sorterColumnCounts[openSorter.Sorter.Index] = openSorter.ColumnCount;
+                    break;
+                case SorterInsertInstruction sorterInsert:
+                    ValidateOpenSorter(sorterInsert.Sorter, openSorters, instructionIndex);
+                    ValidateRegisterRange(sorterInsert.Record, instructionIndex);
+                    ValidateSorterRecordWidth(
+                        sorterInsert.Sorter,
+                        sorterInsert.Record,
+                        sorterColumnCounts[sorterInsert.Sorter.Index],
+                        instructionIndex);
+                    break;
+                case SorterSortInstruction sorterSort:
+                    ValidateOpenSorter(sorterSort.Sorter, openSorters, instructionIndex);
+                    ValidateJumpTarget(sorterSort.EmptyTarget, instructionIndex);
+                    break;
+                case SorterDataInstruction sorterData:
+                    ValidateOpenSorter(sorterData.Sorter, openSorters, instructionIndex);
+                    ValidateRegisterRange(sorterData.Destination, instructionIndex);
+                    ValidateSorterRecordWidth(
+                        sorterData.Sorter,
+                        sorterData.Destination,
+                        sorterColumnCounts[sorterData.Sorter.Index],
+                        instructionIndex);
+                    break;
+                case SorterNextInstruction sorterNext:
+                    ValidateOpenSorter(sorterNext.Sorter, openSorters, instructionIndex);
+                    ValidateJumpTarget(sorterNext.LoopTarget, instructionIndex);
+                    break;
+                case CloseSorterInstruction closeSorter:
+                    ValidateOpenSorter(closeSorter.Sorter, openSorters, instructionIndex);
+                    openSorters[closeSorter.Sorter.Index] = false;
+                    break;
+                case GotoInstruction gotoInstruction:
+                    ValidateJumpTarget(gotoInstruction.Target, instructionIndex);
+                    break;
+                case JumpIfInstruction jumpIf:
+                    ValidateRegister(jumpIf.Register, instructionIndex);
+                    ValidateJumpTarget(jumpIf.Target, instructionIndex);
+                    break;
+                case AggResetInstruction aggReset:
+                    ValidateAccumulator(aggReset.Accumulator, instructionIndex);
+                    break;
+                case AggStepInstruction aggStep:
+                    ValidateAccumulator(aggStep.Accumulator, instructionIndex);
+                    if (aggStep.Aggregate is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} steps accumulator {aggStep.Accumulator.Index} with a null aggregate.");
+                    }
+
+                    ValidateRegisterRange(aggStep.Arguments, instructionIndex);
+                    break;
+                case AggFinalizeInstruction aggFinalize:
+                    ValidateAccumulator(aggFinalize.Accumulator, instructionIndex);
+                    if (aggFinalize.Aggregate is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} finalizes accumulator {aggFinalize.Accumulator.Index} with a null aggregate.");
+                    }
+
+                    ValidateRegister(aggFinalize.Destination, instructionIndex);
+                    break;
+                case SameGroupInstruction sameGroup:
+                    if (sameGroup.Comparer is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} compares groups with a null comparer.");
+                    }
+
+                    ValidateRegisterRange(sameGroup.CurrentKey, instructionIndex);
+                    ValidateRegisterRange(sameGroup.SavedKey, instructionIndex);
+                    if (sameGroup.CurrentKey.Count != sameGroup.SavedKey.Count)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} compares a {sameGroup.CurrentKey.Count}-column key against a {sameGroup.SavedKey.Count}-column key.");
+                    }
+
+                    ValidateJumpTarget(sameGroup.SameGroupTarget, instructionIndex);
+                    break;
+                case ResultRowInstruction resultRow:
+                    ValidateRegisterRange(resultRow.Values, instructionIndex);
+                    break;
+                case DistinctResultRowInstruction distinctRow:
+                    ValidateRegisterRange(distinctRow.Values, instructionIndex);
+                    if (distinctRow.Equality is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} emits a distinct row with a null equality.");
+                    }
+
+                    ValidateDistinctSet(distinctRow.DistinctSetIndex, instructionIndex);
+                    break;
+                case RowSetInsertInstruction rowSetInsert:
+                    ValidateRegisterRange(rowSetInsert.Values, instructionIndex);
+                    if (rowSetInsert.Equality is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} inserts into a row set with a null equality.");
+                    }
+
+                    ValidateDistinctSet(rowSetInsert.RowSetIndex, instructionIndex);
+                    break;
+                case CompoundResultRowInstruction compoundRow:
+                    ValidateRegisterRange(compoundRow.Values, instructionIndex);
+                    if (compoundRow.Equality is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} emits a compound row with a null equality.");
+                    }
+
+                    if (compoundRow.MembershipSetIndices is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} emits a compound row with a null membership set list.");
+                    }
+
+                    if (!Enum.IsDefined(compoundRow.Mode))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} emits a compound row with an undefined membership mode.");
+                    }
+
+                    ValidateDistinctSet(compoundRow.OutputSetIndex, instructionIndex);
+                    foreach (var membershipSet in compoundRow.MembershipSetIndices)
+                    {
+                        ValidateDistinctSet(membershipSet, instructionIndex);
+                        if (membershipSet == compoundRow.OutputSetIndex)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} emits a compound row whose output set {compoundRow.OutputSetIndex} is also a membership set.");
+                        }
+                    }
+
+                    break;
+                case OffsetGateInstruction offsetGate:
+                    ValidateRegister(offsetGate.Counter, instructionIndex);
+                    ValidateJumpTarget(offsetGate.SkipTarget, instructionIndex);
+                    break;
+                case LimitGateInstruction limitGate:
+                    ValidateRegister(limitGate.Counter, instructionIndex);
+                    ValidateJumpTarget(limitGate.DoneTarget, instructionIndex);
+                    break;
+                case YieldInstruction:
+                    break;
+                case BeginTransactionInstruction:
+                case CommitTransactionInstruction:
+                case RollbackTransactionInstruction:
+                    break;
+                case SavepointInstruction savepoint:
+                    ValidateSavepointName(savepoint.Name, instructionIndex);
+                    break;
+                case ReleaseSavepointInstruction release:
+                    ValidateSavepointName(release.Name, instructionIndex);
+                    break;
+                case RollbackToSavepointInstruction rollbackTo:
+                    ValidateSavepointName(rollbackTo.Name, instructionIndex);
+                    break;
+                case OpenWorkTableInstruction openWorkTable:
+                    ValidateWorkTable(openWorkTable.WorkTable, instructionIndex);
+                    if (openWorkTables[openWorkTable.WorkTable.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens work table {openWorkTable.WorkTable.Index} twice.");
+                    }
+
+                    if (openWorkTable.ColumnCount <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens work table {openWorkTable.WorkTable.Index} with a non-positive column count.");
+                    }
+
+                    if (openWorkTable.MaxRows <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens work table {openWorkTable.WorkTable.Index} with a non-positive row guard.");
+                    }
+
+                    if (openWorkTable.MaxDepth < 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens work table {openWorkTable.WorkTable.Index} with a negative depth guard.");
+                    }
+
+                    if (!Enum.IsDefined(openWorkTable.Mode))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens work table {openWorkTable.WorkTable.Index} with an undefined dedup mode.");
+                    }
+
+                    if (openWorkTable.Mode == WorkTableDedupMode.Distinct && openWorkTable.Equality is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens a distinct work table {openWorkTable.WorkTable.Index} with a null equality.");
+                    }
+
+                    if (openWorkTable.Mode == WorkTableDedupMode.KeepAll && openWorkTable.Equality is not null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens a keep-all work table {openWorkTable.WorkTable.Index} with a non-null equality; keep-all performs no de-duplication.");
+                    }
+
+                    openWorkTables[openWorkTable.WorkTable.Index] = true;
+                    workTableColumnCounts[openWorkTable.WorkTable.Index] = openWorkTable.ColumnCount;
+                    break;
+                case SeedWorkTableInstruction seed:
+                    ValidateOpenWorkTable(seed.WorkTable, openWorkTables, instructionIndex);
+                    ValidateRegisterRange(seed.Row, instructionIndex);
+                    ValidateWorkTableRecordWidth(
+                        seed.WorkTable,
+                        seed.Row,
+                        workTableColumnCounts[seed.WorkTable.Index],
+                        instructionIndex);
+                    break;
+                case WorkTableStepInstruction step:
+                    ValidateOpenWorkTable(step.WorkTable, openWorkTables, instructionIndex);
+                    ValidateRegisterRange(step.Destination, instructionIndex);
+                    ValidateWorkTableRecordWidth(
+                        step.WorkTable,
+                        step.Destination,
+                        workTableColumnCounts[step.WorkTable.Index],
+                        instructionIndex);
+                    ValidateJumpTarget(step.DoneTarget, instructionIndex);
+                    break;
+                case WorkTableExpandInstruction expand:
+                    ValidateOpenWorkTable(expand.WorkTable, openWorkTables, instructionIndex);
+                    if (expand.Transform is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} expands work table {expand.WorkTable.Index} with a null transform.");
+                    }
+
+                    ValidateRegisterRange(expand.Source, instructionIndex);
+                    ValidateWorkTableRecordWidth(
+                        expand.WorkTable,
+                        expand.Source,
+                        workTableColumnCounts[expand.WorkTable.Index],
+                        instructionIndex);
+                    break;
+                case CloseWorkTableInstruction closeWorkTable:
+                    ValidateOpenWorkTable(closeWorkTable.WorkTable, openWorkTables, instructionIndex);
+                    openWorkTables[closeWorkTable.WorkTable.Index] = false;
+                    break;
+                case HaltInstruction when instructionIndex == _instructions.Count - 1:
+                    break;
+                case HaltInstruction:
+                    throw new VdbeProgramValidationException(
+                        $"VDBE instruction {instructionIndex} halts before the end of the program.");
+                default:
+                    throw new VdbeProgramValidationException(
+                        $"VDBE instruction {instructionIndex} has unsupported opcode {instruction.Opcode}.");
+            }
+        }
+    }
+
+    private void ValidateRegister(Register register, int instructionIndex)
+    {
+        if (register.Index >= RegisterCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references register {register.Index}, but the program has {RegisterCount} registers.");
+        }
+    }
+
+    private void ValidateRegisterRange(RegisterRange range, int instructionIndex)
+    {
+        if (range.Start.Index > RegisterCount || range.Count > RegisterCount - range.Start.Index)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references registers outside the program register range.");
+        }
+    }
+
+    private void ValidateCursor(Cursor cursor, int instructionIndex)
+    {
+        if (cursor.Index >= CursorCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references cursor {cursor.Index}, but the program has {CursorCount} cursors.");
+        }
+    }
+
+    private void ValidateOpenCursor(Cursor cursor, bool[] openCursors, int instructionIndex)
+    {
+        ValidateCursor(cursor, instructionIndex);
+        if (!openCursors[cursor.Index])
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} uses cursor {cursor.Index} before opening it.");
+        }
+    }
+
+    private static void ValidateColumnIndex(ColumnInstruction column, int cursorColumnCount, int instructionIndex)
+    {
+        if (column.ColumnIndex < 0)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} reads a negative column index.");
+        }
+
+        if (cursorColumnCount > 0 && column.ColumnIndex >= cursorColumnCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} reads column {column.ColumnIndex} of cursor {column.Cursor.Index}, which exposes {cursorColumnCount} columns.");
+        }
+    }
+
+    private void ValidateJumpTarget(ProgramCounter target, int instructionIndex)
+    {
+        if (target.Offset >= _instructions.Count)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} jumps to {target.Offset}, outside the {_instructions.Count}-instruction program.");
+        }
+    }
+
+    private void ValidateSorter(Sorter sorter, int instructionIndex)
+    {
+        if (sorter.Index >= SorterCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references sorter {sorter.Index}, but the program has {SorterCount} sorters.");
+        }
+    }
+
+    private void ValidateOpenSorter(Sorter sorter, bool[] openSorters, int instructionIndex)
+    {
+        ValidateSorter(sorter, instructionIndex);
+        if (!openSorters[sorter.Index])
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} uses sorter {sorter.Index} before opening it.");
+        }
+    }
+
+    private static void ValidateSorterRecordWidth(
+        Sorter sorter,
+        RegisterRange range,
+        int sorterColumnCount,
+        int instructionIndex)
+    {
+        if (range.Count != sorterColumnCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} moves {range.Count} registers for sorter {sorter.Index}, which stores {sorterColumnCount}-column records.");
+        }
+    }
+
+    private void ValidateWorkTable(WorkTable workTable, int instructionIndex)
+    {
+        if (workTable.Index >= WorkTableCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references work table {workTable.Index}, but the program has {WorkTableCount} work tables.");
+        }
+    }
+
+    private void ValidateOpenWorkTable(WorkTable workTable, bool[] openWorkTables, int instructionIndex)
+    {
+        ValidateWorkTable(workTable, instructionIndex);
+        if (!openWorkTables[workTable.Index])
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} uses work table {workTable.Index} before opening it.");
+        }
+    }
+
+    private static void ValidateWorkTableRecordWidth(
+        WorkTable workTable,
+        RegisterRange range,
+        int workTableColumnCount,
+        int instructionIndex)
+    {
+        if (range.Count != workTableColumnCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} moves {range.Count} registers for work table {workTable.Index}, which stores {workTableColumnCount}-column records.");
+        }
+    }
+
+    private void ValidateAccumulator(Accumulator accumulator, int instructionIndex)
+    {
+        if (accumulator.Index >= AccumulatorCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references accumulator {accumulator.Index}, but the program has {AccumulatorCount} accumulators.");
+        }
+    }
+
+    private void ValidateDistinctSet(int distinctSetIndex, int instructionIndex)
+    {
+        if (distinctSetIndex < 0 || distinctSetIndex >= DistinctSetCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references distinct set {distinctSetIndex}, but the program has {DistinctSetCount} distinct sets.");
+        }
+    }
+
+    private void ValidateParameterSlot(ParameterSlot slot, int instructionIndex)
+    {
+        if (slot.Index >= ParameterSlotCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references parameter slot {slot.Index}, but the program has {ParameterSlotCount} parameter slots.");
+        }
+    }
+
+    private static void ValidateSavepointName(string name, int instructionIndex)
+    {
+        if (string.IsNullOrEmpty(name))
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references a savepoint with a null or empty name.");
+        }
+    }
+}

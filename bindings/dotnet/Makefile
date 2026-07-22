@@ -24,7 +24,7 @@ IOS_FRAMEWORK_BUILD_DIR = ./rs_compiled/ios-frameworks
 IOS_XCFRAMEWORK_DIR = ./rs_compiled/ios-universal/native/$(IOS_FRAMEWORK_NAME).xcframework
 
 all:
-	echo "make [build|test|benchmark|build-production]"
+	echo "make [build|test|benchmark|build-production|restore-managed|build-managed|test-managed|pack-managed]"
 
 build-rust-windows64:
 	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
@@ -111,6 +111,23 @@ build-dotnet:
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
+
+# These targets exercise the opt-in managed provider; the native provider remains the default.
+.PHONY: restore-managed build-managed test-managed pack-managed
+restore-managed:
+	dotnet restore ./src/Turso.Tests/Turso.Tests.csproj
+
+build-managed: restore-managed
+	dotnet build --no-restore -c Debug ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
+	dotnet build --no-restore -c Debug ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	dotnet build --no-restore -c Debug ./src/Turso.Tests/Turso.Tests.csproj
+
+test-managed: build-managed
+	dotnet test --no-build --no-restore -c Debug --filter "FullyQualifiedName~Managed" ./src/Turso.Tests/Turso.Tests.csproj
+
+pack-managed: build-managed
+	dotnet pack --no-build --no-restore -c Debug -p:RequireNativeAssetsForPack=false ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
+	dotnet pack --no-build --no-restore -c Debug -p:RequireNativeAssetsForPack=false ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
 
 # Generate the Turso Platform API client from the pinned OpenAPI spec.
 generate-platform-client:

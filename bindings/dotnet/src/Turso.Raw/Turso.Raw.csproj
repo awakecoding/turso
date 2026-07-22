@@ -335,6 +335,10 @@
         </None>
     </ItemGroup>
 
+    <ItemGroup>
+        <ProjectReference Include="..\Turso.Core\Turso.Core.csproj" />
+    </ItemGroup>
+
     <Target Name="ValidateNativeAssetsForPack" BeforeTargets="Pack"
             Condition="'$(Configuration)'=='Release' and '$(RequireNativeAssetsForPack)'=='true'">
         <Error Condition="!Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release\turso_sdk_kit.dll') and !Exists('..\..\rs_compiled\x86_64-pc-windows-msvc\release-official\turso_sdk_kit.dll')"

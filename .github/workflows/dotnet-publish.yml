@@ -310,6 +310,42 @@ jobs:
           path: ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.xcframework/**
           retention-days: 1
 
+  # Debug-only managed-provider packages; the native provider remains the default.
+  package-managed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Build and pack managed provider artifacts
+        run: make pack-managed
+
+      - name: Upload managed provider packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: managed-provider-debug-packages
+          path: |
+            ${{ env.working-directory }}/src/Turso.Data.Sqlite/bin/Debug/Turso.Data.Sqlite.*.nupkg
+            ${{ env.working-directory }}/src/Turso.EntityFrameworkCore.Sqlite/bin/Debug/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+          if-no-files-found: error
+          retention-days: 7
+
   # Create NuGet packages; publish is opt-in
   publish:
     needs: [build-natives, package-ios-framework]
@@ -433,6 +469,7 @@ jobs:
           mkdir -p artifacts/nuget-packages
           files=(
             src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
+            src/Turso.EntityFrameworkCore.Sqlite/bin/Release/Turso.EntityFrameworkCore.Sqlite.*.nupkg
             src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
             src/Turso.Platform.Client/bin/Release/Turso.Platform.Client.*.nupkg
             src/Turso.Serverless.Client/bin/Release/Turso.Serverless.Client.*.nupkg

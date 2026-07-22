@@ -23,6 +23,10 @@ public class TursoSqliteDatabaseCreator(
         Dependencies.Connection.Open();
         try
         {
+            var connectionOptions = new TursoSqliteConnectionStringBuilder(connection.ConnectionString);
+            if (connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+                return;
+
             rawSqlCommandBuilder.Build("PRAGMA journal_mode = 'wal';")
                 .ExecuteNonQuery(
                     new RelationalCommandParameterObject(

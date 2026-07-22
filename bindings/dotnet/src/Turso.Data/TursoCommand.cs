@@ -156,6 +156,8 @@ public class TursoCommand : DbCommand
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText must be set before preparing a command.");
         ValidateTransaction();
+        if (_connection.IsManagedReadOnly)
+            ManagedReadOnlySqlGuard.ThrowIfQueryOnlyIsDisabled(CommandText);
         if (_connection.IsRemote)
             return;
 

@@ -26,6 +26,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
   </ItemGroup>
 

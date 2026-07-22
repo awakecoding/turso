@@ -1,0 +1,526 @@
+using System.Globalization;
+using AwesomeAssertions;
+using Turso.Core;
+using MsData = Microsoft.Data.Sqlite;
+
+namespace Turso.Tests;
+
+// Proves that EmbeddedDatabase routes the running-frame window subset
+// (func(...) OVER (... ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) through the real
+// sorter + AggReset/AggStep/AggFinalize opcode family emitted by WindowProgramBuilder, and that
+// the routed rows stay byte-identical to the tree-walking evaluator (cross-checked against a real
+// SQLite build for the partitioned case). EXPLAIN is the ground truth for "was this lowered to
+// bytecode?": a routed statement dumps the sorter/accumulator opcodes, while every deliberate
+// fallback shape throws on EXPLAIN because EXPLAIN only describes lowered programs. Fallback tests
+// also assert the evaluator still produces the correct value or raises its exact error.
+public class WindowSqlRoutingTests
+{
+    private const string RunningFrame = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+
+    // ---- Routed running-frame values -------------------------------------------------------
+
+    [Test]
+    public void UnpartitionedRunningSumRoutesAndAccumulatesInOrder()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+
+        var query = $"SELECT id, sum(v) OVER (ORDER BY id {RunningFrame}) AS running FROM t ORDER BY id;";
+
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
+        opcodes.Should().Contain("OpenSorter")
+            .And.Contain("SorterInsert")
+            .And.Contain("SorterSort")
+            .And.Contain("SorterData")
+            .And.Contain("AggReset")
+            .And.Contain("AggStep")
+            .And.Contain("AggFinalize");
+        // No partition -> no partition-boundary check.
+        opcodes.Should().NotContain("SameGroup");
+
+        var rows = ReadRows(connection, query);
+        rows.Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(10)),
+            (SqlValue.Integer(2), SqlValue.Integer(30)),
+            (SqlValue.Integer(3), SqlValue.Integer(60)),
+            (SqlValue.Integer(4), SqlValue.Integer(100)));
+    }
+
+    [Test]
+    public void PartitionedRunningSumRoutesWithBoundaryCheckAndMatchesSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE sales(region TEXT, amount INTEGER);",
+            "INSERT INTO sales VALUES ('a', 10), ('a', 20), ('b', 100), ('b', 5), ('a', 30);",
+        ];
+        var query =
+            $"SELECT region, amount, sum(amount) OVER (PARTITION BY region ORDER BY amount {RunningFrame}) AS running " +
+            "FROM sales ORDER BY region, amount;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
+        opcodes.Should().Contain("OpenSorter")
+            .And.Contain("SorterSort")
+            .And.Contain("AggReset")
+            .And.Contain("AggStep")
+            .And.Contain("AggFinalize")
+            .And.Contain("SameGroup");
+
+        var rows = ReadRows(connection, query);
+        rows.Select(row => (row[0], row[1], row[2])).Should().Equal(
+            (SqlValue.Text("a"), SqlValue.Integer(10), SqlValue.Integer(10)),
+            (SqlValue.Text("a"), SqlValue.Integer(20), SqlValue.Integer(30)),
+            (SqlValue.Text("a"), SqlValue.Integer(30), SqlValue.Integer(60)),
+            (SqlValue.Text("b"), SqlValue.Integer(5), SqlValue.Integer(5)),
+            (SqlValue.Text("b"), SqlValue.Integer(100), SqlValue.Integer(105)));
+
+        AssertMatchesSqlite(rows, setup, query);
+    }
+
+    [Test]
+    public void MultipleWindowFunctionsSharingOneSpecRouteThroughOneSorter()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+
+        var query =
+            $"SELECT id, sum(v) OVER (ORDER BY id {RunningFrame}) AS s, " +
+            $"count(*) OVER (ORDER BY id {RunningFrame}) AS c FROM t ORDER BY id;";
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("AggFinalize");
+
+        var rows = ReadRows(connection, query);
+        rows.Select(row => (row[0], row[1], row[2])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(10), SqlValue.Integer(1)),
+            (SqlValue.Integer(2), SqlValue.Integer(30), SqlValue.Integer(2)),
+            (SqlValue.Integer(3), SqlValue.Integer(60), SqlValue.Integer(3)),
+            (SqlValue.Integer(4), SqlValue.Integer(100), SqlValue.Integer(4)));
+    }
+
+    [Test]
+    public void NullaryCountStarRunsAsRowNumberAndRoutes()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (10, 1), (20, 1), (30, 1);");
+
+        var query = $"SELECT id, count(*) OVER (ORDER BY id {RunningFrame}) AS rn FROM t ORDER BY id;";
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("AggStep");
+
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(10), SqlValue.Integer(1)),
+            (SqlValue.Integer(20), SqlValue.Integer(2)),
+            (SqlValue.Integer(30), SqlValue.Integer(3)));
+    }
+
+    [Test]
+    public void RunningMinMaxAvgRouteWithExactTypes()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 30), (2, 10), (3, 20), (4, 40);");
+
+        var query =
+            $"SELECT id, min(v) OVER (ORDER BY id {RunningFrame}) AS lo, " +
+            $"max(v) OVER (ORDER BY id {RunningFrame}) AS hi, " +
+            $"avg(v) OVER (ORDER BY id {RunningFrame}) AS mean FROM t ORDER BY id;";
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("AggFinalize");
+
+        var rows = ReadRows(connection, query);
+        rows.Select(row => (row[1], row[2], row[3])).Should().Equal(
+            (SqlValue.Integer(30), SqlValue.Integer(30), SqlValue.Real(30)),
+            (SqlValue.Integer(10), SqlValue.Integer(30), SqlValue.Real(20)),
+            (SqlValue.Integer(10), SqlValue.Integer(30), SqlValue.Real(20)),
+            (SqlValue.Integer(10), SqlValue.Integer(40), SqlValue.Real(25)));
+    }
+
+    [Test]
+    public void PartitionWithoutWindowOrderRoutesInScanOrderWithinPartition()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(grp INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (1, 20), (2, 30), (2, 40);");
+
+        var query = $"SELECT grp, sum(v) OVER (PARTITION BY grp {RunningFrame}) AS running FROM t ORDER BY grp;";
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("SameGroup");
+
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(10)),
+            (SqlValue.Integer(1), SqlValue.Integer(30)),
+            (SqlValue.Integer(2), SqlValue.Integer(30)),
+            (SqlValue.Integer(2), SqlValue.Integer(70)));
+    }
+
+    [Test]
+    public void UnorderedUnpartitionedRunningFrameRoutesAndPreservesScanOrder()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (5), (3), (8), (1);");
+
+        // No PARTITION BY, no window ORDER BY, and no top-level ORDER BY: the sorter preserves
+        // scan order, so the running total accumulates in insertion order.
+        var query = $"SELECT v, sum(v) OVER ({RunningFrame}) AS running FROM t;";
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("AggFinalize");
+
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(5), SqlValue.Integer(5)),
+            (SqlValue.Integer(3), SqlValue.Integer(8)),
+            (SqlValue.Integer(8), SqlValue.Integer(16)),
+            (SqlValue.Integer(1), SqlValue.Integer(17)));
+    }
+
+    [Test]
+    public void BareRowsUnboundedPrecedingIsTreatedAsRunningFrameAndRoutes()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+        // "ROWS UNBOUNDED PRECEDING" (no BETWEEN) parses to UNBOUNDED PRECEDING .. CURRENT ROW.
+        var query = "SELECT id, sum(v) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS running FROM t ORDER BY id;";
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("SorterSort").And.Contain("AggStep");
+
+        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
+            SqlValue.Integer(10), SqlValue.Integer(30), SqlValue.Integer(60));
+    }
+
+    [Test]
+    public void WhereFilteredRunningWindowRoutesWithFilterOpcode()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+
+        // WHERE runs before windowing, so the running total only folds the surviving rows.
+        var query = $"SELECT id, sum(v) OVER (ORDER BY id {RunningFrame}) AS running FROM t WHERE v >= 20 ORDER BY id;";
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("Filter").And.Contain("AggFinalize");
+
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(2), SqlValue.Integer(20)),
+            (SqlValue.Integer(3), SqlValue.Integer(50)),
+            (SqlValue.Integer(4), SqlValue.Integer(90)));
+    }
+
+    [Test]
+    public void RoutedWindowSelectUsesAliasThenFunctionNameForColumns()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+
+        ColumnNames(connection, $"SELECT id, sum(v) OVER (ORDER BY id {RunningFrame}) AS running FROM t;")
+            .Should().Equal("id", "running");
+        ColumnNames(connection, $"SELECT id, sum(v) OVER (ORDER BY id {RunningFrame}) FROM t;")
+            .Should().Equal("id", "SUM");
+    }
+
+    // ---- Fallback boundaries (evaluator keeps ownership; EXPLAIN cannot describe them) ------
+
+    [Test]
+    public void DefaultRangeFrameFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+        // No ROWS clause -> default RANGE frame, which the running-frame builder cannot model.
+        var query = "SELECT id, sum(v) OVER (ORDER BY id) AS running FROM t ORDER BY id;";
+        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
+            SqlValue.Integer(10), SqlValue.Integer(30), SqlValue.Integer(60));
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void BoundedRowsFrameFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+
+        var query = "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS w FROM t ORDER BY id;";
+        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
+            SqlValue.Integer(10), SqlValue.Integer(30), SqlValue.Integer(50), SqlValue.Integer(70));
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void UnboundedFollowingFrameFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+        var query =
+            "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS total " +
+            "FROM t ORDER BY id;";
+        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
+            SqlValue.Integer(60), SqlValue.Integer(60), SqlValue.Integer(60));
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void FilterClauseFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+        var query =
+            $"SELECT id, sum(v) FILTER (WHERE v > 15) OVER (ORDER BY id {RunningFrame}) AS running FROM t ORDER BY id;";
+        var rows = ReadRows(connection, query);
+        rows.Should().HaveCount(3);
+        rows[0][1].Kind.Should().Be(SqlValueKind.Null);
+        rows[1][1].Should().Be(SqlValue.Integer(20));
+        rows[2][1].Should().Be(SqlValue.Integer(50));
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void DistinctWindowArgumentFallsBackAndEvaluatorRejects()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20);");
+
+        var query = $"SELECT id, sum(DISTINCT v) OVER (ORDER BY id {RunningFrame}) FROM t ORDER BY id;";
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query));
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void GroupConcatWithSeparatorFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, label TEXT);");
+        Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+
+        // A 2-argument group_concat's separator is not a bare column, so the accumulator declines.
+        var query = $"SELECT id, group_concat(label, '|') OVER (ORDER BY id {RunningFrame}) AS acc FROM t ORDER BY id;";
+        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
+            SqlValue.Text("a"), SqlValue.Text("a|b"), SqlValue.Text("a|b|c"));
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void RankingFunctionWindowFallsBackAndEvaluatorRejects()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+        var query = $"SELECT row_number() OVER (ORDER BY id {RunningFrame}) FROM t;";
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query));
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void PercentileWindowFallsBackAndEvaluatorRejects()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
+
+        var query = $"SELECT percentile(v, 50) OVER (ORDER BY id {RunningFrame}) FROM t;";
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query));
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void WindowCombinedWithGroupByFallsBackAndEvaluatorRejects()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+        var query = $"SELECT sum(v) OVER (ORDER BY id {RunningFrame}), count(*) FROM t GROUP BY id;";
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query));
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void WindowInWhereClauseFallsBackAndEvaluatorRejects()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+        var query = $"SELECT id FROM t WHERE sum(v) OVER (ORDER BY id {RunningFrame}) > 10;";
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query));
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void LimitedRunningWindowFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+
+        var query = $"SELECT id, sum(v) OVER (ORDER BY id {RunningFrame}) AS running FROM t ORDER BY id LIMIT 2;";
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(10)),
+            (SqlValue.Integer(2), SqlValue.Integer(30)));
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void OrderByMissingPartitionPrefixFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE sales(region TEXT, amount INTEGER);");
+        Execute(connection, "INSERT INTO sales VALUES ('a', 10), ('b', 5), ('a', 30);");
+
+        // PARTITION BY region ORDER BY amount needs the top ORDER BY to be region, amount for the
+        // sort to be partition-contiguous. A bare "ORDER BY amount" is not, so the route declines.
+        var query =
+            $"SELECT region, amount, sum(amount) OVER (PARTITION BY region ORDER BY amount {RunningFrame}) AS running " +
+            "FROM sales ORDER BY amount;";
+        ReadRows(connection, query).Should().HaveCount(3);
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void RunningWindowWithoutTopOrderButPartitionedFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(grp INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (1, 30);");
+
+        // A partitioned window with no top-level ORDER BY cannot guarantee the builder's sorted
+        // emission equals the evaluator's scan-order output, so it declines.
+        var query = $"SELECT grp, sum(v) OVER (PARTITION BY grp {RunningFrame}) AS running FROM t;";
+        ReadRows(connection, query).Should().HaveCount(3);
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    // ---- Helpers ---------------------------------------------------------------------------
+
+    private static void AssertMatchesSqlite(IReadOnlyList<SqlValue[]> managed, IReadOnlyList<string> setup, string query)
+    {
+        var reference = RunSqlite(setup, query);
+        managed.Should().HaveCount(reference.Count);
+        for (var row = 0; row < reference.Count; row++)
+        {
+            managed[row].Should().HaveCount(reference[row].Length);
+            for (var column = 0; column < reference[row].Length; column++)
+                CellsShouldMatch(managed[row][column], reference[row][column]);
+        }
+    }
+
+    private static List<object?[]> RunSqlite(IReadOnlyList<string> setup, string query)
+    {
+        using var connection = new MsData.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        foreach (var statement in setup)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = statement;
+            command.ExecuteNonQuery();
+        }
+
+        using var queryCommand = connection.CreateCommand();
+        queryCommand.CommandText = query;
+        using var reader = queryCommand.ExecuteReader();
+        var rows = new List<object?[]>();
+        while (reader.Read())
+        {
+            var values = new object?[reader.FieldCount];
+            for (var column = 0; column < values.Length; column++)
+                values[column] = reader.IsDBNull(column) ? null : reader.GetValue(column);
+
+            rows.Add(values);
+        }
+
+        return rows;
+    }
+
+    private static void CellsShouldMatch(SqlValue managed, object? reference)
+    {
+        if (reference is null)
+        {
+            managed.Kind.Should().Be(SqlValueKind.Null);
+            return;
+        }
+
+        switch (reference)
+        {
+            case long integer:
+                ToDouble(managed).Should().Be(integer);
+                break;
+            case double real:
+                ToDouble(managed).Should().BeApproximately(real, 1e-9);
+                break;
+            case string text:
+                managed.Kind.Should().Be(SqlValueKind.Text);
+                managed.AsText().Should().Be(text);
+                break;
+            default:
+                managed.ToString().Should().Be(reference.ToString());
+                break;
+        }
+    }
+
+    private static double ToDouble(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Integer => value.AsInteger(),
+            SqlValueKind.Real => value.AsReal(),
+            SqlValueKind.Text => double.Parse(value.AsText(), CultureInfo.InvariantCulture),
+            _ => throw new InvalidOperationException($"Value {value.Kind} is not numeric."),
+        };
+
+    private static IEnumerable<string> Opcodes(IEnumerable<SqlValue[]> rows)
+        => rows.Select(row => row[1].AsText());
+
+    private static void Execute(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    private static List<SqlValue[]> ReadRows(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        var rows = new List<SqlValue[]>();
+        while (statement.Step() == StatementStepResult.Row)
+        {
+            var values = new SqlValue[statement.GetColumnCount()];
+            for (var ordinal = 0; ordinal < values.Length; ordinal++)
+                values[ordinal] = statement.GetValue(ordinal);
+
+            rows.Add(values);
+        }
+
+        return rows;
+    }
+
+    private static string[] ColumnNames(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        var names = new string[statement.GetColumnCount()];
+        for (var ordinal = 0; ordinal < names.Length; ordinal++)
+            names[ordinal] = statement.GetColumnName(ordinal);
+
+        return names;
+    }
+}

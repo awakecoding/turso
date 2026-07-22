@@ -64,7 +64,12 @@ public class SqliteDataReader : DbDataReader
         get
         {
             EnsureOpen();
-            return _statement is not null && !Regex.IsMatch(_currentSql, @"\bWHERE\b\s+0\s*=\s*1\b", RegexOptions.IgnoreCase);
+            if (_statement is null)
+                return false;
+
+            return _command.Connection?.DatabaseHandle.IsManaged == true
+                ? TursoBindings.HasRows(_statement)
+                : !Regex.IsMatch(_currentSql, @"\bWHERE\b\s+0\s*=\s*1\b", RegexOptions.IgnoreCase);
         }
     }
 
@@ -104,18 +109,7 @@ public class SqliteDataReader : DbDataReader
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
         EnsureOpen();
-        var statement = GetStatement();
-        var bytes = ToBytes(GetTypedValue(ordinal));
-        if (buffer is null)
-            return bytes.Length;
-
-        if (dataOffset >= bytes.Length)
-            return 0;
-
-        var bytesToCopy = Math.Min(length, bytes.Length - (int)dataOffset);
-        bytesToCopy = Math.Min(bytesToCopy, buffer.Length - bufferOffset);
-        Array.Copy(bytes, (int)dataOffset, buffer, bufferOffset, bytesToCopy);
-        return bytesToCopy;
+        return CopyValue(GetBlobValue(ordinal), dataOffset, buffer, bufferOffset, length);
     }
 
     public override char GetChar(int ordinal)
@@ -132,20 +126,7 @@ public class SqliteDataReader : DbDataReader
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
     {
         EnsureOpen();
-        var chars = GetString(ordinal).ToCharArray();
-        if (buffer is null)
-            return chars.Length;
-
-        if (dataOffset > chars.Length)
-            throw new ArgumentOutOfRangeException(nameof(dataOffset));
-
-        if (dataOffset >= chars.Length)
-            return 0;
-
-        var charsToCopy = Math.Min(length, chars.Length - (int)dataOffset);
-        charsToCopy = Math.Min(charsToCopy, buffer.Length - bufferOffset);
-        Array.Copy(chars, (int)dataOffset, buffer, bufferOffset, charsToCopy);
-        return charsToCopy;
+        return CopyValue(GetTextValue(ordinal).ToCharArray(), dataOffset, buffer, bufferOffset, length);
     }
 
     public override string GetDataTypeName(int ordinal)
@@ -338,25 +319,13 @@ public class SqliteDataReader : DbDataReader
     public override Stream GetStream(int ordinal)
     {
         EnsureOpen();
-        var value = GetTypedValue(ordinal);
-        var bytes = ToBytes(value);
-        if (ShouldReturnBlobStream(ordinal, value))
-            return new SqliteBlob(bytes);
-
-        return new MemoryStream(bytes, writable: false);
+        return new MemoryStream(GetBlobValue(ordinal).ToArray(), writable: false);
     }
 
     public override TextReader GetTextReader(int ordinal)
     {
         EnsureOpen();
-        if (IsDBNull(ordinal))
-            return new StringReader(string.Empty);
-
-        var bytes = Encoding.UTF8.GetBytes(GetString(ordinal));
-        Stream stream = ShouldReturnBlobStream(ordinal, TursoValue.String(GetString(ordinal)))
-            ? new SqliteBlob(bytes)
-            : new MemoryStream(bytes, writable: false);
-        return new StreamReader(stream, Encoding.UTF8);
+        return new StringReader(GetTextValue(ordinal));
     }
 
     public override int GetOrdinal(string name)
@@ -519,10 +488,8 @@ public class SqliteDataReader : DbDataReader
         _ = GetStatement();
         EnsureHasCurrentRow();
         ArgumentNullException.ThrowIfNull(values);
-        if (values.Length < FieldCount)
-            throw new IndexOutOfRangeException();
 
-        var count = FieldCount;
+        var count = Math.Min(values.Length, FieldCount);
         for (var i = 0; i < count; i++)
             values[i] = GetValue(i);
 
@@ -1007,20 +974,6 @@ public class SqliteDataReader : DbDataReader
         return value;
     }
 
-    private bool ShouldReturnBlobStream(int ordinal, TursoValue value)
-    {
-        if (value.ValueType == TursoValueType.Blob && ordinal == 1)
-            return true;
-
-        for (var i = 0; i < ordinal; i++)
-        {
-            if (string.Equals(GetName(i), "rowid", StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
-    }
-
     private static DateTime ParseDateTime(string value)
     {
         if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dateTimeOffset)
@@ -1047,17 +1000,40 @@ public class SqliteDataReader : DbDataReader
                    || value.LastIndexOf('-') > timeSeparator);
     }
 
-    private static byte[] ToBytes(TursoValue value)
+    private static long CopyValue<T>(T[] source, long dataOffset, T[]? buffer, int bufferOffset, int length)
     {
-        return value.ValueType switch
-        {
-            TursoValueType.Blob => value.BlobValue,
-            TursoValueType.Text => Encoding.UTF8.GetBytes(value.StringValue),
-            TursoValueType.Integer => Encoding.UTF8.GetBytes(value.IntValue.ToString(CultureInfo.InvariantCulture)),
-            TursoValueType.Real => Encoding.UTF8.GetBytes(value.RealValue.ToString(CultureInfo.InvariantCulture)),
-            TursoValueType.Null or TursoValueType.Empty => [],
-            _ => throw new ArgumentOutOfRangeException()
-        };
+        if (dataOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(dataOffset), dataOffset, message: null);
+        if (buffer is null)
+            return source.LongLength;
+        if (bufferOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(bufferOffset), bufferOffset, message: null);
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length), length, message: null);
+        if (bufferOffset > buffer.Length - length)
+            throw new ArgumentException(Properties.Resources.InvalidOffsetAndCount);
+        if (dataOffset >= source.LongLength)
+            return 0;
+
+        var count = (int)Math.Min(length, source.LongLength - dataOffset);
+        Array.Copy(source, (int)dataOffset, buffer, bufferOffset, count);
+        return count;
+    }
+
+    private byte[] GetBlobValue(int ordinal)
+    {
+        var value = GetTypedValue(ordinal);
+        return value.ValueType == TursoValueType.Blob
+            ? value.BlobValue
+            : throw new InvalidCastException("The requested value is not a BLOB.");
+    }
+
+    private string GetTextValue(int ordinal)
+    {
+        var value = GetTypedValue(ordinal);
+        return value.ValueType == TursoValueType.Text
+            ? value.StringValue
+            : throw new InvalidCastException("The requested value is not TEXT.");
     }
 
     private static Guid ToGuid(TursoValue value)

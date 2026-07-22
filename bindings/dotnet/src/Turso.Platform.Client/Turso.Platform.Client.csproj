@@ -20,13 +20,16 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
 
-    <TransformedOpenApiDocument>$(MSBuildProjectDirectory)/obj/$(TargetFramework)/openapi.transformed.json</TransformedOpenApiDocument>
-    <GeneratedClientSource>$(MSBuildProjectDirectory)/obj/$(TargetFramework)/TursoPlatformClient.generated.cs</GeneratedClientSource>
+    <PlatformClientIntermediateOutputPath>$([System.IO.Path]::Combine('$(BaseIntermediateOutputPath)', '$(Configuration)', '$(TargetFramework)'))/</PlatformClientIntermediateOutputPath>
+    <TransformedOpenApiDocument>$(PlatformClientIntermediateOutputPath)openapi.transformed.json</TransformedOpenApiDocument>
+    <GeneratedClientSource>$(PlatformClientIntermediateOutputPath)TursoPlatformClient.generated.cs</GeneratedClientSource>
+    <OpenApiTitlerBaseIntermediateOutputPath>$(PlatformClientIntermediateOutputPath)OpenApiTitler/obj/</OpenApiTitlerBaseIntermediateOutputPath>
+    <OpenApiTitlerBaseOutputPath>$(PlatformClientIntermediateOutputPath)OpenApiTitler/bin/</OpenApiTitlerBaseOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- The OpenApiTitler tool is its own project; keep it out of this assembly's compile glob. -->
-    <Compile Remove="tools/**" />
+    <!-- Keep generated and tool artifacts out of the client when intermediates are redirected. -->
+    <Compile Remove="artifacts/**;obj/**;tools/**" />
     <None Remove="tools/**" />
   </ItemGroup>
 
@@ -45,8 +48,8 @@
           BeforeTargets="CoreCompile"
           Inputs="$(MSBuildProjectFullPath);openapi.json;nswag.json;tools/OpenApiTitler/Program.cs;tools/OpenApiTitler/OpenApiTitler.csproj"
           Outputs="$(TransformedOpenApiDocument);$(GeneratedClientSource)">
-    <MakeDir Directories="$(MSBuildProjectDirectory)/obj/$(TargetFramework)" />
-    <Exec Command="dotnet run --project &quot;$(MSBuildProjectDirectory)/tools/OpenApiTitler/OpenApiTitler.csproj&quot; --configuration $(Configuration) --no-launch-profile -p:BaseIntermediateOutputPath=$(MSBuildProjectDirectory)/obj/$(Configuration)/$(TargetFramework)/OpenApiTitler/obj/ -p:BaseOutputPath=$(MSBuildProjectDirectory)/obj/$(Configuration)/$(TargetFramework)/OpenApiTitler/bin/ -- &quot;$(MSBuildProjectDirectory)/openapi.json&quot; &quot;$(TransformedOpenApiDocument)&quot;" />
+    <MakeDir Directories="$(PlatformClientIntermediateOutputPath)" />
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)" Command="dotnet run --project &quot;$(MSBuildProjectDirectory)/tools/OpenApiTitler/OpenApiTitler.csproj&quot; --configuration $(Configuration) --no-launch-profile -p:BaseIntermediateOutputPath=&quot;$(OpenApiTitlerBaseIntermediateOutputPath)&quot; -p:BaseOutputPath=&quot;$(OpenApiTitlerBaseOutputPath)&quot; -- &quot;$(MSBuildProjectDirectory)/openapi.json&quot; &quot;$(TransformedOpenApiDocument)&quot;" />
     <Exec Command="$(NSwagExe_Net100) run &quot;$(MSBuildProjectDirectory)/nswag.json&quot; &quot;/variables:OpenApiDocument=$(TransformedOpenApiDocument),GeneratedClientSource=$(GeneratedClientSource)&quot;" />
   </Target>
 

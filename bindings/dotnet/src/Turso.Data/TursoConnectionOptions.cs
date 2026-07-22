@@ -1,5 +1,6 @@
 ﻿using System.Globalization;
 using Turso.Raw.Public.Value;
+using ManagedEncryptionOptions = Turso.Core.Storage.TursoEncryptionOptions;
 
 namespace Turso;
 
@@ -24,6 +25,10 @@ public class TursoConnectionOptions
 
     public string DataSource => _builder.DataSource;
 
+    public string Mode => _builder.Mode;
+
+    public string Cache => _builder.Cache;
+
     public string AuthToken => _builder.AuthToken;
 
     public string ReplicaPath => _builder.ReplicaPath;
@@ -34,11 +39,66 @@ public class TursoConnectionOptions
 
     public bool? Tls => _builder.Tls;
 
+    public TursoLocalProvider LocalProvider => _builder.LocalProvider;
+
     public bool IsRemote => IsRemoteDataSource(DataSource);
 
     public bool IsReplica => IsRemote && !string.IsNullOrWhiteSpace(ReplicaPath);
 
     public TursoEncryptionCipher? GetEncryptionCipher() => _builder.GetEncryptionCipher();
+
+    internal ManagedLocalOpenOptions GetManagedLocalOpenOptions()
+    {
+        var mode = ParseManagedOpenMode(Mode);
+        var dataSource = string.IsNullOrEmpty(DataSource) ? ":memory:" : DataSource;
+        if (mode is ManagedLocalOpenMode.ReadOnly or ManagedLocalOpenMode.ReadWrite
+            && dataSource == ":memory:")
+        {
+            throw new InvalidOperationException($"Mode={Mode} requires an existing database file when Local Provider=Managed.");
+        }
+
+        if (mode is ManagedLocalOpenMode.ReadOnly or ManagedLocalOpenMode.ReadWrite && !File.Exists(dataSource))
+            throw new InvalidOperationException($"Mode={Mode} requires an existing database file when Local Provider=Managed.");
+
+        var cache = Cache;
+        if (!string.IsNullOrWhiteSpace(cache)
+            && !cache.Equals("Default", StringComparison.OrdinalIgnoreCase)
+            && !cache.Equals("Private", StringComparison.OrdinalIgnoreCase))
+        {
+            if (cache.Equals("Shared", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new NotSupportedException(
+                    "Cache=Shared is not supported when Local Provider=Managed because managed connections do not share page caches.");
+            }
+
+            throw new ArgumentException($"Invalid Cache value for Local Provider=Managed: {cache}.", nameof(Cache));
+        }
+
+        if (!string.IsNullOrWhiteSpace(_builder.GetOption("Password")))
+            throw new NotSupportedException("Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.");
+        if (!string.IsNullOrWhiteSpace(_builder.GetOption("Vfs")))
+        {
+            throw new NotSupportedException(
+                "Vfs is not supported when Local Provider=Managed because the managed engine does not use native SQLite VFS implementations.");
+        }
+
+        if (_builder.GetOption("Foreign Keys") is not null)
+            throw new NotSupportedException("Foreign Keys is not supported when Local Provider=Managed.");
+        if (_builder.GetOption("Recursive Triggers") is not null)
+            throw new NotSupportedException("Recursive Triggers is not supported when Local Provider=Managed.");
+        if (_builder.GetOption("Pooling") is { } pooling && Convert.ToBoolean(pooling, CultureInfo.InvariantCulture))
+            throw new NotSupportedException("Pooling=True is not supported when Local Provider=Managed.");
+
+        var timeout = DefaultTimeout;
+        if (timeout < 0)
+            throw new ArgumentOutOfRangeException(nameof(DefaultTimeout), timeout, "Default Timeout cannot be negative.");
+
+        var managedDataSource = mode == ManagedLocalOpenMode.Memory ? ":memory:" : dataSource;
+        return new ManagedLocalOpenOptions(
+            managedDataSource,
+            mode == ManagedLocalOpenMode.ReadOnly,
+            CreateManagedEncryptionOptions(mode, managedDataSource));
+    }
 
     public Uri GetRemoteUri()
     {
@@ -103,4 +163,82 @@ public class TursoConnectionOptions
 
         return normalizedScheme ?? scheme;
     }
+
+    private static ManagedLocalOpenMode ParseManagedOpenMode(string mode)
+    {
+        if (string.IsNullOrWhiteSpace(mode)
+            || mode.Equals("ReadWriteCreate", StringComparison.OrdinalIgnoreCase)
+            || mode.Equals("rwc", StringComparison.OrdinalIgnoreCase))
+        {
+            return ManagedLocalOpenMode.ReadWriteCreate;
+        }
+
+        if (mode.Equals("ReadWrite", StringComparison.OrdinalIgnoreCase)
+            || mode.Equals("rw", StringComparison.OrdinalIgnoreCase))
+        {
+            return ManagedLocalOpenMode.ReadWrite;
+        }
+
+        if (mode.Equals("ReadOnly", StringComparison.OrdinalIgnoreCase)
+            || mode.Equals("ro", StringComparison.OrdinalIgnoreCase))
+        {
+            return ManagedLocalOpenMode.ReadOnly;
+        }
+
+        if (mode.Equals("Memory", StringComparison.OrdinalIgnoreCase))
+            return ManagedLocalOpenMode.Memory;
+
+        throw new ArgumentException($"Invalid Mode value for Local Provider=Managed: {mode}.", nameof(mode));
+    }
+
+    private ManagedEncryptionOptions? CreateManagedEncryptionOptions(
+        ManagedLocalOpenMode mode,
+        string dataSource)
+    {
+        var cipher = GetEncryptionCipher();
+        var key = _builder.GetOption("Encryption Key");
+        if (!cipher.HasValue)
+        {
+            if (key is not null)
+                throw new NotSupportedException("Encryption is not available for the managed engine.");
+
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(key))
+            throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
+        if (mode == ManagedLocalOpenMode.Memory || dataSource == ":memory:")
+        {
+            throw new NotSupportedException(
+                "Encryption is supported only for file-backed databases when Local Provider=Managed.");
+        }
+
+        return cipher.Value switch
+        {
+            TursoEncryptionCipher.Aes128Gcm => ManagedEncryptionOptions.FromHex(
+                Turso.Core.Storage.TursoEncryptionCipher.Aes128Gcm,
+                key),
+            TursoEncryptionCipher.Aes256Gcm => ManagedEncryptionOptions.FromHex(
+                Turso.Core.Storage.TursoEncryptionCipher.Aes256Gcm,
+                key),
+            _ => throw new NotSupportedException(
+                "Local Provider=Managed supports only AES128GCM and AES256GCM encryption ciphers."),
+        };
+    }
+}
+
+internal readonly record struct ManagedLocalOpenOptions(
+    string DataSource,
+    bool ReadOnly,
+    ManagedEncryptionOptions? Encryption) : IDisposable
+{
+    public void Dispose() => Encryption?.Dispose();
+}
+
+internal enum ManagedLocalOpenMode
+{
+    ReadWriteCreate,
+    ReadWrite,
+    ReadOnly,
+    Memory,
 }

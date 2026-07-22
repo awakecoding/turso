@@ -20,6 +20,8 @@ public class SqliteBlob : Stream
         ArgumentNullException.ThrowIfNull(columnName);
         if (connection.State != ConnectionState.Open)
             throw new InvalidOperationException(Properties.Resources.SqlBlobRequiresOpenConnection);
+        if (connection.DatabaseHandle.IsManaged)
+            throw new NotSupportedException(Properties.Resources.ManagedIncrementalBlobNotSupported);
 
         _connection = connection;
         _tableName = tableName;

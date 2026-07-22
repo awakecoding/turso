@@ -20,6 +20,26 @@ public class TursoEfCoreTests
     }
 
     [Test]
+    public async Task UseTursoManagedProviderExecutesEfGeneratedSql()
+    {
+        using var database = TemporaryDatabase.Create();
+        await using var context = CreateManagedContext(database.ConnectionString + ";Local Provider=Managed");
+
+        await context.Database.EnsureCreatedAsync();
+        context.Database.GetDbConnection().Should().BeOfType<SqliteConnection>();
+
+        context.Products.Add(new ManagedProduct { Id = 1, Name = "managed" });
+        await context.SaveChangesAsync();
+
+        var products = await context.Products
+            .Where(product => product.Name == "managed")
+            .Select(product => product.Name)
+            .ToListAsync();
+
+        products.Should().Equal("managed");
+    }
+
+    [Test]
     public async Task DynamicLinqCompositionMaterializesAsync()
     {
         using var database = TemporaryDatabase.Create();
@@ -306,6 +326,15 @@ public class TursoEfCoreTests
         return new TestDbContext(options);
     }
 
+    private static ManagedDbContext CreateManagedContext(string connectionString)
+    {
+        var options = new DbContextOptionsBuilder<ManagedDbContext>()
+            .UseTurso(connectionString)
+            .Options;
+
+        return new ManagedDbContext(options);
+    }
+
     private static async Task SeedAsync(TestDbContext context)
     {
         await context.Database.EnsureCreatedAsync();
@@ -351,6 +380,23 @@ public class TursoEfCoreTests
                 entity.Property(order => order.CreatedAt).IsRequired();
             });
         }
+    }
+
+    private sealed class ManagedDbContext(DbContextOptions<ManagedDbContext> options) : DbContext(options)
+    {
+        public DbSet<ManagedProduct> Products => Set<ManagedProduct>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+            => modelBuilder.Entity<ManagedProduct>()
+                .Property(product => product.Id)
+                .ValueGeneratedNever();
+    }
+
+    private sealed class ManagedProduct
+    {
+        public long Id { get; set; }
+
+        public string Name { get; set; } = "";
     }
 
     private sealed class Customer

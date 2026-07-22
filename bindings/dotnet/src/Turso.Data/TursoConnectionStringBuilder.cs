@@ -42,6 +42,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["SyncInterval"] = "Sync Interval",
         ["Tls"] = "Tls",
         ["TLS"] = "Tls",
+        ["Local Provider"] = "Local Provider",
+        ["LocalProvider"] = "Local Provider",
     };
 
     public TursoConnectionStringBuilder()
@@ -157,6 +159,12 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         set => SetNullable("Tls", value);
     }
 
+    public TursoLocalProvider LocalProvider
+    {
+        get => GetEnum("Local Provider", TursoLocalProvider.Native);
+        set => this["Local Provider"] = value;
+    }
+
     [AllowNull]
     public override object this[string keyword]
     {
@@ -250,6 +258,25 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         return TryGetValue(keyword, out var value)
             ? Convert.ToInt32(value, CultureInfo.InvariantCulture)
             : defaultValue;
+    }
+
+    private TEnum GetEnum<TEnum>(string keyword, TEnum defaultValue)
+        where TEnum : struct, Enum
+    {
+        if (!TryGetValue(keyword, out var value))
+            return defaultValue;
+
+        if (value is TEnum typedValue && Enum.IsDefined(typedValue))
+            return typedValue;
+
+        if (value is string stringValue
+            && Enum.TryParse<TEnum>(stringValue, ignoreCase: true, out var parsedValue)
+            && Enum.IsDefined(parsedValue))
+        {
+            return parsedValue;
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(value), value, $"Invalid {keyword} value.");
     }
 
     private void SetNullable<T>(string keyword, T? value)

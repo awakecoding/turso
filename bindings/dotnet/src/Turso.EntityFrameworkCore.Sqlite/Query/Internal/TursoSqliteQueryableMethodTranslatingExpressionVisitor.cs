@@ -474,9 +474,9 @@ public sealed class TursoSqliteQueryableMethodTranslatingExpressionVisitor : Rel
                 Tables:
                 [
                     TableValuedFunctionExpression
-                    {
-                        Name: "json_each", Schema: null, IsBuiltIn: true, Arguments: [var jsonArrayColumn]
-                    } jsonEachExpression
+                {
+                    Name: "json_each", Schema: null, IsBuiltIn: true, Arguments: [var jsonArrayColumn]
+                } jsonEachExpression
                 ],
                 Predicate: null,
                 GroupBy: [],
@@ -536,16 +536,16 @@ public sealed class TursoSqliteQueryableMethodTranslatingExpressionVisitor : Rel
     protected override bool IsNaturallyOrdered(SelectExpression selectExpression)
     {
         return selectExpression is
-            {
-                Tables: [var mainTable, ..],
-                Orderings:
+        {
+            Tables: [var mainTable, ..],
+            Orderings:
                 [
-                    {
-                        Expression: ColumnExpression { Name: JsonEachKeyColumnName } orderingColumn,
-                        IsAscending: true
-                    }
+                {
+                    Expression: ColumnExpression { Name: JsonEachKeyColumnName } orderingColumn,
+                    IsAscending: true
+                }
                 ]
-            }
+        }
             && orderingColumn.TableAlias == mainTable.Alias
             && IsJsonEachKeyColumn(selectExpression, orderingColumn);
 

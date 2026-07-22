@@ -2,7 +2,6 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
-using System.Text;
 using System.Text.RegularExpressions;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
@@ -305,6 +304,8 @@ public class SqliteCommand : DbCommand
     internal TursoStatementHandle PrepareSingleStatement(string sql)
     {
         var connection = Connection!;
+        if (connection.IsManagedReadOnly)
+            ManagedReadOnlySqlGuard.ThrowIfQueryOnlyIsDisabled(sql);
         sql = RewriteFacadeStatement(sql, connection);
         TursoStatementHandle statement;
         try
@@ -330,6 +331,12 @@ public class SqliteCommand : DbCommand
 
     private void BindParameters(TursoStatementHandle statement)
     {
+        if (Connection!.DatabaseHandle.IsManaged)
+        {
+            BindManagedParameters(statement);
+            return;
+        }
+
         var parameterCount = TursoBindings.GetParameterCount(statement);
         var boundParameters = new bool[parameterCount + 1];
 
@@ -354,6 +361,86 @@ public class SqliteCommand : DbCommand
             if (!boundParameters[i])
             {
                 var parameterName = TursoBindings.GetParameterName(statement, i);
+                throw new InvalidOperationException(
+                    parameterName is null
+                        ? Properties.Resources.MissingParameters(i)
+                        : Properties.Resources.MissingParameters(parameterName));
+            }
+        }
+    }
+
+    private void BindManagedParameters(TursoStatementHandle statement)
+    {
+        var parameterCount = TursoBindings.GetParameterCount(statement);
+        var boundParameters = new bool[parameterCount + 1];
+        var statementParameterNames = new string?[parameterCount + 1];
+        var highestNumberedParameterIndex = 0;
+        for (var i = 1; i <= parameterCount; i++)
+        {
+            var parameterName = TursoBindings.GetParameterName(statement, i);
+            statementParameterNames[i] = parameterName;
+            if (IsNumberedParameterName(parameterName, i))
+                highestNumberedParameterIndex = i;
+        }
+
+        for (var i = 1; i < highestNumberedParameterIndex; i++)
+        {
+            if (statementParameterNames[i] is null)
+            {
+                throw new NotSupportedException(
+                    "Numbered parameters with gaps or preceding unnamed parameters are not supported by Local Provider=Managed.");
+            }
+        }
+
+        List<SqliteParameter>? positionalParameters = null;
+
+        for (var i = 0; i < Parameters.Count; i++)
+        {
+            var parameter = Parameters[i];
+            if (!parameter.HasValue)
+                throw new InvalidOperationException(Properties.Resources.RequiresSet(nameof(parameter.Value)));
+
+            if (string.IsNullOrEmpty(parameter.ParameterName))
+            {
+                (positionalParameters ??= []).Add(parameter);
+                continue;
+            }
+
+            var parameterIndex = IsNumberedParameterName(parameter.ParameterName)
+                ? TursoBindings.BindNamedParameter(statement, parameter.ParameterName, parameter.ToTursoValue())
+                : FindParameterIndex(statement, parameter.ParameterName, parameterCount);
+            if (parameterIndex == 0)
+                continue;
+
+            if (!IsNumberedParameterName(parameter.ParameterName))
+                TursoBindings.BindParameter(statement, parameterIndex, parameter.ToTursoValue());
+            boundParameters[parameterIndex] = true;
+        }
+
+        var positionalParameterIndex = 0;
+        for (var statementParameterIndex = 1; statementParameterIndex <= parameterCount; statementParameterIndex++)
+        {
+            if (statementParameterNames[statementParameterIndex] is not null)
+                continue;
+            if (positionalParameters is null || positionalParameterIndex == positionalParameters.Count)
+                continue;
+
+            var parameter = positionalParameters[positionalParameterIndex++];
+            TursoBindings.BindParameter(statement, statementParameterIndex, parameter.ToTursoValue());
+            boundParameters[statementParameterIndex] = true;
+        }
+
+        if (positionalParameters is not null && positionalParameterIndex != positionalParameters.Count)
+        {
+            throw new InvalidOperationException(
+                Properties.Resources.ParameterNotFound($"at position {positionalParameterIndex + 1}"));
+        }
+
+        for (var i = 1; i <= parameterCount; i++)
+        {
+            if (!boundParameters[i])
+            {
+                var parameterName = statementParameterNames[i];
                 throw new InvalidOperationException(
                     parameterName is null
                         ? Properties.Resources.MissingParameters(i)
@@ -513,68 +600,297 @@ public class SqliteCommand : DbCommand
     private static List<string> SplitStatements(string commandText)
     {
         var statements = new List<string>();
-        var current = new StringBuilder();
-        var inSingleQuote = false;
-        var inDoubleQuote = false;
-        var inLineComment = false;
+        var start = 0;
+        var firstTokenInStatement = true;
+        var triggerHeader = TriggerHeader.None;
+        var triggerBlockDepth = 0;
+        var triggerBodyAtStatementStart = false;
+        var offset = 0;
 
-        for (var i = 0; i < commandText.Length; i++)
+        while (TryReadScriptToken(commandText, ref offset, out var token))
         {
-            var c = commandText[i];
-            var next = i + 1 < commandText.Length ? commandText[i + 1] : '\0';
-
-            if (inLineComment)
+            if (token.Kind == ScriptTokenKind.Semicolon)
             {
-                current.Append(c);
-                if (c == '\n')
-                    inLineComment = false;
-                continue;
-            }
-
-            if (!inSingleQuote && !inDoubleQuote && c == '-' && next == '-')
-            {
-                inLineComment = true;
-                current.Append(c);
-                continue;
-            }
-
-            if (c == '\'' && !inDoubleQuote)
-            {
-                current.Append(c);
-                if (inSingleQuote && next == '\'')
+                if (triggerBlockDepth > 0)
                 {
-                    current.Append(next);
-                    i++;
-                    continue;
+                    triggerBodyAtStatementStart = true;
+                }
+                else
+                {
+                    AddStatement(commandText, start, token.Offset, statements);
+                    start = token.Offset + token.Length;
+                    firstTokenInStatement = true;
+                    triggerHeader = TriggerHeader.None;
                 }
 
-                inSingleQuote = !inSingleQuote;
                 continue;
             }
 
-            if (c == '"' && !inSingleQuote)
-                inDoubleQuote = !inDoubleQuote;
-
-            if (c == ';' && !inSingleQuote && !inDoubleQuote)
+            if (triggerBlockDepth > 0)
             {
-                AddStatement(statements, current);
-                current.Clear();
+                if (triggerBodyAtStatementStart)
+                {
+                    // Only complete trigger-body statements can close a trigger, so CASE ... END
+                    // expressions and words inside strings never affect the outer boundary.
+                    if (IsKeyword(commandText, token, "BEGIN"))
+                        triggerBlockDepth++;
+                    else if (IsKeyword(commandText, token, "END"))
+                        triggerBlockDepth--;
+
+                    triggerBodyAtStatementStart = false;
+                }
+
                 continue;
             }
 
-            current.Append(c);
+            if (firstTokenInStatement)
+            {
+                firstTokenInStatement = false;
+                triggerHeader = IsKeyword(commandText, token, "CREATE")
+                    ? TriggerHeader.ExpectTrigger
+                    : TriggerHeader.NotTrigger;
+            }
+            else
+            {
+                triggerHeader = AdvanceTriggerHeader(
+                    commandText,
+                    triggerHeader,
+                    token,
+                    ref triggerBlockDepth,
+                    ref triggerBodyAtStatementStart);
+            }
         }
 
-        AddStatement(statements, current);
+        AddStatement(commandText, start, commandText.Length, statements);
         return statements;
     }
 
-    private static void AddStatement(List<string> statements, StringBuilder current)
+    private static TriggerHeader AdvanceTriggerHeader(
+        string sql,
+        TriggerHeader header,
+        ScriptToken token,
+        ref int triggerBlockDepth,
+        ref bool triggerBodyAtStatementStart)
     {
-        var statement = current.ToString().Trim();
-        if (statement.Length != 0 && !IsEmptyCommand(statement))
+        return header switch
+        {
+            TriggerHeader.ExpectTrigger => IsKeyword(sql, token, "TRIGGER")
+                ? TriggerHeader.ExpectNameOrIf
+                : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectNameOrIf => IsKeyword(sql, token, "IF")
+                ? TriggerHeader.ExpectNot
+                : IsIdentifier(token)
+                    ? TriggerHeader.ExpectAfter
+                    : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectNot => IsKeyword(sql, token, "NOT")
+                ? TriggerHeader.ExpectExists
+                : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectExists => IsKeyword(sql, token, "EXISTS")
+                ? TriggerHeader.ExpectName
+                : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectName => IsIdentifier(token)
+                ? TriggerHeader.ExpectAfter
+                : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectAfter => IsKeyword(sql, token, "AFTER")
+                ? TriggerHeader.ExpectEvent
+                : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectEvent => IsKeyword(sql, token, "INSERT")
+                || IsKeyword(sql, token, "UPDATE")
+                || IsKeyword(sql, token, "DELETE")
+                    ? TriggerHeader.ExpectOn
+                    : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectOn => IsKeyword(sql, token, "ON")
+                ? TriggerHeader.ExpectTable
+                : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectTable => IsIdentifier(token)
+                ? TriggerHeader.ExpectBegin
+                : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectBegin => EnterTriggerBody(sql, token, ref triggerBlockDepth, ref triggerBodyAtStatementStart),
+            _ => header,
+        };
+    }
+
+    private static TriggerHeader EnterTriggerBody(
+        string sql,
+        ScriptToken token,
+        ref int triggerBlockDepth,
+        ref bool triggerBodyAtStatementStart)
+    {
+        if (!IsKeyword(sql, token, "BEGIN"))
+            return TriggerHeader.NotTrigger;
+
+        triggerBlockDepth = 1;
+        triggerBodyAtStatementStart = true;
+        return TriggerHeader.None;
+    }
+
+    private static bool IsKeyword(string sql, ScriptToken token, string keyword)
+        => token.Kind == ScriptTokenKind.Identifier
+           && token.Length == keyword.Length
+           && sql.AsSpan(token.Offset, token.Length).Equals(keyword, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsIdentifier(ScriptToken token)
+        => token.Kind is ScriptTokenKind.Identifier or ScriptTokenKind.QuotedIdentifier;
+
+    private static bool TryReadScriptToken(string sql, ref int offset, out ScriptToken token)
+    {
+        SkipWhitespaceAndComments(sql, ref offset, out var unterminatedComment);
+        if (unterminatedComment)
+        {
+            token = new ScriptToken(ScriptTokenKind.Malformed, offset, 0);
+            return true;
+        }
+
+        if (offset == sql.Length)
+        {
+            token = default;
+            return false;
+        }
+
+        var start = offset;
+        var current = sql[offset++];
+        switch (current)
+        {
+            case ';':
+                token = new ScriptToken(ScriptTokenKind.Semicolon, start, 1);
+                return true;
+            case '\'':
+                token = new ScriptToken(
+                    ReadDelimitedToken(sql, ref offset, '\'')
+                        ? ScriptTokenKind.Other
+                        : ScriptTokenKind.Malformed,
+                    start,
+                    offset - start);
+                return true;
+            case '"':
+            case '[':
+            case '`':
+                var closingCharacter = current == '[' ? ']' : current;
+                token = new ScriptToken(
+                    ReadDelimitedToken(sql, ref offset, closingCharacter)
+                        ? ScriptTokenKind.QuotedIdentifier
+                        : ScriptTokenKind.Malformed,
+                    start,
+                    offset - start);
+                return true;
+            default:
+                if (IsIdentifierStart(current))
+                {
+                    while (offset < sql.Length && IsIdentifierContinuation(sql[offset]))
+                        offset++;
+
+                    token = new ScriptToken(ScriptTokenKind.Identifier, start, offset - start);
+                    return true;
+                }
+
+                token = new ScriptToken(ScriptTokenKind.Other, start, 1);
+                return true;
+        }
+    }
+
+    private static void SkipWhitespaceAndComments(string sql, ref int offset, out bool unterminatedComment)
+    {
+        unterminatedComment = false;
+        while (offset < sql.Length)
+        {
+            if (char.IsWhiteSpace(sql[offset]))
+            {
+                offset++;
+                continue;
+            }
+
+            if (offset + 1 < sql.Length && sql[offset] == '-' && sql[offset + 1] == '-')
+            {
+                offset += 2;
+                while (offset < sql.Length && sql[offset] is not '\r' and not '\n')
+                    offset++;
+                continue;
+            }
+
+            if (offset + 1 < sql.Length && sql[offset] == '/' && sql[offset + 1] == '*')
+            {
+                offset += 2;
+                while (offset + 1 < sql.Length && (sql[offset] != '*' || sql[offset + 1] != '/'))
+                    offset++;
+
+                if (offset + 1 >= sql.Length)
+                {
+                    offset = sql.Length;
+                    unterminatedComment = true;
+                    return;
+                }
+
+                offset += 2;
+                continue;
+            }
+
+            return;
+        }
+    }
+
+    private static bool ReadDelimitedToken(string sql, ref int offset, char closingCharacter)
+    {
+        while (offset < sql.Length)
+        {
+            if (sql[offset++] != closingCharacter)
+                continue;
+
+            if (offset < sql.Length && sql[offset] == closingCharacter)
+            {
+                offset++;
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsIdentifierStart(char value)
+        => value is >= 'A' and <= 'Z'
+            or >= 'a' and <= 'z'
+            or '_';
+
+    private static bool IsIdentifierContinuation(char value)
+        => IsIdentifierStart(value)
+            || value is >= '0' and <= '9'
+            or '$';
+
+    private static void AddStatement(string sql, int start, int end, List<string> statements)
+    {
+        var statement = sql[start..end].Trim();
+        var offset = 0;
+        if (statement.Length != 0 && TryReadScriptToken(statement, ref offset, out _))
             statements.Add(statement);
     }
+
+    private enum TriggerHeader
+    {
+        None,
+        NotTrigger,
+        ExpectTrigger,
+        ExpectNameOrIf,
+        ExpectNot,
+        ExpectExists,
+        ExpectName,
+        ExpectAfter,
+        ExpectEvent,
+        ExpectOn,
+        ExpectTable,
+        ExpectBegin,
+    }
+
+    private enum ScriptTokenKind
+    {
+        Identifier,
+        QuotedIdentifier,
+        Semicolon,
+        Other,
+        Malformed,
+    }
+
+    private readonly record struct ScriptToken(ScriptTokenKind Kind, int Offset, int Length);
 
     internal static SqliteException ToSqliteException(TursoException ex, string? sql = null)
     {
@@ -660,4 +976,11 @@ public class SqliteCommand : DbCommand
 
     private static bool IsPrefixed(string parameterName)
         => parameterName.Length > 0 && parameterName[0] is '@' or '$' or ':';
+
+    private static bool IsNumberedParameterName(string? parameterName, int? expectedIndex = null)
+        => parameterName is { Length: > 1 }
+           && parameterName[0] == '?'
+           && int.TryParse(parameterName.AsSpan(1), out var index)
+           && index > 0
+           && (expectedIndex is null || index == expectedIndex);
 }

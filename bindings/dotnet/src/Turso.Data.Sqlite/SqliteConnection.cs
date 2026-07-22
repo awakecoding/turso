@@ -2,6 +2,8 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using Turso.Core;
+using Turso.Core.Storage;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
 
@@ -21,6 +23,7 @@ public partial class SqliteConnection : DbConnection
     private int _openReaderCount;
     private string? _dataSource;
     private bool _readOnly;
+    private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
     private bool _recursiveTriggers;
     private bool _readUncommitted;
     private string? _sharedMemoryPath;
@@ -90,6 +93,11 @@ public partial class SqliteConnection : DbConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_database is not null)
             throw new InvalidOperationException("The connection is already open.");
+        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed
+            && _connectionOptions.Cache == SqliteCacheMode.Shared)
+        {
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheNotSupported);
+        }
         if (!string.IsNullOrEmpty(_connectionOptions.Password))
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
 
@@ -97,12 +105,41 @@ public partial class SqliteConnection : DbConnection
         var filename = NormalizeDataSource(_connectionOptions);
         var readOnly = _connectionOptions.Mode == SqliteOpenMode.ReadOnly;
         var sharedMemoryPath = IsSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
+        TursoEncryptionOptions? managedEncryption = null;
         try
         {
-            _database = TursoBindings.OpenDatabase(filename);
+            if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+            {
+                managedEncryption = _connectionOptions.CreateManagedEncryptionOptions();
+                if (managedEncryption is not null
+                    && filename.Equals(":memory:", StringComparison.Ordinal))
+                {
+                    throw new NotSupportedException(Properties.Resources.ManagedMemoryEncryptionNotSupported);
+                }
+
+                _database = OpenManagedDatabase(
+                    filename,
+                    readOnly,
+                    managedEncryption,
+                    out var managedEncryptionFileSystem);
+                _managedEncryptionFileSystem = managedEncryptionFileSystem;
+            }
+            else
+            {
+                if (_connectionOptions.HasEncryptionOptions)
+                {
+                    throw new InvalidOperationException(
+                        "Encryption Cipher and Encryption Key require Local Provider=Managed.");
+                }
+
+                _database = TursoBindings.OpenDatabase(filename);
+            }
+
             _dataSource = filename;
             _readOnly = readOnly;
             _sharedMemoryPath = sharedMemoryPath;
+            if (IsManagedReadOnly)
+                EnableManagedReadOnly();
             ApplyExtensionSettings();
             ApplyConnectionOptions();
             RegisterScalarFunctions();
@@ -121,6 +158,15 @@ public partial class SqliteConnection : DbConnection
             CleanupFailedOpen(sharedMemoryPath);
             throw;
         }
+        catch
+        {
+            CleanupFailedOpen(sharedMemoryPath);
+            throw;
+        }
+        finally
+        {
+            managedEncryption?.Dispose();
+        }
     }
 
     public override Task OpenAsync(CancellationToken cancellationToken)
@@ -136,19 +182,26 @@ public partial class SqliteConnection : DbConnection
             return;
 
         var originalState = State;
-        _database.Dispose();
-        _database = null;
-        FreeNativeFunctionContexts();
-        _dataSource = null;
-        _readOnly = false;
-        _recursiveTriggers = false;
-        _readUncommitted = false;
-        if (_sharedMemoryPath is not null)
+        try
         {
-            ReleaseSharedMemoryFile(_sharedMemoryPath);
-            _sharedMemoryPath = null;
+            Transaction?.Dispose();
         }
-        OnStateChange(new StateChangeEventArgs(originalState, State));
+        finally
+        {
+            DisposeDatabaseAndManagedEncryptionFileSystem();
+            FreeNativeFunctionContexts();
+            _dataSource = null;
+            _readOnly = false;
+            _recursiveTriggers = false;
+            _readUncommitted = false;
+            if (_sharedMemoryPath is not null)
+            {
+                ReleaseSharedMemoryFile(_sharedMemoryPath);
+                _sharedMemoryPath = null;
+            }
+
+            OnStateChange(new StateChangeEventArgs(originalState, State));
+        }
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -175,6 +228,8 @@ public partial class SqliteConnection : DbConnection
             table.Rows.Add(DbMetaDataCollectionNames.ReservedWords, 0, 0);
             table.Rows.Add("Tables", 4, 4);
             table.Rows.Add("Columns", 4, 4);
+            table.Rows.Add("Indexes", 4, 4);
+            table.Rows.Add("IndexColumns", 5, 4);
             return table;
         }
 
@@ -194,6 +249,12 @@ public partial class SqliteConnection : DbConnection
 
         if (string.Equals(collectionName, "Columns", StringComparison.OrdinalIgnoreCase))
             return GetColumnsSchema(collectionName, restrictionValues);
+
+        if (string.Equals(collectionName, "Indexes", StringComparison.OrdinalIgnoreCase))
+            return GetIndexesSchema(collectionName, restrictionValues);
+
+        if (string.Equals(collectionName, "IndexColumns", StringComparison.OrdinalIgnoreCase))
+            return GetIndexColumnsSchema(collectionName, restrictionValues);
 
         throw new ArgumentException(Properties.Resources.UnknownCollection(collectionName));
     }
@@ -329,14 +390,19 @@ public partial class SqliteConnection : DbConnection
 
     public virtual void EnableExtensions(bool enable = true)
     {
+        if (enable && IsManagedProvider)
+            throw new NotSupportedException(Properties.Resources.ManagedExtensionsNotSupported);
+
         _extensionsEnabled = enable;
-        if (_database is not null)
+        if (_database is not null && !DatabaseHandle.IsManaged)
             TursoBindings.EnableLoadExtension(DatabaseHandle, enable);
     }
 
     public virtual void LoadExtension(string file, string? proc = null)
     {
         ArgumentNullException.ThrowIfNull(file);
+        if (IsManagedProvider)
+            throw new NotSupportedException(Properties.Resources.ManagedExtensionsNotSupported);
         if (proc is not null)
             throw new NotSupportedException("Custom extension entry points are not yet supported by the Turso SQLite-compatible provider.");
 
@@ -361,6 +427,16 @@ public partial class SqliteConnection : DbConnection
             throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
         if (destination.State != ConnectionState.Open)
             destination.Open();
+        if (_database.IsManaged || destination.DatabaseHandle.IsManaged)
+        {
+            if (_database.IsManaged && destination.DatabaseHandle.IsManaged)
+            {
+                SqliteManagedBackup.Copy(this, destination, destinationName, sourceName);
+                return;
+            }
+
+            throw new NotSupportedException(Properties.Resources.ManagedBackupMixedProvidersNotSupported);
+        }
 
         foreach (var createSql in GetSchemaSql())
             destination.ExecuteNonQuery(createSql);
@@ -390,6 +466,8 @@ public partial class SqliteConnection : DbConnection
     internal bool HasOpenReader => _openReaderCount > 0;
 
     internal bool IsReadOnly => _readOnly;
+
+    internal bool IsManagedReadOnly => _readOnly && _database?.IsManaged == true;
 
     internal bool RecursiveTriggers => _recursiveTriggers;
 
@@ -537,10 +615,23 @@ public partial class SqliteConnection : DbConnection
             _recursiveTriggers = true;
     }
 
+    private void EnableManagedReadOnly()
+    {
+        using var statement = TursoBindings.PrepareStatement(DatabaseHandle, "PRAGMA query_only = ON;");
+        while (TursoBindings.Read(statement))
+        {
+        }
+    }
+
     private void ApplyExtensionSettings()
     {
         if (_extensionsEnabled)
+        {
+            if (DatabaseHandle.IsManaged)
+                throw new NotSupportedException(Properties.Resources.ManagedExtensionsNotSupported);
+
             TursoBindings.EnableLoadExtension(DatabaseHandle, true);
+        }
     }
 
     private void LoadPendingExtensions()
@@ -552,6 +643,9 @@ public partial class SqliteConnection : DbConnection
 
     private void LoadExtensionCore(string file, string? proc)
     {
+        if (DatabaseHandle.IsManaged)
+            throw new NotSupportedException(Properties.Resources.ManagedExtensionsNotSupported);
+
         try
         {
             TursoBindings.LoadExtension(DatabaseHandle, file);
@@ -564,14 +658,72 @@ public partial class SqliteConnection : DbConnection
 
     private void CleanupFailedOpen(string? sharedMemoryPath)
     {
-        _database?.Dispose();
-        _database = null;
+        DisposeDatabaseAndManagedEncryptionFileSystem();
         FreeNativeFunctionContexts();
         _dataSource = null;
         _readOnly = false;
         _sharedMemoryPath = null;
         if (sharedMemoryPath is not null)
             ReleaseSharedMemoryFile(sharedMemoryPath);
+    }
+
+    private static TursoDatabaseHandle OpenManagedDatabase(
+        string filename,
+        bool readOnly,
+        TursoEncryptionOptions? encryption,
+        out TursoEncryptionFileSystem? managedEncryptionFileSystem)
+    {
+        managedEncryptionFileSystem = null;
+        if (encryption is null && !readOnly)
+            return TursoBindings.OpenManagedDatabase(filename);
+
+        try
+        {
+            IFileSystem fileSystem = PhysicalFileSystem.Instance;
+            if (encryption is not null)
+            {
+                managedEncryptionFileSystem = new TursoEncryptionFileSystem(
+                    PhysicalFileSystem.Instance,
+                    encryption);
+                fileSystem = managedEncryptionFileSystem;
+            }
+
+            var database = EmbeddedDatabase.OpenFile(
+                filename,
+                fileSystem,
+                readOnly: readOnly);
+            try
+            {
+                return TursoDatabaseHandle.FromManaged(database.Connect(), database);
+            }
+            catch
+            {
+                database.Dispose();
+                throw;
+            }
+        }
+        catch
+        {
+            managedEncryptionFileSystem?.Dispose();
+            managedEncryptionFileSystem = null;
+            throw;
+        }
+    }
+
+    private void DisposeDatabaseAndManagedEncryptionFileSystem()
+    {
+        var database = _database;
+        var managedEncryptionFileSystem = _managedEncryptionFileSystem;
+        _database = null;
+        _managedEncryptionFileSystem = null;
+        try
+        {
+            database?.Dispose();
+        }
+        finally
+        {
+            managedEncryptionFileSystem?.Dispose();
+        }
     }
 
     private static void ValidateRestrictions(string collectionName, string?[]? restrictionValues, int maxRestrictions)
@@ -728,6 +880,8 @@ public partial class SqliteConnection : DbConnection
         var dataSource = options.DataSource;
         if (string.IsNullOrEmpty(dataSource))
             return ":memory:";
+        if (options.LocalProvider == TursoLocalProvider.Managed && options.Vfs is { Length: > 0 })
+            throw new NotSupportedException(Properties.Resources.ManagedVfsNotSupported);
         if (options.Vfs is { Length: > 0 } vfs && !IsSupportedVfs(vfs))
             throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_ERROR, "no such vfs: " + vfs), SQLITE_ERROR);
         if (dataSource == ":memory:")
@@ -847,4 +1001,6 @@ public partial class SqliteConnection : DbConnection
         var message = exception.Message;
         return new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_ERROR, message), SQLITE_ERROR);
     }
+
+    private bool IsManagedProvider => _connectionOptions.LocalProvider == TursoLocalProvider.Managed;
 }

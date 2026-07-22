@@ -1193,9 +1193,28 @@ public class TursoRemoteTests
             .WithMessage("Sync requires an embedded replica connection.");
     }
 
+    [Test]
+    public async Task TestRemoteServerDisposalQuiescesAcceptedClientIo()
+    {
+        var server = new TestRemoteServer("{}");
+        using var client = new TcpClient();
+        try
+        {
+            await client.ConnectAsync(server.Url.Host, server.Url.Port);
+            await server.ClientIoStarted;
+        }
+        finally
+        {
+            server.Dispose();
+        }
+
+        server.Completion.IsCompletedSuccessfully.Should().BeTrue();
+    }
+
     private sealed class TestRemoteServer : IDisposable
     {
         private readonly CancellationTokenSource _cancellation = new();
+        private readonly TaskCompletionSource _clientIoStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TcpListener _listener;
         private readonly Queue<string> _responseJson;
         private readonly Task _serverTask;
@@ -1221,27 +1240,36 @@ public class TursoRemoteTests
 
         public List<string> RequestBodies { get; } = [];
 
+        public Task ClientIoStarted => _clientIoStarted.Task;
+
+        public Task Completion => _serverTask;
+
         public void Dispose()
         {
             _cancellation.Cancel();
-            _listener.Stop();
-            _cancellation.Dispose();
+            try
+            {
+                _serverTask.GetAwaiter().GetResult();
+            }
+            finally
+            {
+                // The listener socket is closed only after its canceled accept has completed.
+                _listener.Stop();
+                _cancellation.Dispose();
+            }
         }
 
         private async Task AcceptLoopAsync()
         {
             try
             {
-                while (!_cancellation.IsCancellationRequested)
+                while (true)
                 {
                     using var client = await _listener.AcceptTcpClientAsync(_cancellation.Token);
                     await HandleClientAsync(client);
                 }
             }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (ObjectDisposedException)
+            catch (OperationCanceledException) when (_cancellation.IsCancellationRequested)
             {
             }
         }
@@ -1254,14 +1282,15 @@ public class TursoRemoteTests
             await using var stream = client.GetStream();
             using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
 
-            var requestLine = await reader.ReadLineAsync()
+            _clientIoStarted.TrySetResult();
+            var requestLine = await reader.ReadLineAsync(_cancellation.Token)
                               ?? throw new InvalidOperationException("HTTP request did not include a request line.");
             var requestParts = requestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (requestParts.Length < 2)
                 throw new InvalidOperationException($"Invalid HTTP request line: {requestLine}");
 
             var contentLength = 0;
-            while (await reader.ReadLineAsync() is { Length: > 0 } headerLine)
+            while (await reader.ReadLineAsync(_cancellation.Token) is { Length: > 0 } headerLine)
             {
                 var separatorIndex = headerLine.IndexOf(':', StringComparison.Ordinal);
                 if (separatorIndex < 0)
@@ -1286,7 +1315,7 @@ public class TursoRemoteTests
                 var read = 0;
                 while (read < buffer.Length)
                 {
-                    var count = await reader.ReadAsync(buffer.AsMemory(read, buffer.Length - read));
+                    var count = await reader.ReadAsync(buffer.AsMemory(read, buffer.Length - read), _cancellation.Token);
                     if (count == 0)
                         break;
 
@@ -1300,8 +1329,8 @@ public class TursoRemoteTests
             var body = Encoding.UTF8.GetBytes(_responseJson.Dequeue());
             var headers = Encoding.ASCII.GetBytes(
                 $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
-            await stream.WriteAsync(headers);
-            await stream.WriteAsync(body);
+            await stream.WriteAsync(headers, _cancellation.Token);
+            await stream.WriteAsync(body, _cancellation.Token);
         }
     }
 }
