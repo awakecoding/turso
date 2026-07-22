@@ -1,13 +1,17 @@
 using System.Linq.Expressions;
 using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
+using Microsoft.EntityFrameworkCore.Sqlite.Internal;
 using Microsoft.EntityFrameworkCore.Sqlite.Query.Internal;
 
 namespace Turso.EntityFrameworkCore.Sqlite.Query.Internal;
 
-public sealed class TursoSqliteQuerySqlGenerator(QuerySqlGeneratorDependencies dependencies) : SqliteQuerySqlGenerator(dependencies)
+public sealed class TursoSqliteQuerySqlGenerator(
+    QuerySqlGeneratorDependencies dependencies,
+    bool areJsonEachFunctionsSupported = true) : SqliteQuerySqlGenerator(dependencies)
 {
     private string? _unaliasedDmlTargetTableAlias;
+    private readonly bool _areJsonEachFunctionsSupported = areJsonEachFunctionsSupported;
 
     protected override Expression VisitDelete(DeleteExpression deleteExpression)
     {
@@ -59,6 +63,14 @@ public sealed class TursoSqliteQuerySqlGenerator(QuerySqlGeneratorDependencies d
         }
 
         return base.VisitTable(tableExpression);
+    }
+
+    protected override Expression VisitExtension(Expression extensionExpression)
+    {
+        if (!_areJsonEachFunctionsSupported && extensionExpression is JsonEachExpression)
+            throw new InvalidOperationException(SqliteStrings.QueryingIntoJsonCollectionsNotSupported("3.38.0"));
+
+        return base.VisitExtension(extensionExpression);
     }
 
     protected override Expression VisitOrdering(OrderingExpression orderingExpression)

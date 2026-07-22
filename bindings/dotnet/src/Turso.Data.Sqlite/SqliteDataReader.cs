@@ -15,6 +15,7 @@ namespace Turso.Data.Sqlite;
 public class SqliteDataReader : DbDataReader
 {
     private readonly SqliteCommand _command;
+    private readonly SqliteConnection _connection;
     private SqliteStatementAdapter? _statement;
     private string _currentSql = string.Empty;
     private readonly List<string> _remainingSql = new();
@@ -91,6 +92,8 @@ public class SqliteDataReader : DbDataReader
     internal SqliteDataReader(SqliteCommand command, SqliteStatementAdapter statement, string currentSql, List<string> remainingSql, int recordsAffected, CommandBehavior behavior, Action closeCallback)
     {
         _command = command;
+        _connection = command.Connection
+            ?? throw new InvalidOperationException("A data reader requires an associated connection.");
         _statement = statement;
         _currentSql = currentSql;
         _hadResultSet = true;
@@ -98,14 +101,18 @@ public class SqliteDataReader : DbDataReader
         _recordsAffected = recordsAffected;
         _behavior = behavior;
         _closeCallback = closeCallback;
+        _connection.ReaderOpened(this);
     }
 
     internal SqliteDataReader(SqliteCommand command, int recordsAffected, CommandBehavior behavior, Action closeCallback)
     {
         _command = command;
+        _connection = command.Connection
+            ?? throw new InvalidOperationException("A data reader requires an associated connection.");
         _recordsAffected = recordsAffected;
         _behavior = behavior;
         _closeCallback = closeCallback;
+        _connection.ReaderOpened(this);
     }
 
     public override int Depth => 0;
@@ -686,6 +693,19 @@ public class SqliteDataReader : DbDataReader
 
     public override void Close() => CloseCore();
 
+    internal void CloseFromConnection()
+    {
+        if (_isClosed)
+            return;
+
+        _statement?.Dispose();
+        _statement = null;
+        _remainingSql.Clear();
+        _hasPrefetchedRow = false;
+        _hasCurrentRow = false;
+        FinishClose(closeConnection: false);
+    }
+
     private void CloseCore(bool throwOnError = true)
     {
         if (_isClosed)
@@ -733,14 +753,15 @@ public class SqliteDataReader : DbDataReader
         FinishClose();
     }
 
-    private void FinishClose()
+    private void FinishClose(bool closeConnection = true)
     {
         if (_isClosed)
             return;
 
         _closeCallback();
-        if ((_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-            _command.Connection?.Close();
+        _connection.ReaderClosed(this);
+        if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+            _connection.Close();
 
         _isClosed = true;
     }

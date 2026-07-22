@@ -221,7 +221,6 @@ public class SqliteCommand : DbCommand
         if (IsEmptyCommand(CommandText))
         {
             _hasOpenReader = true;
-            Connection?.ReaderOpened();
             return new SqliteDataReader(this, -1, behavior, CloseReader);
         }
 
@@ -246,7 +245,6 @@ public class SqliteCommand : DbCommand
                 if (statement.ColumnCount > 0)
                 {
                     _hasOpenReader = true;
-                    Connection?.ReaderOpened();
                     return new SqliteDataReader(this, statement, statements[i], statements.Skip(i + 1).ToList(), recordsAffected, behavior, CloseReader);
                 }
 
@@ -263,9 +261,7 @@ public class SqliteCommand : DbCommand
         {
             throw ToSqliteException(ex);
         }
-
         _hasOpenReader = true;
-        Connection?.ReaderOpened();
         return new SqliteDataReader(this, recordsAffected, behavior, CloseReader);
     }
 
@@ -298,7 +294,6 @@ public class SqliteCommand : DbCommand
     private void CloseReader()
     {
         _hasOpenReader = false;
-        Connection?.ReaderClosed();
     }
 
     internal SqliteStatementAdapter PrepareSingleStatement(string sql)

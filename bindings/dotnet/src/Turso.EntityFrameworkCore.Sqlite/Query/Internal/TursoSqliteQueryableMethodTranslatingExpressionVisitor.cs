@@ -27,7 +27,7 @@ public sealed class TursoSqliteQueryableMethodTranslatingExpressionVisitor : Rel
     private readonly IRelationalTypeMappingSource _typeMappingSource;
     private readonly SqliteSqlExpressionFactory _sqlExpressionFactory;
     private readonly SqlAliasManager _sqlAliasManager;
-    private readonly bool _areJsonFunctionsSupported;
+    private readonly bool _areJsonEachFunctionsSupported;
 
     /// <summary>
     ///     This is an internal API that supports the Entity Framework Core infrastructure and not subject to
@@ -56,14 +56,15 @@ public sealed class TursoSqliteQueryableMethodTranslatingExpressionVisitor : Rel
     public TursoSqliteQueryableMethodTranslatingExpressionVisitor(
         QueryableMethodTranslatingExpressionVisitorDependencies dependencies,
         RelationalQueryableMethodTranslatingExpressionVisitorDependencies relationalDependencies,
-        RelationalQueryCompilationContext queryCompilationContext)
+        RelationalQueryCompilationContext queryCompilationContext,
+        bool areJsonEachFunctionsSupported)
         : base(dependencies, relationalDependencies, queryCompilationContext)
     {
         _typeMappingSource = relationalDependencies.TypeMappingSource;
         _sqlExpressionFactory = (SqliteSqlExpressionFactory)relationalDependencies.SqlExpressionFactory;
         _sqlAliasManager = queryCompilationContext.SqlAliasManager;
 
-        _areJsonFunctionsSupported = true;
+        _areJsonEachFunctionsSupported = areJsonEachFunctionsSupported;
     }
 
     /// <summary>
@@ -80,7 +81,7 @@ public sealed class TursoSqliteQueryableMethodTranslatingExpressionVisitor : Rel
         _sqlExpressionFactory = parentVisitor._sqlExpressionFactory;
         _sqlAliasManager = parentVisitor._sqlAliasManager;
 
-        _areJsonFunctionsSupported = parentVisitor._areJsonFunctionsSupported;
+        _areJsonEachFunctionsSupported = parentVisitor._areJsonEachFunctionsSupported;
     }
 
     /// <summary>
@@ -238,15 +239,6 @@ public sealed class TursoSqliteQueryableMethodTranslatingExpressionVisitor : Rel
         IProperty? property,
         string tableAlias)
     {
-        // Support for JSON functions (e.g. json_each) was added in Sqlite 3.38.0 (2022-02-22, see https://www.sqlite.org/json1.html).
-        // This determines whether we have json_each, which is needed to query into JSON columns.
-        if (!_areJsonFunctionsSupported)
-        {
-            AddTranslationErrorDetails(SqliteStrings.QueryingIntoJsonCollectionsNotSupported("3.38.0"));
-
-            return null;
-        }
-
         var elementTypeMapping = (RelationalTypeMapping?)sqlExpression.TypeMapping?.ElementTypeMapping;
         var elementClrType = GetSequenceType(sqlExpression.Type);
         var jsonEachExpression = new JsonEachExpression(tableAlias, sqlExpression);
@@ -320,6 +312,9 @@ public sealed class TursoSqliteQueryableMethodTranslatingExpressionVisitor : Rel
     /// </summary>
     protected override ShapedQueryExpression TransformJsonQueryToTable(JsonQueryExpression jsonQueryExpression)
     {
+        if (!_areJsonEachFunctionsSupported)
+            throw new InvalidOperationException(SqliteStrings.QueryingIntoJsonCollectionsNotSupported("3.38.0"));
+
         var entityType = jsonQueryExpression.EntityType;
         var textTypeMapping = _typeMappingSource.FindMapping(typeof(string));
 

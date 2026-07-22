@@ -238,12 +238,21 @@ public class ManagedSqltestConformanceTests
     [TestCase("foreign_keys.sqltest", "fk-delete-parent-blocked")]
     [TestCase("window/memory.sqltest", "window-same-window-fn-used-multiple-times")]
     [TestCase("window/memory.sqltest", "window-order-by-position-references-window-fn")]
-    public void ExistingSqltestCaseRunsAgainstManagedCore(string fileName, string testName)
+    [TestCase("rollback.sqltest", "simple-rollback")]
+    [TestCase("rollback.sqltest", "simple-rollback-2")]
+    [TestCase("rollback.sqltest", "rollback-after-update")]
+    [TestCase("rollback.sqltest", "rollback-after-delete")]
+    [TestCase("rollback.sqltest", "rollback-mixed-operations")]
+    [TestCase("rollback.sqltest", "insert-after-rollback")]
+    [TestCase("rollback.sqltest", "schema-change-rollback-version")]
+    [TestCase("rollback.sqltest", "schema-version-after-update")]
+    [TestCase("rollback.sqltest", "schema-change-rollback-2")]
+    public void ExistingSqltestCaseRunsAgainstManagedCoreWithoutNativeFallback(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
-        AssertManagedCoreRoute(database, connection);
+        AssertManagedCoreRouteWithoutNativeFallback(database, connection);
 
         if (testCase.ExpectedError is { } expectedError)
         {
@@ -265,7 +274,7 @@ public class ManagedSqltestConformanceTests
         string.Join('\n', rows).Should().Be(testCase.Expected);
     }
 
-    private static void AssertManagedCoreRoute(EmbeddedDatabase database, EmbeddedConnection connection)
+    private static void AssertManagedCoreRouteWithoutNativeFallback(EmbeddedDatabase database, EmbeddedConnection connection)
     {
         Assert.That(database.GetType().Assembly, Is.SameAs(typeof(EmbeddedDatabase).Assembly));
         Assert.That(connection.GetType().Assembly, Is.SameAs(typeof(EmbeddedDatabase).Assembly));

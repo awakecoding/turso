@@ -73,14 +73,16 @@ public static class TursoDbContextOptionsBuilderExtensions
             .ReplaceService<ISqliteRelationalConnection, TursoSqliteRelationalConnection>()
             .ReplaceService<IRelationalDatabaseCreator, TursoSqliteDatabaseCreator>()
             .ReplaceService<IQuerySqlGeneratorFactory, TursoSqliteQuerySqlGeneratorFactory>()
-            .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, TursoSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
             .ReplaceService<IUpdateSqlGenerator, TursoSqliteUpdateSqlGenerator>();
 
         return usesManagedLocalProvider
             ? configuredOptions
+                .ReplaceService<IQuerySqlGeneratorFactory, TursoManagedSqliteQuerySqlGeneratorFactory>()
+                .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, TursoManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
                 .ReplaceService<IMigrationsSqlGenerator, TursoManagedSqliteMigrationsSqlGenerator>()
                 .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, TursoSqliteParameterBasedSqlProcessorFactory>()
-            : configuredOptions;
+            : configuredOptions
+                .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, TursoSqliteQueryableMethodTranslatingExpressionVisitorFactory>();
     }
 
     private static bool UsesManagedLocalProvider(string? connectionString)

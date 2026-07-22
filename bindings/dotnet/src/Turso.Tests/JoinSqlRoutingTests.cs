@@ -452,18 +452,136 @@ public class JoinSqlRoutingTests
     }
 
     [Test]
-    public void LimitOverJoinFallsBackToEvaluator()
+    public void DirectInnerEquiJoinWhereLimitOffsetRoutesAndMatchesEvaluator()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
 
-        var rows = ReadRows(
+        var routed = ReadRows(
             connection,
-            "SELECT o.amount FROM users u JOIN orders o ON u.id = o.user_id LIMIT 2;");
-        rows.Should().HaveCount(2);
+            "SELECT u.id AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;");
+        routed.Select(row => (row[0], row[1], row[2])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(20), SqlValue.Integer(7)),
+            (SqlValue.Integer(2), SqlValue.Integer(30), SqlValue.Integer(7)));
+        ColumnNames(
+                connection,
+                "SELECT u.id AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;")
+            .Should().Equal("user_id", "cost", "marker");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT o.amount FROM users u JOIN orders o ON u.id = o.user_id LIMIT 2;"));
+        // The computed equivalent deliberately falls back because bounded joins currently project
+        // only direct columns/literals. Its evaluator result is the differential oracle for the
+        // routed row stream.
+        var evaluated = ReadRows(
+            connection,
+            "SELECT u.id + 0 AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;");
+        routed.Select(row => (row[0], row[1], row[2]))
+            .Should().Equal(evaluated.Select(row => (row[0], row[1], row[2])));
+
+        var opcodes = Opcodes(ReadRows(
+            connection,
+            "EXPLAIN SELECT u.id AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;"));
+        opcodes.Should().Contain("FilterRegisters")
+            .And.Contain("OffsetGate")
+            .And.Contain("LimitGate")
+            .And.NotContain("JumpIf");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+            connection,
+            "EXPLAIN SELECT u.id + 0 AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;"));
+    }
+
+    [Test]
+    public void BoundedInnerJoinPreservesCollationNullAndParameterResetSemantics()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE l(key TEXT, label TEXT);");
+        Execute(connection, "CREATE TABLE r(key TEXT, amount INTEGER);");
+        Execute(connection, "INSERT INTO l VALUES ('Ada', 'first'), (NULL, 'null-key'), ('Bo', 'third');");
+        Execute(connection, "INSERT INTO r VALUES ('ADA', 10), (NULL, 99), ('BO', 20);");
+
+        using var statement = connection.Prepare(
+            "SELECT l.label AS label, r.amount AS amount FROM l JOIN r ON l.key = r.key COLLATE NOCASE WHERE r.amount >= ? LIMIT ? OFFSET ?;");
+        statement.Bind(1, SqlValue.Integer(0));
+        statement.Bind(2, SqlValue.Integer(1));
+        statement.Bind(3, SqlValue.Integer(1));
+        DrainRows(statement).Select(row => (row[0], row[1]))
+            .Should().Equal((SqlValue.Text("third"), SqlValue.Integer(20)));
+
+        statement.Reset();
+        statement.Bind(1, SqlValue.Integer(0));
+        statement.Bind(2, SqlValue.Integer(2));
+        statement.Bind(3, SqlValue.Integer(0));
+        DrainRows(statement).Select(row => (row[0], row[1]))
+            .Should().Equal(
+                (SqlValue.Text("first"), SqlValue.Integer(10)),
+                (SqlValue.Text("third"), SqlValue.Integer(20)));
+
+        // NULL = NULL remains unknown, not true: the NULL-key pair never enters either routed result.
+        Opcodes(ReadRows(
+            connection,
+            "EXPLAIN SELECT l.label, r.amount FROM l JOIN r ON l.key = r.key COLLATE NOCASE WHERE r.amount >= 0 LIMIT 2;"))
+            .Should().Contain("FilterRegisters").And.Contain("LimitGate");
+    }
+
+    [Test]
+    public void BoundedOuterCrossComputedAndAmbiguousJoinShapesFallBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        SeedOrders(connection);
+        Execute(connection, "INSERT INTO users VALUES (3, 'cy');");
+
+        ReadRows(
+                connection,
+                "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id LIMIT 5;")
+            .Select(row => (row[0], row[1]))
+            .Should().Equal(
+                (SqlValue.Text("ada"), SqlValue.Integer(10)),
+                (SqlValue.Text("ada"), SqlValue.Integer(20)),
+                (SqlValue.Text("bo"), SqlValue.Integer(30)),
+                (SqlValue.Text("cy"), SqlValue.Null));
+        ReadRows(
+                connection,
+                "SELECT u.name, o.amount FROM users u CROSS JOIN orders o LIMIT 1;")
+            .Should().ContainSingle();
+        ReadRows(
+                connection,
+                "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id + 0 = o.user_id LIMIT 1;")
+            .Should().ContainSingle();
+        ReadRows(
+                connection,
+                "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;")
+            .Should().ContainSingle();
+        // Bounded lowering requires qualified direct columns, so the evaluator retains ownership
+        // of outer/cross joins and computed ON/WHERE predicates.
+        foreach (var sql in new[]
+        {
+            "EXPLAIN SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id LIMIT 5;",
+            "EXPLAIN SELECT u.name, o.amount FROM users u CROSS JOIN orders o LIMIT 1;",
+            "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id + 0 = o.user_id LIMIT 1;",
+            "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;",
+        })
+        {
+            Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, sql));
+        }
+    }
+
+    [Test]
+    public void BoundedJoinInvalidColumnAndLimitKeepEvaluatorErrors()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        SeedOrders(connection);
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+                connection,
+                "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE o.missing = 1 LIMIT 1;"))
+            .Message.Should().Be("no such column: o.missing");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+                connection,
+                "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id LIMIT 'x';"))
+            .Message.Should().Be("datatype mismatch");
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+            connection,
+            "EXPLAIN SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE o.missing = 1 LIMIT 1;"));
     }
 
     [Test]
@@ -532,6 +650,21 @@ public class JoinSqlRoutingTests
         var rows = new List<(SqlValue, SqlValue)>();
         while (statement.Step() == StatementStepResult.Row)
             rows.Add((statement.GetValue(0), statement.GetValue(1)));
+
+        return rows;
+    }
+
+    private static List<SqlValue[]> DrainRows(EmbeddedStatement statement)
+    {
+        var rows = new List<SqlValue[]>();
+        while (statement.Step() == StatementStepResult.Row)
+        {
+            var row = new SqlValue[statement.GetColumnCount()];
+            for (var ordinal = 0; ordinal < row.Length; ordinal++)
+                row[ordinal] = statement.GetValue(ordinal);
+
+            rows.Add(row);
+        }
 
         return rows;
     }

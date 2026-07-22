@@ -13,8 +13,8 @@ namespace Turso.Tests;
 // scan, a source-less constant projection, scalar/grouped aggregates with an aggregate-only HAVING
 // predicate, or a bounded single-table sorter over bare-column/literal projections and resolved
 // column ORDER BY keys. Deliberate fallbacks keep the evaluator's exact rows AND error timing:
-// LIMIT 0 (validate-then-skip-the-scan), JOIN + LIMIT, DISTINCT + LIMIT, compound + LIMIT,
-// unsupported ORDER BY shapes, and non-integer LIMIT/OFFSET ("datatype mismatch").
+// LIMIT 0 (validate-then-skip-the-scan), non-simple/outer JOIN + LIMIT, DISTINCT + LIMIT,
+// compound + LIMIT, unsupported ORDER BY shapes, and non-integer LIMIT/OFFSET ("datatype mismatch").
 public class LimitOffsetSqlRoutingTests
 {
     // ---- Scan + LIMIT / OFFSET routing ------------------------------------------------------
@@ -395,7 +395,7 @@ public class LimitOffsetSqlRoutingTests
     }
 
     [Test]
-    public void JoinLimitFallsBackToTheEvaluator()
+    public void SimpleInnerEquiJoinLimitRoutesThroughTheGate()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE a(x INTEGER);");
@@ -405,8 +405,8 @@ public class LimitOffsetSqlRoutingTests
 
         ReadRows(connection, "SELECT a.x FROM a JOIN b ON a.x = b.x LIMIT 2;")
             .Select(row => row[0]).Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT a.x FROM a JOIN b ON a.x = b.x LIMIT 2;"));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT a.x FROM a JOIN b ON a.x = b.x LIMIT 2;"))
+            .Should().Contain("FilterRegisters").And.Contain("LimitGate");
     }
 
     [Test]

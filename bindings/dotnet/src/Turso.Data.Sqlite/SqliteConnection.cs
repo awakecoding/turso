@@ -20,7 +20,7 @@ public partial class SqliteConnection : DbConnection
     private SqliteConnectionStringBuilder _connectionOptions = new();
     private bool _disposed;
     private int? _defaultTimeout;
-    private int _openReaderCount;
+    private readonly HashSet<SqliteDataReader> _openReaders = [];
     private string? _dataSource;
     private bool _readOnly;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
@@ -186,6 +186,7 @@ public partial class SqliteConnection : DbConnection
         var originalState = State;
         try
         {
+            CloseOpenReaders();
             Transaction?.Dispose();
         }
         finally
@@ -471,7 +472,7 @@ public partial class SqliteConnection : DbConnection
 
     internal bool UsesManagedDatabase => IsManagedConnection;
 
-    internal bool HasOpenReader => _openReaderCount > 0;
+    internal bool HasOpenReader => _openReaders.Count != 0;
 
     internal bool IsReadOnly => _readOnly;
 
@@ -479,12 +480,17 @@ public partial class SqliteConnection : DbConnection
 
     internal bool RecursiveTriggers => _recursiveTriggers;
 
-    internal void ReaderOpened() => _openReaderCount++;
-
-    internal void ReaderClosed()
+    internal void ReaderOpened(SqliteDataReader reader)
     {
-        if (_openReaderCount > 0)
-            _openReaderCount--;
+        ArgumentNullException.ThrowIfNull(reader);
+        if (!_openReaders.Add(reader))
+            throw new InvalidOperationException("The data reader is already registered with this connection.");
+    }
+
+    internal void ReaderClosed(SqliteDataReader reader)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        _openReaders.Remove(reader);
     }
 
     internal void ExecuteNonQuery(string sql)
@@ -740,6 +746,12 @@ public partial class SqliteConnection : DbConnection
                 managedEncryptionFileSystem?.Dispose();
             }
         }
+    }
+
+    private void CloseOpenReaders()
+    {
+        foreach (var reader in _openReaders.ToArray())
+            reader.CloseFromConnection();
     }
 
     private static void ValidateRestrictions(string collectionName, string?[]? restrictionValues, int maxRestrictions)

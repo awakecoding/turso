@@ -7,3 +7,10 @@ public sealed class TursoSqliteQuerySqlGeneratorFactory(QuerySqlGeneratorDepende
     public QuerySqlGenerator Create()
         => new TursoSqliteQuerySqlGenerator(dependencies);
 }
+
+public sealed class TursoManagedSqliteQuerySqlGeneratorFactory(
+    QuerySqlGeneratorDependencies dependencies) : IQuerySqlGeneratorFactory
+{
+    public QuerySqlGenerator Create()
+        => new TursoSqliteQuerySqlGenerator(dependencies, areJsonEachFunctionsSupported: false);
+}

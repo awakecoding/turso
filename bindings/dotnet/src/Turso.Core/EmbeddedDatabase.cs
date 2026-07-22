@@ -3568,10 +3568,10 @@ public sealed class EmbeddedDatabase : IDisposable
         out CompiledSelect compiled)
     {
         // A SELECT carrying LIMIT/OFFSET lowers only when its LIMIT/OFFSET-free base is a
-        // gate-able route. Direct scans, constant projections, aggregates, and the deliberately
-        // narrow bounded sorted-scan subset route through the dedicated path that layers
-        // LimitOffsetProgramBuilder gates onto that base. Joins, DISTINCT, computed shapes,
-        // and compounds keep LIMIT/OFFSET on the evaluator.
+        // gate-able route. Direct scans, constant projections, aggregates, the deliberately
+        // narrow bounded sorted-scan subset, and a strictly-gated inner equi-join subset route
+        // through the dedicated path that layers LimitOffsetProgramBuilder gates onto that base.
+        // DISTINCT, computed shapes, outer joins, and compounds keep LIMIT/OFFSET on the evaluator.
         if (select.Limit is not null || select.Offset is not null)
             return TryCompileLimitedSelect(select, parameters, context, outerRow, out compiled);
 
@@ -3972,18 +3972,20 @@ public sealed class EmbeddedDatabase : IDisposable
     //
     // Routed entirely through the VDBE:
     //  - the base (the same SELECT with LIMIT/OFFSET stripped) lowers via the direct-scan /
-    //    constant-projection compiler, aggregate route, or bounded sorted-scan route. Each
-    //    emits through one unconditional ResultRow, which is exactly what the gate can bound:
-    //    OFFSET skips leading candidates without charging LIMIT, then LIMIT caps the survivors,
-    //    matching the evaluator's OFFSET-then-LIMIT ApplyDistinctLimit order.
+    //    constant-projection compiler, aggregate route, bounded sorted-scan route, or the
+    //    deliberately small inner equi-join route. Each emits through unconditional ResultRow
+    //    instructions, which is exactly what the gate can bound: OFFSET skips leading candidates
+    //    without charging LIMIT, then LIMIT caps the survivors, matching the evaluator's
+    //    OFFSET-then-LIMIT ApplyDistinctLimit order.
     //  - LIMIT/OFFSET resolve to integers exactly as ExecuteSelect resolves them
     //    (RequireLimitInteger, with a negative OFFSET clamped to zero and a null/negative
     //    LIMIT treated as unbounded), so the gated program yields the identical row window.
     //
     // Deliberately kept on the evaluator (fallback):
-    //  - ORDER BY outside the bounded sorted-scan subset: joins, DISTINCT,
-    //    aggregate/window shapes, non-base sources, computed projections, and non-column order
-    //    keys all need semantics this scan/sorter/gate pipeline does not represent exactly.
+    //  - ORDER BY outside the bounded sorted-scan subset; joins outside the narrow inner
+    //    equi-join shape; DISTINCT, aggregate/window shapes, non-base sources, computed
+    //    projections, and non-column order keys all need semantics this pipeline does not
+    //    represent exactly.
     //  - DISTINCT: the base carries DISTINCT, which every gate-able route rejects, so the
     //    evaluator applies de-duplication before trimming.
     //  - LIMIT 0: the evaluator validates every projection/WHERE/GROUP BY/HAVING/ORDER BY
@@ -4018,11 +4020,14 @@ public sealed class EmbeddedDatabase : IDisposable
         if (limit == 0)
             return false;
 
-        // Gate only the row-count-preserving routes whose lone unconditional ResultRow the
-        // builder can bound exactly.
+        // Gate only the row-count-preserving routes whose unconditional ResultRows the builder
+        // can bound exactly. The join branch below is intentionally stricter than the existing
+        // unbounded join route: bounded joins currently claim only an explicit INNER equi-join
+        // over two base tables with direct projections and predicates.
         var baseSelect = select with { Limit = null, Offset = null };
         if (!TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase)
-            && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase))
+            && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase)
+            && !TryCompileLimitedInnerJoinSelect(baseSelect, parameters, context, outerRow, out compiledBase))
         {
             return false;
         }
@@ -4034,6 +4039,127 @@ public sealed class EmbeddedDatabase : IDisposable
             ? compiledBase
             : new CompiledSelect(gated, compiledBase.CursorSources);
         return true;
+    }
+
+    // Bounded joins are deliberately a smaller contract than TryCompileJoinSelect. A LIMIT/OFFSET gate is
+    // mechanically valid over any unconditional ResultRow, but this route claims only the simple shape whose
+    // join, projection, and post-join filter can all be inspected structurally: two base tables, an explicit
+    // INNER equality between one column from each side, direct column/literal projections, and an optional
+    // direct comparison WHERE. More expressive joins continue through the evaluator until their exact routing
+    // contract is independently established.
+    private bool TryCompileLimitedInnerJoinSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+
+        if (select.Source is not JoinTableSource
+            {
+                Kind: JoinKind.Inner,
+                Natural: false,
+                UsingColumns: null,
+                Condition: { } condition,
+            } join)
+        {
+            return false;
+        }
+
+        var leftTarget = ResolveScanTarget(join.Left, context);
+        var rightTarget = ResolveScanTarget(join.Right, context);
+        if (leftTarget is null
+            || rightTarget is null
+            || !IsDirectInnerJoinEquality(condition, leftTarget, rightTarget)
+            || select.Projections.Any(projection =>
+                !IsDirectJoinProjection(projection.Expression, leftTarget, rightTarget))
+            || (select.Where is not null
+                && !IsDirectJoinWherePredicate(select.Where, leftTarget, rightTarget)))
+        {
+            return false;
+        }
+
+        return TryCompileJoinSelect(select, parameters, context, outerRow, out compiled);
+    }
+
+    // The ON comparison must use one direct column from each input. Requiring a qualifier keeps duplicate
+    // names and self-joins from accidentally binding to the first matching combined-row column.
+    private static bool IsDirectInnerJoinEquality(
+        Expression expression,
+        ScanTarget leftTarget,
+        ScanTarget rightTarget)
+    {
+        if (expression is not BinaryExpression { Operator: BinaryOperator.Equal } equality)
+            return false;
+
+        return IsDirectColumnFrom(equality.Left, leftTarget, rightTarget)
+               && IsDirectColumnFrom(equality.Right, rightTarget, leftTarget)
+            || IsDirectColumnFrom(equality.Left, rightTarget, leftTarget)
+               && IsDirectColumnFrom(equality.Right, leftTarget, rightTarget);
+    }
+
+    private static bool IsDirectJoinProjection(
+        Expression expression,
+        ScanTarget leftTarget,
+        ScanTarget rightTarget)
+        => expression is LiteralExpression
+            || IsDirectColumnFrom(expression, leftTarget, rightTarget)
+            || IsDirectColumnFrom(expression, rightTarget, leftTarget);
+
+    private static bool IsDirectJoinWherePredicate(
+        Expression expression,
+        ScanTarget leftTarget,
+        ScanTarget rightTarget)
+    {
+        if (expression is not BinaryExpression comparison
+            || comparison.Operator is not (BinaryOperator.Equal
+                or BinaryOperator.NotEqual
+                or BinaryOperator.LessThan
+                or BinaryOperator.LessThanOrEqual
+                or BinaryOperator.GreaterThan
+                or BinaryOperator.GreaterThanOrEqual))
+        {
+            return false;
+        }
+
+        return IsDirectJoinPredicateOperand(comparison.Left, leftTarget, rightTarget)
+            && IsDirectJoinPredicateOperand(comparison.Right, leftTarget, rightTarget)
+            && (IsDirectColumnFrom(comparison.Left, leftTarget, rightTarget)
+                || IsDirectColumnFrom(comparison.Left, rightTarget, leftTarget)
+                || IsDirectColumnFrom(comparison.Right, leftTarget, rightTarget)
+                || IsDirectColumnFrom(comparison.Right, rightTarget, leftTarget));
+    }
+
+    private static bool IsDirectJoinPredicateOperand(
+        Expression expression,
+        ScanTarget leftTarget,
+        ScanTarget rightTarget)
+        => IsDirectColumnFrom(expression, leftTarget, rightTarget)
+            || IsDirectColumnFrom(expression, rightTarget, leftTarget)
+            || UnwrapCollation(expression) is LiteralExpression or ParameterExpression;
+
+    private static bool IsDirectColumnFrom(
+        Expression expression,
+        ScanTarget target,
+        ScanTarget otherTarget)
+    {
+        if (UnwrapCollation(expression) is not ColumnExpression { Name: var name }
+            || !name.Contains('.'))
+        {
+            return false;
+        }
+
+        return target.ResolveColumnIndex(name) is not null
+            && otherTarget.ResolveColumnIndex(name) is null;
+    }
+
+    private static Expression UnwrapCollation(Expression expression)
+    {
+        while (expression is CollationExpression collation)
+            expression = collation.Expression;
+
+        return expression;
     }
 
     // Lowers the intentionally small ORDER BY + LIMIT/OFFSET family. The base sorter consumes

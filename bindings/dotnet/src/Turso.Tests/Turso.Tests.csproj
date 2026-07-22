@@ -125,5 +125,8 @@
         <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\managed-recursive-cte-upstream.sqltest"
                  Link="Conformance\managed-recursive-cte-upstream.sqltest"
                  CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\rollback.sqltest"
+                 Link="Conformance\rollback.sqltest"
+                 CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 </Project>
