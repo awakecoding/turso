@@ -247,6 +247,11 @@ public class ManagedSqltestConformanceTests
     [TestCase("rollback.sqltest", "schema-change-rollback-version")]
     [TestCase("rollback.sqltest", "schema-version-after-update")]
     [TestCase("rollback.sqltest", "schema-change-rollback-2")]
+    [TestCase("default_value.sqltest", "default-value-text")]
+    [TestCase("default_value.sqltest", "default-value-integer")]
+    [TestCase("default_value.sqltest", "default-value-real")]
+    [TestCase("default_value.sqltest", "default-value-null")]
+    [TestCase("default_value.sqltest", "default-value-boolean")]
     public void ExistingSqltestCaseRunsAgainstManagedCoreWithoutNativeFallback(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

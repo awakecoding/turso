@@ -1,4 +1,5 @@
 using System.Data;
+using System.Data.Common;
 using AwesomeAssertions;
 using Turso.Data.Sqlite;
 
@@ -82,5 +83,40 @@ public sealed class ManagedProviderIndexSchemaMetadataTests
             .Message.Should().Contain("Indexes");
         Assert.Throws<ArgumentException>(() => connection.GetSchema("IndexColumns", new string?[6]))!
             .Message.Should().Contain("IndexColumns");
+    }
+
+    [Test]
+    public void ReaderSchemaPreservesBaseMetadataForManagedAliasedColumns()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery("""
+            CREATE TABLE products(
+                id INTEGER PRIMARY KEY,
+                sku TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL
+            );
+            INSERT INTO products VALUES (1, 'SKU-1', 'Widget');
+            """);
+
+        using var reader = connection.ExecuteReader(
+            "SELECT id AS product_id, sku AS product_sku, name AS product_name FROM products;");
+        reader.Read().Should().BeTrue();
+
+        var schema = reader.GetSchemaTable();
+        schema.Rows[0][SchemaTableColumn.BaseColumnName].Should().Be("id");
+        schema.Rows[0][SchemaTableColumn.IsKey].Should().Be(true);
+        schema.Rows[0][SchemaTableColumn.IsAliased].Should().Be(true);
+        schema.Rows[0][SchemaTableColumn.IsExpression].Should().Be(false);
+        schema.Rows[0][SchemaTableColumn.AllowDBNull].Should().Be(true);
+        schema.Rows[1][SchemaTableColumn.IsUnique].Should().Be(false);
+        schema.Rows[1][SchemaTableColumn.AllowDBNull].Should().Be(true);
+
+        var columns = ((DbDataReader)reader).GetColumnSchema();
+        columns[0].BaseColumnName.Should().Be("id");
+        columns[0].IsKey.Should().BeTrue();
+        columns[0].AllowDBNull.Should().BeTrue();
+        columns[1].IsUnique.Should().BeFalse();
+        columns[1].AllowDBNull.Should().BeTrue();
     }
 }

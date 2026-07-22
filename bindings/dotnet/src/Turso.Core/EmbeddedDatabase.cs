@@ -4022,12 +4022,13 @@ public sealed class EmbeddedDatabase : IDisposable
 
         // Gate only the row-count-preserving routes whose unconditional ResultRows the builder
         // can bound exactly. The join branch below is intentionally stricter than the existing
-        // unbounded join route: bounded joins currently claim only an explicit INNER equi-join
-        // over two base tables with direct projections and predicates.
+        // unbounded join route: bounded joins currently claim only explicit INNER or LEFT equi-joins
+        // over two base tables with direct projections. LEFT joins exclude WHERE because it filters
+        // null-extended rows after matching, while the reusable nested loop only gates the join stream.
         var baseSelect = select with { Limit = null, Offset = null };
         if (!TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase)
             && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase)
-            && !TryCompileLimitedInnerJoinSelect(baseSelect, parameters, context, outerRow, out compiledBase))
+            && !TryCompileLimitedEquiJoinSelect(baseSelect, parameters, context, outerRow, out compiledBase))
         {
             return false;
         }
@@ -4042,12 +4043,12 @@ public sealed class EmbeddedDatabase : IDisposable
     }
 
     // Bounded joins are deliberately a smaller contract than TryCompileJoinSelect. A LIMIT/OFFSET gate is
-    // mechanically valid over any unconditional ResultRow, but this route claims only the simple shape whose
-    // join, projection, and post-join filter can all be inspected structurally: two base tables, an explicit
-    // INNER equality between one column from each side, direct column/literal projections, and an optional
-    // direct comparison WHERE. More expressive joins continue through the evaluator until their exact routing
-    // contract is independently established.
-    private bool TryCompileLimitedInnerJoinSelect(
+    // mechanically valid over every unconditional ResultRow that JoinProgramBuilder emits, including the
+    // mutually-exclusive matched and null-extension emission sites of a LEFT join. This route claims two base
+    // tables, an explicit equality between one direct column from each side, and direct column/literal
+    // projections. INNER joins may add a direct post-join WHERE; LEFT joins must not, because filtering the
+    // null-extended row is post-join work that the nested-loop program cannot express.
+    private bool TryCompileLimitedEquiJoinSelect(
         SelectStatement select,
         SqlValue[] parameters,
         QueryContext context,
@@ -4058,20 +4059,25 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (select.Source is not JoinTableSource
             {
-                Kind: JoinKind.Inner,
                 Natural: false,
                 UsingColumns: null,
                 Condition: { } condition,
-            } join)
+            } join
+            || join.Kind is not (JoinKind.Inner or JoinKind.Left))
         {
             return false;
         }
+
+        // The left-outer builder's predicate controls matching only. Keeping every LEFT WHERE on the
+        // evaluator preserves filtering after the unmatched row has been null-extended.
+        if (join.Kind == JoinKind.Left && select.Where is not null)
+            return false;
 
         var leftTarget = ResolveScanTarget(join.Left, context);
         var rightTarget = ResolveScanTarget(join.Right, context);
         if (leftTarget is null
             || rightTarget is null
-            || !IsDirectInnerJoinEquality(condition, leftTarget, rightTarget)
+            || !IsDirectEquiJoinEquality(condition, leftTarget, rightTarget)
             || select.Projections.Any(projection =>
                 !IsDirectJoinProjection(projection.Expression, leftTarget, rightTarget))
             || (select.Where is not null
@@ -4085,7 +4091,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
     // The ON comparison must use one direct column from each input. Requiring a qualifier keeps duplicate
     // names and self-joins from accidentally binding to the first matching combined-row column.
-    private static bool IsDirectInnerJoinEquality(
+    private static bool IsDirectEquiJoinEquality(
         Expression expression,
         ScanTarget leftTarget,
         ScanTarget rightTarget)

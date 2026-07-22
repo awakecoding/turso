@@ -482,13 +482,15 @@ public class SqliteDataReader : DbDataReader
                 ? GetClrTypeFromSqliteType(info.TypeName, valueType)
                 : GetClrTypeFromValueType(valueType);
             var isExpression = info is null;
+            var isAliased = info is null
+                || !string.Equals(info.Name, columnName, StringComparison.Ordinal);
             var row = schema.NewRow();
             row[SchemaTableColumn.ColumnName] = columnName;
             row[SchemaTableColumn.ColumnOrdinal] = i;
             row[SchemaTableColumn.ColumnSize] = -1;
             row[SchemaTableColumn.NumericPrecision] = DBNull.Value;
             row[SchemaTableColumn.NumericScale] = DBNull.Value;
-            row[SchemaTableColumn.IsUnique] = info is not null ? info.IsUnique : DBNull.Value;
+            row[SchemaTableColumn.IsUnique] = info is not null ? !isAliased && info.IsUnique : DBNull.Value;
             row[SchemaTableColumn.IsKey] = info is not null ? info.IsKey : DBNull.Value;
             row["BaseServerName"] = "";
             row["BaseCatalogName"] = info is not null ? "main" : DBNull.Value;
@@ -497,8 +499,8 @@ public class SqliteDataReader : DbDataReader
             row[SchemaTableColumn.BaseTableName] = info is not null ? tableName : DBNull.Value;
             row[SchemaTableColumn.DataType] = dataType;
             row["DataTypeName"] = dataTypeName;
-            row[SchemaTableColumn.AllowDBNull] = info is not null ? info.AllowNull : DBNull.Value;
-            row[SchemaTableColumn.IsAliased] = isExpression;
+            row[SchemaTableColumn.AllowDBNull] = info is not null ? isAliased || info.AllowNull : DBNull.Value;
+            row[SchemaTableColumn.IsAliased] = isAliased;
             row[SchemaTableColumn.IsExpression] = isExpression;
             row[SchemaTableOptionalColumn.IsAutoIncrement] = hasBaseColumn ? false : DBNull.Value;
             row[SchemaTableColumn.IsLong] = DBNull.Value;

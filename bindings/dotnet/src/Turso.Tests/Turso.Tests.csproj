@@ -128,5 +128,8 @@
         <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\rollback.sqltest"
                  Link="Conformance\rollback.sqltest"
                  CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\default_value.sqltest"
+                 Link="Conformance\default_value.sqltest"
+                 CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 </Project>

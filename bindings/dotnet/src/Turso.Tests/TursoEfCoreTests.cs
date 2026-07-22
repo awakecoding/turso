@@ -417,7 +417,8 @@ public class TursoEfCoreTests
 
         var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
 
-        await ensureCreated.Should().ThrowAsync<NotSupportedException>();
+        await ensureCreated.Should().ThrowAsync<NotSupportedException>()
+            .WithMessage("*ON DELETE Cascade*");
 
         await using var connection = new SqliteConnection(database.ConnectionString + ";Local Provider=Managed");
         await connection.OpenAsync();
@@ -600,6 +601,13 @@ public class TursoEfCoreTests
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            modelBuilder.Entity<CascadeParent>()
+                .Property(parent => parent.Id)
+                .ValueGeneratedNever();
+            modelBuilder.Entity<CascadeChild>()
+                .Property(child => child.Id)
+                .ValueGeneratedNever();
+
             modelBuilder.Entity<CascadeParent>()
                 .HasMany(parent => parent.Children)
                 .WithOne(child => child.Parent)
