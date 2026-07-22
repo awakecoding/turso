@@ -226,7 +226,12 @@ public class ManagedSqltestConformanceTests
     [TestCase("window/filter-over.sqltest", "filter-over-full-window-aggregate-matrix")]
     [TestCase("managed-recursive-cte-upstream.sqltest", "upstream-with2-8-2-union-distinct")]
     [TestCase("managed-recursive-cte-upstream.sqltest", "upstream-with1-6-4-linear-counter")]
+    [TestCase("on_conflict.sqltest", "insert-or-abort-unique")]
+    [TestCase("on_conflict.sqltest", "insert-or-ignore-unique")]
+    [TestCase("on_conflict.sqltest", "insert-or-ignore-pk")]
     [TestCase("on_conflict.sqltest", "insert-or-ignore-continue-after-skip")]
+    [TestCase("on_conflict.sqltest", "insert-or-replace-unique")]
+    [TestCase("on_conflict.sqltest", "insert-or-replace-pk")]
     [TestCase("on_conflict.sqltest", "insert-or-replace-multiple-conflicts")]
     [TestCase("insert-cte-compound.sqltest", "insert-cte-union-all-basic")]
     [TestCase("insert-cte-compound.sqltest", "insert-cte-union-distinct")]
@@ -253,6 +258,19 @@ public class ManagedSqltestConformanceTests
     [TestCase("default_value.sqltest", "default-value-null")]
     [TestCase("default_value.sqltest", "default-value-boolean")]
     public void ExistingSqltestCaseRunsAgainstManagedCoreWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
+    [TestCase("scalar-functions-format.sqltest", "format-mixed-all-types")]
+    [TestCase("scalar-functions-format.sqltest", "format-char-from-float")]
+    [TestCase("scalar-functions-printf.sqltest", "printf-float-precision-2")]
+    [TestCase("scalar-functions-printf.sqltest", "printf-int-width-and-precision")]
+    [TestCase("scalar-functions-printf.sqltest", "printf-string-width-and-precision")]
+    [TestCase("scalar-functions-printf.sqltest", "printf-format-float")]
+    [TestCase("scalar-functions-printf.sqltest", "format-alias")]
+    public void ManagedPrintfAndFormatSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
+    private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);
         using var database = new EmbeddedDatabase();

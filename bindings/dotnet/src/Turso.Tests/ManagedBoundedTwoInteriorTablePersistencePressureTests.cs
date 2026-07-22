@@ -14,6 +14,9 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
     private const int BoundedMutationPageSize = SqlitePageSize.Minimum;
     private const int BoundedMutationRowCount = 700;
     private const int BoundedMutationPayloadLength = 80;
+    private const int ThirdInteriorMutationRowCount = 5_000;
+    private const int ThirdInteriorMutationPayloadLength = 100;
+    private const long ThirdInteriorMutationFirstRowId = 9_000_000_000_000_000_000L;
     private const string BoundedMutationEncryptionKey =
         "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
 
@@ -406,7 +409,7 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
     }
 
     [Test]
-    public void DeletingFromAThirdInteriorLevelFallsBackToTheSafeFullRewrite()
+    public void DeletingFromAnOverflowLeafAtTheThirdInteriorLevelFallsBackToTheSafeFullRewrite()
     {
         var faults = new DeterministicFaultInjector();
         var fileSystem = new InMemoryFileSystem(faults);
@@ -454,6 +457,213 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         QueryText(reopenedConnection, firstRowId + 1).Should().Be(new string('x', payloadLength));
     }
 
+    [Test]
+    public void ThreeInteriorLevelMaximumDeletePropagatesToTheRootReopensAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("three-interior-root-separator");
+        try
+        {
+            CreateBoundedThirdInteriorTable(path, PhysicalFileSystem.Instance);
+            var target = FindThirdInteriorRootBoundaryTarget(PhysicalFileSystem.Instance, path);
+            byte[] grandparentBefore;
+            byte[] parentBefore;
+            using (var pager = SqlitePager.Open(
+                       PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                grandparentBefore = pager.ReadCommittedPage(target.GrandparentPage);
+                parentBefore = pager.ReadCommittedPage(target.ParentPage);
+            }
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+                Execute(connection, $"DELETE FROM t WHERE id = {target.DeletedRowId};");
+
+            AssertThirdInteriorRootBoundaryDeletion(
+                PhysicalFileSystem.Instance,
+                path,
+                target,
+                grandparentBefore,
+                parentBefore);
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path, readOnly: true))
+            using (var connection = reopened.Connect())
+            {
+                QueryCount(connection).Should().Be(ThirdInteriorMutationRowCount - 1);
+                QueryText(connection, target.ReplacementSeparator)
+                    .Should()
+                    .Be(new string('x', ThirdInteriorMutationPayloadLength));
+            }
+
+            VerifyNestedMutationWithSqlite(
+                path,
+                ThirdInteriorMutationRowCount - 1,
+                target.DeletedRowId);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void ThreeInteriorLevelMaximumDeleteUpdatesItsGrandparentSeparatorWithoutRewritingTheRoot()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "three-interior-grandparent-separator.db";
+        CreateBoundedThirdInteriorTable(path, fileSystem);
+        var target = FindThirdInteriorGrandparentBoundaryTarget(fileSystem, path);
+        byte[] rootBefore;
+        byte[] parentBefore;
+        using (var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true))
+        {
+            rootBefore = pager.ReadCommittedPage(target.RootPage);
+            parentBefore = pager.ReadCommittedPage(target.ParentPage);
+        }
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+            Execute(connection, $"DELETE FROM t WHERE id = {target.DeletedRowId};");
+
+        using (var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true))
+        {
+            var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+            pager.ReadCommittedPage(target.RootPage).Should().Equal(rootBefore);
+            pager.ReadCommittedPage(target.ParentPage).Should().Equal(parentBefore);
+            var grandparent = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(target.GrandparentPage),
+                header.UsableSpace);
+            grandparent.Cells[target.GrandparentParentIndex].Cell.LeftChildPage.Should().Be(target.ParentPage);
+            grandparent.Cells[target.GrandparentParentIndex].Cell.RowId.Should().Be(target.ReplacementSeparator);
+            var leaf = SqliteTableLeafPageView.Parse(
+                pager.ReadCommittedPage(target.LeafPage),
+                header.UsableSpace);
+            leaf.Search(target.DeletedRowId).IsExact.Should().BeFalse();
+            leaf.Cells[^1].Cell.RowId.Should().Be(target.ReplacementSeparator);
+            ReadTableHeight(pager, header, target.RootPage, new HashSet<uint>()).Should().Be(4);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true);
+        using var reopenedConnection = reopened.Connect();
+        QueryCount(reopenedConnection).Should().Be(ThirdInteriorMutationRowCount - 1);
+    }
+
+    [Test]
+    public void InterruptedThreeInteriorLevelRootSeparatorMutationRecoversThePriorCommittedTree()
+    {
+        for (var failedWrite = 1; failedWrite <= 3; failedWrite++)
+        {
+            var faults = new DeterministicFaultInjector();
+            var fileSystem = new InMemoryFileSystem(faults);
+            var path = $"three-interior-root-separator-wal-{failedWrite}.db";
+            CreateBoundedThirdInteriorTable(path, fileSystem);
+            var target = FindThirdInteriorRootBoundaryTarget(fileSystem, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                faults.FailOnOccurrence(
+                    FileSystemOperation.Write,
+                    faults.GetOperationCount(FileSystemOperation.Write) + failedWrite);
+                Assert.Throws<IOException>(() => Execute(connection, $"DELETE FROM t WHERE id = {target.DeletedRowId};"));
+            }
+
+            using (var recovered = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = recovered.Connect())
+            {
+                QueryCount(connection).Should().Be(ThirdInteriorMutationRowCount);
+                QueryText(connection, target.DeletedRowId)
+                    .Should()
+                    .Be(new string('x', ThirdInteriorMutationPayloadLength));
+            }
+
+            using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+            var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+            var root = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(target.RootPage),
+                header.UsableSpace);
+            root.Cells[target.RootGrandparentIndex].Cell.RowId.Should().Be(target.DeletedRowId);
+        }
+    }
+
+    [Test]
+    public void EncryptedThreeInteriorLevelRootSeparatorMutationReopensReadOnly()
+    {
+        using var encryption = TursoEncryptionOptions.FromHex(
+            TursoEncryptionCipher.Aes256Gcm,
+            BoundedMutationEncryptionKey);
+        var fileSystem = new TursoEncryptionFileSystem(new InMemoryFileSystem(), encryption);
+        const string path = "encrypted-three-interior-root-separator.db";
+        CreateBoundedThirdInteriorTable(path, fileSystem);
+        var target = FindThirdInteriorRootBoundaryTarget(fileSystem, path);
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+            Execute(connection, $"DELETE FROM t WHERE id = {target.DeletedRowId};");
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true);
+        using var readOnlyConnection = reopened.Connect();
+        QueryCount(readOnlyConnection).Should().Be(ThirdInteriorMutationRowCount - 1);
+        QueryText(readOnlyConnection, target.ReplacementSeparator)
+            .Should()
+            .Be(new string('x', ThirdInteriorMutationPayloadLength));
+    }
+
+    [Test]
+    public void ThreeInteriorLevelRootSeparatorMutationCannotBypassReadOnlyPager()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "three-interior-root-separator-read-only.db";
+        CreateBoundedThirdInteriorTable(path, fileSystem);
+        var target = FindThirdInteriorRootBoundaryTarget(fileSystem, path);
+        var writesBeforeDelete = faults.GetOperationCount(FileSystemOperation.Write);
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem, readOnly: true))
+        using (var connection = database.Connect())
+            Assert.Throws<EmbeddedSqlException>(() => Execute(connection, $"DELETE FROM t WHERE id = {target.DeletedRowId};"));
+
+        faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeDelete);
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        QueryCount(reopenedConnection).Should().Be(ThirdInteriorMutationRowCount);
+        QueryText(reopenedConnection, target.DeletedRowId)
+            .Should()
+            .Be(new string('x', ThirdInteriorMutationPayloadLength));
+    }
+
+    [Test]
+    public void ReopenRejectsCorruptThirdInteriorRootSeparatorBeforeMutation()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "three-interior-root-separator-corrupt.db";
+        CreateBoundedThirdInteriorTable(path, fileSystem);
+        var target = FindThirdInteriorRootBoundaryTarget(fileSystem, path);
+        SqliteDatabaseHeader header;
+
+        using (var store = SqlitePageStore.Open(fileSystem, path))
+        {
+            header = store.Header;
+            var root = SqliteTableInteriorPageView.Parse(
+                store.ReadPage(target.RootPage),
+                header.UsableSpace);
+            var corruptedRoot = store.ReadPage(target.RootPage);
+            corruptedRoot[root.CellPointers[target.RootGrandparentIndex] + sizeof(uint)] = 0;
+            store.WritePage(target.RootPage, corruptedRoot);
+            store.Flush();
+        }
+
+        ReplaceWalWithEmptyFile(fileSystem, path, header, salt1: 97, salt2: 101);
+        var writesBeforeReopen = faults.GetOperationCount(FileSystemOperation.Write);
+        var reopen = () => EmbeddedDatabase.OpenFile(path, fileSystem);
+        reopen.Should().Throw<EmbeddedSqlException>().WithMessage("*separator*");
+        faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeReopen);
+    }
+
     private static void CreateBoundedNestedTable(string path, IFileSystem fileSystem)
     {
         var header = SqliteDatabaseHeader.CreateDefault() with { PageSize = BoundedMutationPageSize };
@@ -470,6 +680,153 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);");
         Execute(connection, BuildPressureInsert(BoundedMutationRowCount, BoundedMutationPayloadLength));
+    }
+
+    private static void CreateBoundedThirdInteriorTable(string path, IFileSystem fileSystem)
+    {
+        var header = SqliteDatabaseHeader.CreateDefault() with { PageSize = BoundedMutationPageSize };
+        using (SqlitePager.Create(
+                   fileSystem,
+                   path,
+                   path + "-wal",
+                   SqliteWalHeader.Create(header.PageSize, salt1: 0x1122_3344, salt2: 0x5566_7788),
+                   header))
+        {
+        }
+
+        using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);");
+        Execute(connection, BuildPressureInsert(
+            ThirdInteriorMutationRowCount,
+            ThirdInteriorMutationPayloadLength,
+            ThirdInteriorMutationFirstRowId));
+    }
+
+    private static ThirdInteriorLeafTarget FindThirdInteriorRootBoundaryTarget(
+        IFileSystem fileSystem,
+        string path)
+    {
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var rootPage = FindTableRootPage(pager.ReadCommittedPage(1), header);
+        ReadTableHeight(pager, header, rootPage, new HashSet<uint>()).Should().Be(4);
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(rootPage),
+            header.UsableSpace);
+        root.Cells.Should().NotBeEmpty();
+
+        for (var grandparentIndex = 0; grandparentIndex < root.Cells.Count; grandparentIndex++)
+        {
+            var grandparentPage = root.Cells[grandparentIndex].Cell.LeftChildPage;
+            var grandparent = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(grandparentPage),
+                header.UsableSpace);
+            var parentPage = grandparent.Header.RightMostChildPage;
+            var parent = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(parentPage),
+                header.UsableSpace);
+            var leafPage = parent.Header.RightMostChildPage;
+            var leaf = SqliteTableLeafPageView.Parse(
+                pager.ReadCommittedPage(leafPage),
+                header.UsableSpace);
+            if (leaf.Cells.Count < 2)
+                continue;
+
+            var deletedRowId = leaf.Cells[^1].Cell.RowId;
+            deletedRowId.Should().Be(root.Cells[grandparentIndex].Cell.RowId);
+            return new ThirdInteriorLeafTarget(
+                rootPage,
+                grandparentPage,
+                parentPage,
+                leafPage,
+                grandparentIndex,
+                grandparent.Cells.Count,
+                deletedRowId,
+                leaf.Cells[^2].Cell.RowId);
+        }
+
+        throw new InvalidOperationException(
+            "Unable to create a three-interior-level table with a root-owned multi-cell boundary leaf.");
+    }
+
+    private static ThirdInteriorLeafTarget FindThirdInteriorGrandparentBoundaryTarget(
+        IFileSystem fileSystem,
+        string path)
+    {
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var rootPage = FindTableRootPage(pager.ReadCommittedPage(1), header);
+        ReadTableHeight(pager, header, rootPage, new HashSet<uint>()).Should().Be(4);
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(rootPage),
+            header.UsableSpace);
+
+        for (var grandparentIndex = 0; grandparentIndex < root.Cells.Count; grandparentIndex++)
+        {
+            var grandparentPage = root.Cells[grandparentIndex].Cell.LeftChildPage;
+            var grandparent = SqliteTableInteriorPageView.Parse(
+                pager.ReadCommittedPage(grandparentPage),
+                header.UsableSpace);
+            for (var parentIndex = 0; parentIndex < grandparent.Cells.Count; parentIndex++)
+            {
+                var parentPage = grandparent.Cells[parentIndex].Cell.LeftChildPage;
+                var parent = SqliteTableInteriorPageView.Parse(
+                    pager.ReadCommittedPage(parentPage),
+                    header.UsableSpace);
+                var leafPage = parent.Header.RightMostChildPage;
+                var leaf = SqliteTableLeafPageView.Parse(
+                    pager.ReadCommittedPage(leafPage),
+                    header.UsableSpace);
+                if (leaf.Cells.Count < 2)
+                    continue;
+
+                var deletedRowId = leaf.Cells[^1].Cell.RowId;
+                deletedRowId.Should().Be(grandparent.Cells[parentIndex].Cell.RowId);
+                return new ThirdInteriorLeafTarget(
+                    rootPage,
+                    grandparentPage,
+                    parentPage,
+                    leafPage,
+                    grandparentIndex,
+                    parentIndex,
+                    deletedRowId,
+                    leaf.Cells[^2].Cell.RowId);
+            }
+        }
+
+        throw new InvalidOperationException(
+            "Unable to create a three-interior-level table with a grandparent-owned multi-cell boundary leaf.");
+    }
+
+    private static void AssertThirdInteriorRootBoundaryDeletion(
+        IFileSystem fileSystem,
+        string path,
+        ThirdInteriorLeafTarget target,
+        ReadOnlySpan<byte> grandparentBefore,
+        ReadOnlySpan<byte> parentBefore)
+    {
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        header.FirstFreelistTrunkPage.Should().Be(0);
+        header.FreelistPageCount.Should().Be(0);
+        SqliteFreelist.Read(header, pager.CommittedPageCount, pager.ReadCommittedPage)
+            .PageNumbers
+            .Should()
+            .BeEmpty();
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(target.RootPage),
+            header.UsableSpace);
+        root.Cells[target.RootGrandparentIndex].Cell.LeftChildPage.Should().Be(target.GrandparentPage);
+        root.Cells[target.RootGrandparentIndex].Cell.RowId.Should().Be(target.ReplacementSeparator);
+        pager.ReadCommittedPage(target.GrandparentPage).Should().Equal(grandparentBefore.ToArray());
+        pager.ReadCommittedPage(target.ParentPage).Should().Equal(parentBefore.ToArray());
+        var leaf = SqliteTableLeafPageView.Parse(
+            pager.ReadCommittedPage(target.LeafPage),
+            header.UsableSpace);
+        leaf.Search(target.DeletedRowId).IsExact.Should().BeFalse();
+        leaf.Cells[^1].Cell.RowId.Should().Be(target.ReplacementSeparator);
+        ReadTableHeight(pager, header, target.RootPage, new HashSet<uint>()).Should().Be(4);
     }
 
     private static NestedLeafTarget FindNestedLeafTarget(IFileSystem fileSystem, string path)
@@ -778,6 +1135,16 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         uint LeafPage,
         int RootParentIndex,
         int ParentCellIndex,
+        long DeletedRowId,
+        long ReplacementSeparator);
+
+    private sealed record ThirdInteriorLeafTarget(
+        uint RootPage,
+        uint GrandparentPage,
+        uint ParentPage,
+        uint LeafPage,
+        int RootGrandparentIndex,
+        int GrandparentParentIndex,
         long DeletedRowId,
         long ReplacementSeparator);
 }

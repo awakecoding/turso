@@ -17,6 +17,7 @@ public class TursoConnection : DbConnection
     private bool _readUncommitted;
     private bool _remoteTransactionActive;
     private bool _managedReadOnly;
+    private readonly HashSet<TursoDataReader> _openReaders = [];
 
     [AllowNull]
     public override string ConnectionString
@@ -127,24 +128,31 @@ public class TursoConnection : DbConnection
         var nativeDatabase = _nativeDatabase;
         var managedDatabase = _managedDatabase;
         var managedEncryptionFileSystem = _managedEncryptionFileSystem;
-        _nativeDatabase = null;
-        _managedDatabase = null;
-        _managedEncryptionFileSystem = null;
         try
         {
-            nativeDatabase?.Dispose();
+            CloseOpenReaders();
         }
         finally
         {
+            _nativeDatabase = null;
+            _managedDatabase = null;
+            _managedEncryptionFileSystem = null;
             try
             {
-                managedDatabase?.Dispose();
+                nativeDatabase?.Dispose();
             }
             finally
             {
-                managedEncryptionFileSystem?.Dispose();
-                _readUncommitted = false;
-                _managedReadOnly = false;
+                try
+                {
+                    managedDatabase?.Dispose();
+                }
+                finally
+                {
+                    managedEncryptionFileSystem?.Dispose();
+                    _readUncommitted = false;
+                    _managedReadOnly = false;
+                }
             }
         }
     }
@@ -231,6 +239,10 @@ public class TursoConnection : DbConnection
 
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("Turso database is closed.");
+
+    internal void ReaderOpened(TursoDataReader reader) => _openReaders.Add(reader);
+
+    internal void ReaderClosed(TursoDataReader reader) => _openReaders.Remove(reader);
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
         string sql,
@@ -515,5 +527,11 @@ public class TursoConnection : DbConnection
         _remoteClient = null;
         _remoteTransactionActive = false;
         _readUncommitted = false;
+    }
+
+    private void CloseOpenReaders()
+    {
+        foreach (var reader in _openReaders.ToArray())
+            reader.CloseFromConnection();
     }
 }

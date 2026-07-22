@@ -44,7 +44,7 @@ public sealed class ManagedModuloAndPrintfConformanceTests
     }
 
     [Test]
-    public void PrintfSupportsOnlyTheDocumentedUnmodifiedVerbs()
+    public void PrintfSupportsDocumentedVerbsWithDefaultFormatting()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
@@ -68,22 +68,103 @@ public sealed class ManagedModuloAndPrintfConformanceTests
         ReadRow(connection, "SELECT printf('%d|%s')")[0].Should().Be(SqlValue.Text("0|"));
     }
 
-    [TestCase("%05d")]
-    [TestCase("%.2f")]
-    [TestCase("%*d")]
-    [TestCase("%p")]
-    [TestCase("%s", "1.0")]
-    public void PrintfRejectsUnsupportedFormatModifiersVerbsAndConversions(string format, string? argument = null)
+    [Test]
+    public void PrintfAndFormatSupportBoundedStaticWidthPrecisionAndCoercions()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
-        var value = argument ?? "42";
-        var exception = Assert.Throws<EmbeddedSqlException>(() => ReadRow(connection, $"SELECT printf('{format}', {value})"));
+        ReadRow(
+            connection,
+            """
+            SELECT format(
+                'i=%+05d|u=%.4u|x=%08x|o=%-6.3o|f=%+010.2f|e=%.2e|g=%.3g|s=%8.3s|q=%7.3q|Q=%-8.2Q|w=%7.3w|c=%4.3c|blob=%5.3s',
+                -42, 8, 255, 8, 3.14, 23000000.0, 123.456, 'hello', 'a''b''', 'abc', 'a"bc', 'z', x'4142434400')
+            """)[0].Should().Be(SqlValue.Text(
+            "i=-0042|u=0008|x=000000ff|o=010   |f=+000003.14|e=2.30e+07|g=123"
+            + "|s=     hel|q=   a''b|Q='ab'    |w=   a\"\"b|c= zzz|blob=  ABC"));
 
-        if (argument is null)
-            exception!.Message.Should().Be($"unsupported printf format specifier: %{format[1]}");
-        else
-            exception!.Message.Should().Be("printf() text rendering does not support real values.");
+        ReadRow(connection, "SELECT format('%s|%d|%f|%s', 1.5, '123abc', x'31322e35', x'410042')")[0]
+            .Should().Be(SqlValue.Text("1.5|123|12.500000|A"));
+        ReadRow(connection, "SELECT format('x%s|%Q|%q|%w', NULL, NULL, NULL, NULL)")[0]
+            .Should().Be(SqlValue.Text("x|NULL|(NULL)|(NULL)"));
+        ReadRow(connection, "SELECT format('%.0f|%.1f|%.2f|%.0e', 0.5, 0.25, 0.125, 2.5)")[0]
+            .Should().Be(SqlValue.Text("1|0.3|0.13|3e+00"));
+        ReadRow(connection, "SELECT format('|%10s|%.1s|%5.1s|', 'é', 'é', 'é')")[0]
+            .Should().Be(SqlValue.Text("|        é|�|    �|"));
+        ReadRow(connection, "SELECT format('')")[0].Should().Be(SqlValue.Null);
+    }
+
+    [Test]
+    public void PrintfAppliesPrecisionToNullSentinelsAndUsesSqliteRealTextCoercion()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadRow(
+            connection,
+            "SELECT printf('%.1Q|%.1q|%.1w|%5.1Q|%5.1q|%5.1w', NULL, NULL, NULL, NULL, NULL, NULL)")[0]
+            .Should().Be(SqlValue.Text("N|(|(|    N|    (|    ("));
+        ReadRow(
+            connection,
+            "SELECT printf('%s|%q|%Q|%w|%c', 1.2345678901234567, 1.2345678901234567, 1.2345678901234567, 1.2345678901234567, 1.2345678901234567)")[0]
+            .Should().Be(SqlValue.Text(
+                "1.23456789012346|1.23456789012346|'1.23456789012346'|1.23456789012346|1"));
+    }
+
+    [Test]
+    public void PrintfBoundsUtf8EncodingForPrecisionAndOversizeOutput()
+    {
+        const int largeInputLength = 4_000_000;
+        const long maximumExecutionAllocation = 1_000_000;
+        var largeInput = new string('a', largeInputLength);
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadRow(connection, "SELECT printf('%.3s', 'warm')");
+
+        using (var prefix = connection.Prepare("SELECT printf('%.3s', ?)"))
+        {
+            prefix.Bind(1, SqlValue.Text(largeInput));
+            var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+            prefix.Step().Should().Be(StatementStepResult.Row);
+
+            (GC.GetAllocatedBytesForCurrentThread() - allocatedBefore)
+                .Should().BeLessThan(maximumExecutionAllocation);
+            prefix.GetValue(0).Should().Be(SqlValue.Text("aaa"));
+        }
+
+        using var oversize = connection.Prepare("SELECT printf('%s', ?)");
+        oversize.Bind(1, SqlValue.Text(largeInput));
+        var oversizeAllocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+        var exception = Assert.Throws<EmbeddedSqlException>(() => oversize.Step());
+
+        exception!.Message.Should().Be("printf output exceeds 1000000 characters.");
+        (GC.GetAllocatedBytesForCurrentThread() - oversizeAllocatedBefore)
+            .Should().BeLessThan(maximumExecutionAllocation);
+    }
+
+    [TestCase("%*d")]
+    [TestCase("%p")]
+    [TestCase("%#x")]
+    [TestCase("%!f")]
+    [TestCase("%,d")]
+    [TestCase("%ld")]
+    public void PrintfRejectsUnsupportedFormatExtensions(string format)
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        var exception = Assert.Throws<EmbeddedSqlException>(() => ReadRow(connection, $"SELECT printf('{format}', 42)"));
+
+        exception!.Message.Should().Be(format switch
+        {
+            "%*d" => "unsupported printf dynamic width or precision.",
+            "%p" => "unsupported printf format conversion: %p",
+            "%#x" => "unsupported printf format flag: #",
+            "%!f" => "unsupported printf format flag: !",
+            "%,d" => "unsupported printf format flag: ,",
+            "%ld" => "unsupported printf length modifier: l",
+            _ => throw new InvalidOperationException($"Unexpected test format {format}."),
+        });
     }
 
     private static SqlValue[] ReadRow(EmbeddedConnection connection, string sql)

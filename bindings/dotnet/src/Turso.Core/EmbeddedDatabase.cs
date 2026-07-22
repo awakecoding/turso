@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -10153,7 +10154,7 @@ public sealed class EmbeddedDatabase : IDisposable
             "MIN" => EvaluateScalarMinMax(arguments, maximum: false),
             "MAX" => EvaluateScalarMinMax(arguments, maximum: true),
             "NULLIF" => EvaluateNullIf(function, arguments),
-            "PRINTF" => EvaluatePrintf(arguments),
+            "FORMAT" or "PRINTF" => EvaluatePrintf(arguments),
             "STRFTIME" => SqliteDateTime.Strftime(arguments),
             "TIME" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.Time),
             "TYPEOF" => EvaluateTypeOf(arguments),
@@ -10176,71 +10177,361 @@ public sealed class EmbeddedDatabase : IDisposable
         return EvaluateGlobValues(arguments[1], arguments[0], negated: false);
     }
 
-    // The managed evaluator intentionally implements only the unmodified SQLite printf verbs
-    // below. Width, precision, flags, and dynamic-width arguments have formatter-specific
-    // behavior that is not shared by .NET's formatting APIs, so they fail explicitly.
+    // Keep this bounded independently of SQLite's process-wide SQLITE_LIMIT_LENGTH. The managed
+    // evaluator must not let a SQL format string allocate an unbounded managed string.
+    private const int MaximumPrintfWidth = 1_000_000;
+    private const int MaximumPrintfPrecision = 1_000;
+    private const int MaximumPrintfOutputLength = 1_000_000;
+
+    // SQLite format() is an alias for printf(). This parser deliberately owns the stable subset
+    // that can be reproduced without relying on the platform formatter: static width/precision,
+    // -, +, space, and 0 flags, and SQLite's scalar conversion rules. SQLite-specific extensions
+    // whose rules are not represented here (dynamic width, #, !, comma, and length modifiers)
+    // fail explicitly rather than producing a plausible but incorrect result.
     private static SqlValue EvaluatePrintf(IReadOnlyList<SqlValue> arguments)
     {
         if (arguments.Count == 0 || arguments[0].Kind == SqlValueKind.Null)
             return SqlValue.Null;
 
         var format = ToPrintfText(arguments[0]);
-        var result = new StringBuilder(format.Length);
+        if (format.Length == 0)
+            return SqlValue.Null;
+
+        var result = new StringBuilder(Math.Min(format.Length, MaximumPrintfOutputLength));
         var argumentIndex = 1;
         for (var formatIndex = 0; formatIndex < format.Length; formatIndex++)
         {
             var character = format[formatIndex];
             if (character != '%')
             {
-                result.Append(character);
+                AppendPrintfOutput(result, character.ToString());
                 continue;
             }
 
             if (++formatIndex == format.Length)
             {
-                result.Append('%');
+                AppendPrintfOutput(result, "%");
                 break;
             }
 
-            var verb = format[formatIndex];
-            if (verb == '%')
+            if (format[formatIndex] == '%')
             {
-                result.Append('%');
+                AppendPrintfOutput(result, "%");
                 continue;
             }
 
-            if (!IsSupportedPrintfVerb(verb))
-                throw new EmbeddedSqlException($"unsupported printf format specifier: %{verb}");
-
+            var specifier = ParsePrintfSpecifier(format, ref formatIndex);
             var value = argumentIndex < arguments.Count ? arguments[argumentIndex] : SqlValue.Null;
             argumentIndex++;
-            result.Append(FormatPrintfValue(verb, value));
+            AppendPrintfOutput(result, FormatPrintfValue(specifier, value).Value);
         }
 
         return SqlValue.Text(result.ToString());
+    }
+
+    private static PrintfSpecifier ParsePrintfSpecifier(string format, ref int formatIndex)
+    {
+        var leftJustify = false;
+        var forceSign = false;
+        var spaceSign = false;
+        var zeroPad = false;
+
+        while (formatIndex < format.Length)
+        {
+            switch (format[formatIndex])
+            {
+                case '-':
+                    leftJustify = true;
+                    formatIndex++;
+                    continue;
+                case '+':
+                    forceSign = true;
+                    formatIndex++;
+                    continue;
+                case ' ':
+                    spaceSign = true;
+                    formatIndex++;
+                    continue;
+                case '0':
+                    zeroPad = true;
+                    formatIndex++;
+                    continue;
+                case '#':
+                case '!':
+                case ',':
+                    throw new EmbeddedSqlException($"unsupported printf format flag: {format[formatIndex]}");
+                default:
+                    break;
+            }
+
+            break;
+        }
+
+        if (formatIndex < format.Length && format[formatIndex] == '*')
+            throw new EmbeddedSqlException("unsupported printf dynamic width or precision.");
+
+        var width = ReadPrintfSize(format, ref formatIndex, MaximumPrintfWidth, "width");
+        int? precision = null;
+        if (formatIndex < format.Length && format[formatIndex] == '.')
+        {
+            formatIndex++;
+            if (formatIndex < format.Length && format[formatIndex] == '*')
+                throw new EmbeddedSqlException("unsupported printf dynamic width or precision.");
+
+            precision = ReadPrintfSize(format, ref formatIndex, MaximumPrintfPrecision, "precision") ?? 0;
+        }
+
+        if (formatIndex == format.Length)
+            throw new EmbeddedSqlException("unterminated printf format specifier.");
+
+        if (format[formatIndex] is 'h' or 'l' or 'L' or 'z' or 't' or 'j')
+            throw new EmbeddedSqlException($"unsupported printf length modifier: {format[formatIndex]}");
+
+        var verb = format[formatIndex];
+        if (!IsSupportedPrintfVerb(verb))
+            throw new EmbeddedSqlException($"unsupported printf format conversion: %{verb}");
+
+        var numeric = verb is 'd' or 'i' or 'u' or 'x' or 'X' or 'o' or 'f' or 'e' or 'E' or 'g' or 'G';
+        var signedNumeric = verb is 'd' or 'i' or 'f' or 'e' or 'E' or 'g' or 'G';
+        if ((forceSign || spaceSign) && !signedNumeric)
+            throw new EmbeddedSqlException($"unsupported printf sign flag for %{verb}");
+        if (zeroPad && !numeric)
+            throw new EmbeddedSqlException($"unsupported printf zero-padding flag for %{verb}");
+
+        return new PrintfSpecifier(
+            verb,
+            leftJustify,
+            forceSign,
+            spaceSign,
+            zeroPad && !leftJustify,
+            width,
+            precision);
+    }
+
+    private static int? ReadPrintfSize(string format, ref int formatIndex, int maximum, string kind)
+    {
+        if (formatIndex == format.Length || !char.IsAsciiDigit(format[formatIndex]))
+            return null;
+
+        var value = 0;
+        while (formatIndex < format.Length && char.IsAsciiDigit(format[formatIndex]))
+        {
+            var digit = format[formatIndex] - '0';
+            if (value > (maximum - digit) / 10)
+                throw new EmbeddedSqlException($"printf {kind} exceeds {maximum}.");
+
+            value = value * 10 + digit;
+            formatIndex++;
+        }
+
+        return value;
     }
 
     private static bool IsSupportedPrintfVerb(char verb)
         => verb is 's' or 'd' or 'i' or 'u' or 'x' or 'X' or 'o'
             or 'f' or 'e' or 'E' or 'g' or 'G' or 'c' or 'q' or 'Q' or 'w';
 
-    private static string FormatPrintfValue(char verb, SqlValue value)
+    private static void AppendPrintfOutput(StringBuilder output, string value)
     {
-        return verb switch
+        if (value.Length > MaximumPrintfOutputLength - output.Length)
+            throw new EmbeddedSqlException($"printf output exceeds {MaximumPrintfOutputLength} characters.");
+
+        output.Append(value);
+    }
+
+    private static PrintfText FormatPrintfValue(PrintfSpecifier specifier, SqlValue value)
+    {
+        return specifier.Verb switch
         {
-            's' => value.Kind == SqlValueKind.Null ? string.Empty : ToPrintfText(value),
-            'd' or 'i' => ToPrintfInteger(value).ToString(CultureInfo.InvariantCulture),
-            'u' => unchecked((ulong)ToPrintfInteger(value)).ToString(CultureInfo.InvariantCulture),
-            'x' => unchecked((ulong)ToPrintfInteger(value)).ToString("x", CultureInfo.InvariantCulture),
-            'X' => unchecked((ulong)ToPrintfInteger(value)).ToString("X", CultureInfo.InvariantCulture),
-            'o' => FormatPrintfOctal(unchecked((ulong)ToPrintfInteger(value))),
-            'f' or 'e' or 'E' or 'g' or 'G' => FormatPrintfReal(verb, ToPrintfReal(value)),
-            'c' => FormatPrintfCharacter(value),
-            'q' => value.Kind == SqlValueKind.Null ? "(NULL)" : ToPrintfText(value).Replace("'", "''", StringComparison.Ordinal),
-            'Q' => value.Kind == SqlValueKind.Null ? "NULL" : $"'{ToPrintfText(value).Replace("'", "''", StringComparison.Ordinal)}'",
-            'w' => value.Kind == SqlValueKind.Null ? "(NULL)" : ToPrintfText(value).Replace("\"", "\"\"", StringComparison.Ordinal),
-            _ => throw new InvalidOperationException($"Unexpected printf verb {verb}."),
+            's' => ApplyPrintfTextWidth(
+                specifier,
+                value.Kind == SqlValueKind.Null
+                    ? PrintfText.Empty
+                    : LimitPrintfText(value, specifier.Precision)),
+            'd' or 'i' => FormatPrintfSignedInteger(specifier, ToPrintfInteger(value)),
+            'u' => FormatPrintfUnsignedInteger(
+                specifier,
+                unchecked((ulong)ToPrintfInteger(value)).ToString(CultureInfo.InvariantCulture)),
+            'x' => FormatPrintfUnsignedInteger(
+                specifier,
+                unchecked((ulong)ToPrintfInteger(value)).ToString("x", CultureInfo.InvariantCulture)),
+            'X' => FormatPrintfUnsignedInteger(
+                specifier,
+                unchecked((ulong)ToPrintfInteger(value)).ToString("X", CultureInfo.InvariantCulture)),
+            'o' => FormatPrintfUnsignedInteger(
+                specifier,
+                FormatPrintfOctal(unchecked((ulong)ToPrintfInteger(value)))),
+            'f' or 'e' or 'E' or 'g' or 'G' => FormatPrintfFloatingPoint(specifier, ToPrintfReal(value)),
+            'c' => FormatPrintfCharacter(specifier, value),
+            'q' => FormatPrintfQuotedText(specifier, value, '\0'),
+            'Q' => FormatPrintfQuotedText(specifier, value, '\''),
+            'w' => FormatPrintfQuotedText(specifier, value, '"'),
+            _ => throw new InvalidOperationException($"Unexpected printf verb {specifier.Verb}."),
         };
+    }
+
+    private static PrintfText FormatPrintfSignedInteger(PrintfSpecifier specifier, long value)
+    {
+        var negative = value < 0;
+        var magnitude = negative
+            ? unchecked((ulong)(-(value + 1))) + 1
+            : (ulong)value;
+        var digits = ApplyPrintfIntegerPrecision(
+            magnitude.ToString(CultureInfo.InvariantCulture),
+            specifier.Precision);
+        var sign = negative ? "-" : specifier.ForceSign ? "+" : specifier.SpaceSign ? " " : string.Empty;
+        return ApplyPrintfNumericWidth(specifier, sign, digits);
+    }
+
+    private static PrintfText FormatPrintfUnsignedInteger(PrintfSpecifier specifier, string digits)
+        => ApplyPrintfNumericWidth(
+            specifier,
+            string.Empty,
+            ApplyPrintfIntegerPrecision(digits, specifier.Precision));
+
+    private static string ApplyPrintfIntegerPrecision(string digits, int? precision)
+    {
+        if (precision is not { } minimumDigits || digits.Length >= minimumDigits)
+            return digits;
+
+        return string.Concat(new string('0', minimumDigits - digits.Length), digits);
+    }
+
+    private static PrintfText FormatPrintfFloatingPoint(PrintfSpecifier specifier, double value)
+    {
+        var negative = value < 0;
+        var sign = negative ? "-" : specifier.ForceSign ? "+" : specifier.SpaceSign ? " " : string.Empty;
+        var digits = FormatPrintfReal(specifier.Verb, Math.Abs(value), specifier.Precision);
+        return ApplyPrintfNumericWidth(specifier, sign, digits);
+    }
+
+    private static PrintfText FormatPrintfQuotedText(PrintfSpecifier specifier, SqlValue value, char quote)
+    {
+        if (value.Kind == SqlValueKind.Null)
+        {
+            var nullText = quote == '\'' ? "NULL" : "(NULL)";
+            return ApplyPrintfTextWidth(specifier, LimitPrintfText(nullText, specifier.Precision));
+        }
+
+        var text = LimitPrintfText(value, specifier.Precision);
+        var quoteCount = text.Value.Count(character => character == quote || (quote == '\0' && character == '\''));
+        var enclosingQuoteCount = quote == '\'' ? 2 : 0;
+        if (text.Value.Length > MaximumPrintfOutputLength - quoteCount - enclosingQuoteCount)
+            throw new EmbeddedSqlException($"printf output exceeds {MaximumPrintfOutputLength} characters.");
+
+        var escaped = quote switch
+        {
+            '\0' => text.Value.Replace("'", "''", StringComparison.Ordinal),
+            '\'' => $"'{text.Value.Replace("'", "''", StringComparison.Ordinal)}'",
+            '"' => text.Value.Replace("\"", "\"\"", StringComparison.Ordinal),
+            _ => throw new InvalidOperationException($"Unexpected printf quote {quote}."),
+        };
+        var byteLength = text.ByteLength + quoteCount + enclosingQuoteCount;
+        return ApplyPrintfTextWidth(specifier, new PrintfText(escaped, byteLength));
+    }
+
+    private static PrintfText FormatPrintfCharacter(PrintfSpecifier specifier, SqlValue value)
+    {
+        if (value.Kind == SqlValueKind.Null)
+            return ApplyPrintfTextWidth(specifier, PrintfText.Empty);
+
+        var text = ToPrintfText(value);
+        var runes = text.EnumerateRunes();
+        if (!runes.MoveNext())
+            return ApplyPrintfTextWidth(specifier, PrintfText.Empty);
+
+        var character = runes.Current.ToString();
+        var count = specifier.Precision is > 0 ? specifier.Precision.Value : 1;
+        var builder = new StringBuilder(character.Length * count);
+        for (var index = 0; index < count; index++)
+            builder.Append(character);
+
+        var output = builder.ToString();
+        return ApplyPrintfTextWidth(
+            specifier,
+            new PrintfText(output, Encoding.UTF8.GetByteCount(character) * count));
+    }
+
+    private static PrintfText LimitPrintfText(SqlValue value, int? precision)
+        => value.Kind == SqlValueKind.Text
+            ? LimitPrintfText(value.AsText(), precision)
+            : LimitPrintfText(ToPrintfText(value), precision);
+
+    private static PrintfText LimitPrintfText(string value, int? precision)
+    {
+        if (precision is not { } byteLimit)
+        {
+            var terminatorOffset = value.IndexOf('\0');
+            var textLength = terminatorOffset >= 0 ? terminatorOffset : value.Length;
+            if (textLength > MaximumPrintfOutputLength)
+                throw new EmbeddedSqlException($"printf output exceeds {MaximumPrintfOutputLength} characters.");
+
+            var text = terminatorOffset >= 0 ? value[..terminatorOffset] : value;
+            return new PrintfText(text, Encoding.UTF8.GetByteCount(text));
+        }
+
+        if (byteLimit == 0)
+            return PrintfText.Empty;
+
+        // Each UTF-16 code unit produces at least one UTF-8 byte. Inspecting at most byteLimit
+        // code units therefore establishes the requested prefix without traversing the remainder.
+        var sourceLength = Math.Min(value.Length, byteLimit);
+        var source = value.AsSpan(0, sourceLength);
+        var nulOffset = source.IndexOf('\0');
+        var isTerminated = nulOffset >= 0;
+        if (isTerminated)
+            source = source[..nulOffset];
+
+        Span<byte> bytes = stackalloc byte[byteLimit + 3];
+        Encoding.UTF8.GetEncoder().Convert(
+            source,
+            bytes,
+            flush: true,
+            out _,
+            out var bytesUsed,
+            out var completed);
+
+        if ((sourceLength == value.Length || isTerminated) && completed && bytesUsed <= byteLimit)
+        {
+            var text = isTerminated ? source.ToString() : value;
+            return new PrintfText(text, bytesUsed);
+        }
+
+        return new PrintfText(Encoding.UTF8.GetString(bytes[..byteLimit]), byteLimit);
+    }
+
+    private static PrintfText ApplyPrintfTextWidth(PrintfSpecifier specifier, PrintfText text)
+    {
+        var padding = Math.Max(0, (specifier.Width ?? 0) - text.ByteLength);
+        if (padding == 0)
+            return text;
+
+        var spaces = new string(' ', padding);
+        return specifier.LeftJustify
+            ? new PrintfText(string.Concat(text.Value, spaces), text.ByteLength + padding)
+            : new PrintfText(string.Concat(spaces, text.Value), text.ByteLength + padding);
+    }
+
+    private static PrintfText ApplyPrintfNumericWidth(PrintfSpecifier specifier, string sign, string digits)
+    {
+        var padding = Math.Max(0, (specifier.Width ?? 0) - sign.Length - digits.Length);
+        if (padding == 0)
+            return new PrintfText(string.Concat(sign, digits), sign.Length + digits.Length);
+
+        if (specifier.LeftJustify)
+        {
+            var spaces = new string(' ', padding);
+            return new PrintfText(string.Concat(sign, digits, spaces), sign.Length + digits.Length + padding);
+        }
+
+        if (specifier.ZeroPad)
+        {
+            var zeroes = new string('0', padding);
+            return new PrintfText(string.Concat(sign, zeroes, digits), sign.Length + digits.Length + padding);
+        }
+
+        var leadingSpaces = new string(' ', padding);
+        return new PrintfText(string.Concat(leadingSpaces, sign, digits), sign.Length + digits.Length + padding);
     }
 
     private static string ToPrintfText(SqlValue value)
@@ -10248,9 +10539,9 @@ public sealed class EmbeddedDatabase : IDisposable
         if (value.Kind == SqlValueKind.Integer)
             return value.AsInteger().ToString(CultureInfo.InvariantCulture);
         if (value.Kind == SqlValueKind.Text)
-            return value.AsText();
+            return TruncatePrintfAtNul(value.AsText());
         if (value.Kind == SqlValueKind.Real)
-            throw new EmbeddedSqlException("printf() text rendering does not support real values.");
+            return FormatPrintfTextReal(value.AsReal());
         if (value.Kind != SqlValueKind.Blob)
             throw new EmbeddedSqlException($"Cannot convert {value.Kind} to printf text.");
 
@@ -10261,12 +10552,56 @@ public sealed class EmbeddedDatabase : IDisposable
 
         try
         {
-            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(blob);
+            return TruncatePrintfAtNul(
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(blob));
         }
         catch (DecoderFallbackException exception)
         {
             throw new EmbeddedSqlException("printf() only supports UTF-8 blob arguments.", exception);
         }
+    }
+
+    private static string TruncatePrintfAtNul(string value)
+    {
+        var nulOffset = value.IndexOf('\0');
+        return nulOffset >= 0 ? value[..nulOffset] : value;
+    }
+
+    private static string FormatPrintfTextReal(double value)
+    {
+        if (double.IsNaN(value))
+            return "NaN";
+        if (double.IsPositiveInfinity(value))
+            return "Inf";
+        if (double.IsNegativeInfinity(value))
+            return "-Inf";
+        if (value == 0)
+            return "0.0";
+
+        var formatted = FormatPrintfGeneral(Math.Abs(value), 15, upperCase: false);
+        if (value < 0)
+            formatted = string.Concat("-", formatted);
+
+        var exponentIndex = formatted.IndexOfAny(['e', 'E']);
+        if (exponentIndex < 0)
+            return formatted.Contains('.') ? formatted : $"{formatted}.0";
+
+        var mantissa = formatted[..exponentIndex];
+        if (!mantissa.Contains('.'))
+            mantissa += ".0";
+
+        var exponent = NormalizePrintfExponent(formatted[exponentIndex..], upperCase: false);
+        return string.Concat(mantissa, exponent);
+    }
+
+    private static string NormalizePrintfExponent(string exponent, bool upperCase)
+    {
+        var sign = exponent[1];
+        var digits = exponent[2..].TrimStart('0');
+        if (digits.Length == 0)
+            digits = "0";
+
+        return string.Concat(upperCase ? "E" : "e", sign, digits.PadLeft(2, '0'));
     }
 
     private static long ToPrintfInteger(SqlValue value)
@@ -10412,54 +10747,203 @@ public sealed class EmbeddedDatabase : IDisposable
         return new string(buffer[index..]);
     }
 
-    private static string FormatPrintfReal(char verb, double value)
+    private static string FormatPrintfReal(char verb, double value, int? requestedPrecision)
     {
         if (double.IsNaN(value))
             return "NaN";
         if (double.IsPositiveInfinity(value))
             return "Inf";
-        if (double.IsNegativeInfinity(value))
-            return "-Inf";
-        if (value == 0)
-            value = 0;
 
         return verb switch
         {
-            'f' => value.ToString("F6", CultureInfo.InvariantCulture),
-            'e' => NormalizePrintfExponent(value.ToString("e6", CultureInfo.InvariantCulture), upperCase: false),
-            'E' => NormalizePrintfExponent(value.ToString("E6", CultureInfo.InvariantCulture), upperCase: true),
-            'g' => NormalizePrintfExponent(value.ToString("g6", CultureInfo.InvariantCulture), upperCase: false),
-            'G' => NormalizePrintfExponent(value.ToString("G6", CultureInfo.InvariantCulture), upperCase: true),
+            'f' => FormatPrintfFixed(value, requestedPrecision ?? 6),
+            'e' => FormatPrintfExponential(value, requestedPrecision ?? 6, upperCase: false),
+            'E' => FormatPrintfExponential(value, requestedPrecision ?? 6, upperCase: true),
+            'g' => FormatPrintfGeneral(value, requestedPrecision ?? 6, upperCase: false),
+            'G' => FormatPrintfGeneral(value, requestedPrecision ?? 6, upperCase: true),
             _ => throw new InvalidOperationException($"Unexpected printf real verb {verb}."),
         };
     }
 
-    private static string NormalizePrintfExponent(string value, bool upperCase)
+    private static string FormatPrintfFixed(double value, int precision)
     {
-        var exponentIndex = value.IndexOf('e');
-        if (exponentIndex < 0)
-            exponentIndex = value.IndexOf('E');
-        if (exponentIndex < 0)
+        var digits = RoundPrintfReal(value, precision).ToString(CultureInfo.InvariantCulture);
+        if (precision == 0)
+            return digits;
+
+        if (digits.Length <= precision)
+            digits = digits.PadLeft(precision + 1, '0');
+
+        return string.Concat(digits.AsSpan(0, digits.Length - precision), ".", digits.AsSpan(digits.Length - precision));
+    }
+
+    private static string FormatPrintfExponential(double value, int precision, bool upperCase)
+    {
+        if (value == 0)
+            return BuildPrintfExponential(BigInteger.Zero, precision, 0, upperCase);
+
+        var exponent = GetPrintfDecimalExponent(value);
+        var digits = RoundPrintfReal(value, precision - exponent);
+        var overflow = BigInteger.Pow(10, precision + 1);
+        if (digits >= overflow)
+        {
+            digits /= 10;
+            exponent++;
+        }
+
+        return BuildPrintfExponential(digits, precision, exponent, upperCase);
+    }
+
+    private static string FormatPrintfGeneral(double value, int requestedPrecision, bool upperCase)
+    {
+        var precision = requestedPrecision == 0 ? 1 : requestedPrecision;
+        if (value == 0)
+            return "0";
+
+        var exponent = GetPrintfDecimalExponent(value);
+        var digits = RoundPrintfReal(value, precision - 1 - exponent);
+        var overflow = BigInteger.Pow(10, precision);
+        if (digits >= overflow)
+        {
+            digits /= 10;
+            exponent++;
+        }
+
+        if (exponent < -4 || exponent >= precision)
+        {
+            var exponential = BuildPrintfExponential(digits, precision - 1, exponent, upperCase);
+            return TrimPrintfFractionalZeros(exponential);
+        }
+
+        var decimalDigits = digits.ToString(CultureInfo.InvariantCulture).PadLeft(precision, '0');
+        string fixedPoint;
+        if (exponent >= precision - 1)
+        {
+            fixedPoint = string.Concat(decimalDigits, new string('0', exponent - precision + 1));
+        }
+        else if (exponent >= 0)
+        {
+            fixedPoint = string.Concat(
+                decimalDigits.AsSpan(0, exponent + 1),
+                ".",
+                decimalDigits.AsSpan(exponent + 1));
+        }
+        else
+        {
+            fixedPoint = string.Concat(
+                "0.",
+                new string('0', -exponent - 1),
+                decimalDigits);
+        }
+
+        return TrimPrintfFractionalZeros(fixedPoint);
+    }
+
+    private static string BuildPrintfExponential(BigInteger digits, int precision, int exponent, bool upperCase)
+    {
+        var mantissaDigits = digits.ToString(CultureInfo.InvariantCulture).PadLeft(precision + 1, '0');
+        var mantissa = precision == 0
+            ? mantissaDigits
+            : string.Concat(mantissaDigits[0], ".", mantissaDigits[1..]);
+        var exponentSign = exponent < 0 ? '-' : '+';
+        var exponentDigits = Math.Abs(exponent).ToString(CultureInfo.InvariantCulture).PadLeft(2, '0');
+        return string.Concat(mantissa, upperCase ? "E" : "e", exponentSign, exponentDigits);
+    }
+
+    private static string TrimPrintfFractionalZeros(string value)
+    {
+        var exponentIndex = value.IndexOfAny(['e', 'E']);
+        var mantissa = exponentIndex < 0 ? value : value[..exponentIndex];
+        var exponent = exponentIndex < 0 ? string.Empty : value[exponentIndex..];
+        if (!mantissa.Contains('.'))
             return value;
 
-        var exponent = value[(exponentIndex + 1)..];
-        var sign = exponent[0];
-        var digits = exponent[1..].TrimStart('0');
-        if (digits.Length == 0)
-            digits = "0";
-
-        return $"{value[..exponentIndex]}{(upperCase ? 'E' : 'e')}{sign}{digits.PadLeft(2, '0')}";
+        mantissa = mantissa.TrimEnd('0').TrimEnd('.');
+        return string.Concat(mantissa, exponent);
     }
 
-    private static string FormatPrintfCharacter(SqlValue value)
+    private static BigInteger RoundPrintfReal(double value, int decimalScale)
     {
-        if (value.Kind == SqlValueKind.Null)
-            return string.Empty;
+        var parts = GetPrintfDoubleParts(value);
+        var numerator = parts.Significand;
+        var denominator = BigInteger.One;
+        var binaryScale = parts.BinaryExponent;
 
-        var text = ToPrintfText(value);
-        var runes = text.EnumerateRunes();
-        return runes.MoveNext() ? runes.Current.ToString() : string.Empty;
+        if (decimalScale >= 0)
+        {
+            numerator *= BigInteger.Pow(5, decimalScale);
+            binaryScale += decimalScale;
+        }
+        else
+        {
+            denominator = BigInteger.Pow(5, -decimalScale);
+            binaryScale += decimalScale;
+        }
+
+        if (binaryScale >= 0)
+            numerator <<= binaryScale;
+        else
+            denominator <<= -binaryScale;
+
+        var quotient = BigInteger.DivRem(numerator, denominator, out var remainder);
+        return remainder * 2 >= denominator ? quotient + 1 : quotient;
     }
+
+    private static int GetPrintfDecimalExponent(double value)
+    {
+        var exponent = (int)Math.Floor(Math.Log10(value));
+        while (ComparePrintfRealWithPowerOfTen(value, exponent) < 0)
+            exponent--;
+        while (ComparePrintfRealWithPowerOfTen(value, exponent + 1) >= 0)
+            exponent++;
+
+        return exponent;
+    }
+
+    private static int ComparePrintfRealWithPowerOfTen(double value, int decimalExponent)
+    {
+        var parts = GetPrintfDoubleParts(value);
+        if (decimalExponent >= 0)
+        {
+            var commonBinaryExponent = Math.Min(parts.BinaryExponent, decimalExponent);
+            var left = parts.Significand << (parts.BinaryExponent - commonBinaryExponent);
+            var right = BigInteger.Pow(5, decimalExponent) << (decimalExponent - commonBinaryExponent);
+            return left.CompareTo(right);
+        }
+
+        var decimalPower = -decimalExponent;
+        var numerator = parts.Significand * BigInteger.Pow(5, decimalPower);
+        var binaryExponent = parts.BinaryExponent + decimalPower;
+        return binaryExponent >= 0
+            ? (numerator << binaryExponent).CompareTo(BigInteger.One)
+            : numerator.CompareTo(BigInteger.One << -binaryExponent);
+    }
+
+    private static PrintfDoubleParts GetPrintfDoubleParts(double value)
+    {
+        var bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(value));
+        var exponent = (int)((bits >> 52) & 0x7ff);
+        var fraction = bits & ((1UL << 52) - 1);
+        return exponent == 0
+            ? new PrintfDoubleParts(new BigInteger(fraction), -1074)
+            : new PrintfDoubleParts(new BigInteger((1UL << 52) | fraction), exponent - 1023 - 52);
+    }
+
+    private readonly record struct PrintfSpecifier(
+        char Verb,
+        bool LeftJustify,
+        bool ForceSign,
+        bool SpaceSign,
+        bool ZeroPad,
+        int? Width,
+        int? Precision);
+
+    private readonly record struct PrintfText(string Value, int ByteLength)
+    {
+        public static PrintfText Empty { get; } = new(string.Empty, 0);
+    }
+
+    private readonly record struct PrintfDoubleParts(BigInteger Significand, int BinaryExponent);
 
     // last_insert_rowid() reports the rowid of the most recent successful INSERT on this
     // connection, or 0 before any INSERT, matching SQLite's per-connection semantics.

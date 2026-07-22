@@ -9,7 +9,7 @@ namespace Turso;
 
 public class TursoDataReader : DbDataReader
 {
-    private readonly TursoCommand _command;
+    private readonly TursoConnection _connection;
     private readonly TursoNativeStatement? _nativeStatement;
     private readonly IManagedStatementAdapter? _managedStatement;
     private readonly CommandBehavior _behavior;
@@ -86,10 +86,12 @@ public class TursoDataReader : DbDataReader
         if ((nativeStatement is null) == (managedStatement is null))
             throw new ArgumentException("A reader requires exactly one statement implementation.");
 
-        _command = command;
+        _connection = command.Connection as TursoConnection
+            ?? throw new InvalidOperationException("A data reader requires an associated TursoConnection.");
         _nativeStatement = nativeStatement;
         _managedStatement = managedStatement;
         _behavior = behavior;
+        _connection.ReaderOpened(this);
     }
 
     public override bool GetBoolean(int ordinal)
@@ -286,7 +288,7 @@ public class TursoDataReader : DbDataReader
     public override int RecordsAffected => GetRowsAffected();
     public override bool HasRows => HasRowsCore();
     public override bool IsClosed => _isClosed
-        || _command.Connection?.State != ConnectionState.Open
+        || _connection.State != ConnectionState.Open
         || (_managedStatement is null && (_nativeStatement?.IsInvalid ?? true));
 
     public override bool NextResult()
@@ -302,17 +304,13 @@ public class TursoDataReader : DbDataReader
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !_isClosed)
-        {
-            _nativeStatement?.Dispose();
-            _managedStatement?.Dispose();
-            if ((_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-                _command.Connection?.Close();
-        }
+        if (disposing)
+            CloseCore(closeConnection: true);
 
-        _isClosed = true;
         base.Dispose(disposing);
     }
+
+    internal void CloseFromConnection() => CloseCore(closeConnection: false);
 
     public override bool Read()
     {
@@ -449,5 +447,25 @@ public class TursoDataReader : DbDataReader
     {
         if (IsClosed)
             throw new InvalidOperationException("The data reader is closed.");
+    }
+
+    private void CloseCore(bool closeConnection)
+    {
+        if (_isClosed)
+            return;
+
+        try
+        {
+            _nativeStatement?.Dispose();
+            _managedStatement?.Dispose();
+        }
+        finally
+        {
+            _hasCurrentRow = false;
+            _isClosed = true;
+            _connection.ReaderClosed(this);
+            if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+                _connection.Close();
+        }
     }
 }

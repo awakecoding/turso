@@ -95,6 +95,12 @@
         <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\scalar-functions.sqltest"
                  Link="Conformance\scalar-functions.sqltest"
                  CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\scalar-functions-format.sqltest"
+                 Link="Conformance\scalar-functions-format.sqltest"
+                 CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\scalar-functions-printf.sqltest"
+                 Link="Conformance\scalar-functions-printf.sqltest"
+                 CopyToOutputDirectory="PreserveNewest" />
         <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\drop_index.sqltest"
                  Link="Conformance\drop_index.sqltest"
                  CopyToOutputDirectory="PreserveNewest" />
@@ -130,6 +136,9 @@
                  CopyToOutputDirectory="PreserveNewest" />
         <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\default_value.sqltest"
                  Link="Conformance\default_value.sqltest"
+                 CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\on_conflict.sqltest"
+                 Link="Conformance\on_conflict.sqltest"
                  CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 </Project>
