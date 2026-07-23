@@ -3569,10 +3569,11 @@ public sealed class EmbeddedDatabase : IDisposable
         out CompiledSelect compiled)
     {
         // A SELECT carrying LIMIT/OFFSET lowers only when its LIMIT/OFFSET-free base is a
-        // gate-able route. Direct scans, constant projections, aggregates, the deliberately
-        // narrow bounded sorted-scan subset, and a strictly-gated equi-join subset route
-        // through the dedicated path that layers LimitOffsetProgramBuilder gates onto that base.
-        // DISTINCT, computed shapes, outer joins, and compounds keep LIMIT/OFFSET on the evaluator.
+        // gate-able route. Direct scans, constant projections, source-less scalar Function programs,
+        // aggregates, the deliberately narrow bounded sorted-scan subset, and a strictly-gated
+        // equi-join subset route through the dedicated path that layers LimitOffsetProgramBuilder
+        // gates onto that base. DISTINCT, computed shapes, outer joins, and compounds keep
+        // LIMIT/OFFSET on the evaluator.
         if (select.Limit is not null || select.Offset is not null)
             return TryCompileLimitedSelect(select, parameters, context, outerRow, out compiled);
 
@@ -4031,10 +4032,13 @@ public sealed class EmbeddedDatabase : IDisposable
         // can bound exactly. The join branch below is intentionally stricter than the existing
         // unbounded join route: bounded joins claim only direct INNER/LEFT equi-joins or INNER
         // cross joins over two base tables with direct projections. A narrowly validated LEFT
-        // WHERE runs after null extension inside the reusable nested loop.
+        // WHERE runs after null extension inside the reusable nested loop. The scalar-function
+        // branch is restricted to source-less programs, whose one candidate row cannot change
+        // expression error timing when a gate stops the stream.
         var baseSelect = select with { Limit = null, Offset = null };
         if (!TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase)
             && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase)
+            && !TryCompileLimitedScalarFunctionValues(baseSelect, parameters, context, out compiledBase)
             && !TryCompileLimitedJoinSelect(baseSelect, parameters, context, outerRow, out compiledBase))
         {
             return false;
@@ -4047,6 +4051,25 @@ public sealed class EmbeddedDatabase : IDisposable
             ? compiledBase
             : new CompiledSelect(gated, compiledBase.CursorSources);
         return true;
+    }
+
+    // Gates only a source-less scalar Function program. A scalar scan might evaluate an erroring
+    // function on fewer rows when a VDBE LimitGate halts early, while the evaluator materializes
+    // its scan before trimming; retaining those scans preserves evaluator error timing. A source-less
+    // program has exactly one candidate row, so its Function instruction always runs before the
+    // gate exactly as the evaluator's projection does before it applies LIMIT/OFFSET.
+    private bool TryCompileLimitedScalarFunctionValues(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+
+        if (select.Source is not null || select.Where is not null)
+            return false;
+
+        return TryCompileScalarFunctionSelect(select, parameters, context, out compiled);
     }
 
     // Bounded joins are deliberately a smaller contract than TryCompileJoinSelect. A LIMIT/OFFSET gate is

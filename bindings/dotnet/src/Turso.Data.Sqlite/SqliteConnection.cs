@@ -21,6 +21,7 @@ public partial class SqliteConnection : DbConnection
     private bool _disposed;
     private int? _defaultTimeout;
     private readonly HashSet<SqliteDataReader> _openReaders = [];
+    private readonly HashSet<SqliteBlob> _openManagedBlobs = [];
     private string? _dataSource;
     private bool _readOnly;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
@@ -186,6 +187,7 @@ public partial class SqliteConnection : DbConnection
         var originalState = State;
         try
         {
+            CloseOpenManagedBlobs();
             CloseOpenReaders();
             Transaction?.Dispose();
         }
@@ -493,6 +495,19 @@ public partial class SqliteConnection : DbConnection
         _openReaders.Remove(reader);
     }
 
+    internal void ManagedBlobOpened(SqliteBlob blob)
+    {
+        ArgumentNullException.ThrowIfNull(blob);
+        if (!_openManagedBlobs.Add(blob))
+            throw new InvalidOperationException("The managed incremental blob is already registered with this connection.");
+    }
+
+    internal void ManagedBlobClosed(SqliteBlob blob)
+    {
+        ArgumentNullException.ThrowIfNull(blob);
+        _openManagedBlobs.Remove(blob);
+    }
+
     internal void ExecuteNonQuery(string sql)
     {
         using var command = new SqliteCommand(sql, this);
@@ -765,6 +780,12 @@ public partial class SqliteConnection : DbConnection
     {
         foreach (var reader in _openReaders.ToArray())
             reader.CloseFromConnection();
+    }
+
+    private void CloseOpenManagedBlobs()
+    {
+        foreach (var blob in _openManagedBlobs.ToArray())
+            blob.CloseFromConnection();
     }
 
     private static void ValidateRestrictions(string collectionName, string?[]? restrictionValues, int maxRestrictions)

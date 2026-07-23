@@ -1,5 +1,6 @@
 using AwesomeAssertions;
 using Turso.Core;
+using MsData = Microsoft.Data.Sqlite;
 
 namespace Turso.Tests;
 
@@ -10,10 +11,11 @@ namespace Turso.Tests;
 // while every deliberate fallback shape throws because EXPLAIN only describes lowered programs.
 //
 // Routable subset (the base with LIMIT/OFFSET stripped must itself lower): a direct single-table
-// scan, a source-less constant projection, scalar/grouped aggregates with an aggregate-only HAVING
-// predicate, or a bounded single-table sorter over bare-column/literal projections and resolved
-// column ORDER BY keys. Deliberate fallbacks keep the evaluator's exact rows AND error timing:
-// LIMIT 0 (validate-then-skip-the-scan), non-simple/outer JOIN + LIMIT, DISTINCT + LIMIT,
+// scan, a source-less constant or scalar-function projection, scalar/grouped aggregates with an
+// aggregate-only HAVING predicate, or a bounded single-table sorter over bare-column/literal
+// projections and resolved column ORDER BY keys. Deliberate fallbacks keep the evaluator's exact
+// rows AND error timing: LIMIT 0 (validate-then-skip-the-scan), scan scalar functions (which may
+// throw on a row a gate would not reach), non-simple/outer JOIN + LIMIT, DISTINCT + LIMIT,
 // compound + LIMIT, unsupported ORDER BY shapes, and non-integer LIMIT/OFFSET ("datatype mismatch").
 public class LimitOffsetSqlRoutingTests
 {
@@ -193,6 +195,49 @@ public class LimitOffsetSqlRoutingTests
         ReadRows(connection, "SELECT 42 LIMIT 1 OFFSET 1;").Should().BeEmpty();
         Opcodes(ReadRows(connection, "EXPLAIN SELECT 42 LIMIT 1 OFFSET 1;"))
             .Should().Contain("OffsetGate").And.Contain("LimitGate");
+    }
+
+    // ---- Source-less scalar Function ---------------------------------------------------------
+
+    [Test]
+    public void SourceLessScalarFunctionLimitOffsetRoutesAndMatchesSqlite()
+    {
+        const string query = "SELECT upper(@value) LIMIT @limit OFFSET @offset;";
+        var bindings = new[]
+        {
+            SqlValue.Text("mIxEd"),
+            SqlValue.Integer(1),
+            SqlValue.Integer(0),
+        };
+
+        using var connection = new EmbeddedDatabase().Connect();
+        var managed = ReadRows(connection, query, bindings);
+        managed.Should().ContainSingle().Which.Should().Equal(SqlValue.Text("MIXED"));
+        AssertMatchesSqlite(
+            managed,
+            query,
+            ("@value", "mIxEd"),
+            ("@limit", 1L),
+            ("@offset", 0L));
+
+        var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query, bindings)).ToList();
+        opcodes.Should().Contain("Function").And.Contain("LimitGate");
+        opcodes.Should().NotContain("OffsetGate");
+
+        var skipped = ReadRows(
+            connection,
+            query,
+            SqlValue.Text("mIxEd"),
+            SqlValue.Integer(1),
+            SqlValue.Integer(1));
+        skipped.Should().BeEmpty();
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN " + query,
+                SqlValue.Text("mIxEd"),
+                SqlValue.Integer(1),
+                SqlValue.Integer(1)))
+            .Should().Contain("Function").And.Contain("OffsetGate").And.Contain("LimitGate");
     }
 
     // ---- Aggregate --------------------------------------------------------------------------
@@ -381,6 +426,32 @@ public class LimitOffsetSqlRoutingTests
     }
 
     [Test]
+    public void BoundedScalarFunctionScanFallsBackToTheEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(x INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (-3), (-2);");
+
+        // A gate could halt before a later scalar call runs; keep scans with Function opcodes
+        // evaluator-owned so their projection error timing cannot change.
+        ReadRows(connection, "SELECT abs(x) FROM t LIMIT 1;")[0]
+            .Should().Equal(SqlValue.Integer(3));
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "EXPLAIN SELECT abs(x) FROM t LIMIT 1;"));
+    }
+
+    [Test]
+    public void SourceLessScalarFunctionLimitZeroFallsBackToTheEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        const string query = "SELECT upper(@value) LIMIT 0;";
+
+        ReadRows(connection, query, SqlValue.Text("mIxEd")).Should().BeEmpty();
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "EXPLAIN " + query, SqlValue.Text("mIxEd")));
+    }
+
+    [Test]
     public void SimpleOrderByLimitRoutesThroughSorterAndLimitGate()
     {
         using var connection = new EmbeddedDatabase().Connect();
@@ -496,9 +567,15 @@ public class LimitOffsetSqlRoutingTests
         statement.Step().Should().Be(StatementStepResult.Done);
     }
 
-    private static List<SqlValue[]> ReadRows(EmbeddedConnection connection, string sql)
+    private static List<SqlValue[]> ReadRows(
+        EmbeddedConnection connection,
+        string sql,
+        params SqlValue[] positional)
     {
         using var statement = connection.Prepare(sql);
+        for (var index = 0; index < positional.Length; index++)
+            statement.Bind(index + 1, positional[index]);
+
         var rows = new List<SqlValue[]>();
         while (statement.Step() == StatementStepResult.Row)
         {
@@ -510,6 +587,55 @@ public class LimitOffsetSqlRoutingTests
         }
 
         return rows;
+    }
+
+    private static void AssertMatchesSqlite(
+        IReadOnlyList<SqlValue[]> managed,
+        string query,
+        params (string Name, object Value)[] parameters)
+    {
+        using var connection = new MsData.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = query;
+        foreach (var (name, value) in parameters)
+            command.Parameters.AddWithValue(name, value);
+
+        using var reader = command.ExecuteReader();
+        var row = 0;
+        while (reader.Read())
+        {
+            managed.Should().HaveCountGreaterThan(row);
+            managed[row].Should().HaveCount(reader.FieldCount);
+            for (var column = 0; column < reader.FieldCount; column++)
+            {
+                var reference = reader.IsDBNull(column) ? null : reader.GetValue(column);
+                CellsShouldMatch(managed[row][column], reference);
+            }
+
+            row++;
+        }
+
+        managed.Should().HaveCount(row);
+    }
+
+    private static void CellsShouldMatch(SqlValue managed, object? reference)
+    {
+        switch (reference)
+        {
+            case null:
+                managed.Kind.Should().Be(SqlValueKind.Null);
+                break;
+            case long integer:
+                managed.Should().Be(SqlValue.Integer(integer));
+                break;
+            case string text:
+                managed.Should().Be(SqlValue.Text(text));
+                break;
+            default:
+                Assert.Fail($"Unexpected SQLite value type {reference.GetType().Name}.");
+                break;
+        }
     }
 
     private static string[] ColumnNames(EmbeddedConnection connection, string sql)

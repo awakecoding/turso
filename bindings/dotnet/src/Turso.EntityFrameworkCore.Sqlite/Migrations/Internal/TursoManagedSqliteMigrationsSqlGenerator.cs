@@ -113,6 +113,13 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                 throw new NotSupportedException(
                     $"The managed local provider does not support filtered indexes ('{createIndex.Name}' on '{createIndex.Table}').");
             }
+
+            if (operation is CreateIndexOperation { IsDescending: { } sortOrders } descendingIndex
+                && (sortOrders.Length == 0 || sortOrders.Any(static descending => descending)))
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support descending indexes ('{descendingIndex.Name}' on '{descendingIndex.Table}').");
+            }
         }
     }
 }

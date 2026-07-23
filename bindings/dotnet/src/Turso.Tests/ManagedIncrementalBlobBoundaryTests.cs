@@ -212,6 +212,24 @@ public sealed class ManagedIncrementalBlobBoundaryTests
         Assert.Throws<ObjectDisposedException>(() => _ = blob.Length);
     }
 
+    [Test]
+    public void ClosingManagedConnectionDisposesOpenIncrementalBlobs()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE data(value BLOB); INSERT INTO data(rowid, value) VALUES (1, X'01');");
+
+        using var blob = new SqliteBlob(connection, "data", "value", 1);
+
+        connection.Close();
+
+        blob.CanRead.Should().BeFalse();
+        blob.CanSeek.Should().BeFalse();
+        blob.CanWrite.Should().BeFalse();
+        Assert.Throws<ObjectDisposedException>(() => _ = blob.Length);
+        Assert.Throws<ObjectDisposedException>(() => blob.Position = 0);
+    }
+
     private static object? GetPrivateField(object instance, string fieldName)
     {
         var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)

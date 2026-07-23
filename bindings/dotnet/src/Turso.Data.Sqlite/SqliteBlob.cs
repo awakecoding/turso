@@ -44,6 +44,7 @@ public class SqliteBlob : Stream
                 throw SqliteCommand.ToSqliteException(exception);
             }
 
+            connection.ManagedBlobOpened(this);
             return;
         }
 
@@ -194,13 +195,22 @@ public class SqliteBlob : Stream
     {
         if (disposing && !_disposed)
         {
-            _managedBlob?.Dispose();
-            _stream?.Dispose();
+            try
+            {
+                _managedBlob?.Dispose();
+                _stream?.Dispose();
+            }
+            finally
+            {
+                _connection?.ManagedBlobClosed(this);
+                _disposed = true;
+            }
         }
 
-        _disposed = true;
         base.Dispose(disposing);
     }
+
+    internal void CloseFromConnection() => Dispose();
 
     private MemoryStream GetStream()
     {

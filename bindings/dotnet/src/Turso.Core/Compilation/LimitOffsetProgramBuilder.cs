@@ -29,9 +29,9 @@ namespace Turso.Core.Compilation;
 /// <para>
 /// Composition: because a shared pair of counters gates <em>every</em> <c>ResultRow</c> in the program,
 /// this composes with any program whose output is emitted through unconditional <c>ResultRow</c> opcodes —
-/// direct table scans, sorted scans, joins, aggregations, constant projections, and <c>UNION ALL</c>
-/// compounds (whose per-term <c>ResultRow</c>s share the counters, so LIMIT/OFFSET spans the concatenated
-/// stream). Programs that emit through the conditional compound primitives
+/// direct table scans, sorted scans, joins, aggregations, constant and source-less scalar-function
+/// projections, and <c>UNION ALL</c> compounds (whose per-term <c>ResultRow</c>s share the counters,
+/// so LIMIT/OFFSET spans the concatenated stream). Programs that emit through the conditional compound primitives
 /// (<see cref="DistinctResultRowInstruction"/>, <see cref="CompoundResultRowInstruction"/>,
 /// <see cref="RowSetInsertInstruction"/> — i.e. <c>UNION</c>/<c>DISTINCT</c>, <c>INTERSECT</c>,
 /// <c>EXCEPT</c>) are rejected with <see cref="StatementCompilationException"/>, because a pre-emit gate
@@ -220,6 +220,7 @@ public static class LimitOffsetProgramBuilder
                 or AggResetInstruction
                 or AggStepInstruction
                 or AggFinalizeInstruction
+                or FunctionInstruction
                 or YieldInstruction
                 or HaltInstruction => instruction,
             _ => throw new StatementCompilationException(
