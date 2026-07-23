@@ -5,7 +5,7 @@ namespace Turso.Tests;
 
 // Proves that EmbeddedDatabase routes the byte-identical-safe SQL arithmetic subset through the real
 // Arithmetic opcode (ArithmeticProgramBuilder.BuildOverValues + VdbeArithmetic.Evaluate) and that every
-// other shape stays on the tree-walking evaluator. Only one grammar lowers:
+// other source-less shape stays on the tree-walking evaluator. This suite covers one grammar:
 //
 //     SELECT <op1> {+,-,*,/,%} <op2>        (source-less, single projection, no other clauses)
 //
@@ -337,8 +337,8 @@ public class ArithmeticSqlRoutingTests
         Execute(connection, "CREATE TABLE t(x INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (10), (20);");
 
-        // The over-values route is source-less; a column operand means a FROM clause, which declines. (A
-        // dynamically-typed column can hold text/blob, so column affinity cannot be proven exact anyway.)
+        // The direct scan route accepts only two bare column operands. A literal operand needs a separate
+        // per-row load shape, so this query remains evaluator-owned.
         ReadRows(connection, "SELECT x + 1 FROM t;").Select(row => row[0])
             .Should().Equal(SqlValue.Integer(11), SqlValue.Integer(21));
 

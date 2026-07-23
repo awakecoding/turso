@@ -365,6 +365,37 @@ public class ManagedSqltestConformanceTests
     public void ManagedAdditionalSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("delete.sqltest", "delete-insert-alternate-1")]
+    [TestCase("delete.sqltest", "delete-ends-1")]
+    [TestCase("delete.sqltest", "delete-reuse-1")]
+    [TestCase("delete.sqltest", "delete-in-subquery-1")]
+    [TestCase("delete.sqltest", "delete-not-in-subquery-1")]
+    [TestCase("delete.sqltest", "delete-in-subquery-empty-1")]
+    [TestCase("delete.sqltest", "delete-not-in-subquery-empty-1")]
+    [TestCase("delete.sqltest", "delete-in-subquery-multicol-1")]
+    [TestCase("delete.sqltest", "delete-scalar-eq-subquery-1")]
+    [TestCase("delete.sqltest", "delete-scalar-gt-subquery-1")]
+    [TestCase("delete.sqltest", "delete-scalar-lt-subquery-1")]
+    [TestCase("delete.sqltest", "delete-exists-empty-1")]
+    [TestCase("update.sqltest", "update-mul")]
+    [TestCase("update.sqltest", "update-where")]
+    [TestCase("update.sqltest", "update-where-2")]
+    [TestCase("update.sqltest", "update-all-many")]
+    [TestCase("update.sqltest", "update-null")]
+    [TestCase("update.sqltest", "update-not-null-1")]
+    [TestCase("update.sqltest", "update-not-null-2")]
+    [TestCase("update.sqltest", "update-not-null-3")]
+    [TestCase("update.sqltest", "update-mixed-types")]
+    [TestCase("update.sqltest", "update-self-reference")]
+    [TestCase("update.sqltest", "update-self-ref-all")]
+    [TestCase("update.sqltest", "update-large-text")]
+    [TestCase("update.sqltest", "update-with-null-condition")]
+    [TestCase("update.sqltest", "update-to-null")]
+    [TestCase("update.sqltest", "update-multiple-columns")]
+    [TestCase("update.sqltest", "update-true-expr")]
+    public void ManagedDmlSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

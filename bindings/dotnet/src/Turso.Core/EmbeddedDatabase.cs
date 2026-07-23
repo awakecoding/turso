@@ -3589,11 +3589,12 @@ public sealed class EmbeddedDatabase : IDisposable
             return true;
 
         // Pure-constant arithmetic (e.g. 1 + 2) folds in the constant route above; this route claims the
-        // remaining exact subset -- a single source-less binary +,-,*,/,% projection whose two operands each
-        // resolve to a baked INTEGER/REAL/NULL value -- lowering it to the real Arithmetic opcode. Because
-        // VdbeArithmetic is byte-identical to the evaluator's numeric operators only for numeric/NULL operands,
-        // every text/blob/coercion/complex/column shape declines and stays on the tree-walking evaluator.
-        if (TryCompileArithmeticSelect(select, parameters, out compiled))
+        // remaining exact subset -- a source-less binary +,-,*,/,% projection over baked numeric values, or an
+        // unfiltered base-table scan whose trailing arithmetic projection reads only numeric-or-NULL columns --
+        // lowering it to the real Arithmetic opcode. Because VdbeArithmetic is byte-identical to the evaluator's
+        // numeric operators only for numeric/NULL operands, every text/blob/coercion/complex shape declines and
+        // stays on the tree-walking evaluator.
+        if (TryCompileArithmeticSelect(select, parameters, context, out compiled))
             return true;
 
         // The unordered scan/constant compiler declines aggregation. Try the aggregate
@@ -3839,36 +3840,43 @@ public sealed class EmbeddedDatabase : IDisposable
         return true;
     }
 
-    // Routes a source-less SELECT whose single projection is a binary arithmetic expression (+, -, *, /, %)
-    // over two operands that each resolve to a baked INTEGER/REAL/NULL value to the real Arithmetic opcode
-    // (ArithmeticProgramBuilder.BuildOverValues). This is exactly the subset where VdbeArithmetic.Evaluate is
-    // byte-identical to the evaluator's own numeric operators: for numeric operands the integer/real typing,
-    // overflow-to-real, and divide/modulo-by-zero-to-NULL rules match, and a NULL operand makes both paths
-    // short-circuit to NULL. Every other shape stays on the evaluator -- a text/blob operand (the opcode raises
-    // a VdbeArithmeticException where the evaluator applies numeric affinity), a column or nested/complex
-    // operand, the concatenation/comparison/logical operators, a FROM/WHERE/DISTINCT/GROUP BY/HAVING/ORDER BY/
-    // LIMIT/OFFSET clause, or more than one projection. LIMIT/OFFSET are peeled off by TryCompileLimitedSelect
-    // before this point. Pure-literal arithmetic never reaches here (the constant-projection route folds it
-    // first), so this route fires only when at least one operand is a parameter.
+    // Routes the exact arithmetic subset to ArithmeticProgramBuilder: source-less values use two baked
+    // INTEGER/REAL/NULL operands, while a scan reads two bare columns whose current live values are all
+    // INTEGER/REAL/NULL. The latter preflight is essential because the evaluator applies numeric affinity to
+    // text/blob values while the Arithmetic opcode rejects them. LIMIT/OFFSET are peeled off before this point.
     private bool TryCompileArithmeticSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+
+        if (select.Distinct
+            || select.Where is not null
+            || select.Having is not null
+            || select.GroupBy.Count != 0
+            || select.OrderBy.Count != 0
+            || select.Limit is not null
+            || select.Offset is not null)
+        {
+            return false;
+        }
+
+        return select.Source is null
+            ? TryCompileArithmeticOverValues(select, parameters, out compiled)
+            : TryCompileArithmeticOverScan(select, context, out compiled);
+    }
+
+    private bool TryCompileArithmeticOverValues(
         SelectStatement select,
         SqlValue[] parameters,
         out CompiledSelect compiled)
     {
         compiled = null!;
 
-        if (select.Distinct
-            || select.Source is not null
-            || select.Where is not null
-            || select.Having is not null
-            || select.GroupBy.Count != 0
-            || select.OrderBy.Count != 0
-            || select.Limit is not null
-            || select.Offset is not null
-            || select.Projections.Count != 1)
-        {
+        if (select.Projections.Count != 1)
             return false;
-        }
 
         if (select.Projections[0].Expression is not BinaryExpression binary
             || !TryMapArithmeticOperator(binary.Operator, out var op))
@@ -3883,6 +3891,73 @@ public sealed class EmbeddedDatabase : IDisposable
         }
 
         compiled = new CompiledSelect(ArithmeticProgramBuilder.BuildOverValues(op, [left, right]), []);
+        return true;
+    }
+
+    // The scan builder emits leading passthrough columns followed by one arithmetic result. Its operands are
+    // deliberately restricted to declared columns: literal/parameter operands need a distinct per-row load
+    // shape, and nested expressions need their own register lowering. Preflighting the live operand cells keeps
+    // text/blob numeric-affinity behavior and its evaluator timing outside this direct path.
+    private bool TryCompileArithmeticOverScan(
+        SelectStatement select,
+        QueryContext context,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+
+        if (select.Projections.Count == 0)
+            return false;
+
+        var target = ResolveScanTarget(select.Source, context);
+        if (target is null || target.Columns.Length == 0)
+            return false;
+
+        var arithmeticIndex = select.Projections.Count - 1;
+        if (select.Projections[arithmeticIndex].Expression is not BinaryExpression binary
+            || !TryMapArithmeticOperator(binary.Operator, out var op)
+            || !TryResolveScanColumnOrdinal(binary.Left, target, out var left)
+            || !TryResolveScanColumnOrdinal(binary.Right, target, out var right))
+        {
+            return false;
+        }
+
+        var passthrough = new List<int>(arithmeticIndex);
+        for (var index = 0; index < arithmeticIndex; index++)
+        {
+            if (!TryResolveScanColumnOrdinal(select.Projections[index].Expression, target, out var column))
+                return false;
+
+            passthrough.Add(column);
+        }
+
+        if (!HasOnlyNumericOrNullArithmeticOperands(target.Rows, left, right))
+            return false;
+
+        var term = ArithmeticProgramBuilder.BuildOverScan(
+            op,
+            target.TableName,
+            target.Columns.Length,
+            [left, right],
+            target.Rows,
+            passthrough);
+        compiled = new CompiledSelect(term.Program, term.CursorSources);
+        return true;
+    }
+
+    private static bool HasOnlyNumericOrNullArithmeticOperands(
+        IReadOnlyList<SqlValue[]> rows,
+        int left,
+        int right)
+    {
+        foreach (var row in rows)
+        {
+            if (row[left].Kind is not (SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Null)
+                || row[right].Kind is not (SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Null))
+            {
+                return false;
+            }
+        }
+
         return true;
     }
 

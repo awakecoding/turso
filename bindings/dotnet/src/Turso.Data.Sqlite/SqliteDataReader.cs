@@ -663,31 +663,34 @@ public class SqliteDataReader : DbDataReader
     }
 
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
-    {
-        return cancellationToken.IsCancellationRequested
-            ? Task.FromCanceled<bool>(cancellationToken)
-            : Task.FromResult(Read());
-    }
+        => CompleteAsync(Read, cancellationToken);
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
-    {
-        return cancellationToken.IsCancellationRequested
-            ? Task.FromCanceled<bool>(cancellationToken)
-            : Task.FromResult(NextResult());
-    }
+        => CompleteAsync(NextResult, cancellationToken);
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
-    {
-        return cancellationToken.IsCancellationRequested
-            ? Task.FromCanceled<bool>(cancellationToken)
-            : Task.FromResult(IsDBNull(ordinal));
-    }
+        => CompleteAsync(() => IsDBNull(ordinal), cancellationToken);
 
     public override Task<T> GetFieldValueAsync<T>(int ordinal, CancellationToken cancellationToken)
+        => CompleteAsync(() => GetFieldValue<T>(ordinal), cancellationToken);
+
+    private static Task<T> CompleteAsync<T>(Func<T> operation, CancellationToken cancellationToken)
     {
         return cancellationToken.IsCancellationRequested
             ? Task.FromCanceled<T>(cancellationToken)
-            : Task.FromResult(GetFieldValue<T>(ordinal));
+            : Complete(operation);
+    }
+
+    private static Task<T> Complete<T>(Func<T> operation)
+    {
+        try
+        {
+            return Task.FromResult(operation());
+        }
+        catch (Exception exception)
+        {
+            return Task.FromException<T>(exception);
+        }
     }
 
     protected override void Dispose(bool disposing)

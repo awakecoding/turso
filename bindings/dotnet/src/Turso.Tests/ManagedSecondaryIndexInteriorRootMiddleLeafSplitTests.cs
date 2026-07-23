@@ -26,7 +26,38 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
                 Execute(connection, InsertStatement(target.RowId, target.Code));
 
             var after = ReadTopology(PhysicalFileSystem.Instance, path);
-            AssertMiddleLeafSplit(before, after, target);
+            AssertChildLeafSplit(before, after, target);
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Count(connection).Should().Be(target.RowCount + 1);
+                CountById(connection, target.RowId).Should().Be(1);
+            }
+
+            VerifyWithSqlite(path, target);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void InteriorRootLeftmostChildLeafInsertionPersistsReopensAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("leftmost-integrity");
+        try
+        {
+            var target = SeedLeftmostLeafInsertionTopology(PhysicalFileSystem.Instance, path);
+            var before = ReadTopology(PhysicalFileSystem.Instance, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+                Execute(connection, InsertStatement(target.RowId, target.Code));
+
+            var after = ReadTopology(PhysicalFileSystem.Instance, path);
+            AssertLeftmostChildLeafInsertion(before, after, target);
             using (var reopened = EmbeddedDatabase.OpenFile(path))
             using (var connection = reopened.Connect())
             {
@@ -74,8 +105,50 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
         }
     }
 
-    private static SplitTarget SeedMiddleLeafSplitTopology(IFileSystem fileSystem, string path)
+    [Test]
+    public void EveryInterruptedInteriorRootLeftmostChildLeafInsertionFrameRecoversThePriorTree()
     {
+        for (var failedFrame = 1; failedFrame <= 3; failedFrame++)
+        {
+            var faults = new DeterministicFaultInjector();
+            var fileSystem = new InMemoryFileSystem(faults);
+            var path = $"secondary-index-leftmost-child-leaf-insertion-wal-{failedFrame}.db";
+            var target = SeedLeftmostLeafInsertionTopology(fileSystem, path);
+            var before = ReadTopology(fileSystem, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                faults.FailOnOccurrence(
+                    FileSystemOperation.Write,
+                    faults.GetOperationCount(FileSystemOperation.Write) + failedFrame);
+                Assert.Throws<IOException>(() => Execute(connection, InsertStatement(target.RowId, target.Code)));
+            }
+
+            using (var recovered = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = recovered.Connect())
+            {
+                Count(connection).Should().Be(target.RowCount);
+                CountById(connection, target.RowId).Should().Be(0);
+            }
+
+            AssertUnchanged(before, ReadTopology(fileSystem, path));
+        }
+    }
+
+    private static SplitTarget SeedMiddleLeafSplitTopology(IFileSystem fileSystem, string path)
+        => SeedChildLeafTopology(fileSystem, path, ChildPosition.Middle, requireSplit: true);
+
+    private static SplitTarget SeedLeftmostLeafInsertionTopology(IFileSystem fileSystem, string path)
+        => SeedChildLeafTopology(fileSystem, path, ChildPosition.Leftmost, requireSplit: false);
+
+    private static SplitTarget SeedChildLeafTopology(
+        IFileSystem fileSystem,
+        string path,
+        ChildPosition childPosition,
+        bool requireSplit)
+    {
+        var initialRowCount = 5;
         CreateMinimumPageDatabase(fileSystem, path);
         using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
         using (var connection = database.Connect())
@@ -83,23 +156,31 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
             Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, code INTEGER NOT NULL);");
             Execute(
                 connection,
-                InsertStatement(Enumerable.Range(1, 5).Select(id => (Id: id, Code: id * 100))));
+                InsertStatement(Enumerable.Range(1, initialRowCount).Select(id => (Id: id, Code: id * 100))));
             Execute(
                 connection,
                 $"CREATE UNIQUE INDEX {IndexName} ON target({RepeatedIndexColumns("code", RepeatedColumnCount)});");
         }
 
-        var rowCount = 5;
-        for (var rowId = 6; rowId <= 96; rowId++)
+        var rowCount = initialRowCount;
+        for (var rowId = initialRowCount + 1; rowId <= 96; rowId++)
         {
-            if (TryFindMiddleChildSplitTarget(fileSystem, path, rowCount, rowId, requireSplit: true, out var target))
+            if (TryFindChildSplitTarget(
+                    fileSystem,
+                    path,
+                    rowCount,
+                    rowId,
+                    childPosition,
+                    requireSplit,
+                    out var target))
                 return target;
 
-            var filler = TryFindMiddleChildSplitTarget(
+            var filler = TryFindChildSplitTarget(
                 fileSystem,
                 path,
                 rowCount,
                 rowId,
+                childPosition,
                 requireSplit: false,
                 out var candidate)
                 ? candidate
@@ -112,14 +193,15 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
         }
 
         throw new InvalidOperationException(
-            "Unable to create a bounded middle-child secondary-index leaf split topology.");
+            $"Unable to create a bounded {childPosition} secondary-index leaf split topology.");
     }
 
-    private static bool TryFindMiddleChildSplitTarget(
+    private static bool TryFindChildSplitTarget(
         IFileSystem fileSystem,
         string path,
         int rowCount,
         int rowId,
+        ChildPosition childPosition,
         bool requireSplit,
         out SplitTarget target)
     {
@@ -147,7 +229,8 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
             pager.ReadCommittedPage(indexRootPage),
             header.UsableSpace,
             header.TextEncoding);
-        if (root.Cells.Count < 2 || root.Cells.Any(cell => cell.Cell.Key.FirstOverflowPage is not null))
+        if (root.Cells.Count < (childPosition == ChildPosition.Middle ? 2 : 1)
+            || root.Cells.Any(cell => cell.Cell.Key.FirstOverflowPage is not null))
             return false;
 
         var comparer = new SqliteIndexRecordComparer(header.TextEncoding);
@@ -179,8 +262,11 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
             var record = BuildIndexRecord(code, rowId, header.TextEncoding);
             var route = root.SearchChild(record);
             if (route.IsSeparatorKey
-                || route.ChildIndex <= 0
-                || route.ChildIndex >= root.Cells.Count)
+                || route.ChildIndex < 0
+                || route.ChildIndex >= root.Cells.Count
+                || (childPosition == ChildPosition.Leftmost && route.ChildIndex != 0)
+                || (childPosition == ChildPosition.Middle
+                    && (route.ChildIndex == 0 || route.ChildIndex >= root.Cells.Count)))
             {
                 continue;
             }
@@ -366,7 +452,7 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
             ReadIndexRowIds(root, children));
     }
 
-    private static void AssertMiddleLeafSplit(Topology before, Topology after, SplitTarget target)
+    private static void AssertChildLeafSplit(Topology before, Topology after, SplitTarget target)
     {
         after.PageCount.Should().Be(before.PageCount + 1);
         after.Header.DatabaseSizeInPages.Should().Be(after.PageCount);
@@ -385,6 +471,35 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
             .Equal(before.ParentCells[target.ChildIndex].Record);
         after.Children[target.ChildIndex].PageNumber.Should().Be(target.ChildPage);
         after.Children[target.ChildIndex + 1].PageNumber.Should().Be(after.PageCount);
+        after.IndexRowIds.Should().BeEquivalentTo(before.IndexRowIds.Append(target.RowId));
+    }
+
+    private static void AssertLeftmostChildLeafInsertion(Topology before, Topology after, SplitTarget target)
+    {
+        target.ChildIndex.Should().Be(0);
+        after.PageCount.Should().Be(before.PageCount);
+        after.Header.DatabaseSizeInPages.Should().Be(before.Header.DatabaseSizeInPages);
+        after.Header.ChangeCounter.Should().Be(before.Header.ChangeCounter + 1);
+        after.Header.VersionValidFor.Should().Be(after.Header.ChangeCounter);
+        after.Header.SchemaCookie.Should().Be(before.Header.SchemaCookie);
+        after.Header.FirstFreelistTrunkPage.Should().Be(0);
+        after.Header.FreelistPageCount.Should().Be(0);
+        after.TableRootPage.Should().Be(before.TableRootPage);
+        after.IndexRootPage.Should().Be(before.IndexRootPage);
+        after.ParentCells.Should().BeEquivalentTo(before.ParentCells, options => options.WithStrictOrdering());
+        after.RightMostChildPage.Should().Be(before.RightMostChildPage);
+        after.IndexRootImage.Should().Equal(before.IndexRootImage);
+        after.Children.Select(child => child.PageNumber)
+            .Should()
+            .Equal(before.Children.Select(child => child.PageNumber));
+        after.Children[target.ChildIndex].PageNumber.Should().Be(target.ChildPage);
+        after.Children[target.ChildIndex].RowIds.Should()
+            .BeEquivalentTo(before.Children[target.ChildIndex].RowIds.Append(target.RowId));
+        after.Children.Where((_, index) => index != target.ChildIndex)
+            .Should()
+            .BeEquivalentTo(
+                before.Children.Where((_, index) => index != target.ChildIndex),
+                options => options.WithStrictOrdering());
         after.IndexRowIds.Should().BeEquivalentTo(before.IndexRowIds.Append(target.RowId));
     }
 
@@ -552,6 +667,12 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
     }
 
     private sealed record SplitTarget(int RowId, int Code, int RowCount, int ChildIndex, uint ChildPage);
+
+    private enum ChildPosition
+    {
+        Leftmost,
+        Middle,
+    }
 
     private sealed record ParentCell(uint LeftChildPage, byte[] Record);
 

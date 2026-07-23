@@ -75,6 +75,38 @@ public sealed class ManagedProviderAsyncParityTests
         Assert.ThrowsAsync<TursoException>(async () => await command.ExecuteReaderAsync());
     }
 
+    [Test]
+    public async Task ManagedSqliteReaderAsyncOperationsReturnFaultedTasksAfterDisposal()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1;";
+        var reader = await command.ExecuteReaderAsync();
+        await reader.DisposeAsync();
+
+        Task<bool>? read = null;
+        Assert.DoesNotThrow(() => read = reader.ReadAsync());
+        Assert.ThrowsAsync<InvalidOperationException>(async () => await read!);
+
+        Task<bool>? nextResult = null;
+        Assert.DoesNotThrow(() => nextResult = reader.NextResultAsync());
+        Assert.ThrowsAsync<InvalidOperationException>(async () => await nextResult!);
+
+        Task<bool>? isDbNull = null;
+        Assert.DoesNotThrow(() => isDbNull = reader.IsDBNullAsync(0));
+        Assert.ThrowsAsync<InvalidOperationException>(async () => await isDbNull!);
+
+        Task<long>? fieldValue = null;
+        Assert.DoesNotThrow(() => fieldValue = reader.GetFieldValueAsync<long>(0));
+        Assert.ThrowsAsync<InvalidOperationException>(async () => await fieldValue!);
+
+        using var verification = connection.CreateCommand();
+        verification.CommandText = "SELECT 2;";
+        (await verification.ExecuteScalarAsync()).Should().Be(2L);
+    }
+
     private static void AssertCanceled(Task task)
     {
         task.IsCanceled.Should().BeTrue();

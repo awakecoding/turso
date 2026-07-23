@@ -1230,7 +1230,9 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// complete key fits strictly between its adjacent parent separators and the
     /// parent can accept the promoted separator. It can atomically insert or delete
     /// one record in direct middle children of multiple compatible one-level index
-    /// roots when no parent separator changes. It can delete a singleton direct
+    /// roots when no parent separator changes, and it can insert one record into
+    /// the left-most direct child of exactly one compatible one-level index root.
+    /// It can delete a singleton direct
     /// child when its parent retains at least two separators, transferring the
     /// removed child's adjacent separator into its surviving sibling before
     /// freelisting the retired page.
@@ -2174,7 +2176,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         var route = parent.SearchChild(addedRecord);
         if (route.IsSeparatorKey
-            || route.ChildIndex <= 0
+            || route.ChildIndex < 0
             || route.ChildIndex >= parent.Cells.Count
             || childPages[route.ChildIndex] != route.ChildPage)
         {
