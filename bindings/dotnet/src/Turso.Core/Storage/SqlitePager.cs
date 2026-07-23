@@ -475,6 +475,53 @@ public sealed class SqlitePager : IDisposable
     }
 
     /// <summary>
+    /// Discards an uncommitted, partial, or corrupt WAL tail without publishing a
+    /// new transaction. The recovery runs while holding the managed writer and
+    /// recovery locks, so it honors the supplied busy timeout and cannot race a
+    /// managed writer or recovery operation.
+    /// </summary>
+    public void RecoverUncommittedWalTail(TimeSpan? busyTimeout = null)
+    {
+        var configuredBusyTimeout = ResolveBusyTimeout(busyTimeout);
+        var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
+            ? null
+            : Stopwatch.StartNew();
+        using var writerLock = _lockManager.EnterWriter(configuredBusyTimeout);
+        using var recoveryLock = _lockManager.EnterRecoveryLock(
+            SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
+            configuredBusyTimeout);
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            ThrowIfReadOnly();
+            if (_state != SqlitePagerState.Ready)
+                throw new InvalidOperationException($"Cannot recover a SQLite WAL while the pager is {_state}.");
+
+            try
+            {
+                var recovery = _wal.ScanRecovery();
+                InitializeCommittedView(recovery);
+                _lockGeneration = _lockManager.Generation;
+                if (!HasUncommittedOrInvalidTail(recovery))
+                    return;
+
+                _wal.RecoverToLastCommittedFrame();
+                recovery = _wal.ScanRecovery();
+                if (HasUncommittedOrInvalidTail(recovery))
+                    throw new InvalidDataException("SQLite WAL recovery did not remove its uncommitted or invalid tail.");
+
+                InitializeCommittedView(recovery);
+                _lockGeneration = writerLock.PublishStorageChange();
+            }
+            catch
+            {
+                TransitionToFaulted();
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
     /// Commits a complete table-leaf mutation through this pager's WAL overlay.
     /// Its source page count must match the currently committed view.
     /// </summary>

@@ -3601,12 +3601,13 @@ public sealed class EmbeddedDatabase : IDisposable
             return true;
 
         // Pure-constant arithmetic (e.g. 1 + 2) folds in the constant route above; this route claims the
-        // remaining exact subset -- a source-less binary +,-,*,/,% projection over baked numeric values, or an
-        // unfiltered base-table scan whose trailing arithmetic projection reads only numeric-or-NULL columns --
+        // remaining exact subset -- a source-less binary +,-,*,/,% projection over baked numeric values, or a
+        // base-table scan whose arithmetic projection reads only numeric-or-NULL columns and whose optional
+        // WHERE is a simple built-in-collation column comparison --
         // lowering it to the real Arithmetic opcode. Because VdbeArithmetic is byte-identical to the evaluator's
         // numeric operators only for numeric/NULL operands, every text/blob/coercion/complex shape declines and
         // stays on the tree-walking evaluator.
-        if (TryCompileArithmeticSelect(select, parameters, context, out compiled))
+        if (TryCompileArithmeticSelect(select, parameters, context, outerRow, out compiled))
             return true;
 
         // The unordered scan/constant compiler declines aggregation. Try the aggregate
@@ -4003,12 +4004,12 @@ public sealed class EmbeddedDatabase : IDisposable
         SelectStatement select,
         SqlValue[] parameters,
         QueryContext context,
+        SourceRow? outerRow,
         out CompiledSelect compiled)
     {
         compiled = null!;
 
         if (select.Distinct
-            || select.Where is not null
             || select.Having is not null
             || select.GroupBy.Count != 0
             || select.OrderBy.Count != 0
@@ -4020,7 +4021,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         return select.Source is null
             ? TryCompileArithmeticOverValues(select, parameters, out compiled)
-            : TryCompileArithmeticOverScan(select, context, out compiled);
+            : TryCompileArithmeticOverScan(select, parameters, context, outerRow, out compiled);
     }
 
     private bool TryCompileArithmeticOverValues(
@@ -4030,7 +4031,7 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         compiled = null!;
 
-        if (select.Projections.Count != 1)
+        if (select.Where is not null || select.Projections.Count != 1)
             return false;
 
         if (select.Projections[0].Expression is not BinaryExpression binary
@@ -4051,12 +4052,14 @@ public sealed class EmbeddedDatabase : IDisposable
 
     // The scan builder can place its one arithmetic result among direct declared-column projections. Its operands
     // remain deliberately restricted to declared columns: literal/parameter operands need a distinct per-row load
-    // shape, and nested expressions need their own register lowering. Preflighting every live operand cell and
-    // arithmetic evaluation keeps text/blob numeric-affinity behavior and late evaluator errors outside this direct
-    // path before the VDBE can yield an earlier row.
+    // shape, and nested expressions need their own register lowering. A simple built-in-collation column
+    // comparison may gate the scan. Preflighting WHERE then arithmetic for every source row preserves the
+    // evaluator's filter-before-projection error ordering before the VDBE can yield an earlier row.
     private bool TryCompileArithmeticOverScan(
         SelectStatement select,
+        SqlValue[] parameters,
         QueryContext context,
+        SourceRow? outerRow,
         out CompiledSelect compiled)
     {
         compiled = null!;
@@ -4113,10 +4116,30 @@ public sealed class EmbeddedDatabase : IDisposable
             projections.Add(ArithmeticProgramBuilder.ScanProjection.ForColumn(column));
         }
 
-        if (!HasOnlyNumericOrNullArithmeticOperands(target.Rows, left, right))
-            return false;
+        VdbeRowPredicate? predicate = null;
+        if (select.Where is not null)
+        {
+            if (!IsStreamingSafeScalarScanPredicate(select.Where, target, context))
+                return false;
 
-        ValidateArithmeticScanBeforeStreaming(target, binary, context);
+            predicate = CompileRowPredicate(select.Where, target, parameters, context, outerRow);
+            if (predicate is null)
+                return false;
+        }
+
+        if (!HasOnlyNumericOrNullArithmeticOperands(
+                target,
+                left,
+                right,
+                select.Where,
+                parameters,
+                context,
+                outerRow))
+        {
+            return false;
+        }
+
+        ValidateArithmeticScanBeforeStreaming(target, binary, select.Where, parameters, context, outerRow);
 
         var term = ArithmeticProgramBuilder.BuildOverScanWithProjectionOrder(
             op,
@@ -4124,18 +4147,28 @@ public sealed class EmbeddedDatabase : IDisposable
             target.Columns.Length,
             [left, right],
             target.Rows,
-            projections);
+            projections,
+            predicate);
         compiled = new CompiledSelect(term.Program, term.CursorSources);
         return true;
     }
 
-    private static bool HasOnlyNumericOrNullArithmeticOperands(
-        IReadOnlyList<SqlValue[]> rows,
+    private bool HasOnlyNumericOrNullArithmeticOperands(
+        ScanTarget target,
         int left,
-        int right)
+        int right,
+        Expression? where,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
     {
-        foreach (var row in rows)
+        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, target.Columns);
+        foreach (var row in target.Rows)
         {
+            var sourceRow = new SourceRow(target.Columns, row, qualifiedColumns, outerRow);
+            if (where is not null && !IsTrue(Evaluate(where, parameters, sourceRow, context)))
+                continue;
+
             if (row[left].Kind is not (SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Null)
                 || row[right].Kind is not (SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Null))
             {
@@ -4149,11 +4182,18 @@ public sealed class EmbeddedDatabase : IDisposable
     private void ValidateArithmeticScanBeforeStreaming(
         ScanTarget target,
         BinaryExpression expression,
-        QueryContext context)
+        Expression? where,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
     {
         var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, target.Columns);
         foreach (var row in target.Rows)
-            _ = Evaluate(expression, EmptyParameters, new SourceRow(target.Columns, row, qualifiedColumns), context);
+        {
+            var sourceRow = new SourceRow(target.Columns, row, qualifiedColumns, outerRow);
+            if (where is null || IsTrue(Evaluate(where, parameters, sourceRow, context)))
+                _ = Evaluate(expression, parameters, sourceRow, context);
+        }
     }
 
     // Maps the arithmetic BinaryOperators to their ArithmeticOperator opcode. Only the numeric family the

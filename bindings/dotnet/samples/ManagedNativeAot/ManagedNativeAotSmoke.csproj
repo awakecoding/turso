@@ -6,9 +6,10 @@
     <Nullable>enable</Nullable>
     <PublishAot>true</PublishAot>
     <SelfContained>true</SelfContained>
+    <TursoPackageVersion Condition="'$(TursoPackageVersion)' == ''">0.0.0-managed-local</TursoPackageVersion>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\Turso.Core\Turso.Core.csproj" />
+    <PackageReference Include="Turso.Data.Sqlite" Version="$(TursoPackageVersion)" />
   </ItemGroup>
 </Project>

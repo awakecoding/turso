@@ -210,8 +210,7 @@ public class ManagedProviderRoutingTests
             .Message.Should().Be("BackupDatabase does not support copying between managed and native providers.");
 
         managedSource.State.Should().Be(System.Data.ConnectionState.Open);
-        nativeDestination.State.Should().Be(System.Data.ConnectionState.Open);
-        nativeDestination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+        nativeDestination.State.Should().Be(System.Data.ConnectionState.Closed);
         managedSource.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("managed");
     }
 
@@ -229,8 +228,7 @@ public class ManagedProviderRoutingTests
             .Message.Should().Be("BackupDatabase does not support copying between managed and native providers.");
 
         nativeSource.State.Should().Be(System.Data.ConnectionState.Open);
-        managedDestination.State.Should().Be(System.Data.ConnectionState.Open);
-        managedDestination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+        managedDestination.State.Should().Be(System.Data.ConnectionState.Closed);
         nativeSource.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("native");
     }
 

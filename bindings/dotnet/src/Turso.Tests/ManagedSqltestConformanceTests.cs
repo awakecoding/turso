@@ -612,6 +612,34 @@ public class ManagedSqltestConformanceTests
     public void ManagedRemainingComparisonSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("affinity.sqltest", "affinity")]
+    [TestCase("affinity.sqltest", "affinity-join-blob-vs-text-column")]
+    [TestCase("affinity.sqltest", "affinity-insert-text-from-integer")]
+    [TestCase("affinity.sqltest", "affinity-insert-text-with-index")]
+    [TestCase("affinity.sqltest", "affinity-update-text-from-real")]
+    [TestCase("affinity.sqltest", "affinity-update-text-with-index")]
+    [TestCase("affinity.sqltest", "affinity-upsert-text")]
+    [TestCase("affinity.sqltest", "affinity-real-non-numeric-text")]
+    [TestCase("affinity.sqltest", "affinity-mixed-columns-insert")]
+    [TestCase("affinity.sqltest", "affinity-mixed-columns-update")]
+    [TestCase("affinity.sqltest", "affinity-insert-text-from-integer-2")]
+    [TestCase("affinity.sqltest", "affinity-insert-text-with-index-2")]
+    [TestCase("affinity.sqltest", "affinity-update-text-from-real-2")]
+    [TestCase("affinity.sqltest", "affinity-update-text-with-index-2")]
+    [TestCase("affinity.sqltest", "affinity-upsert-text-2")]
+    [TestCase("affinity.sqltest", "affinity-mixed-columns-insert-2")]
+    [TestCase("affinity.sqltest", "affinity-mixed-columns-update-2")]
+    [TestCase("affinity.sqltest", "affinity-real-leading-plus-sign")]
+    [TestCase("affinity.sqltest", "affinity-real-mixed-signs")]
+    [TestCase("affinity.sqltest", "affinity-any-non-strict")]
+    [TestCase("affinity.sqltest", "affinity-compound-subquery-text-numeric-no-affinity")]
+    [TestCase("affinity.sqltest", "affinity-compound-subquery-order-independent")]
+    [TestCase("affinity.sqltest", "affinity-compound-subquery-all-numeric")]
+    [TestCase("affinity.sqltest", "affinity-compound-subquery-text-col-plus-numeric-literal")]
+    [TestCase("affinity.sqltest", "affinity-compound-subquery-three-arms-mixed")]
+    public void ManagedAffinityAndComparisonSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

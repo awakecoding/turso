@@ -431,17 +431,14 @@ public partial class SqliteConnection : DbConnection
         ArgumentNullException.ThrowIfNull(destination);
         if (Transaction is not null)
             throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
+        if (IsManagedProvider != destination.IsManagedProvider)
+            throw new NotSupportedException(Properties.Resources.ManagedBackupMixedProvidersNotSupported);
         if (destination.State != ConnectionState.Open)
             destination.Open();
-        if (IsManagedProvider || destination.IsManagedProvider)
+        if (IsManagedProvider)
         {
-            if (IsManagedProvider && destination.IsManagedProvider)
-            {
-                SqliteManagedBackup.Copy(this, destination, destinationName, sourceName);
-                return;
-            }
-
-            throw new NotSupportedException(Properties.Resources.ManagedBackupMixedProvidersNotSupported);
+            SqliteManagedBackup.Copy(this, destination, destinationName, sourceName);
+            return;
         }
 
         foreach (var createSql in GetSchemaSql())

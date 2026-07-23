@@ -158,7 +158,8 @@ public static class ArithmeticProgramBuilder
 
     /// <summary>
     /// Builds an arithmetic scan whose direct-column projections and arithmetic result occur
-    /// in the supplied output order. The projection list must contain exactly one arithmetic
+    /// in the supplied output order, optionally filtering each source row before any
+    /// projection expression runs. The projection list must contain exactly one arithmetic
     /// result and otherwise only source-column reads.
     /// </summary>
     public static CompoundTerm BuildOverScanWithProjectionOrder(
@@ -167,7 +168,8 @@ public static class ArithmeticProgramBuilder
         int columnCount,
         IReadOnlyList<int> operandColumns,
         IReadOnlyList<SqlValue[]> rows,
-        IReadOnlyList<ScanProjection> projections)
+        IReadOnlyList<ScanProjection> projections,
+        VdbeRowPredicate? predicate = null)
     {
         ArgumentNullException.ThrowIfNull(tableName);
         ArgumentNullException.ThrowIfNull(operandColumns);
@@ -213,9 +215,10 @@ public static class ArithmeticProgramBuilder
 
         var cursor = new Cursor(0);
         const int loopStart = 2;
+        var filterCount = predicate is null ? 0 : 1;
         var directColumnCount = projections.Count(projection => !projection.IsArithmeticResult);
         var bodyLength = directColumnCount + arity + 2; // column reads + arithmetic + result row
-        var nextAddr = loopStart + bodyLength;
+        var nextAddr = loopStart + filterCount + bodyLength;
         var closeAddr = nextAddr + 1;
 
         var instructions = new List<VdbeInstruction>(closeAddr + 2)
@@ -223,6 +226,15 @@ public static class ArithmeticProgramBuilder
             new OpenReadCursorInstruction(cursor, tableName, columnCount),
             new RewindCursorInstruction(cursor, new ProgramCounter(closeAddr)),
         };
+
+        if (predicate is not null)
+        {
+            instructions.Add(new FilterInstruction(
+                cursor,
+                predicate,
+                new ProgramCounter(nextAddr),
+                $"skip row when WHERE is false, goto {nextAddr}"));
+        }
 
         for (var index = 0; index < projections.Count; index++)
         {
