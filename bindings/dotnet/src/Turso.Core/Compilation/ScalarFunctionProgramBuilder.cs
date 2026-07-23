@@ -123,6 +123,7 @@ public static class ScalarFunctionProgramBuilder
     /// <param name="rows">The live rows the emitted cursor iterates.</param>
     /// <param name="passthroughColumns">Optional column ordinals emitted verbatim before the function
     /// result, e.g. a key column carried alongside a computed value.</param>
+    /// <param name="predicate">An optional per-row filter evaluated before the function arguments are read.</param>
     /// <returns>A <see cref="CompoundTerm"/> pairing the program with its single cursor's row source.</returns>
     /// <exception cref="ArgumentNullException">A required reference argument is null.</exception>
     /// <exception cref="ArgumentException"><paramref name="tableName"/> is empty, <paramref name="columnCount"/>
@@ -134,7 +135,8 @@ public static class ScalarFunctionProgramBuilder
         int columnCount,
         IReadOnlyList<int> argumentColumns,
         IReadOnlyList<SqlValue[]> rows,
-        IReadOnlyList<int>? passthroughColumns = null)
+        IReadOnlyList<int>? passthroughColumns = null,
+        VdbeRowPredicate? predicate = null)
     {
         ArgumentNullException.ThrowIfNull(function);
         ArgumentNullException.ThrowIfNull(tableName);
@@ -165,8 +167,9 @@ public static class ScalarFunctionProgramBuilder
 
         var cursor = new Cursor(0);
         const int loopStart = 2;
+        var filterCount = predicate is null ? 0 : 1;
         var bodyLength = passthroughCount + argumentCount + 2; // column reads + function + result row
-        var nextAddr = loopStart + bodyLength;
+        var nextAddr = loopStart + filterCount + bodyLength;
         var closeAddr = nextAddr + 1;
 
         var instructions = new List<VdbeInstruction>(closeAddr + 2)
@@ -174,6 +177,15 @@ public static class ScalarFunctionProgramBuilder
             new OpenReadCursorInstruction(cursor, tableName, columnCount),
             new RewindCursorInstruction(cursor, new ProgramCounter(closeAddr)),
         };
+
+        if (predicate is not null)
+        {
+            instructions.Add(new FilterInstruction(
+                cursor,
+                predicate,
+                new ProgramCounter(nextAddr),
+                $"skip row when WHERE is false, goto {nextAddr}"));
+        }
 
         for (var j = 0; j < passthroughCount; j++)
             instructions.Add(new ColumnInstruction(cursor, passthrough[j], new Register(j)));

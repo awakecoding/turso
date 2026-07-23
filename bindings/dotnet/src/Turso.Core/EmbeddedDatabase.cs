@@ -3590,7 +3590,7 @@ public sealed class EmbeddedDatabase : IDisposable
         // shapes that route leaves behind — a single builtin scalar call over parameter arguments
         // (source-less) or over base-table columns (a scan) — lowering them to the real Function opcode
         // while reusing the evaluator's own function dispatch so values, NULLs, and errors stay identical.
-        if (TryCompileScalarFunctionSelect(select, parameters, context, out compiled))
+        if (TryCompileScalarFunctionSelect(select, parameters, context, outerRow, out compiled))
             return true;
 
         // Pure-constant arithmetic (e.g. 1 + 2) folds in the constant route above; this route claims the
@@ -3732,12 +3732,13 @@ public sealed class EmbeddedDatabase : IDisposable
     // real Function opcode, in two safely-expressible shapes:
     //   * source-less: SELECT f(<literal|parameter>, ...)   -> ScalarFunctionProgramBuilder.BuildOverValues
     //   * single scan: SELECT <col>, ..., f(<col>, ...) FROM t -> ScalarFunctionProgramBuilder.BuildOverScan
-    // Every other shape (nested/complex arguments, WHERE on a scan, aggregates, DISTINCT/FILTER/OVER, a UDF
-    // shadowing the name, and every excluded function) declines so the tree-walking evaluator keeps it.
+    // Every other shape (nested/complex arguments, an unsupported scan predicate, aggregates, DISTINCT/FILTER/OVER,
+    // a UDF shadowing the name, and every excluded function) declines so the tree-walking evaluator keeps it.
     private bool TryCompileScalarFunctionSelect(
         SelectStatement select,
         SqlValue[] parameters,
         QueryContext context,
+        SourceRow? outerRow,
         out CompiledSelect compiled)
     {
         compiled = null!;
@@ -3757,7 +3758,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         return select.Source is null
             ? TryCompileScalarFunctionOverValues(select, parameters, context, out compiled)
-            : TryCompileScalarFunctionOverScan(select, parameters, context, out compiled);
+            : TryCompileScalarFunctionOverScan(select, parameters, context, outerRow, out compiled);
     }
 
     // Source-less shape: a single builtin scalar call whose arguments are all bare literals or parameters.
@@ -3805,13 +3806,10 @@ public sealed class EmbeddedDatabase : IDisposable
         SelectStatement select,
         SqlValue[] parameters,
         QueryContext context,
+        SourceRow? outerRow,
         out CompiledSelect compiled)
     {
         compiled = null!;
-
-        // BuildOverScan is an unconditional cursor loop; a WHERE predicate stays on the evaluator.
-        if (select.Where is not null)
-            return false;
 
         var target = ResolveScanTarget(select.Source, context);
         if (target is null || target.Columns.Length == 0)
@@ -3839,6 +3837,19 @@ public sealed class EmbeddedDatabase : IDisposable
             argumentColumns.Add(ordinal);
         }
 
+        VdbeRowPredicate? predicate = null;
+        if (select.Where is not null)
+        {
+            // The evaluator filters every input row before evaluating any projection. A streaming VDBE loop
+            // can preserve that error order only for a simple built-in-collation column comparison.
+            if (!IsStreamingSafeScalarScanPredicate(select.Where, target, context))
+                return false;
+
+            predicate = CompileRowPredicate(select.Where, target, parameters, context, outerRow);
+            if (predicate is null)
+                return false;
+        }
+
         var vdbeFunction = BuildBuiltinScalarFunction(function, parameters, context);
         var term = ScalarFunctionProgramBuilder.BuildOverScan(
             vdbeFunction,
@@ -3846,9 +3857,45 @@ public sealed class EmbeddedDatabase : IDisposable
             target.Columns.Length,
             argumentColumns,
             target.Rows,
-            passthrough);
+            passthrough,
+            predicate);
         compiled = new CompiledSelect(term.Program, term.CursorSources);
         return true;
+    }
+
+    private static bool IsStreamingSafeScalarScanPredicate(
+        Expression expression,
+        ScanTarget target,
+        QueryContext context)
+    {
+        if (expression is not BinaryExpression binary
+            || !IsComparisonOperator(binary.Operator)
+            || !context.Tables.TryGetValue(target.TableName, out var table))
+        {
+            return false;
+        }
+
+        return (IsStreamingSafeScalarScanColumn(binary.Left, target, table) && IsLiteralOrParameter(binary.Right))
+            || (IsStreamingSafeScalarScanColumn(binary.Right, target, table) && IsLiteralOrParameter(binary.Left));
+    }
+
+    private static bool IsStreamingSafeScalarScanColumn(
+        Expression expression,
+        ScanTarget target,
+        EmbeddedTable table)
+    {
+        return expression switch
+        {
+            ColumnExpression column when target.ResolveColumnIndex(column.Name) is { } ordinal
+                => IsStreamingSafeDistinctCollation(table.ColumnDefinitions[ordinal].Collation),
+            CollationExpression
+            {
+                Expression: ColumnExpression column,
+                Name: var collation,
+            } when target.ResolveColumnIndex(column.Name) is not null
+                => IsStreamingSafeDistinctCollation(collation),
+            _ => false,
+        };
     }
 
     // A bare column reference that resolves to a real ordinal of the scanned table. Anything else — a literal,
@@ -4207,7 +4254,7 @@ public sealed class EmbeddedDatabase : IDisposable
         if (select.Source is not null || select.Where is not null)
             return false;
 
-        return TryCompileScalarFunctionSelect(select, parameters, context, out compiled);
+        return TryCompileScalarFunctionSelect(select, parameters, context, outerRow: null, out compiled);
     }
 
     // Bounded joins are deliberately a smaller contract than TryCompileJoinSelect. A LIMIT/OFFSET gate is

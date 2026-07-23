@@ -475,6 +475,25 @@ public class ManagedSqltestConformanceTests
     public void ManagedAdditionalSqltestConformanceCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("hex-real-compare.sqltest", "compare-hex-real-le-delete-regression")]
+    [TestCase("subquery/cte_chain_regression.sqltest", "cte-chain-large-linear-regression")]
+    [TestCase("correlated-subquery-nested-exists.sqltest", "correlated-subquery-nested-exists-count-sum")]
+    [TestCase("groupby/duplicate-order-by.sqltest", "duplicate_order_by_with_group_by")]
+    [TestCase("groupby/duplicate-order-by.sqltest", "duplicate_order_by_desc_with_group_by")]
+    [TestCase("groupby/duplicate-order-by.sqltest", "triple_duplicate_order_by_with_group_by")]
+    [TestCase("joins/using_clause_case_insensitive.sqltest", "issue-7371-natural-join-quoted-hyphen")]
+    [TestCase("joins/using_clause_case_insensitive.sqltest", "issue-7371-natural-join-mixed-case")]
+    [TestCase("joins/using_clause_case_insensitive.sqltest", "issue-7371-using-quoted-mixed-case")]
+    [TestCase("joins/using_clause_case_insensitive.sqltest", "issue-7371-using-bare-different-case")]
+    [TestCase("using-dedup-outer-ref.sqltest", "correlated-subquery-using-dedup-outer-ref")]
+    [TestCase("using-dedup-outer-ref.sqltest", "qualified-ref-to-using-hidden-col-in-subquery")]
+    [TestCase("joins/left_join_null_index_bug.sqltest", "left-join-null-index-bug")]
+    [TestCase("joins/left_join_null_index_bug.sqltest", "left-join-null-index-bug-composite-key")]
+    [TestCase("pragma-unknown-no-op.sqltest", "unknown-pragma-recursive-triggers")]
+    [TestCase("pragma-unknown-no-op.sqltest", "known-pragma-still-works")]
+    public void ManagedNextUpstreamSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

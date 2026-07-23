@@ -150,6 +150,12 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                     $"The managed local provider does not support filtered indexes ('{createIndex.Name}' on '{createIndex.Table}').");
             }
 
+            if (operation is RenameIndexOperation renameIndex)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support renaming indexes ('{renameIndex.Name}' on '{renameIndex.Table}').");
+            }
+
             if (operation is CreateIndexOperation { IsDescending: { } sortOrders } descendingIndex
                 && (sortOrders.Length == 0 || sortOrders.Any(static descending => descending)))
             {

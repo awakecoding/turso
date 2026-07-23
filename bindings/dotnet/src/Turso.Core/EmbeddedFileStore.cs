@@ -1232,7 +1232,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// one record in direct middle children, or append one strict maximum record to
     /// direct right-most children, of multiple compatible one-level index roots when
     /// no parent separator changes, and it can insert one record into
-    /// the left-most direct child of exactly one compatible one-level index root.
+    /// the left-most direct children of multiple compatible one-level index roots.
     /// It can delete a singleton direct
     /// child when its parent retains at least two separators, transferring the
     /// removed child's adjacent separator into its surviving sibling before
@@ -3050,7 +3050,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         var route = parent.SearchChild(addedRecord);
         if (route.IsSeparatorKey
-            || route.ChildIndex <= 0
+            || route.ChildIndex < 0
             || route.ChildIndex >= childPages.Length
             || childPages[route.ChildIndex] != route.ChildPage)
         {

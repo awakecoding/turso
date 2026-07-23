@@ -360,18 +360,19 @@ public class ScalarFunctionSqlRoutingTests
     }
 
     [Test]
-    public void WhereOnScanFunctionFallsBackToEvaluator()
+    public void UnbackedRowIdWhereOnScanFunctionFallsBackToEvaluator()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(x INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (-3), (4), (-1);");
 
-        // BuildOverScan has no predicate, so a WHERE keeps the whole scan on the evaluator.
-        ReadRows(connection, "SELECT abs(x) FROM t WHERE x < 0;").Select(row => row[0])
-            .Should().Equal(SqlValue.Integer(3), SqlValue.Integer(1));
+        // The filtered Function route materializes declared columns only, so an unbacked rowid predicate
+        // remains evaluator-owned.
+        ReadRows(connection, "SELECT abs(x) FROM t WHERE rowid = 1;").Select(row => row[0])
+            .Should().Equal(SqlValue.Integer(3));
 
         Assert.Throws<EmbeddedSqlException>(
-                () => ReadRows(connection, "EXPLAIN SELECT abs(x) FROM t WHERE x < 0;"))!
+                () => ReadRows(connection, "EXPLAIN SELECT abs(x) FROM t WHERE rowid = 1;"))!
             .Message.Should().Contain("EXPLAIN is only supported");
     }
 
