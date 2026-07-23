@@ -53,6 +53,43 @@ jobs:
           done
           PATH="$deny_directory:$PATH" CARGO="$deny_directory/cargo" RUSTC="$deny_directory/rustc" make test-managed
 
+  managed-nativeaot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Verify NativeAOT prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang --version
+          test -f /usr/include/zlib.h
+
+      - name: Validate managed NativeAOT closure without Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          deny_directory="$PWD/.managed-toolchain-deny"
+          mkdir -p "$deny_directory"
+          trap 'rm -rf "$deny_directory"' EXIT
+          for tool in cargo rustc; do
+            printf '#!/usr/bin/env bash\necho "managed NativeAOT validation must not invoke %s" >&2\nexit 97\n' "$tool" > "$deny_directory/$tool"
+            chmod +x "$deny_directory/$tool"
+          done
+          PATH="$deny_directory:$PATH" CARGO="$deny_directory/cargo" RUSTC="$deny_directory/rustc" make validate-managed-nativeaot
+
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30

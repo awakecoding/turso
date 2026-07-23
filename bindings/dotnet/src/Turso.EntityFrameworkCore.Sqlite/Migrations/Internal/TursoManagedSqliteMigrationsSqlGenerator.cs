@@ -96,6 +96,12 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                     ValidateDefaultValueSql(column);
                     ValidateComputedColumn(column);
                 }
+
+                foreach (var foreignKey in createTableWithDefaultSql.ForeignKeys)
+                {
+                    ValidateForeignKeyShape(foreignKey);
+                    ValidateReferentialActions(foreignKey);
+                }
             }
 
             if (operation is AddColumnOperation or AlterColumnOperation)

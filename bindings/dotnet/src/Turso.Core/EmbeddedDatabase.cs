@@ -3586,6 +3586,13 @@ public sealed class EmbeddedDatabase : IDisposable
         if (TryCompileScanOrConstant(select, parameters, context, outerRow, out compiled))
             return true;
 
+        // A source-less list of bare literals and parameters has no evaluation semantics beyond preserving
+        // projection order, so it can stream directly through LoadConstant/ResultRow. Computed
+        // expressions deliberately stay with the evaluator: its left-to-right evaluation order owns their
+        // error timing.
+        if (TryCompileBareValueProjectionSelect(select, parameters, out compiled))
+            return true;
+
         // Pure-constant scalar calls (e.g. abs(5)) fold in the constant route above; this route claims the
         // shapes that route leaves behind — a single builtin scalar call over parameter arguments
         // (source-less) or over base-table columns (a scan) — lowering them to the real Function opcode
@@ -3636,6 +3643,50 @@ public sealed class EmbeddedDatabase : IDisposable
             outerRow,
             allowPostJoinWhere: false,
             compiled: out compiled);
+    }
+
+    // Lowers only SELECT <literal-or-parameter>, ... with no source or clauses. Parameters are resolved in
+    // projection order and baked as constants, so repeated ?NNN/named placeholders retain their parser-assigned
+    // identity and a missing binding fails at the same first projection the evaluator would evaluate. WHERE,
+    // ordering, DISTINCT, and every computed expression remain evaluator-owned because this one-row values
+    // program cannot reproduce their evaluation or error order.
+    private static bool TryCompileBareValueProjectionSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+        if (select.Source is not null
+            || select.Where is not null
+            || select.Having is not null
+            || select.Distinct
+            || select.GroupBy.Count != 0
+            || select.OrderBy.Count != 0
+            || select.Limit is not null
+            || select.Offset is not null
+            || select.Projections.Count == 0)
+        {
+            return false;
+        }
+
+        var values = new SqlValue[select.Projections.Count];
+        for (var index = 0; index < select.Projections.Count; index++)
+        {
+            switch (select.Projections[index].Expression)
+            {
+                case LiteralExpression literal:
+                    values[index] = literal.Value;
+                    break;
+                case ParameterExpression parameter:
+                    values[index] = ReadParameter(parameters, parameter.Index);
+                    break;
+                default:
+                    return false;
+            }
+        }
+
+        compiled = new CompiledSelect(ValuesProgramBuilder.Build([values]), []);
+        return true;
     }
 
     // The direct-scan / source-less constant-projection subset, delegated to the shared
@@ -6748,7 +6799,8 @@ public sealed class EmbeddedDatabase : IDisposable
         switch (statement.Inner)
         {
             case SelectStatement select
-                when TryCompileSelect(select, parameters, context, outerRow: null, out var compiledSelect):
+                when !IsBareParameterProjection(select)
+                     && TryCompileSelect(select, parameters, context, outerRow: null, out var compiledSelect):
                 return DescribeProgram(compiledSelect.Program);
             case CompoundSelectStatement compound
                 when TryCompileCompoundSelect(compound, parameters, context, outerRow: null, out var compiledCompound):
@@ -6774,6 +6826,16 @@ public sealed class EmbeddedDatabase : IDisposable
         throw new EmbeddedSqlException(
             "EXPLAIN is only supported for statements lowered to the bytecode compiler.");
     }
+
+    // EXPLAIN retains its established parameterized bare-projection boundary. Runtime compilation bakes bound
+    // parameter values per execution, but exposing those transient values as a plan would make EXPLAIN behavior
+    // depend on statement bindings rather than SQL shape.
+    private static bool IsBareParameterProjection(SelectStatement select)
+        => select.Source is null
+            && select.Projections.Count > 0
+            && select.Projections.All(projection =>
+                projection.Expression is LiteralExpression or ParameterExpression)
+            && select.Projections.Any(projection => projection.Expression is ParameterExpression);
 
     internal static string[] ExplainColumns() => ["addr", "opcode", "p1", "p2", "p3", "p4", "comment"];
 

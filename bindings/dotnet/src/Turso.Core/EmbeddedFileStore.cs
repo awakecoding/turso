@@ -1348,6 +1348,14 @@ internal sealed class EmbeddedFileStore : IDisposable
                           schemaPage,
                           existingPage,
                           currentHeader)
+                       || TryPersistBoundedTableInteriorRootDirectLeafInsertion(
+                          tableName,
+                          table,
+                          persisted.Tables[tableName],
+                          rootPage,
+                          schemaPage,
+                          existingPage,
+                          currentHeader)
                        || TryPersistBoundedTableInteriorRootSingleLeafMutation(
                           tableName,
                           table,
@@ -4664,6 +4672,129 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
+    private bool TryPersistBoundedTableInteriorRootDirectLeafInsertion(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedTable persistedTable,
+        uint rootPage,
+        ReadOnlySpan<byte> schemaPage,
+        ReadOnlySpan<byte> existingRootPage,
+        SqliteDatabaseHeader currentHeader)
+    {
+        if (!TryGetBoundedSingleInsertionCell(
+                tableName,
+                table,
+                persistedTable,
+                out var persistedCells,
+                out var insertedCell))
+        {
+            return false;
+        }
+
+        var parent = SqliteTableInteriorPageView.Parse(existingRootPage, _usableSpace);
+        var sourcePageCount = currentHeader.DatabaseSizeInPages;
+        var childPages = parent.Cells
+            .Select(cell => cell.Cell.LeftChildPage)
+            .Append(parent.Header.RightMostChildPage)
+            .ToArray();
+        if (childPages.Length == 0)
+            return false;
+
+        var ownedPages = new HashSet<uint> { rootPage };
+        var persistedCellIndex = 0;
+        long? previousMaximumRowId = null;
+        SqliteTableLeafPageView? sourceLeaf = null;
+        byte[]? sourceLeafPage = null;
+        uint targetLeafPage = 0;
+
+        for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
+        {
+            var childPage = childPages[childIndex];
+            if (childPage < 2
+                || childPage > sourcePageCount
+                || !ownedPages.Add(childPage))
+            {
+                return false;
+            }
+
+            var childImage = _pager.ReadCommittedPage(childPage);
+            if (SqliteBtreePageHeader.Parse(childImage).PageType != SqliteBtreePageType.TableLeaf)
+                return false;
+
+            var childLeaf = SqliteTableLeafPageView.Parse(childImage, _usableSpace);
+            if (childLeaf.Cells.Count == 0
+                || childLeaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
+                || (previousMaximumRowId is { } previousMaximum
+                    && childLeaf.Cells[0].Cell.RowId <= previousMaximum))
+            {
+                return false;
+            }
+
+            var childMaximumRowId = childLeaf.Cells[^1].Cell.RowId;
+            if (childIndex < parent.Cells.Count
+                && parent.Cells[childIndex].Cell.RowId != childMaximumRowId)
+            {
+                return false;
+            }
+
+            foreach (var cell in childLeaf.Cells)
+            {
+                if (persistedCellIndex >= persistedCells.Count
+                    || cell.Cell.RowId != persistedCells[persistedCellIndex].RowId
+                    || !cell.Cell.LocalPayload.Span.SequenceEqual(
+                        persistedCells[persistedCellIndex].Record))
+                {
+                    return false;
+                }
+
+                persistedCellIndex++;
+            }
+
+            if ((previousMaximumRowId is null || insertedCell.RowId > previousMaximumRowId)
+                && (childIndex == childPages.Length - 1 || insertedCell.RowId <= childMaximumRowId))
+            {
+                if (sourceLeaf is not null)
+                    return false;
+
+                sourceLeaf = childLeaf;
+                sourceLeafPage = childImage;
+                targetLeafPage = childPage;
+            }
+
+            previousMaximumRowId = childMaximumRowId;
+        }
+
+        if (persistedCellIndex != persistedCells.Count
+            || sourceLeaf is null
+            || sourceLeafPage is null
+            || targetLeafPage == 0)
+        {
+            return false;
+        }
+
+        var insertion = sourceLeaf.Search(insertedCell.RowId);
+        if (insertion.IsExact)
+            return false;
+
+        var replacementCells = sourceLeaf.Cells.Select(cell => cell.Cell).ToList();
+        replacementCells.Insert(insertion.Index, insertedCell);
+        if (!TryBuildBoundedTableLeafPage(
+                replacementCells,
+                0,
+                replacementCells.Count,
+                out var replacementLeafPage))
+        {
+            return false;
+        }
+
+        return CommitBoundedTableInteriorRootLeafMutation(
+            targetLeafPage,
+            sourceLeafPage,
+            replacementLeafPage,
+            schemaPage,
+            currentHeader);
+    }
+
     private bool TryPersistBoundedTableInteriorRootSingleLeafMutation(
         string tableName,
         EmbeddedTable table,
@@ -5247,6 +5378,74 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         return persistedIndex == persistedCells.Count && change is not null;
+    }
+
+    private bool TryGetBoundedSingleInsertionCell(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedTable persistedTable,
+        out IReadOnlyList<(long RowId, byte[] Record)> persistedCells,
+        out SqliteTableLeafCell insertedCell)
+    {
+        persistedCells = EnumerateRowCells(tableName, persistedTable).ToArray();
+        insertedCell = null!;
+        var targetCells = EnumerateRowCells(tableName, table).ToArray();
+        if (targetCells.Length != persistedCells.Count + 1)
+            return false;
+
+        var persistedIndex = 0;
+        (long RowId, byte[] Record)? insertion = null;
+        for (var targetIndex = 0; targetIndex < targetCells.Length; targetIndex++)
+        {
+            if (persistedIndex < persistedCells.Count
+                && targetCells[targetIndex].RowId == persistedCells[persistedIndex].RowId)
+            {
+                if (!targetCells[targetIndex].Record.AsSpan().SequenceEqual(
+                        persistedCells[persistedIndex].Record))
+                {
+                    return false;
+                }
+
+                persistedIndex++;
+                continue;
+            }
+
+            if (insertion is not null
+                || (persistedIndex < persistedCells.Count
+                    && targetCells[targetIndex].RowId > persistedCells[persistedIndex].RowId))
+            {
+                return false;
+            }
+
+            insertion = targetCells[targetIndex];
+        }
+
+        if (persistedIndex != persistedCells.Count || insertion is null)
+            return false;
+
+        var layout = SqlitePayloadLayout.Calculate(
+            SqliteBtreePageType.TableLeaf,
+            checked((ulong)insertion.Value.Record.Length),
+            _usableSpace);
+        if (layout.UsesOverflow)
+            return false;
+
+        try
+        {
+            insertedCell = SqliteTableLeafCell.Create(
+                insertion.Value.RowId,
+                insertion.Value.Record,
+                _usableSpace);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
     }
 
     private bool TryGetBoundedStrictAppendCell(

@@ -27,6 +27,29 @@ MANAGED_PACKAGE_OUTPUT ?= ./artifacts/managed-packages
 MANAGED_PACKAGE_CONSUMER_OUTPUT ?= ./artifacts/managed-package-consumer
 MANAGED_PACKAGE_OUTPUT_ARG = $(if $(MANAGED_PACKAGE_OUTPUT),--output "$(MANAGED_PACKAGE_OUTPUT)")
 MANAGED_PACKAGE_VERSION_ARG = $(if $(MANAGED_PACKAGE_VERSION),-p:PackageVersion=$(MANAGED_PACKAGE_VERSION))
+MANAGED_NATIVEAOT_OUTPUT ?= ./artifacts/managed-nativeaot-smoke
+
+ifeq ($(OS),Windows_NT)
+	MANAGED_NATIVEAOT_RID ?= win-x64
+else
+	MANAGED_NATIVEAOT_UNAME_M := $(shell uname -m)
+	ifeq ($(UNAME_S),Linux)
+		ifeq ($(filter aarch64 arm64,$(MANAGED_NATIVEAOT_UNAME_M)),)
+			MANAGED_NATIVEAOT_RID ?= linux-x64
+		else
+			MANAGED_NATIVEAOT_RID ?= linux-arm64
+		endif
+	endif
+	ifeq ($(UNAME_S),Darwin)
+		ifneq ($(filter x86_64 amd64,$(MANAGED_NATIVEAOT_UNAME_M)),)
+			MANAGED_NATIVEAOT_RID ?= osx-x64
+		else
+			MANAGED_NATIVEAOT_RID ?= osx-arm64
+		endif
+	endif
+endif
+
+MANAGED_NATIVEAOT_EXECUTABLE ?= $(MANAGED_NATIVEAOT_OUTPUT)/ManagedNativeAotSmoke$(if $(filter win-%,$(MANAGED_NATIVEAOT_RID)),.exe)
 
 all:
 	echo "make [restore|build|test|pack|validate-managed-package|validate-managed-nativeaot|build-native|test-native|pack-native|pack-nativeaot-static|pack-release|benchmark]"
@@ -157,11 +180,23 @@ validate-managed-package:
 	fi
 
 validate-managed-nativeaot:
-	rm -rf ./samples/ManagedNativeAot/bin ./samples/ManagedNativeAot/obj ./artifacts/managed-nativeaot-smoke
-	dotnet publish -c Release -r win-x64 --self-contained true -o ./artifacts/managed-nativeaot-smoke ./samples/ManagedNativeAot/ManagedNativeAotSmoke.csproj
-	./artifacts/managed-nativeaot-smoke/ManagedNativeAotSmoke.exe
-	@if find "./artifacts/managed-nativeaot-smoke" -type f \( -iname 'Turso.Raw.dll' -o -iname 'Turso.Data.Native.dll' -o -iname 'Turso.Data.Sqlite.Native.dll' -o -iname 'Turso.Data.Sqlite.NativeAot.*.dll' -o -iname 'turso_sdk_kit.dll' -o -iname 'libturso_sdk_kit.so' -o -iname 'libturso_sdk_kit.dylib' -o -iname 'libturso_sdk_kit.a' \) -print -quit | grep -q .; then \
-		echo "Managed NativeAOT publish output must not contain native companion assets"; \
+	rm -rf ./samples/ManagedNativeAot/bin ./samples/ManagedNativeAot/obj "$(MANAGED_NATIVEAOT_OUTPUT)"
+	dotnet publish -c Release -r "$(MANAGED_NATIVEAOT_RID)" --self-contained true -o "$(MANAGED_NATIVEAOT_OUTPUT)" ./samples/ManagedNativeAot/ManagedNativeAotSmoke.csproj
+	"$(MANAGED_NATIVEAOT_EXECUTABLE)"
+	@if grep -R -E -i --include='*.cs' '(DllImport|LibraryImport|NativeLibrary|P/Invoke)' ./src/Turso.Core ./samples/ManagedNativeAot; then \
+		echo "Managed NativeAOT source closure must not introduce P/Invoke"; \
+		exit 1; \
+	fi
+	@if grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(cargo|rustc|cargo-ndk|turso_sdk_kit)' ./src/Turso.Core ./samples/ManagedNativeAot; then \
+		echo "Managed NativeAOT build closure must not introduce Rust or native runtime dependencies"; \
+		exit 1; \
+	fi
+	@if grep -E -i '"Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)/' ./samples/ManagedNativeAot/obj/project.assets.json; then \
+		echo "Managed NativeAOT restore closure must not include a native Turso package"; \
+		exit 1; \
+	fi
+	@if find "$(MANAGED_NATIVEAOT_OUTPUT)" -type f ! -name 'ManagedNativeAotSmoke' ! -name 'ManagedNativeAotSmoke.exe' ! -name '*.pdb' ! -name '*.dbg' ! -name '*.xml' -print -quit | grep -q .; then \
+		echo "Managed NativeAOT publish output must contain only the executable, symbols, and documentation"; \
 		exit 1; \
 	fi
 
