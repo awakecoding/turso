@@ -29,6 +29,18 @@ public static class TursoReplicaProvider
 
     internal static TursoReplicaDatabase OpenReplica(TursoReplicaOptions options)
     {
+        return GetFactory().OpenReplica(options);
+    }
+
+    internal static Task<TursoReplicaDatabase> OpenReplicaAsync(
+        TursoReplicaOptions options,
+        CancellationToken cancellationToken)
+    {
+        return GetFactory().OpenReplicaAsync(options, cancellationToken);
+    }
+
+    private static TursoReplicaProviderFactory GetFactory()
+    {
         var factory = Volatile.Read(ref s_factory);
         if (factory is null)
         {
@@ -36,7 +48,7 @@ public static class TursoReplicaProvider
             factory = Volatile.Read(ref s_factory);
         }
 
-        return factory?.OpenReplica(options)
+        return factory
             ?? throw new NotSupportedException(
                 "Embedded replica connections are not supported yet by the .NET provider. " +
                 "Add the matching Turso.Data.Sqlite.Sync companion package to enable them.");
@@ -70,7 +82,22 @@ public sealed class TursoReplicaOptions
     /// <summary>
     /// Initializes embedded-replica connection options.
     /// </summary>
-    public TursoReplicaOptions(string path, Uri remoteUri, string? authToken)
+    public TursoReplicaOptions(
+        string path,
+        Uri remoteUri,
+        string? authToken)
+        : this(path, remoteUri, authToken, bootstrapIfEmpty: true)
+    {
+    }
+
+    /// <summary>
+    /// Initializes embedded-replica connection options.
+    /// </summary>
+    public TursoReplicaOptions(
+        string path,
+        Uri remoteUri,
+        string? authToken,
+        bool bootstrapIfEmpty = true)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         ArgumentNullException.ThrowIfNull(remoteUri);
@@ -78,6 +105,7 @@ public sealed class TursoReplicaOptions
         Path = path;
         RemoteUri = remoteUri;
         AuthToken = authToken;
+        BootstrapIfEmpty = bootstrapIfEmpty;
     }
 
     /// <summary>
@@ -94,6 +122,11 @@ public sealed class TursoReplicaOptions
     /// Gets the bearer token sent to the remote database, if configured.
     /// </summary>
     public string? AuthToken { get; }
+
+    /// <summary>
+    /// Gets whether a missing local replica is bootstrapped from the remote database.
+    /// </summary>
+    public bool BootstrapIfEmpty { get; }
 }
 
 /// <summary>
@@ -105,6 +138,17 @@ public abstract class TursoReplicaProviderFactory
     /// Opens an embedded replica and its local native SQL connection.
     /// </summary>
     public abstract TursoReplicaDatabase OpenReplica(TursoReplicaOptions options);
+
+    /// <summary>
+    /// Asynchronously opens an embedded replica and its local native SQL connection.
+    /// </summary>
+    public virtual Task<TursoReplicaDatabase> OpenReplicaAsync(
+        TursoReplicaOptions options,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(OpenReplica(options));
+    }
 }
 
 /// <summary>

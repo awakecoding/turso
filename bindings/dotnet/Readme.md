@@ -27,6 +27,22 @@ Applications that intentionally select `Local Provider=Native` can reference the
 
 `Turso.Data.Sqlite.Native` activates the native provider and resolves its `Turso.Raw` runtime companion for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices. These are optional companion packages with their own native-asset validation; they are not restored or packed by the managed release path. Remote Turso/libSQL connections use the managed HTTP client and do not require either native package.
 
+## Embedded replicas
+
+Embedded replicas require the matching-version `Turso.Data.Sqlite.Sync` companion package:
+
+```xml
+<ItemGroup>
+  <PackageReference Include="Turso.Data.Sqlite" Version="0.7.0-pre.18" />
+  <PackageReference Include="Turso.Data.Sqlite.Sync" Version="0.7.0-pre.18" />
+</ItemGroup>
+```
+
+Specify a remote `Data Source` and a local `Replica Path`. The companion bootstraps
+the replica on first open, and `Sync()` or `SyncAsync(CancellationToken)` explicitly
+pushes local changes then pulls and applies remote changes. Automatic `Sync Interval`
+is intentionally unsupported.
+
 ## NativeAOT static linking
 
 NativeAOT apps can opt into statically linking the Turso native library so publish output does not include a sidecar `turso_sdk_kit` DLL, `.so`, or `.dylib`. Reference the RID-specific static package alongside `Turso.Data.Sqlite`:
@@ -144,8 +160,6 @@ batch.BatchCommands.Add(select);
 await using var reader = await batch.ExecuteReaderAsync();
 ```
 
-Embedded replicas are not enabled yet in the .NET provider. `Replica Path` and `Sync Interval` are parsed so applications fail early with clear errors, and `TursoConnection.Sync()` / `SyncAsync(CancellationToken)` are reserved for that mode once `turso_sync_sdk_kit` is packaged and wired through .NET.
-
 Provider factories are available through `TursoFactory.Instance`:
 
 ```C#
@@ -183,9 +197,9 @@ Supported common connection string keywords include:
 | `Encryption Cipher` | Turso local encryption cipher. |
 | `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
 | `Auth Token` | Bearer token for remote Turso/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
-| `Replica Path` | Reserved for embedded replicas. The .NET provider currently fails early with a clear unsupported error. |
+| `Replica Path` | Local path for an embedded replica. Requires the `Turso.Data.Sqlite.Sync` companion package and a remote Turso URL. |
 | `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |
-| `Sync Interval` | Reserved for embedded replicas. Automatic sync is not enabled yet. |
+| `Sync Interval` | Automatic replica synchronization is not supported. Call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly. |
 | `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
 
 ## SQLite-compatible facade coverage
@@ -193,8 +207,9 @@ Supported common connection string keywords include:
 - `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, SQL-backed blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
 - `PRAGMA read_uncommitted` is tracked as connection-local state for API compatibility, but Turso does not currently implement SQLite shared-cache dirty reads.
-- `SqliteBlob` preserves fixed-length blob stream behavior through SQL reads and writes. It is not yet backed by a native incremental-blob storage handle.
+- `SqliteBlob` preserves fixed-length blob stream behavior through the managed incremental-blob storage adapter. It is not backed by a native SQLitePCL blob handle.
 - SQLite virtual-table modules such as FTS3/FTS5 are not built in unless provided by a Turso extension/module.
+- The managed engine does not implement experimental MVCC or vector-search functions. `PRAGMA journal_mode = mvcc` and functions such as `vector32()` fail rather than enabling partial behavior.
 - Async methods currently use the base ADO.NET behavior rather than a dedicated async native path.
 
 ## Entity Framework Core

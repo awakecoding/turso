@@ -11,6 +11,7 @@ on:
       - "Cargo.lock"
       - "core/**"
       - "sdk-kit/**"
+      - "sync/**"
   # Manual trigger with dry-run / publish controls
   workflow_dispatch:
     inputs:
@@ -237,7 +238,7 @@ jobs:
             $library.LastWriteTimeUtc = $now
           }
 
-      # Code-sign the Windows native DLL with Azure Artifact Signing (formerly
+      # Code-sign the Windows native DLLs with Azure Artifact Signing (formerly
       # Trusted Signing). Runs only for the windows-msvc targets, only when
       # the AZURE_SIGNING_ENABLED repo variable is set to "true", and only on
       # main pushes or manual dispatch: the Entra federated credential matches
@@ -253,14 +254,16 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Code sign Windows native library
+      - name: Code sign Windows native libraries
         if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
         uses: azure/trusted-signing-action@v0
         with:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
-          files: ${{ github.workspace }}/bindings/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sdk_kit.dll
+          files: |
+            ${{ github.workspace }}/bindings/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sdk_kit.dll
+            ${{ github.workspace }}/bindings/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sync_sdk_kit.dll
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -276,6 +279,9 @@ jobs:
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.so
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.dylib
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.a
+            ${{ env.working-directory }}/rs_compiled/**/turso_sync_sdk_kit.dll
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sync_sdk_kit.so
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sync_sdk_kit.dylib
 
           retention-days: 1
 
@@ -301,13 +307,17 @@ jobs:
           merge-multiple: true
 
       - name: Package iOS XCFramework
-        run: make package-rust-iosframework RUST_PROFILE_DIR=release-official
+        run: |
+          make package-rust-iosframework RUST_PROFILE_DIR=release-official
+          make package-rust-ios-syncframework RUST_PROFILE_DIR=release-official
 
       - name: Upload iOS XCFramework
         uses: actions/upload-artifact@v6
         with:
           name: native-ios-universal
-          path: ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.xcframework/**
+          path: |
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.xcframework/**
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sync_sdk_kit.xcframework/**
           retention-days: 1
 
   # This validates the managed-only package without restoring Rust or downloading native artifacts.
@@ -506,6 +516,37 @@ jobs:
             exit 1
           fi
 
+          sync_package=$(find src/Turso.Data.Sync/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.Sync.*.nupkg' | head -n 1)
+          if [ -z "$sync_package" ]; then
+            echo "No Turso.Data.Sqlite.Sync NuGet package found"
+            exit 1
+          fi
+          unzip -Z1 "$sync_package" > sync-package-files.txt
+          sync_required_files=(
+            "lib/net8.0/Turso.Data.Sync.dll"
+            "lib/net9.0/Turso.Data.Sync.dll"
+            "lib/net10.0/Turso.Data.Sync.dll"
+            "runtimes/win-x64/native/turso_sync_sdk_kit.dll"
+            "runtimes/win-arm64/native/turso_sync_sdk_kit.dll"
+            "runtimes/linux-x64/native/libturso_sync_sdk_kit.so"
+            "runtimes/linux-arm64/native/libturso_sync_sdk_kit.so"
+            "runtimes/osx-x64/native/libturso_sync_sdk_kit.dylib"
+            "runtimes/osx-arm64/native/libturso_sync_sdk_kit.dylib"
+            "runtimes/android-arm64/native/libturso_sync_sdk_kit.so"
+            "runtimes/android-arm/native/libturso_sync_sdk_kit.so"
+            "runtimes/android-x64/native/libturso_sync_sdk_kit.so"
+            "runtimes/android-x86/native/libturso_sync_sdk_kit.so"
+            "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/Info.plist"
+            "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64/libturso_sync_sdk_kit.framework/libturso_sync_sdk_kit"
+            "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64-simulator/libturso_sync_sdk_kit.framework/libturso_sync_sdk_kit"
+          )
+          for required_file in "${sync_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" sync-package-files.txt; then
+              echo "Missing $required_file in $sync_package"
+              exit 1
+            fi
+          done
+
           raw_package=$(find src/Turso.Raw/bin/Release -maxdepth 1 -name 'Turso.Raw.*.nupkg' | head -n 1)
           if [ -z "$raw_package" ]; then
             echo "No Turso.Raw NuGet package found"
@@ -615,6 +656,7 @@ jobs:
           mkdir -p artifacts/native-nuget-packages
           files=(
             src/Turso.Data.Native/bin/Release/Turso.Data.Sqlite.Native.*.nupkg
+            src/Turso.Data.Sync/bin/Release/Turso.Data.Sqlite.Sync.*.nupkg
             src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg
             src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
           )

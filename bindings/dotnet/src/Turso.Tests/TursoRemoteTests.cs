@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using AwesomeAssertions;
+using Turso.Data.Sync;
 using Turso.Raw.Public;
 
 namespace Turso.Tests;
@@ -27,14 +28,146 @@ public class TursoRemoteTests
     }
 
     [Test]
-    public void TestRemoteReplicaFailsBeforeNetworkAccess()
+    public void TestReplicaOptionsPreserveOriginalConstructor()
+    {
+        var options = new TursoReplicaOptions(
+            ":memory:",
+            new Uri("https://example.turso.io"),
+            authToken: null);
+
+        options.BootstrapIfEmpty.Should().BeTrue();
+    }
+
+    [Test]
+    public void TestRemoteReplicaRejectsAutomaticSyncBeforeNetworkAccess()
     {
         using var connection = new TursoConnection(
-            "Data Source=libsql://example.turso.io;Auth Token=secret;Replica Path=replica.db");
+            "Data Source=libsql://example.turso.io;Auth Token=secret;Replica Path=replica.db;Sync Interval=1");
 
         connection.Invoking(x => x.Open())
             .Should().Throw<NotSupportedException>()
-            .WithMessage("Embedded replica connections are not supported yet by the .NET provider.*");
+            .WithMessage("Sync Interval is not supported yet for embedded replica connections. Call Sync or SyncAsync explicitly.");
+    }
+
+    [Test]
+    public void TestRemoteReplicaDrivesBootstrapIoAndSurfacesTransportFailure()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+
+        var replicaPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.db");
+        try
+        {
+            using var connection = new TursoConnection(
+                $"Data Source=http://127.0.0.1:{port};Replica Path={replicaPath}");
+
+            connection.Invoking(x => x.Open())
+                .Should().Throw<TursoException>();
+            connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        }
+
+        finally
+        {
+            foreach (var file in Directory.EnumerateFiles(
+                         Path.GetDirectoryName(replicaPath)!,
+                         Path.GetFileName(replicaPath) + "*"))
+            {
+                File.Delete(file);
+            }
+        }
+    }
+
+    [Test]
+    public void TestReplicaCompanionConnectsDeferredBootstrapDatabase()
+    {
+        using var replica = SyncReplicaDatabase.Open(
+            new TursoReplicaOptions(
+                ":memory:",
+                new Uri("http://127.0.0.1:1"),
+                authToken: null,
+                bootstrapIfEmpty: false));
+        using var statement = replica.PrepareStatement("SELECT 42");
+
+        statement.Read().Should().BeTrue();
+        statement.GetValue(0).IntValue.Should().Be(42);
+        statement.Read().Should().BeFalse();
+    }
+
+    [Test]
+    public async Task TestReplicaCompanionCancelsPendingSyncIo()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var serverCancellation = new CancellationTokenSource();
+        var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var server = HoldFirstRequestAsync(listener, requestStarted, serverCancellation.Token);
+
+        try
+        {
+            using var replica = SyncReplicaDatabase.Open(
+                new TursoReplicaOptions(
+                    ":memory:",
+                    new Uri($"http://127.0.0.1:{port}"),
+                    authToken: null,
+                    bootstrapIfEmpty: false));
+            using var cancellation = new CancellationTokenSource();
+            var sync = replica.SyncAsync(cancellation.Token);
+
+            await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await cancellation.CancelAsync();
+
+            var synchronize = async () => await sync;
+            await synchronize.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            await serverCancellation.CancelAsync();
+            listener.Stop();
+            await server;
+        }
+    }
+
+    [Test]
+    public async Task TestRemoteReplicaOpenAsyncCancelsPendingBootstrapIo()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var serverCancellation = new CancellationTokenSource();
+        var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var server = HoldFirstRequestAsync(listener, requestStarted, serverCancellation.Token);
+        var replicaPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.db");
+
+        try
+        {
+            using var connection = new TursoConnection(
+                $"Data Source=http://127.0.0.1:{port};Replica Path={replicaPath}");
+            using var cancellation = new CancellationTokenSource();
+            var open = connection.OpenAsync(cancellation.Token);
+
+            await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await cancellation.CancelAsync();
+
+            var openReplica = async () => await open;
+            await openReplica.Should().ThrowAsync<OperationCanceledException>();
+            connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        }
+        finally
+        {
+            await serverCancellation.CancelAsync();
+            listener.Stop();
+            await server;
+
+            foreach (var file in Directory.EnumerateFiles(
+                         Path.GetDirectoryName(replicaPath)!,
+                         Path.GetFileName(replicaPath) + "*"))
+            {
+                File.Delete(file);
+            }
+        }
     }
 
     [Test]
@@ -45,6 +178,29 @@ public class TursoRemoteTests
         connection.Invoking(x => x.Open())
             .Should().Throw<InvalidOperationException>()
             .WithMessage("Tls=True conflicts with the http URL scheme.");
+    }
+
+    private static async Task HoldFirstRequestAsync(
+        TcpListener listener,
+        TaskCompletionSource requestStarted,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var client = await listener.AcceptTcpClientAsync(cancellationToken);
+            await using var stream = client.GetStream();
+            var buffer = new byte[1];
+            if (await stream.ReadAsync(buffer, cancellationToken) > 0)
+                requestStarted.TrySetResult();
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (SocketException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
     [Test]

@@ -58,61 +58,21 @@ public class TursoConnection : DbConnection
 
     public override void Open()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null)
-            throw new InvalidOperationException("The connection is already open.");
-        if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
-        {
-            if (!_connectionOptions.IsRemote && _connectionOptions.LocalProvider == TursoLocalProvider.Managed)
-            {
-                throw new NotSupportedException(
-                    "Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.");
-            }
-
-            throw new NotSupportedException(
-                "Password is not supported. Use Encryption Cipher and Encryption Key for local encrypted databases.");
-        }
-
-        if (_connectionOptions.IsRemote)
-        {
-            OpenRemote();
-            return;
-        }
-
-        ValidateLocalOnlyOptions();
-
-        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
-        {
-            using var managedOptions = _connectionOptions.GetManagedLocalOpenOptions();
-            OpenManagedDatabase(managedOptions);
-
-            return;
-        }
-
-        var filename = _connectionOptions["Data Source"] ?? ":memory:";
-        var cipher = _connectionOptions.GetEncryptionCipher();
-        var hexkey = _connectionOptions["Encryption Key"];
-
-        if (cipher.HasValue)
-        {
-            if (string.IsNullOrWhiteSpace(hexkey))
-                throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
-
-            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher, hexkey);
-        }
-        else
-        {
-            if (!string.IsNullOrWhiteSpace(hexkey))
-                throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
-
-            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher: null, encryptionKey: null);
-        }
+        ValidateCanOpen();
+        OpenCore();
     }
 
     public override Task OpenAsync(CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
+
+        if (_connectionOptions.IsRemote && _connectionOptions.IsReplica)
+        {
+            ValidateCanOpen();
+            ValidateReplicaLocalProvider();
+            return OpenRemoteReplicaAsync(GetReplicaOptions(), cancellationToken);
+        }
 
         Open();
         return Task.CompletedTask;
@@ -387,31 +347,11 @@ public class TursoConnection : DbConnection
 
     private void OpenRemote()
     {
-        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
-            throw new NotSupportedException("Local Provider=Managed is supported only for local database connections.");
+        ValidateReplicaLocalProvider();
 
         if (_connectionOptions.IsReplica)
         {
-            if (_connectionOptions.SyncInterval > 0)
-            {
-                throw new NotSupportedException(
-                    "Sync Interval is not supported yet for embedded replica connections. Call Sync or SyncAsync explicitly.");
-            }
-
-            if (_connectionOptions.GetEncryptionCipher().HasValue
-                || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
-            {
-                throw new InvalidOperationException(
-                    "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
-            }
-
-            var replicaDatabase = TursoReplicaProvider.OpenReplica(
-                new TursoReplicaOptions(
-                    _connectionOptions.ReplicaPath,
-                    _connectionOptions.GetRemoteUri(),
-                    _connectionOptions.AuthToken));
-            _replicaDatabase = replicaDatabase;
-            _nativeDatabase = replicaDatabase;
+            SetReplicaDatabase(TursoReplicaProvider.OpenReplica(GetReplicaOptions()));
             return;
         }
 
@@ -422,6 +362,105 @@ public class TursoConnection : DbConnection
             throw new InvalidOperationException("Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
 
         _remoteClient = new TursoRemoteClient(_connectionOptions.GetRemoteUri(), _connectionOptions.AuthToken);
+    }
+
+    private async Task OpenRemoteReplicaAsync(
+        TursoReplicaOptions options,
+        CancellationToken cancellationToken)
+    {
+        var ValidateRemoteLocalProvider = await TursoReplicaProvider
+            .OpenReplicaAsync(options, cancellationToken)
+            .ConfigureAwait(false);
+        SetReplicaDatabase(ValidateRemoteLocalProvider);
+    }
+
+    private void ValidateReplicaLocalProvider()
+    {
+        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+            throw new NotSupportedException("Local Provider=Managed is supported only for local database connections.");
+    }
+
+    private TursoReplicaOptions GetReplicaOptions()
+    {
+        if (_connectionOptions.SyncInterval > 0)
+        {
+            throw new NotSupportedException(
+                "Sync Interval is not supported yet for embedded replica connections. Call Sync or SyncAsync explicitly.");
+        }
+
+        if (_connectionOptions.GetEncryptionCipher().HasValue
+            || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
+        {
+            throw new InvalidOperationException(
+                "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
+        }
+
+        return new TursoReplicaOptions(
+            _connectionOptions.ReplicaPath,
+            _connectionOptions.GetRemoteUri(),
+            _connectionOptions.AuthToken);
+    }
+
+    private void SetReplicaDatabase(TursoReplicaDatabase replicaDatabase)
+    {
+        _replicaDatabase = replicaDatabase;
+        _nativeDatabase = replicaDatabase;
+    }
+
+    private void ValidateCanOpen()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null)
+            throw new InvalidOperationException("The connection is already open.");
+        if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
+        {
+            if (!_connectionOptions.IsRemote && _connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+            {
+                throw new NotSupportedException(
+                    "Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.");
+            }
+
+            throw new NotSupportedException(
+                "Password is not supported. Use Encryption Cipher and Encryption Key for local encrypted databases.");
+        }
+    }
+
+    private void OpenCore()
+    {
+        if (_connectionOptions.IsRemote)
+        {
+            OpenRemote();
+            return;
+        }
+
+        ValidateLocalOnlyOptions();
+
+        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+        {
+            using var managedOptions = _connectionOptions.GetManagedLocalOpenOptions();
+            OpenManagedDatabase(managedOptions);
+
+            return;
+        }
+
+        var filename = _connectionOptions["Data Source"] ?? ":memory:";
+        var cipher = _connectionOptions.GetEncryptionCipher();
+        var hexkey = _connectionOptions["Encryption Key"];
+
+        if (cipher.HasValue)
+        {
+            if (string.IsNullOrWhiteSpace(hexkey))
+                throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
+
+            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher, hexkey);
+        }
+        else
+        {
+            if (!string.IsNullOrWhiteSpace(hexkey))
+                throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
+
+            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher: null, encryptionKey: null);
+        }
     }
 
     private void ValidateLocalOnlyOptions()

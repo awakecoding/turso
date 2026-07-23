@@ -22,6 +22,10 @@ IOS_FRAMEWORK_NAME = libturso_sdk_kit
 IOS_DYLIB_FILE = libturso_sdk_kit.dylib
 IOS_FRAMEWORK_BUILD_DIR = ./rs_compiled/ios-frameworks
 IOS_XCFRAMEWORK_DIR = ./rs_compiled/ios-universal/native/$(IOS_FRAMEWORK_NAME).xcframework
+IOS_SYNC_FRAMEWORK_NAME = libturso_sync_sdk_kit
+IOS_SYNC_DYLIB_FILE = libturso_sync_sdk_kit.dylib
+IOS_SYNC_FRAMEWORK_BUILD_DIR = ./rs_compiled/ios-sync-frameworks
+IOS_SYNC_XCFRAMEWORK_DIR = ./rs_compiled/ios-sync-universal/native/$(IOS_SYNC_FRAMEWORK_NAME).xcframework
 MANAGED_PACKAGE_VERSION ?=
 MANAGED_PACKAGE_OUTPUT ?= ./artifacts/managed-packages
 MANAGED_PACKAGE_CONSUMER_OUTPUT ?= ./artifacts/managed-package-consumer
@@ -59,42 +63,42 @@ all:
 	echo "make [restore|build|test|pack|validate-managed-package|validate-managed-nativeaot|build-native|test-native|pack-native|pack-nativeaot-static|pack-release|benchmark]"
 
 build-rust-windows64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
 
 build-rust-windowsarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-pc-windows-msvc $(RUST_RELEASE_OPT)
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-pc-windows-msvc $(RUST_RELEASE_OPT)
 
 build-rust-linux64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-unknown-linux-gnu $(RUST_RELEASE_OPT)
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target x86_64-unknown-linux-gnu $(RUST_RELEASE_OPT)
 
 build-rust-linuxarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-unknown-linux-gnu $(RUST_RELEASE_OPT)
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-unknown-linux-gnu $(RUST_RELEASE_OPT)
 
 build-rust-macos64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-apple-darwin $(RUST_RELEASE_OPT)
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target x86_64-apple-darwin $(RUST_RELEASE_OPT)
 
 build-rust-macosarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-darwin $(RUST_RELEASE_OPT)
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-darwin $(RUST_RELEASE_OPT)
 
 build-rust-androidarm64:
-	cargo ndk --target aarch64-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cargo ndk --target aarch64-linux-android --platform 31 build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
 
 build-rust-androidarm:
-	cargo ndk --target armv7-linux-androideabi --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cargo ndk --target armv7-linux-androideabi --platform 31 build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
 
 build-rust-androidx64:
-	cargo ndk --target x86_64-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cargo ndk --target x86_64-linux-android --platform 31 build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
 
 build-rust-androidx86:
-	cargo ndk --target i686-linux-android --platform 31 build -p turso_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
+	cargo ndk --target i686-linux-android --platform 31 build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled $(RUST_RELEASE_OPT)
 
 build-rust-android: build-rust-androidarm64 build-rust-androidarm build-rust-androidx64 build-rust-androidx86
 
 build-rust-iosarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios $(RUST_RELEASE_OPT)
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios $(RUST_RELEASE_OPT)
 
 build-rust-iossimulatorarm64:
-	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios-sim $(RUST_RELEASE_OPT)
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios-sim $(RUST_RELEASE_OPT)
 
 build-rust-ios: build-rust-iosarm64 build-rust-iossimulatorarm64
 
@@ -133,6 +137,41 @@ package-rust-iosframework:
 	cp "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/Info.plist" "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/Info.plist"
 	xcodebuild -create-xcframework -framework "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework" -framework "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework" -output "$(IOS_XCFRAMEWORK_DIR)"
 
+package-rust-ios-syncframework:
+	rm -rf "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)" "$(IOS_SYNC_XCFRAMEWORK_DIR)"
+	mkdir -p "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework" "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework" ./rs_compiled/ios-sync-universal/native
+	cp ./rs_compiled/aarch64-apple-ios/$(RUST_PROFILE_DIR)/$(IOS_SYNC_DYLIB_FILE) "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
+	install_name_tool -id @rpath/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME) "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
+	cp ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/$(IOS_SYNC_DYLIB_FILE) "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
+	install_name_tool -id @rpath/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME) "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
+	printf '%s\n' \
+		'<?xml version="1.0" encoding="UTF-8"?>' \
+		'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+		'<plist version="1.0">' \
+		'<dict>' \
+		'  <key>CFBundleDevelopmentRegion</key>' \
+		'  <string>en</string>' \
+		'  <key>CFBundleExecutable</key>' \
+		'  <string>$(IOS_SYNC_FRAMEWORK_NAME)</string>' \
+		'  <key>CFBundleIdentifier</key>' \
+		'  <string>com.turso.turso-sync-sdk-kit</string>' \
+		'  <key>CFBundleInfoDictionaryVersion</key>' \
+		'  <string>6.0</string>' \
+		'  <key>CFBundlePackageType</key>' \
+		'  <string>FMWK</string>' \
+		'  <key>CFBundleSignature</key>' \
+		'  <string>????</string>' \
+		'  <key>CFBundleVersion</key>' \
+		'  <string>1.0.0</string>' \
+		'  <key>CFBundleShortVersionString</key>' \
+		'  <string>1.0.0</string>' \
+		'  <key>MinimumOSVersion</key>' \
+		'  <string>12.2</string>' \
+		'</dict>' \
+		'</plist>' > "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/Info.plist"
+	cp "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/Info.plist" "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework/Info.plist"
+	xcodebuild -create-xcframework -framework "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework" -framework "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework" -output "$(IOS_SYNC_XCFRAMEWORK_DIR)"
+
 build-rust: 
 	echo "Building for $(OS_TARGET)"
 	$(MAKE) build-rust-$(OS_TARGET)
@@ -140,6 +179,7 @@ build-rust:
 build-dotnet:
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Data/Turso.Data.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
+	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Data.Sync/Turso.Data.Sync.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
 	dotnet build $(DOTNET_RELEASE_OPT) ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
@@ -147,7 +187,7 @@ build-dotnet:
 # The default restore/build/test/pack path is managed-only: it neither invokes
 # Cargo nor requires rs_compiled native runtime assets. Native distribution
 # targets remain explicit below.
-.PHONY: restore build test pack restore-managed build-managed test-managed pack-managed validate-managed-project-closure validate-managed-packed-closure validate-managed-package validate-managed-nativeaot build-native test-native pack-native pack-nativeaot-static pack-release
+.PHONY: restore build test pack restore-managed build-managed test-managed pack-managed validate-managed-project-closure validate-managed-packed-closure validate-managed-package validate-managed-nativeaot build-native build-sync-native test-native test-sync pack-native pack-sync pack-nativeaot-static pack-release
 restore: restore-managed
 
 restore-managed:
@@ -204,8 +244,14 @@ validate-managed-nativeaot: validate-managed-project-closure
 
 pack-native:
 	dotnet restore ./src/Turso.Data.Native/Turso.Data.Native.csproj
+	dotnet restore ./src/Turso.Data.Sync/Turso.Data.Sync.csproj
 	dotnet pack --no-restore -c Release ./src/Turso.Raw/Turso.Raw.csproj
 	dotnet pack --no-restore -c Release ./src/Turso.Data.Native/Turso.Data.Native.csproj
+	dotnet pack --no-restore -c Release ./src/Turso.Data.Sync/Turso.Data.Sync.csproj
+
+pack-sync:
+	dotnet restore ./src/Turso.Data.Sync/Turso.Data.Sync.csproj
+	dotnet pack --no-restore -c Release ./src/Turso.Data.Sync/Turso.Data.Sync.csproj
 
 # Generate the Turso Platform API client from the pinned OpenAPI spec.
 generate-platform-client:
@@ -218,10 +264,15 @@ build-production:
 
 build-native: build-rust build-dotnet
 
+build-sync-native: build-native
+
 test: test-managed
 
 test-native: build-native
 	dotnet test ./src/Turso.Tests/Turso.Tests.csproj
+
+test-sync: build-sync-native
+	dotnet test ./src/Turso.Tests/Turso.Tests.csproj --filter "FullyQualifiedName~TursoRemoteTests"
 
 benchmark: build-production
 	dotnet run -c Release --project ./src/Benchmarks/Benchmarks.csproj
