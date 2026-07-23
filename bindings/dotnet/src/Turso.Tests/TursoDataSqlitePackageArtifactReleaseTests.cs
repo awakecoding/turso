@@ -15,8 +15,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
     [Test]
     public void PackageContainsManagedDependenciesWithoutRawAndLoadsManagedConnection()
     {
-        var packageDirectory = Path.Combine(AppContext.BaseDirectory, $"turso-package-validation-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(packageDirectory);
+        var packageDirectory = CreatePackageDirectory("turso-package-validation");
 
         try
         {
@@ -75,15 +74,14 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         }
         finally
         {
-            Directory.Delete(packageDirectory, recursive: true);
+            DeletePackageDirectory(packageDirectory);
         }
     }
 
     [Test]
     public void NativeCompanionPackageRoutesExplicitNativeConnections()
     {
-        var packageDirectory = Path.Combine(AppContext.BaseDirectory, $"turso-native-package-validation-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(packageDirectory);
+        var packageDirectory = CreatePackageDirectory("turso-native-package-validation");
 
         try
         {
@@ -103,15 +101,14 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         }
         finally
         {
-            Directory.Delete(packageDirectory, recursive: true);
+            DeletePackageDirectory(packageDirectory);
         }
     }
 
     [Test]
     public void RawPackageContainsManagedClosureForEveryTargetFramework()
     {
-        var packageDirectory = Path.Combine(AppContext.BaseDirectory, $"turso-raw-package-validation-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(packageDirectory);
+        var packageDirectory = CreatePackageDirectory("turso-raw-package-validation");
 
         try
         {
@@ -155,15 +152,14 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         }
         finally
         {
-            Directory.Delete(packageDirectory, recursive: true);
+            DeletePackageDirectory(packageDirectory);
         }
     }
 
     [Test]
     public void NativeAotStaticPackageDeclaresManagedFacadeAndRestoresClosure()
     {
-        var packageDirectory = Path.Combine(AppContext.BaseDirectory, $"turso-nativeaot-package-validation-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(packageDirectory);
+        var packageDirectory = CreatePackageDirectory("turso-nativeaot-package-validation");
 
         try
         {
@@ -216,7 +212,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         }
         finally
         {
-            Directory.Delete(packageDirectory, recursive: true);
+            DeletePackageDirectory(packageDirectory);
         }
     }
 
@@ -571,6 +567,8 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 WorkingDirectory = workingDirectory,
             },
         };
+        process.StartInfo.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        process.StartInfo.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
         foreach (var argument in arguments)
             process.StartInfo.ArgumentList.Add(argument);
 
@@ -580,6 +578,33 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         process.WaitForExit();
         Task.WaitAll(output, error);
         Assert.That(process.ExitCode, Is.EqualTo(0), output.Result + Environment.NewLine + error.Result);
+    }
+
+    private static void DeletePackageDirectory(string packageDirectory)
+    {
+        IOException? lastError = null;
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            try
+            {
+                Directory.Delete(packageDirectory, recursive: true);
+                return;
+            }
+            catch (IOException exception) when (attempt < 9)
+            {
+                lastError = exception;
+                Thread.Sleep(100);
+            }
+        }
+
+        throw lastError ?? new IOException($"Unable to delete package directory '{packageDirectory}'.");
+    }
+
+    private static string CreatePackageDirectory(string prefix)
+    {
+        var packageDirectory = Path.Combine(Path.GetTempPath(), $"{prefix}-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(packageDirectory);
+        return packageDirectory;
     }
 
     private static Assembly? LoadPackageAssembly(
