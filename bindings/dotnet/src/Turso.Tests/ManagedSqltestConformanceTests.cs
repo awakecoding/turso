@@ -640,6 +640,26 @@ public class ManagedSqltestConformanceTests
     public void ManagedAffinityAndComparisonSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("collate.sqltest", "collate_unique_constraint")]
+    [TestCase("collate.sqltest", "collate_unique_constraint-2")]
+    [TestCase("collate.sqltest", "collate_aggregation_default_binary")]
+    [TestCase("collate.sqltest", "collate_aggregation_explicit_binary")]
+    [TestCase("collate.sqltest", "collate_grouped_aggregation_default_binary")]
+    [TestCase("collate.sqltest", "collate_grouped_aggregation_explicit_binary")]
+    public void ManagedCollationSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
+    [TestCase("drop_table.sqltest", "drop-table-basic-1")]
+    [TestCase("drop_table.sqltest", "drop-table-case-insensitive")]
+    [TestCase("drop_table.sqltest", "drop-table-if-exists-1")]
+    [TestCase("drop_table.sqltest", "drop-table-if-exists-2")]
+    [TestCase("drop_table.sqltest", "drop-table-with-index-1")]
+    [TestCase("drop_table.sqltest", "drop-table-schema-cleanup-1")]
+    [TestCase("drop_table.sqltest", "drop-table-after-ops-1")]
+    [TestCase("drop_table.sqltest", "drop-table-fk-disabled-ok")]
+    public void ManagedDropTableSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

@@ -140,8 +140,7 @@ public class SqliteCommand : DbCommand
         }
 
         reader.Close();
-        if (IsTransactionControlCommand(CommandText))
-            Connection?.Transaction?.MarkCompletedExternally(IsRollbackCommand(CommandText));
+        MarkTransactionCompletedExternally();
 
         return reader.RecordsAffected;
     }
@@ -149,7 +148,10 @@ public class SqliteCommand : DbCommand
     public override object? ExecuteScalar()
     {
         using var reader = Execute("ExecuteScalar");
-        return reader.Read() ? reader.GetValue(0) : null;
+        var result = reader.Read() ? reader.GetValue(0) : null;
+        reader.Close();
+        MarkTransactionCompletedExternally();
+        return result;
     }
 
     public override void Prepare()
@@ -300,6 +302,12 @@ public class SqliteCommand : DbCommand
     private void CloseReader()
     {
         _hasOpenReader = false;
+    }
+
+    private void MarkTransactionCompletedExternally()
+    {
+        if (IsTransactionControlCommand(CommandText))
+            Connection?.Transaction?.MarkCompletedExternally(IsRollbackCommand(CommandText));
     }
 
     internal SqliteStatementAdapter PrepareSingleStatement(string sql)

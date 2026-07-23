@@ -10860,6 +10860,7 @@ public sealed class EmbeddedDatabase : IDisposable
             "GLOB" => EvaluateGlobFunction(arguments),
             "HEX" => EvaluateHex(arguments),
             "IFNULL" => EvaluateIfNull(arguments),
+            "INSTR" => EvaluateInstr(arguments),
             "JSON" => SqliteJson.Json(arguments),
             "JSON_ARRAY" => SqliteJson.JsonArray(arguments),
             "JSON_ARRAY_LENGTH" => SqliteJson.JsonArrayLength(arguments),
@@ -11863,6 +11864,31 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         RequireArgumentCount("ifnull", arguments, 2);
         return arguments[0].Kind == SqlValueKind.Null ? arguments[1] : arguments[0];
+    }
+
+    private static SqlValue EvaluateInstr(IReadOnlyList<SqlValue> arguments)
+    {
+        RequireArgumentCount("instr", arguments, 2);
+        var haystack = arguments[0];
+        var needle = arguments[1];
+        if (haystack.Kind == SqlValueKind.Null || needle.Kind == SqlValueKind.Null)
+            return SqlValue.Null;
+
+        if (haystack.Kind == SqlValueKind.Blob && needle.Kind == SqlValueKind.Blob)
+        {
+            var offset = haystack.AsBlob().Span.IndexOf(needle.AsBlob().Span);
+            return SqlValue.Integer(offset + 1L);
+        }
+
+        var text = ToSqlText(haystack);
+        var index = text.IndexOf(ToSqlText(needle), StringComparison.Ordinal);
+        if (index < 0)
+            return SqlValue.Integer(0);
+
+        var codePointCount = 0;
+        foreach (var _ in text.AsSpan(0, index).EnumerateRunes())
+            codePointCount++;
+        return SqlValue.Integer(codePointCount + 1L);
     }
 
     private static SqlValue EvaluateLength(IReadOnlyList<SqlValue> arguments)

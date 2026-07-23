@@ -16,8 +16,6 @@ concurrency:
 
 env:
   working-directory: bindings/dotnet
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
 
 jobs:
   managed:
@@ -93,6 +91,9 @@ jobs:
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: 10
 
     defaults:
       run:

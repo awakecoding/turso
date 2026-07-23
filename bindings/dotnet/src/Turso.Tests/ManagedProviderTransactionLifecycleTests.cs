@@ -72,4 +72,25 @@ public class ManagedProviderTransactionLifecycleTests
             }
         }
     }
+
+    [Test]
+    public void ExecuteScalarRollbackPreventsFurtherManagedAmbientTransactionCommands()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+
+        using var transaction = connection.BeginTransaction();
+        using var command = connection.CreateCommand();
+        command.CommandText = "ROLLBACK;";
+
+        command.ExecuteScalar().Should().BeNull();
+
+        connection.Invoking(static value => value.ExecuteNonQuery("SELECT 1;"))
+            .Should()
+            .Throw<InvalidOperationException>()
+            .WithMessage(Data.Sqlite.Properties.Resources.TransactionCompleted);
+
+        transaction.Rollback();
+        connection.ExecuteScalar<long>("SELECT 1;").Should().Be(1);
+    }
 }

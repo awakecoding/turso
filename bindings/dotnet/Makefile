@@ -146,7 +146,7 @@ build-dotnet:
 # The default restore/build/test/pack path is managed-only: it neither invokes
 # Cargo nor requires rs_compiled native runtime assets. Native distribution
 # targets remain explicit below.
-.PHONY: restore build test pack restore-managed build-managed test-managed pack-managed validate-managed-project-closure validate-managed-package validate-managed-nativeaot build-native test-native pack-native pack-nativeaot-static pack-release
+.PHONY: restore build test pack restore-managed build-managed test-managed pack-managed validate-managed-project-closure validate-managed-packed-closure validate-managed-package validate-managed-nativeaot build-native test-native pack-native pack-nativeaot-static pack-release
 restore: restore-managed
 
 restore-managed:
@@ -163,21 +163,31 @@ build-managed: restore-managed
 
 test-managed: validate-managed-package
 
-pack-managed: restore-managed
+pack-managed: restore-managed validate-managed-project-closure
 	rm -rf "$(MANAGED_PACKAGE_OUTPUT)"
 	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
 	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
 	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Platform.Client/Turso.Platform.Client.csproj
 	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
+	$(MAKE) validate-managed-packed-closure
 
 validate-managed-project-closure:
-	@if grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit)' ./src/Turso.Core ./src/Turso.Data ./src/Turso.Data.Sqlite ./samples/ManagedPackageConsumer ./samples/ManagedNativeAot; then \
-		echo "Managed package and NativeAOT build configurations must not reference native Turso packages, assets, or Rust tooling"; \
+	@if grep -E -i '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit)' ./Directory.Build.props ./Directory.Build.targets ./Turso.slnx || grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit)' ./src/Turso.Core ./src/Turso.Data ./src/Turso.Data.Sqlite ./src/Turso.EntityFrameworkCore.Sqlite ./src/Turso.Platform.Client ./src/Turso.Serverless.Client ./samples/ManagedPackageConsumer ./samples/ManagedNativeAot; then \
+		echo "Managed package, solution, and NativeAOT build configurations must not reference native Turso packages, assets, or Rust tooling"; \
 		exit 1; \
 	fi
 
+validate-managed-packed-closure:
+	@for package in "$(MANAGED_PACKAGE_OUTPUT)"/*.nupkg; do \
+		if unzip -p "$$package" '*.nuspec' | grep -E -i '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit)'; then \
+			echo "Managed package $$package must not declare a native or Rust dependency"; \
+			exit 1; \
+		fi; \
+	done
+
 validate-managed-package: validate-managed-project-closure
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
+	$(MAKE) validate-managed-packed-closure
 	rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)"
 	dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --source "$(MANAGED_PACKAGE_OUTPUT)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local
 	dotnet build --no-restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
@@ -190,6 +200,7 @@ validate-managed-package: validate-managed-project-closure
 
 validate-managed-nativeaot: validate-managed-project-closure
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
+	$(MAKE) validate-managed-packed-closure
 	rm -rf ./samples/ManagedNativeAot/bin ./samples/ManagedNativeAot/obj "$(MANAGED_NATIVEAOT_OUTPUT)"
 	mkdir -p ./samples/ManagedNativeAot/obj
 	printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration>' '  <packageSources>' '    <clear />' '    <add key="managed-package" value="$(MANAGED_PACKAGE_OUTPUT_ABSOLUTE)" />' '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />' '  </packageSources>' '</configuration>' > "$(MANAGED_NATIVEAOT_NUGET_CONFIG)"

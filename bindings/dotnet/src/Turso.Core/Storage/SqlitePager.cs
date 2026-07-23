@@ -440,7 +440,11 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     public SqlitePagerTransaction BeginTransaction(uint targetDatabaseSizeInPages, TimeSpan? busyTimeout = null)
     {
-        var writerLock = _lockManager.EnterWriter(ResolveBusyTimeout(busyTimeout));
+        var configuredBusyTimeout = ResolveBusyTimeout(busyTimeout);
+        var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
+            ? null
+            : Stopwatch.StartNew();
+        var writerLock = _lockManager.EnterWriter(configuredBusyTimeout);
         try
         {
             lock (_gate)
@@ -448,14 +452,21 @@ public sealed class SqlitePager : IDisposable
                 ThrowIfDisposed();
                 ThrowIfReadOnly();
                 SynchronizeCommittedView();
-                try
+                if (_lockManager.UsesFileBackedWalLocks
+                    && HasUncommittedOrInvalidTail(_recoveryInfo))
                 {
-                    RecoverUncommittedTailUnderWriterLock(writerLock);
-                }
-                catch
-                {
-                    TransitionToFaulted();
-                    throw;
+                    using var recoveryLock = _lockManager.EnterRecoveryLock(
+                        SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
+                        configuredBusyTimeout);
+                    try
+                    {
+                        RecoverUncommittedTailUnderWriterLock(writerLock);
+                    }
+                    catch
+                    {
+                        TransitionToFaulted();
+                        throw;
+                    }
                 }
                 if (_state != SqlitePagerState.Ready)
                     throw new InvalidOperationException($"Cannot begin a SQLite pager transaction while the pager is {_state}.");
