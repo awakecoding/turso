@@ -861,6 +861,12 @@ public sealed class ResumableStatement : IDisposable
         if (position < 0 || position >= count)
             throw new InvalidOperationException($"Cursor {cursor.Index} is not positioned on a row.");
 
+        var source = _cursorSources is not null && cursor.Index < _cursorSources.Count
+            ? _cursorSources[cursor.Index]
+            : null;
+        if (source?.RowIds is { } rowIds)
+            return rowIds[position];
+
         var target = RequireWriteTarget(cursor);
         var getRowId = target.GetRowId
             ?? throw new InvalidOperationException(

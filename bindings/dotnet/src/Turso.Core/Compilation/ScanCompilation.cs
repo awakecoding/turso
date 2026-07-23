@@ -15,12 +15,17 @@ namespace Turso.Core.Compilation;
 /// Maps a (possibly qualified) column reference to its ordinal, or <c>null</c> when
 /// the reference does not name a column of this table.
 /// </param>
+/// <param name="RowIds">The optional hidden rowids aligned with <paramref name="Rows"/>.</param>
 internal sealed record ScanTarget(
     string TableName,
     string Qualifier,
     string[] Columns,
     IReadOnlyList<SqlValue[]> Rows,
-    Func<string, int?> ResolveColumnIndex);
+    Func<string, int?> ResolveColumnIndex,
+    IReadOnlyList<long>? RowIds = null)
+{
+    public bool HasRowId => RowIds is not null;
+}
 
 /// <summary>
 /// A lowered <see cref="SelectStatement"/>: the emitted <see cref="VdbeProgram"/>

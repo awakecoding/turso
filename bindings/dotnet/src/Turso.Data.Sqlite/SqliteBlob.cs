@@ -158,6 +158,7 @@ public class SqliteBlob : Stream
 
     public override void Write(byte[] buffer, int offset, int count)
     {
+        ThrowIfDisposed();
         if (_readOnly)
             throw new NotSupportedException(Properties.Resources.WriteNotSupported);
 

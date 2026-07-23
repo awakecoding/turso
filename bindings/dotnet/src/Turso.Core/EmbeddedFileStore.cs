@@ -1228,11 +1228,12 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// non-overflow index leaf under a one-level root when the target adds one
     /// maximum complete key, or split a full non-rightmost child when one new
     /// complete key fits strictly between its adjacent parent separators and the
-    /// parent can accept the promoted separator. It can atomically delete one record from a nonempty
-    /// direct child of multiple compatible one-level index roots when no parent
-    /// separator changes, or delete a singleton direct child when its parent
-    /// retains at least two separators, transferring the removed child's adjacent
-    /// separator into its surviving sibling before freelisting the retired page.
+    /// parent can accept the promoted separator. It can atomically insert or delete
+    /// one record in direct middle children of multiple compatible one-level index
+    /// roots when no parent separator changes. It can delete a singleton direct
+    /// child when its parent retains at least two separators, transferring the
+    /// removed child's adjacent separator into its surviving sibling before
+    /// freelisting the retired page.
     /// All routing changes retain their catalog rootpage and are
     /// published with the replacement table page in one WAL transaction whose
     /// final frame is page one. Any overflow ownership change, unproven
@@ -1402,15 +1403,24 @@ internal sealed class EmbeddedFileStore : IDisposable
             && indexRootImages.All(index =>
                 SqliteBtreePageHeader.Parse(index.SourcePage).PageType == SqliteBtreePageType.IndexInterior))
         {
-            return TryPersistBoundedSecondaryIndexInteriorRootLeafDeletions(
-                table,
-                persisted.Tables[tableName],
-                rootPage,
-                replacementPage,
-                indexRootImages,
-                schemaPage,
-                existingPage,
-                currentHeader);
+            return TryPersistBoundedSecondaryIndexInteriorRootLeafInsertions(
+                       table,
+                       persisted.Tables[tableName],
+                       rootPage,
+                       replacementPage,
+                       indexRootImages,
+                       schemaPage,
+                       existingPage,
+                       currentHeader)
+                   || TryPersistBoundedSecondaryIndexInteriorRootLeafDeletions(
+                       table,
+                       persisted.Tables[tableName],
+                       rootPage,
+                       replacementPage,
+                       indexRootImages,
+                       schemaPage,
+                       existingPage,
+                       currentHeader);
         }
 
         var indexReplacementPages = new List<(uint PageNumber, byte[] SourcePage, byte[] ReplacementPage)>(
@@ -2511,6 +2521,286 @@ internal sealed class EmbeddedFileStore : IDisposable
         mutation.CommitTo(_pager);
         CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        return true;
+    }
+
+    private bool TryPersistBoundedSecondaryIndexInteriorRootLeafInsertions(
+        EmbeddedTable table,
+        EmbeddedTable persistedTable,
+        uint tableRootPage,
+        ReadOnlySpan<byte> replacementTablePage,
+        IReadOnlyList<(IndexDefinition Definition, uint RootPage, byte[] SourcePage)> indexes,
+        ReadOnlySpan<byte> schemaPage,
+        ReadOnlySpan<byte> sourceTablePage,
+        SqliteDatabaseHeader currentHeader)
+    {
+        if (currentHeader.FreelistPageCount != 0
+            || currentHeader.FirstFreelistTrunkPage != 0
+            || indexes.Count < 2)
+        {
+            return false;
+        }
+
+        var sourcePageCount = currentHeader.DatabaseSizeInPages;
+        var ownedPages = new HashSet<uint> { SchemaRootPage, tableRootPage };
+        var insertions = new List<BoundedSecondaryIndexInteriorLeafInsertion>(indexes.Count);
+        foreach (var (definition, indexRootPage, sourceIndexRootPage) in indexes)
+        {
+            if (!TryPrepareBoundedSecondaryIndexInteriorRootLeafInsertion(
+                    table,
+                    persistedTable,
+                    definition,
+                    indexRootPage,
+                    sourceIndexRootPage,
+                    currentHeader,
+                    out var insertion))
+            {
+                return false;
+            }
+
+            foreach (var sourcePage in insertion.SourceTreePages)
+            {
+                if (!ownedPages.Add(sourcePage.PageNumber))
+                    return false;
+            }
+
+            insertions.Add(insertion);
+        }
+
+        var sourceSchemaPage = schemaPage.ToArray();
+        var targetSchemaPage = schemaPage.ToArray();
+        var newChangeCounter = currentHeader.ChangeCounter + 1;
+        var newHeader = currentHeader with
+        {
+            ChangeCounter = newChangeCounter,
+            VersionValidFor = newChangeCounter,
+        };
+        newHeader.WriteTo(targetSchemaPage);
+
+        var sourcePages = new List<SqlitePageImage>(checked(2 + ownedPages.Count))
+        {
+            new(SchemaRootPage, sourceSchemaPage),
+            new(tableRootPage, sourceTablePage),
+        };
+        foreach (var insertion in insertions)
+            sourcePages.AddRange(insertion.SourceTreePages);
+
+        var writeImages = new List<SqlitePageImage>(checked(2 + insertions.Count))
+        {
+            new(tableRootPage, replacementTablePage),
+        };
+        writeImages.AddRange(insertions
+            .OrderBy(insertion => insertion.LeafPageNumber)
+            .Select(insertion => new SqlitePageImage(
+                insertion.LeafPageNumber,
+                insertion.ReplacementLeafPage)));
+        // Page one publishes all table and index leaf replacements only after
+        // every routed page image is present in the WAL.
+        writeImages.Add(new SqlitePageImage(SchemaRootPage, targetSchemaPage));
+
+        var mutation = new SqliteBtreeSplitMutation(
+            sourcePageCount,
+            sourcePageCount,
+            _pageSize,
+            sourcePages,
+            writeImages);
+        mutation.CommitTo(_pager);
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
+        _header = newHeader;
+        return true;
+    }
+
+    private bool TryPrepareBoundedSecondaryIndexInteriorRootLeafInsertion(
+        EmbeddedTable table,
+        EmbeddedTable persistedTable,
+        IndexDefinition definition,
+        uint indexRootPage,
+        ReadOnlySpan<byte> sourceIndexRootPage,
+        SqliteDatabaseHeader currentHeader,
+        out BoundedSecondaryIndexInteriorLeafInsertion insertion)
+    {
+        insertion = null!;
+        var sourcePageCount = currentHeader.DatabaseSizeInPages;
+        if (indexRootPage < 2
+            || indexRootPage > sourcePageCount
+            || SqliteBtreePageHeader.Parse(sourceIndexRootPage).PageType != SqliteBtreePageType.IndexInterior)
+        {
+            return false;
+        }
+
+        var comparer = new SqliteIndexRecordComparer(_textEncoding);
+        var parent = SqliteIndexInteriorPageView.Parse(
+            sourceIndexRootPage,
+            _usableSpace,
+            _textEncoding);
+        if (parent.Cells.Count < 2
+            || parent.Cells.Any(cell => cell.Cell.Key.FirstOverflowPage is not null))
+        {
+            return false;
+        }
+
+        var childPages = parent.Cells
+            .Select(cell => cell.Cell.LeftChildPage)
+            .Append(parent.Header.RightMostChildPage)
+            .ToArray();
+        if (childPages.Length != parent.Cells.Count + 1)
+            return false;
+
+        var ownedPages = new HashSet<uint> { indexRootPage };
+        var sourceTreePages = new List<SqlitePageImage>(childPages.Length + 1)
+        {
+            new(indexRootPage, sourceIndexRootPage),
+        };
+        var sourceChildPages = new List<byte[]>(childPages.Length);
+        var childRecords = new List<List<byte[]>>(childPages.Length);
+        var existingRecords = new List<byte[]>();
+        byte[]? previousRecord = null;
+        for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
+        {
+            var childPage = childPages[childIndex];
+            if (childPage < 2
+                || childPage > sourcePageCount
+                || !ownedPages.Add(childPage))
+            {
+                return false;
+            }
+
+            var childPageImage = _pager.ReadCommittedPage(childPage);
+            if (SqliteBtreePageHeader.Parse(childPageImage).PageType != SqliteBtreePageType.IndexLeaf)
+                return false;
+
+            var child = SqliteIndexLeafPageView.Parse(
+                childPageImage,
+                _usableSpace,
+                _textEncoding);
+            if (child.Cells.Count == 0
+                || child.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null))
+            {
+                return false;
+            }
+
+            var records = new List<byte[]>(child.Cells.Count);
+            for (var recordIndex = 0; recordIndex < child.Cells.Count; recordIndex++)
+            {
+                var record = child.GetRecord(recordIndex);
+                if (previousRecord is not null && comparer.Compare(previousRecord, record) >= 0)
+                    return false;
+
+                records.Add(record);
+                existingRecords.Add(record);
+                previousRecord = record;
+            }
+
+            sourceTreePages.Add(new SqlitePageImage(childPage, childPageImage));
+            sourceChildPages.Add(childPageImage);
+            childRecords.Add(records);
+            if (childIndex >= parent.Cells.Count)
+                continue;
+
+            var separator = parent.GetRecord(childIndex);
+            if (comparer.Compare(previousRecord!, separator) >= 0)
+                return false;
+
+            existingRecords.Add(separator);
+            previousRecord = separator;
+        }
+
+        var persistedRecords = BuildIndexRecords(
+            definition.TableName,
+            persistedTable,
+            definition.Index,
+            comparer);
+        var targetRecords = BuildIndexRecords(
+            definition.TableName,
+            table,
+            definition.Index,
+            comparer);
+        ValidateBoundedUniqueIndexRecords(definition, targetRecords, comparer);
+        if (persistedRecords.Count != existingRecords.Count
+            || targetRecords.Count != existingRecords.Count + 1)
+        {
+            return false;
+        }
+
+        var addedRecordIndex = -1;
+        var existingRecordIndex = 0;
+        for (var targetRecordIndex = 0; targetRecordIndex < targetRecords.Count; targetRecordIndex++)
+        {
+            if (existingRecordIndex < existingRecords.Count
+                && targetRecords[targetRecordIndex].AsSpan()
+                    .SequenceEqual(existingRecords[existingRecordIndex]))
+            {
+                existingRecordIndex++;
+                continue;
+            }
+
+            if (addedRecordIndex >= 0)
+                return false;
+
+            addedRecordIndex = targetRecordIndex;
+        }
+
+        if (addedRecordIndex < 0 || existingRecordIndex != existingRecords.Count)
+            return false;
+
+        for (var recordIndex = 0; recordIndex < existingRecords.Count; recordIndex++)
+        {
+            if (!persistedRecords[recordIndex].AsSpan().SequenceEqual(existingRecords[recordIndex]))
+                return false;
+        }
+
+        var addedRecord = targetRecords[addedRecordIndex];
+        if (SqlitePayloadLayout.Calculate(
+                SqliteBtreePageType.IndexLeaf,
+                checked((ulong)addedRecord.Length),
+                _usableSpace).UsesOverflow)
+        {
+            return false;
+        }
+
+        var route = parent.SearchChild(addedRecord);
+        if (route.IsSeparatorKey
+            || route.ChildIndex <= 0
+            || route.ChildIndex >= parent.Cells.Count
+            || childPages[route.ChildIndex] != route.ChildPage)
+        {
+            return false;
+        }
+
+        var routedRecords = childRecords[route.ChildIndex];
+        var insertionIndex = 0;
+        while (insertionIndex < routedRecords.Count
+               && comparer.Compare(routedRecords[insertionIndex], addedRecord) < 0)
+        {
+            insertionIndex++;
+        }
+
+        if ((insertionIndex > 0
+             && comparer.Compare(routedRecords[insertionIndex - 1], addedRecord) >= 0)
+            || (insertionIndex < routedRecords.Count
+                && comparer.Compare(addedRecord, routedRecords[insertionIndex]) >= 0)
+            || comparer.Compare(parent.GetRecord(route.ChildIndex - 1), addedRecord) >= 0
+            || comparer.Compare(addedRecord, parent.GetRecord(route.ChildIndex)) >= 0)
+        {
+            return false;
+        }
+
+        var replacementRecords = new List<byte[]>(routedRecords.Count + 1);
+        replacementRecords.AddRange(routedRecords.Take(insertionIndex));
+        replacementRecords.Add(addedRecord);
+        replacementRecords.AddRange(routedRecords.Skip(insertionIndex));
+        if (!TryBuildBoundedIndexLeafReplacementPage(
+                replacementRecords,
+                sourceChildPages[route.ChildIndex],
+                out var replacementLeafPage))
+        {
+            return false;
+        }
+
+        insertion = new BoundedSecondaryIndexInteriorLeafInsertion(
+            route.ChildPage,
+            replacementLeafPage,
+            sourceTreePages);
         return true;
     }
 
@@ -4885,6 +5175,11 @@ internal sealed class EmbeddedFileStore : IDisposable
         byte[] SeparatorRecord);
 
     private sealed record BoundedSecondaryIndexInteriorLeafDeletion(
+        uint LeafPageNumber,
+        byte[] ReplacementLeafPage,
+        IReadOnlyList<SqlitePageImage> SourceTreePages);
+
+    private sealed record BoundedSecondaryIndexInteriorLeafInsertion(
         uint LeafPageNumber,
         byte[] ReplacementLeafPage,
         IReadOnlyList<SqlitePageImage> SourceTreePages);

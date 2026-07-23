@@ -89,6 +89,15 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
     {
         foreach (var operation in operations)
         {
+            if (operation is CreateTableOperation createTableWithDefaultSql)
+            {
+                foreach (var column in createTableWithDefaultSql.Columns)
+                    ValidateDefaultValueSql(column);
+            }
+
+            if (operation is AddColumnOperation or AlterColumnOperation)
+                ValidateDefaultValueSql((ColumnOperation)operation);
+
             if (operation is CreateTableOperation { CheckConstraints.Count: > 0 } createTable)
             {
                 throw new NotSupportedException(
@@ -120,6 +129,16 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                 throw new NotSupportedException(
                     $"The managed local provider does not support descending indexes ('{descendingIndex.Name}' on '{descendingIndex.Table}').");
             }
+        }
+    }
+
+    private static void ValidateDefaultValueSql(ColumnOperation operation)
+    {
+        if (operation.DefaultValueSql is not null)
+        {
+            throw new NotSupportedException(
+                $"The managed local provider does not support default SQL expressions for '{operation.Name}' on '{operation.Table}'. " +
+                "Use a modeled literal default value instead.");
         }
     }
 }

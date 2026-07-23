@@ -3646,7 +3646,8 @@ public sealed class EmbeddedDatabase : IDisposable
             IsConstantScalarExpression,
             expression => Evaluate(expression, parameters, null, context),
             source => ResolveScanTarget(source, context),
-            (where, target) => CompileRowPredicate(where, target, parameters, context, outerRow));
+            (where, target) => CompileRowPredicate(where, target, parameters, context, outerRow),
+            (where, target) => CompileSimpleRowIdPredicate(where, target, parameters, context, outerRow));
         return compiler.TryCompile(select, out compiled);
     }
 
@@ -5737,7 +5738,8 @@ public sealed class EmbeddedDatabase : IDisposable
             qualifier,
             columns,
             table.Rows,
-            name => ResolveScanColumnIndex(name, columns, qualifiedColumns));
+            name => ResolveScanColumnIndex(name, columns, qualifiedColumns),
+            table.HasRowid ? table.RowIds : null);
     }
 
     private static int? ResolveScanColumnIndex(
@@ -5785,6 +5787,75 @@ public sealed class EmbeddedDatabase : IDisposable
             new SourceRow(columns, row, qualifiedColumns, outerRow),
             context));
     }
+
+    // A rowid-aware scan keeps the evaluator authoritative for SQL comparison semantics, but only claims a
+    // single hidden-rowid comparison against a literal or bound parameter. More complex rowid expressions
+    // remain evaluator-backed rather than risking a different name-resolution or error-timing contract.
+    private VdbeRowIdPredicate? CompileSimpleRowIdPredicate(
+        Expression where,
+        ScanTarget target,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        if (!target.HasRowId || !IsSimpleRowIdComparison(where, target))
+            return null;
+
+        var columns = target.Columns;
+        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, columns);
+        return (row, rowId) => IsTrue(Evaluate(
+            where,
+            parameters,
+            new SourceRow(
+                columns,
+                row,
+                qualifiedColumns,
+                outerRow,
+                RowId: rowId,
+                RowIdQualifier: target.Qualifier),
+            context));
+    }
+
+    private static bool IsSimpleRowIdComparison(Expression expression, ScanTarget target)
+    {
+        if (expression is not BinaryExpression binary || !IsComparisonOperator(binary.Operator))
+            return false;
+
+        return (IsTargetRowIdReference(binary.Left, target) && IsLiteralOrParameter(binary.Right))
+            || (IsTargetRowIdReference(binary.Right, target) && IsLiteralOrParameter(binary.Left));
+    }
+
+    private static bool IsTargetRowIdReference(Expression expression, ScanTarget target)
+    {
+        if (expression is not ColumnExpression column
+            || !target.HasRowId
+            || target.ResolveColumnIndex(column.Name) is not null)
+        {
+            return false;
+        }
+
+        var separator = column.Name.IndexOf('.');
+        var bareName = separator < 0 ? column.Name : column.Name[(separator + 1)..];
+        return EmbeddedTable.IsRowidAliasName(bareName)
+            && (separator < 0
+                || string.Equals(
+                    column.Name[..separator],
+                    target.Qualifier,
+                    StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsLiteralOrParameter(Expression expression)
+        => expression is LiteralExpression or ParameterExpression;
+
+    private static bool IsComparisonOperator(BinaryOperator op)
+        => op is BinaryOperator.Is
+            or BinaryOperator.IsNot
+            or BinaryOperator.Equal
+            or BinaryOperator.NotEqual
+            or BinaryOperator.LessThan
+            or BinaryOperator.LessThanOrEqual
+            or BinaryOperator.GreaterThan
+            or BinaryOperator.GreaterThanOrEqual;
 
     // Detects a reference to rowid/_rowid_/oid that the scan target does not back with a
     // declared column, so the predicate cannot be compiled against materialized columns.

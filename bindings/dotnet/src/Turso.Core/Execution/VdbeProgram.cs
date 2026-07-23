@@ -381,13 +381,27 @@ public sealed class VdbeFunctionException : InvalidOperationException
 /// </summary>
 public sealed class VdbeCursorSource
 {
-    public VdbeCursorSource(IReadOnlyList<SqlValue[]> rows)
+    public VdbeCursorSource(IReadOnlyList<SqlValue[]> rows, IReadOnlyList<long>? rowIds = null)
     {
         ArgumentNullException.ThrowIfNull(rows);
+        if (rowIds is not null && rowIds.Count != rows.Count)
+        {
+            throw new ArgumentException(
+                "A cursor source with rowids must have exactly one rowid per row.",
+                nameof(rowIds));
+        }
+
         Rows = rows;
+        RowIds = rowIds;
     }
 
     public IReadOnlyList<SqlValue[]> Rows { get; }
+
+    /// <summary>
+    /// Optional hidden rowids aligned with <see cref="Rows"/>. A source without
+    /// these is a value-only cursor and cannot satisfy <see cref="RowIdInstruction"/>.
+    /// </summary>
+    public IReadOnlyList<long>? RowIds { get; }
 }
 
 /// <summary>

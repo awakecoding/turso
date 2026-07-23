@@ -213,6 +213,21 @@ public sealed class ManagedIncrementalBlobBoundaryTests
     }
 
     [Test]
+    public async Task ManagedBlobAsyncDisposalRejectsZeroLengthWritesWithoutNativeFallback()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE data(value BLOB); INSERT INTO data(rowid, value) VALUES (1, X'01');");
+
+        GetPrivateField(connection, "_database").Should().BeNull();
+        var blob = new SqliteBlob(connection, "data", "value", 1);
+        await blob.DisposeAsync();
+
+        Assert.Throws<ObjectDisposedException>(() => blob.Write([], 0, 0));
+        connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE rowid = 1;").Should().Equal(1);
+    }
+
+    [Test]
     public void ClosingManagedConnectionDisposesOpenIncrementalBlobs()
     {
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");

@@ -318,6 +318,53 @@ public class ManagedSqltestConformanceTests
     public void ManagedViewSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("null/default.sqltest", "is-null")]
+    [TestCase("where/memory.sqltest", "where_alias_precedence")]
+    [TestCase("join/natural_join_no_common.sqltest", "natural-join-no-common-columns")]
+    [TestCase("join/natural_join_no_common.sqltest", "natural-join-no-common-columns-empty")]
+    [TestCase("join/natural_join_no_common.sqltest", "natural-join-no-common-columns-single")]
+    [TestCase("negative_zero.sqltest", "negative-zero-literal")]
+    [TestCase("negative_zero.sqltest", "negative-zero-comparison-equals")]
+    [TestCase("negative_zero.sqltest", "negative-zero-comparison-not-equals")]
+    [TestCase("negative_zero.sqltest", "negative-zero-comparison-less-than")]
+    [TestCase("negative_zero.sqltest", "negative-zero-comparison-greater-than")]
+    [TestCase("negative_zero.sqltest", "negative-zero-in-table")]
+    [TestCase("negative_zero.sqltest", "negative-zero-in-table-comparison")]
+    [TestCase("negative_zero.sqltest", "negative-zero-order-by")]
+    [TestCase("negative_zero.sqltest", "negative-zero-distinct")]
+    [TestCase("negative_zero.sqltest", "negative-zero-group-by")]
+    [TestCase("literal.sqltest", "numberic-literal-1")]
+    [TestCase("literal.sqltest", "numberic-literal-10")]
+    [TestCase("literal.sqltest", "invalid-numberic-literal-1")]
+    [TestCase("literal.sqltest", "invalid-numberic-literal-2")]
+    [TestCase("literal.sqltest", "invalid-numberic-literal-3")]
+    [TestCase("literal.sqltest", "invalid-numberic-literal-4")]
+    [TestCase("strict.sqltest", "strict-insert-select-any-to-blob-rejects-xfer")]
+    [TestCase("strict.sqltest", "strict-not-null-still-enforced")]
+    [TestCase("last_insert_rowid.sqltest", "last-insert-rowid-unchanged-after-update")]
+    [TestCase("last_insert_rowid.sqltest", "last-insert-rowid-unchanged-after-upsert-update")]
+    [TestCase("transactions.sqltest", "basic-tx-1")]
+    [TestCase("transactions.sqltest", "basic-tx-2")]
+    [TestCase("transactions.sqltest", "basic-tx-3")]
+    [TestCase("int64-overflow-seek.sqltest", "int64-max-overflow-ge")]
+    [TestCase("int64-overflow-seek.sqltest", "int64-max-overflow-ge-expr")]
+    [TestCase("int64-overflow-seek.sqltest", "int64-max-gt")]
+    [TestCase("int64-overflow-seek.sqltest", "int64-max-ge")]
+    [TestCase("int64-overflow-seek.sqltest", "int64-min-overflow-le")]
+    [TestCase("int64-overflow-seek.sqltest", "int64-min-le")]
+    [TestCase("int64-overflow-seek.sqltest", "int64-min-lt")]
+    [TestCase("issue_5212.sqltest", "basic_alias")]
+    [TestCase("issue_5212.sqltest", "multiple_aliases")]
+    [TestCase("issue_5212.sqltest", "regression_no_explicit_columns")]
+    [TestCase("coalesce/memory.sqltest", "coalesce")]
+    [TestCase("coalesce/memory.sqltest", "coalesce-2")]
+    [TestCase("coalesce/memory.sqltest", "coalesce-nested")]
+    [TestCase("coalesce/memory.sqltest", "coalesce-nested-2")]
+    [TestCase("coalesce/memory.sqltest", "coalesce-null")]
+    [TestCase("coalesce/memory.sqltest", "coalesce-first")]
+    public void ManagedAdditionalSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

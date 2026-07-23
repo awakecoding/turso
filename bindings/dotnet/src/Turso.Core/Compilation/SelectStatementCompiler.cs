@@ -44,21 +44,25 @@ internal sealed class SelectStatementCompiler
     private readonly Func<Expression, SqlValue> _fold;
     private readonly Func<TableSource, ScanTarget?> _resolveScanTarget;
     private readonly Func<Expression, ScanTarget, VdbeRowPredicate?> _compilePredicate;
+    private readonly Func<Expression, ScanTarget, VdbeRowIdPredicate?> _compileRowIdPredicate;
 
     public SelectStatementCompiler(
         Func<Expression, bool> isConstant,
         Func<Expression, SqlValue> fold,
         Func<TableSource, ScanTarget?> resolveScanTarget,
-        Func<Expression, ScanTarget, VdbeRowPredicate?> compilePredicate)
+        Func<Expression, ScanTarget, VdbeRowPredicate?> compilePredicate,
+        Func<Expression, ScanTarget, VdbeRowIdPredicate?> compileRowIdPredicate)
     {
         ArgumentNullException.ThrowIfNull(isConstant);
         ArgumentNullException.ThrowIfNull(fold);
         ArgumentNullException.ThrowIfNull(resolveScanTarget);
         ArgumentNullException.ThrowIfNull(compilePredicate);
+        ArgumentNullException.ThrowIfNull(compileRowIdPredicate);
         _isConstant = isConstant;
         _fold = fold;
         _resolveScanTarget = resolveScanTarget;
         _compilePredicate = compilePredicate;
+        _compileRowIdPredicate = compileRowIdPredicate;
     }
 
     /// <summary>
@@ -162,15 +166,21 @@ internal sealed class SelectStatementCompiler
             return false;
 
         VdbeRowPredicate? predicate = null;
+        VdbeRowIdPredicate? rowIdPredicate = null;
         if (statement.Where is not null)
         {
             predicate = _compilePredicate(statement.Where, target);
             if (predicate is null)
+            {
+                rowIdPredicate = _compileRowIdPredicate(statement.Where, target);
+            }
+
+            if (predicate is null && rowIdPredicate is null)
                 return false;
         }
 
-        var program = BuildScanProgram(target, projectionOps, predicate);
-        compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows)]);
+        var program = BuildScanProgram(target, projectionOps, predicate, rowIdPredicate);
+        compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows, target.RowIds)]);
         return true;
     }
 
@@ -188,6 +198,9 @@ internal sealed class SelectStatementCompiler
                 return true;
             case ColumnExpression column when target.ResolveColumnIndex(column.Name) is { } columnIndex:
                 ops.Add(ProjectionOp.ForColumn(columnIndex));
+                return true;
+            case ColumnExpression column when IsTargetRowIdReference(column, target):
+                ops.Add(ProjectionOp.ForRowId());
                 return true;
             case QualifiedStarExpression qualifiedStar
                 when string.Equals(qualifiedStar.Qualifier, target.Qualifier, StringComparison.OrdinalIgnoreCase):
@@ -213,14 +226,33 @@ internal sealed class SelectStatementCompiler
         }
     }
 
+    private static bool IsTargetRowIdReference(ColumnExpression column, ScanTarget target)
+    {
+        if (!target.HasRowId || target.ResolveColumnIndex(column.Name) is not null)
+            return false;
+
+        var separator = column.Name.IndexOf('.');
+        var bareName = separator < 0 ? column.Name : column.Name[(separator + 1)..];
+        return EmbeddedTable.IsRowidAliasName(bareName)
+            && (separator < 0
+                || string.Equals(
+                    column.Name[..separator],
+                    target.Qualifier,
+                    StringComparison.OrdinalIgnoreCase));
+    }
+
     private static VdbeProgram BuildScanProgram(
         ScanTarget target,
         IReadOnlyList<ProjectionOp> projectionOps,
-        VdbeRowPredicate? predicate)
+        VdbeRowPredicate? predicate,
+        VdbeRowIdPredicate? rowIdPredicate)
     {
+        if (predicate is not null && rowIdPredicate is not null)
+            throw new ArgumentException("A scan can have either a row predicate or a rowid predicate.");
+
         var cursor = new Cursor(0);
         var registerCount = projectionOps.Count;
-        var filterCount = predicate is null ? 0 : 1;
+        var filterCount = predicate is null && rowIdPredicate is null ? 0 : 1;
 
         // Fixed layout so jump targets can be computed up front:
         //   0            OpenReadCursor
@@ -251,13 +283,25 @@ internal sealed class SelectStatementCompiler
                 new ProgramCounter(nextAddr),
                 $"skip row when WHERE is false, goto {nextAddr}"));
         }
+        else if (rowIdPredicate is not null)
+        {
+            instructions.Add(new FilterRowIdInstruction(
+                cursor,
+                rowIdPredicate,
+                new ProgramCounter(nextAddr),
+                $"skip row when WHERE is false, goto {nextAddr}"));
+        }
 
         for (var register = 0; register < registerCount; register++)
         {
             var op = projectionOps[register];
-            instructions.Add(op.IsColumn
-                ? new ColumnInstruction(cursor, op.ColumnIndex, new Register(register))
-                : new LoadConstantInstruction(new Register(register), op.Constant));
+            instructions.Add(op.Kind switch
+            {
+                ProjectionKind.Column => new ColumnInstruction(cursor, op.ColumnIndex, new Register(register)),
+                ProjectionKind.RowId => new RowIdInstruction(cursor, new Register(register)),
+                ProjectionKind.Constant => new LoadConstantInstruction(new Register(register), op.Constant),
+                _ => throw new InvalidOperationException($"Unsupported projection kind {op.Kind}."),
+            });
         }
 
         instructions.Add(new ResultRowInstruction(new RegisterRange(new Register(0), registerCount)));
@@ -270,10 +314,19 @@ internal sealed class SelectStatementCompiler
 
     // One emitted output register: either a column read from the cursor row or a
     // folded compile-time constant.
-    private readonly record struct ProjectionOp(bool IsColumn, int ColumnIndex, SqlValue Constant)
+    private enum ProjectionKind
     {
-        public static ProjectionOp ForColumn(int columnIndex) => new(true, columnIndex, default);
+        Column,
+        RowId,
+        Constant,
+    }
 
-        public static ProjectionOp ForConstant(SqlValue value) => new(false, 0, value);
+    private readonly record struct ProjectionOp(ProjectionKind Kind, int ColumnIndex, SqlValue Constant)
+    {
+        public static ProjectionOp ForColumn(int columnIndex) => new(ProjectionKind.Column, columnIndex, default);
+
+        public static ProjectionOp ForRowId() => new(ProjectionKind.RowId, 0, default);
+
+        public static ProjectionOp ForConstant(SqlValue value) => new(ProjectionKind.Constant, 0, value);
     }
 }
