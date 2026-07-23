@@ -51,4 +51,4 @@ static bool IsNativeCompanionPackage(string packageIdentity)
     => packageIdentity.StartsWith("Turso.Raw/", StringComparison.OrdinalIgnoreCase) ||
        packageIdentity.StartsWith("Turso.Data.Native/", StringComparison.OrdinalIgnoreCase) ||
        packageIdentity.StartsWith("Turso.Data.Sqlite.Native/", StringComparison.OrdinalIgnoreCase) ||
-       packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot.", StringComparison.OrdinalIgnoreCase);
+       packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot", StringComparison.OrdinalIgnoreCase);

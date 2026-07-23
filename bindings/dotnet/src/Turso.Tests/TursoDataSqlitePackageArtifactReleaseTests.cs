@@ -499,7 +499,21 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
         RunDotnet(consumerDirectory, "restore", projectPath, "--source", packageDirectory);
         AssertManagedConsumerRestoresNoNativeCompanions(consumerDirectory);
-        RunDotnet(consumerDirectory, "run", "--no-restore", "--project", projectPath);
+        RunDotnet(consumerDirectory, "build", projectPath, "--no-restore");
+        RunDotnet(consumerDirectory, "run", projectPath, "--no-build", "--no-restore");
+
+        var publishDirectory = Path.Combine(consumerDirectory, "publish");
+        RunDotnet(
+            consumerDirectory,
+            "publish",
+            projectPath,
+            "--configuration",
+            "Debug",
+            "--no-build",
+            "--no-restore",
+            "--output",
+            publishDirectory);
+        AssertManagedConsumerPublishOutputHasNoNativeAssets(publishDirectory);
     }
 
     private static void AssertManagedConsumerRestoresNoNativeCompanions(string consumerDirectory)
@@ -523,7 +537,26 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         => packageIdentity.StartsWith("Turso.Raw/", StringComparison.OrdinalIgnoreCase) ||
            packageIdentity.StartsWith("Turso.Data.Native/", StringComparison.OrdinalIgnoreCase) ||
            packageIdentity.StartsWith("Turso.Data.Sqlite.Native/", StringComparison.OrdinalIgnoreCase) ||
-           packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot.", StringComparison.OrdinalIgnoreCase);
+           packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot", StringComparison.OrdinalIgnoreCase);
+
+    private static void AssertManagedConsumerPublishOutputHasNoNativeAssets(string publishDirectory)
+    {
+        var nativeAssets = Directory
+            .EnumerateFiles(publishDirectory, "*", SearchOption.AllDirectories)
+            .Where(path => Path.GetFileName(path) is
+                "Turso.Raw.dll" or
+                "Turso.Data.Native.dll" or
+                "turso_sdk_kit.dll" or
+                "libturso_sdk_kit.so" or
+                "libturso_sdk_kit.dylib" or
+                "libturso_sdk_kit.a")
+            .ToArray();
+
+        Assert.That(
+            nativeAssets,
+            Is.Empty,
+            "publishing a consumer of Turso.Data.Sqlite alone must not emit native companion assets");
+    }
 
     private static void RunDotnet(string workingDirectory, params string[] arguments)
     {

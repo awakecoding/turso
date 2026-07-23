@@ -13,6 +13,8 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
     private const int InitialRowCount = 5;
     private const int MaximumRowCount = 64;
     private const string IndexName = "target_code_repeated";
+    private static readonly string[] MultiIndexNames =
+        ["target_code_repeated_one", "target_code_repeated_two", "target_code_repeated_three"];
     private const string EncryptionKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
 
     [Test]
@@ -188,6 +190,86 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
         faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBefore);
     }
 
+    [Test]
+    public void MultiIndexInteriorLeafDeletionPersistsReopensAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("multi-index-integrity");
+        try
+        {
+            var target = SeedMultiIndexDirectLeafTopology(PhysicalFileSystem.Instance, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+                Execute(connection, $"DELETE FROM target WHERE id = {target.RowId};");
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Count(connection).Should().Be(target.RowCount - 1);
+                CountById(connection, target.RowId).Should().Be(0);
+                RowId(connection, checked((int)SurvivingRowId(target.RowId)))
+                    .Should()
+                    .Be(SurvivingRowId(target.RowId));
+            }
+
+            VerifyMultiIndexWithSqlite(path, target);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void MultiIndexInteriorLeafDeletionCommitsOnlyItsTableAndThreeIndexLeaves()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "multi-index-interior-leaf-deletion.db";
+        var target = SeedMultiIndexDirectLeafTopology(fileSystem, path);
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
+            Execute(connection, $"DELETE FROM target WHERE id = {target.RowId};");
+            (faults.GetOperationCount(FileSystemOperation.Write) - writesBefore).Should().Be(10);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Count(reopenedConnection).Should().Be(target.RowCount - 1);
+        CountById(reopenedConnection, target.RowId).Should().Be(0);
+    }
+
+    [Test]
+    public void EveryInterruptedMultiIndexInteriorLeafDeletionFrameRecoversThePriorTree()
+    {
+        for (var failedFrame = 1; failedFrame <= MultiIndexNames.Length + 2; failedFrame++)
+        {
+            var faults = new DeterministicFaultInjector();
+            var fileSystem = new InMemoryFileSystem(faults);
+            var path = $"multi-index-interior-leaf-deletion-wal-{failedFrame}.db";
+            var target = SeedMultiIndexDirectLeafTopology(fileSystem, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                faults.FailOnOccurrence(
+                    FileSystemOperation.Write,
+                    faults.GetOperationCount(FileSystemOperation.Write) + failedFrame);
+                Assert.Throws<IOException>(() => Execute(connection, $"DELETE FROM target WHERE id = {target.RowId};"));
+            }
+
+            using var recovered = EmbeddedDatabase.OpenFile(path, fileSystem);
+            using var recoveredConnection = recovered.Connect();
+            Count(recoveredConnection).Should().Be(target.RowCount);
+            CountById(recoveredConnection, target.RowId).Should().Be(1);
+            RowId(recoveredConnection, checked((int)target.RowId)).Should().Be(target.RowId);
+        }
+    }
+
     private static SingletonLeafTarget SeedDirectLeafTopology(
         IFileSystem fileSystem,
         string path,
@@ -223,6 +305,108 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
         }
 
         throw new InvalidOperationException("Unable to create a direct secondary-index leaf for deletion.");
+    }
+
+    private static MultiIndexLeafTarget SeedMultiIndexDirectLeafTopology(
+        IFileSystem fileSystem,
+        string path)
+    {
+        CreateMinimumPageDatabase(fileSystem, path);
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY);");
+            Execute(connection, InsertStatement(Enumerable.Range(1, InitialRowCount)));
+            foreach (var indexName in MultiIndexNames)
+                Execute(connection, $"CREATE UNIQUE INDEX {indexName} ON target({RepeatedIndexColumns(48)});");
+        }
+
+        for (var rowCount = InitialRowCount; rowCount <= MaximumRowCount; rowCount++)
+        {
+            if (TryFindMultiIndexLeafTarget(fileSystem, path, rowCount, out var target))
+                return target;
+
+            if (rowCount == MaximumRowCount)
+                break;
+
+            using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+            using var connection = database.Connect();
+            Execute(connection, InsertStatement([rowCount + 1]));
+        }
+
+        throw new InvalidOperationException("Unable to create safe direct leaves for every secondary index.");
+    }
+
+    private static bool TryFindMultiIndexLeafTarget(
+        IFileSystem fileSystem,
+        string path,
+        int rowCount,
+        out MultiIndexLeafTarget target)
+    {
+        target = null!;
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var tableRootPage = FindRootPage(pager, header, "table", "target");
+        if (SqliteBtreePageHeader.Parse(pager.ReadCommittedPage(tableRootPage)).PageType
+            != SqliteBtreePageType.TableLeaf)
+        {
+            return false;
+        }
+
+        HashSet<long>? candidates = null;
+        foreach (var indexName in MultiIndexNames)
+        {
+            var indexRootPage = FindRootPage(pager, header, "index", indexName);
+            if (SqliteBtreePageHeader.Parse(pager.ReadCommittedPage(indexRootPage)).PageType
+                != SqliteBtreePageType.IndexInterior)
+            {
+                return false;
+            }
+
+            var root = SqliteIndexInteriorPageView.Parse(
+                pager.ReadCommittedPage(indexRootPage),
+                header.UsableSpace,
+                header.TextEncoding);
+            var indexCandidates = new HashSet<long>();
+            var childPages = root.Cells
+                .Select(cell => cell.Cell.LeftChildPage)
+                .Append(root.Header.RightMostChildPage)
+                .ToArray();
+            for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
+            {
+                var leaf = SqliteIndexLeafPageView.Parse(
+                    pager.ReadCommittedPage(childPages[childIndex]),
+                    header.UsableSpace,
+                    header.TextEncoding);
+                if (leaf.Cells.Count <= 1)
+                    continue;
+
+                var safeRecordCount = childIndex == root.Cells.Count
+                    ? leaf.Cells.Count
+                    : leaf.Cells.Count - 1;
+                for (var recordIndex = 0; recordIndex < safeRecordCount; recordIndex++)
+                {
+                    var rowId = SqliteRecordCodec.Decode(leaf.GetRecord(recordIndex), header.TextEncoding)[^1]
+                        .AsInteger();
+                    indexCandidates.Add(rowId);
+                }
+            }
+
+            if (indexCandidates.Count == 0)
+                return false;
+
+            candidates = candidates is null
+                ? indexCandidates
+                : candidates.Intersect(indexCandidates).ToHashSet();
+            if (candidates.Count == 0)
+                return false;
+        }
+
+        if (candidates is null || candidates.Count == 0)
+            return false;
+
+        target = new MultiIndexLeafTarget(candidates.Min(), rowCount);
+        return true;
     }
 
     private static SingletonLeafTarget SeedSingletonReclamationTopology(
@@ -535,6 +719,35 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
         }
     }
 
+    private static void VerifyMultiIndexWithSqlite(string path, MultiIndexLeafTarget target)
+    {
+        var verificationPath = path + ".verify.db";
+        File.Copy(path, verificationPath, overwrite: true);
+        try
+        {
+            using var sqlite = new MsData.SqliteConnection($"Data Source={verificationPath}");
+            sqlite.Open();
+
+            using (var integrity = sqlite.CreateCommand())
+            {
+                integrity.CommandText = "PRAGMA integrity_check;";
+                integrity.ExecuteScalar().Should().Be("ok");
+            }
+
+            foreach (var indexName in MultiIndexNames)
+            {
+                using var indexedCount = sqlite.CreateCommand();
+                indexedCount.CommandText = $"SELECT COUNT(*) FROM target INDEXED BY {indexName};";
+                Convert.ToInt64(indexedCount.ExecuteScalar()).Should().Be(target.RowCount - 1);
+            }
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(verificationPath);
+        }
+    }
+
     private static string RepeatedIndexColumns(int count) => string.Join(", ", Enumerable.Repeat("id", count));
 
     private static string InsertStatement(IEnumerable<int> rowIds)
@@ -589,7 +802,11 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
     private static int SurvivingRowId(SingletonLeafTarget target)
         => target.RowId == 1 ? 2 : 1;
 
+    private static long SurvivingRowId(long rowId) => rowId == 1 ? 2 : 1;
+
     private sealed record SingletonLeafTarget(int ChildIndex, uint PageNumber, long RowId, int RowCount);
+
+    private sealed record MultiIndexLeafTarget(long RowId, int RowCount);
 
     private sealed record IndexLeafTopology(uint PageNumber, IReadOnlyList<long> RowIds);
 

@@ -531,7 +531,11 @@ public partial class SqliteConnection : DbConnection
         table.Columns.Add("TABLE_NAME", typeof(string));
         table.Columns.Add("TABLE_TYPE", typeof(string));
 
+        if (!MatchesCatalogAndSchemaRestrictions(restrictionValues))
+            return table;
+
         var tableNameRestriction = GetRestriction(restrictionValues, 2);
+        var tableTypeRestriction = GetRestriction(restrictionValues, 3);
         using var command = CreateCommand();
         command.CommandText = "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'"
                               + (tableNameRestriction is null ? "" : " AND name COLLATE NOCASE = $table")
@@ -543,6 +547,12 @@ public partial class SqliteConnection : DbConnection
         while (reader.Read())
         {
             var type = reader.GetString(1).Equals("view", StringComparison.OrdinalIgnoreCase) ? "VIEW" : "BASE TABLE";
+            if (tableTypeRestriction is not null
+                && !string.Equals(type, tableTypeRestriction, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             var tableName = GetDeclaredSchemaObjectName(
                 reader.GetString(0),
                 reader.GetString(1),
@@ -566,6 +576,9 @@ public partial class SqliteConnection : DbConnection
         table.Columns.Add("COLUMN_DEFAULT", typeof(string));
         table.Columns.Add("IS_NULLABLE", typeof(bool));
         table.Columns.Add("DATA_TYPE", typeof(string));
+
+        if (!MatchesCatalogAndSchemaRestrictions(restrictionValues))
+            return table;
 
         var tableNameRestriction = GetRestriction(restrictionValues, 2);
         var columnNameRestriction = GetRestriction(restrictionValues, 3);
@@ -764,6 +777,14 @@ public partial class SqliteConnection : DbConnection
         => restrictionValues is not null && restrictionValues.Length > index && !string.IsNullOrEmpty(restrictionValues[index])
             ? restrictionValues[index]
             : null;
+
+    private static bool MatchesCatalogAndSchemaRestrictions(string?[]? restrictionValues)
+    {
+        var catalog = GetRestriction(restrictionValues, 0);
+        var schema = GetRestriction(restrictionValues, 1);
+        return (catalog is null || string.Equals(catalog, "main", StringComparison.OrdinalIgnoreCase))
+               && schema is null;
+    }
 
     private static string GetDeclaredSchemaObjectName(string storedName, string type, string? createSql)
     {

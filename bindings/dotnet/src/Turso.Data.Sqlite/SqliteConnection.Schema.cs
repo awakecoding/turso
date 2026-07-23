@@ -9,6 +9,9 @@ public partial class SqliteConnection
         EnsureOpen();
         ValidateRestrictions(collectionName, restrictionValues, 4);
         var table = CreateIndexesSchemaTable();
+        if (!MatchesCatalogAndSchemaRestrictions(restrictionValues))
+            return table;
+
         var tableNameRestriction = GetRestriction(restrictionValues, 2);
         var indexNameRestriction = GetRestriction(restrictionValues, 3);
 
@@ -58,6 +61,9 @@ public partial class SqliteConnection
         table.Columns.Add("ORDINAL_POSITION", typeof(int));
         table.Columns.Add("COLUMN_ORDINAL", typeof(int));
         table.Columns.Add("COLUMN_NAME", typeof(string));
+
+        if (!MatchesCatalogAndSchemaRestrictions(restrictionValues))
+            return table;
 
         var tableNameRestriction = GetRestriction(restrictionValues, 2);
         var indexNameRestriction = GetRestriction(restrictionValues, 3);

@@ -24,6 +24,7 @@ IOS_FRAMEWORK_BUILD_DIR = ./rs_compiled/ios-frameworks
 IOS_XCFRAMEWORK_DIR = ./rs_compiled/ios-universal/native/$(IOS_FRAMEWORK_NAME).xcframework
 MANAGED_PACKAGE_VERSION ?=
 MANAGED_PACKAGE_OUTPUT ?= ./artifacts/managed-packages
+MANAGED_PACKAGE_CONSUMER_OUTPUT ?= ./artifacts/managed-package-consumer
 MANAGED_PACKAGE_OUTPUT_ARG = $(if $(MANAGED_PACKAGE_OUTPUT),--output "$(MANAGED_PACKAGE_OUTPUT)")
 MANAGED_PACKAGE_VERSION_ARG = $(if $(MANAGED_PACKAGE_VERSION),-p:PackageVersion=$(MANAGED_PACKAGE_VERSION))
 
@@ -145,9 +146,15 @@ pack-managed: restore-managed
 
 validate-managed-package:
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
-	rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj
+	rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)"
 	dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --source "$(MANAGED_PACKAGE_OUTPUT)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local
-	dotnet run --no-restore --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
+	dotnet build --no-restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
+	dotnet run --no-build --no-restore --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
+	dotnet publish --configuration Debug --no-build --no-restore --output "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)" ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
+	@if find "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)" -type f \( -iname 'Turso.Raw.dll' -o -iname 'Turso.Data.Native.dll' -o -iname 'turso_sdk_kit.dll' -o -iname 'libturso_sdk_kit.so' -o -iname 'libturso_sdk_kit.dylib' -o -iname 'libturso_sdk_kit.a' \) -print -quit | grep -q .; then \
+		echo "Managed package publish output must not contain native companion assets"; \
+		exit 1; \
+	fi
 
 pack-native:
 	dotnet restore ./src/Turso.Data.Native/Turso.Data.Native.csproj

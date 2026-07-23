@@ -40,8 +40,18 @@ jobs:
             9.0.x
             10.0.x
 
-      - name: Run managed-only tests
-        run: make test-managed
+      - name: Run managed-only tests without Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          deny_directory="$PWD/.managed-toolchain-deny"
+          mkdir -p "$deny_directory"
+          trap 'rm -rf "$deny_directory"' EXIT
+          for tool in cargo rustc; do
+            printf '#!/usr/bin/env bash\necho "managed .NET validation must not invoke %s" >&2\nexit 97\n' "$tool" > "$deny_directory/$tool"
+            chmod +x "$deny_directory/$tool"
+          done
+          PATH="$deny_directory:$PATH" CARGO="$deny_directory/cargo" RUSTC="$deny_directory/rustc" make test-managed
 
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404

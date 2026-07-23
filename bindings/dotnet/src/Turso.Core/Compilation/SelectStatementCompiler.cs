@@ -24,7 +24,7 @@ public sealed class StatementCompilationException : InvalidOperationException
 ///     constants, emitted as <c>LoadConstant</c> / <c>ResultRow</c> / <c>Halt</c>; and
 ///   </item>
 ///   <item>
-///     a single base-table scan projecting bare columns and/or constants, with an
+///     a single base-table scan projecting bare or qualifying stars, bare columns, and/or constants, with an
 ///     optional <c>WHERE</c> filter, emitted as a real cursor loop
 ///     (<c>OpenReadCursor</c>, <c>Rewind</c>, <c>Column</c>, <c>Filter</c>,
 ///     <c>ResultRow</c>, <c>Next</c>, <c>CloseCursor</c>, <c>Halt</c>).
@@ -189,8 +189,18 @@ internal sealed class SelectStatementCompiler
             case ColumnExpression column when target.ResolveColumnIndex(column.Name) is { } columnIndex:
                 ops.Add(ProjectionOp.ForColumn(columnIndex));
                 return true;
+            case QualifiedStarExpression qualifiedStar
+                when string.Equals(qualifiedStar.Qualifier, target.Qualifier, StringComparison.OrdinalIgnoreCase):
+                // A single scan has exactly one raw output shape, so its resolved qualifier expands
+                // to the same declared-column sequence as the evaluator.
+                if (target.Columns.Length == 0)
+                    return false;
+
+                for (var index = 0; index < target.Columns.Length; index++)
+                    ops.Add(ProjectionOp.ForColumn(index));
+                return true;
             case QualifiedStarExpression:
-                // "t.*" is left to the evaluator to keep the subset small and honest.
+                // An unmatched qualifier must reach the evaluator, which owns its diagnostic.
                 return false;
             default:
                 if (_isConstant(expression))

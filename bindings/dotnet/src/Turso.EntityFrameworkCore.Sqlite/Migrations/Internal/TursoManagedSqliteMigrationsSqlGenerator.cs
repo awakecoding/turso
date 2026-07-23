@@ -89,6 +89,18 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
     {
         foreach (var operation in operations)
         {
+            if (operation is CreateTableOperation { CheckConstraints.Count: > 0 } createTable)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support check constraints on '{createTable.Name}'.");
+            }
+
+            if (operation is AddCheckConstraintOperation addCheckConstraint)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support check constraints on '{addCheckConstraint.Table}'.");
+            }
+
             if (operation is CreateIndexOperation { Filter: not null } createIndex)
             {
                 throw new NotSupportedException(
