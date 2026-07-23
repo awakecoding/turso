@@ -45,24 +45,28 @@ internal sealed class SelectStatementCompiler
     private readonly Func<TableSource, ScanTarget?> _resolveScanTarget;
     private readonly Func<Expression, ScanTarget, VdbeRowPredicate?> _compilePredicate;
     private readonly Func<Expression, ScanTarget, VdbeRowIdPredicate?> _compileRowIdPredicate;
+    private readonly Func<SelectStatement, ScanTarget, VdbeRowEquality?> _compileDistinctEquality;
 
     public SelectStatementCompiler(
         Func<Expression, bool> isConstant,
         Func<Expression, SqlValue> fold,
         Func<TableSource, ScanTarget?> resolveScanTarget,
         Func<Expression, ScanTarget, VdbeRowPredicate?> compilePredicate,
-        Func<Expression, ScanTarget, VdbeRowIdPredicate?> compileRowIdPredicate)
+        Func<Expression, ScanTarget, VdbeRowIdPredicate?> compileRowIdPredicate,
+        Func<SelectStatement, ScanTarget, VdbeRowEquality?> compileDistinctEquality)
     {
         ArgumentNullException.ThrowIfNull(isConstant);
         ArgumentNullException.ThrowIfNull(fold);
         ArgumentNullException.ThrowIfNull(resolveScanTarget);
         ArgumentNullException.ThrowIfNull(compilePredicate);
         ArgumentNullException.ThrowIfNull(compileRowIdPredicate);
+        ArgumentNullException.ThrowIfNull(compileDistinctEquality);
         _isConstant = isConstant;
         _fold = fold;
         _resolveScanTarget = resolveScanTarget;
         _compilePredicate = compilePredicate;
         _compileRowIdPredicate = compileRowIdPredicate;
+        _compileDistinctEquality = compileDistinctEquality;
     }
 
     /// <summary>
@@ -139,8 +143,7 @@ internal sealed class SelectStatementCompiler
 
         // The scan subset covers only the row-at-a-time pipeline. Clauses that
         // reshape or reorder the result set stay with the tree-walking evaluator.
-        if (statement.Distinct
-            || statement.Having is not null
+        if (statement.Having is not null
             || statement.GroupBy.Count != 0
             || statement.OrderBy.Count != 0
             || statement.Limit is not null
@@ -153,6 +156,14 @@ internal sealed class SelectStatementCompiler
         var target = _resolveScanTarget(statement.Source!);
         if (target is null)
             return false;
+
+        VdbeRowEquality? distinctEquality = null;
+        if (statement.Distinct)
+        {
+            distinctEquality = _compileDistinctEquality(statement, target);
+            if (distinctEquality is null)
+                return false;
+        }
 
         // Lower every projection into a column read or a folded constant load.
         var projectionOps = new List<ProjectionOp>();
@@ -179,7 +190,7 @@ internal sealed class SelectStatementCompiler
                 return false;
         }
 
-        var program = BuildScanProgram(target, projectionOps, predicate, rowIdPredicate);
+        var program = BuildScanProgram(target, projectionOps, predicate, rowIdPredicate, distinctEquality);
         compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows, target.RowIds)]);
         return true;
     }
@@ -245,7 +256,8 @@ internal sealed class SelectStatementCompiler
         ScanTarget target,
         IReadOnlyList<ProjectionOp> projectionOps,
         VdbeRowPredicate? predicate,
-        VdbeRowIdPredicate? rowIdPredicate)
+        VdbeRowIdPredicate? rowIdPredicate,
+        VdbeRowEquality? distinctEquality)
     {
         if (predicate is not null && rowIdPredicate is not null)
             throw new ArgumentException("A scan can have either a row predicate or a rowid predicate.");
@@ -304,12 +316,19 @@ internal sealed class SelectStatementCompiler
             });
         }
 
-        instructions.Add(new ResultRowInstruction(new RegisterRange(new Register(0), registerCount)));
+        var resultRange = new RegisterRange(new Register(0), registerCount);
+        instructions.Add(distinctEquality is null
+            ? new ResultRowInstruction(resultRange)
+            : new DistinctResultRowInstruction(resultRange, distinctEquality, DistinctSetIndex: 0));
         instructions.Add(new NextInstruction(cursor, new ProgramCounter(loopStart)));
         instructions.Add(new CloseCursorInstruction(cursor));
         instructions.Add(new HaltInstruction());
 
-        return new VdbeProgram(registerCount, cursorCount: 1, instructions);
+        return new VdbeProgram(
+            registerCount,
+            cursorCount: 1,
+            instructions,
+            distinctSetCount: distinctEquality is null ? 0 : 1);
     }
 
     // One emitted output register: either a column read from the cursor row or a

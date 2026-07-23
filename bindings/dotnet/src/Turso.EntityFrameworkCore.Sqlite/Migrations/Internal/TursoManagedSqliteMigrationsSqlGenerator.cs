@@ -92,11 +92,17 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
             if (operation is CreateTableOperation createTableWithDefaultSql)
             {
                 foreach (var column in createTableWithDefaultSql.Columns)
+                {
                     ValidateDefaultValueSql(column);
+                    ValidateComputedColumn(column);
+                }
             }
 
             if (operation is AddColumnOperation or AlterColumnOperation)
+            {
                 ValidateDefaultValueSql((ColumnOperation)operation);
+                ValidateComputedColumn((ColumnOperation)operation);
+            }
 
             if (operation is CreateTableOperation { CheckConstraints.Count: > 0 } createTable)
             {
@@ -139,6 +145,16 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
             throw new NotSupportedException(
                 $"The managed local provider does not support default SQL expressions for '{operation.Name}' on '{operation.Table}'. " +
                 "Use a modeled literal default value instead.");
+        }
+    }
+
+    private static void ValidateComputedColumn(ColumnOperation operation)
+    {
+        if (operation.ComputedColumnSql is not null && operation.IsStored is not true)
+        {
+            throw new NotSupportedException(
+                $"The managed local provider does not support virtual computed columns for '{operation.Name}' on '{operation.Table}'. " +
+                "Declare the computed column as STORED.");
         }
     }
 }

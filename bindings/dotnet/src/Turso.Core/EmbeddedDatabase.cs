@@ -3648,8 +3648,39 @@ public sealed class EmbeddedDatabase : IDisposable
             expression => Evaluate(expression, parameters, null, context),
             source => ResolveScanTarget(source, context),
             (where, target) => CompileRowPredicate(where, target, parameters, context, outerRow),
-            (where, target) => CompileSimpleRowIdPredicate(where, target, parameters, context, outerRow));
+            (where, target) => CompileSimpleRowIdPredicate(where, target, parameters, context, outerRow),
+            (select, target) => CompileDistinctScanEquality(select, target, context));
         return compiler.TryCompile(select, out compiled);
+    }
+
+    // DISTINCT runs as rows stream from the cursor, whereas the evaluator first completes source filtering.
+    // Restrict the direct route to an unfiltered base scan of direct declared columns: this has no deferred
+    // expression failure, retains first-occurrence order, and maps each projection to its declared collation.
+    private VdbeRowEquality? CompileDistinctScanEquality(
+        SelectStatement select,
+        ScanTarget target,
+        QueryContext context)
+    {
+        if (!select.Distinct || select.Where is not null || select.Projections.Count == 0)
+            return null;
+
+        var table = context.Tables[target.TableName];
+        var collations = new List<string?>(select.Projections.Count);
+        foreach (var projection in select.Projections)
+        {
+            if (projection.Expression is not ColumnExpression column)
+            {
+                return null;
+            }
+
+            var index = target.ResolveColumnIndex(column.Name);
+            if (index is null)
+                return null;
+
+            collations.Add(table.ColumnDefinitions[index.Value].Collation);
+        }
+
+        return (left, right) => RowsEqual(left, right, collations);
     }
 
     // Builtin scalar functions whose evaluator implementation reads ONLY the already-evaluated argument
@@ -4088,6 +4119,11 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         compiled = null!;
 
+        // DISTINCT de-duplicates before applying the row window. Its direct scan emits
+        // DistinctResultRow, which LimitOffsetProgramBuilder deliberately cannot gate.
+        if (select.Distinct)
+            return false;
+
         // ORDER BY needs a sorter before row gates run. Its bounded subset has an explicit
         // preflight below; every other ordered shape remains evaluator-owned.
         if (select.OrderBy.Count != 0)
@@ -4474,7 +4510,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var columnCount = -1;
         foreach (var term in statement.Terms)
         {
-            if (term is not SelectStatement select
+            if (term is not SelectStatement { Distinct: false } select
                 || !TryCompileSelect(select, parameters, context, outerRow, out var compiledTerm))
             {
                 return false;
@@ -7148,8 +7184,78 @@ public sealed class EmbeddedDatabase : IDisposable
                 statement.Distinct,
                 offset,
                 limit,
-                statement.Projections.Select(projection => GetCollation(projection.Expression)).ToArray()),
+                GetDistinctProjectionCollations(
+                    statement.Projections,
+                    outputColumns,
+                    rawOutputColumns,
+                    statement.Source,
+                    context)),
             0);
+    }
+
+    private static IReadOnlyList<string?> GetDistinctProjectionCollations(
+        IReadOnlyList<Projection> projections,
+        IReadOnlyList<OutputColumn> outputColumns,
+        IReadOnlyList<OutputColumn> rawOutputColumns,
+        TableSource? source,
+        QueryContext context)
+    {
+        var collations = new List<string?>();
+        foreach (var projection in projections)
+        {
+            switch (projection.Expression)
+            {
+                case StarExpression:
+                    collations.AddRange(outputColumns.Select(column =>
+                        GetDeclaredOutputColumnCollation(source, column, context)));
+                    break;
+                case QualifiedStarExpression qualifiedStar:
+                    foreach (var raw in rawOutputColumns.Where(raw =>
+                                 string.Equals(raw.Qualifier, qualifiedStar.Qualifier, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        var output = outputColumns.FirstOrDefault(column =>
+                            string.Equals(column.Qualifier, qualifiedStar.Qualifier, StringComparison.OrdinalIgnoreCase)
+                            && column.Index == raw.Index) ?? raw;
+                        collations.Add(GetDeclaredOutputColumnCollation(source, output, context));
+                    }
+
+                    break;
+                default:
+                    collations.Add(GetCollation(projection.Expression));
+                    break;
+            }
+        }
+
+        return collations;
+    }
+
+    private static string? GetDeclaredOutputColumnCollation(
+        TableSource? source,
+        OutputColumn column,
+        QueryContext context)
+    {
+        switch (source)
+        {
+            case NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table):
+            {
+                var qualifier = named.Alias ?? named.Name;
+                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                    return null;
+
+                for (var index = 0; index < table.Columns.Length; index++)
+                {
+                    if (string.Equals(table.Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
+                        return table.ColumnDefinitions[index].Collation;
+                }
+
+                return null;
+            }
+            case JoinTableSource join:
+                return GetDeclaredOutputColumnCollation(join.Left, column, context)
+                    ?? GetDeclaredOutputColumnCollation(join.Right, column, context);
+            default:
+                return null;
+        }
     }
 
     private void ValidateLimitZeroExpressions(

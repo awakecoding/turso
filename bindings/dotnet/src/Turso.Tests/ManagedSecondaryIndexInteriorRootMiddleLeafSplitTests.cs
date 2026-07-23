@@ -75,6 +75,38 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
     }
 
     [Test]
+    public void InteriorRootLeftmostChildLeafSplitPersistsReopensAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("leftmost-split-integrity");
+        try
+        {
+            var target = SeedLeftmostLeafSplitTopology(PhysicalFileSystem.Instance, path);
+            var before = ReadTopology(PhysicalFileSystem.Instance, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+                Execute(connection, InsertStatement(target.RowId, target.Code));
+
+            var after = ReadTopology(PhysicalFileSystem.Instance, path);
+            AssertChildLeafSplit(before, after, target);
+            target.ChildIndex.Should().Be(0);
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Count(connection).Should().Be(target.RowCount + 1);
+                CountById(connection, target.RowId).Should().Be(1);
+            }
+
+            VerifyWithSqlite(path, target);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void EveryInterruptedInteriorRootMiddleChildLeafSplitFrameRecoversThePriorTree()
     {
         for (var failedFrame = 1; failedFrame <= 5; failedFrame++)
@@ -136,11 +168,45 @@ public sealed class ManagedSecondaryIndexInteriorRootMiddleLeafSplitTests
         }
     }
 
+    [Test]
+    public void EveryInterruptedInteriorRootLeftmostChildLeafSplitFrameRecoversThePriorTree()
+    {
+        for (var failedFrame = 1; failedFrame <= 5; failedFrame++)
+        {
+            var faults = new DeterministicFaultInjector();
+            var fileSystem = new InMemoryFileSystem(faults);
+            var path = $"secondary-index-leftmost-child-leaf-split-wal-{failedFrame}.db";
+            var target = SeedLeftmostLeafSplitTopology(fileSystem, path);
+            var before = ReadTopology(fileSystem, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                faults.FailOnOccurrence(
+                    FileSystemOperation.Write,
+                    faults.GetOperationCount(FileSystemOperation.Write) + failedFrame);
+                Assert.Throws<IOException>(() => Execute(connection, InsertStatement(target.RowId, target.Code)));
+            }
+
+            using (var recovered = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = recovered.Connect())
+            {
+                Count(connection).Should().Be(target.RowCount);
+                CountById(connection, target.RowId).Should().Be(0);
+            }
+
+            AssertUnchanged(before, ReadTopology(fileSystem, path));
+        }
+    }
+
     private static SplitTarget SeedMiddleLeafSplitTopology(IFileSystem fileSystem, string path)
         => SeedChildLeafTopology(fileSystem, path, ChildPosition.Middle, requireSplit: true);
 
     private static SplitTarget SeedLeftmostLeafInsertionTopology(IFileSystem fileSystem, string path)
         => SeedChildLeafTopology(fileSystem, path, ChildPosition.Leftmost, requireSplit: false);
+
+    private static SplitTarget SeedLeftmostLeafSplitTopology(IFileSystem fileSystem, string path)
+        => SeedChildLeafTopology(fileSystem, path, ChildPosition.Leftmost, requireSplit: true);
 
     private static SplitTarget SeedChildLeafTopology(
         IFileSystem fileSystem,

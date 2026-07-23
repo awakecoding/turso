@@ -68,7 +68,7 @@ public class SqliteFacadeTests
     {
         using var cancellation = new CancellationTokenSource();
         await cancellation.CancelAsync();
-        using var connection = new SqliteConnection("Data Source=:memory:");
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
 
         Assert.ThrowsAsync<OperationCanceledException>(() => connection.OpenAsync(cancellation.Token))!
             .CancellationToken.Should().Be(cancellation.Token);
@@ -76,8 +76,19 @@ public class SqliteFacadeTests
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT 1;";
 
-        Assert.ThrowsAsync<OperationCanceledException>(() => command.ExecuteScalarAsync(cancellation.Token))!
+        Task<object?>? execution = null;
+        Assert.DoesNotThrow(() => execution = command.ExecuteScalarAsync(cancellation.Token));
+        execution!.IsCanceled.Should().BeTrue();
+        Assert.ThrowsAsync<TaskCanceledException>(async () => await execution)!
             .CancellationToken.Should().Be(cancellation.Token);
+
+        connection.Open();
+        command.CommandText = "SELECT * FROM missing_table;";
+
+        Task<object?>? faulted = null;
+        Assert.DoesNotThrow(() => faulted = command.ExecuteScalarAsync());
+        faulted!.IsFaulted.Should().BeTrue();
+        Assert.ThrowsAsync<SqliteException>(async () => await faulted);
     }
 
     [Test]

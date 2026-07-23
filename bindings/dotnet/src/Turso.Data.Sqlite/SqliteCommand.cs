@@ -190,21 +190,27 @@ public class SqliteCommand : DbCommand
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => Execute("ExecuteReader", behavior);
 
     public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(ExecuteNonQuery());
-    }
+        => CompleteAsync(ExecuteNonQuery, cancellationToken);
 
     public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(ExecuteScalar());
-    }
+        => CompleteAsync(ExecuteScalar, cancellationToken);
 
     protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+        => CompleteAsync<DbDataReader>(() => Execute("ExecuteReader", behavior), cancellationToken);
+
+    private static Task<T> CompleteAsync<T>(Func<T> operation, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult<DbDataReader>(Execute("ExecuteReader", behavior));
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<T>(cancellationToken);
+
+        try
+        {
+            return Task.FromResult(operation());
+        }
+        catch (Exception exception)
+        {
+            return Task.FromException<T>(exception);
+        }
     }
 
     protected override void Dispose(bool disposing)

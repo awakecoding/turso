@@ -197,5 +197,8 @@
         <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\coalesce\memory.sqltest"
                  Link="Conformance\coalesce\memory.sqltest"
                  CopyToOutputDirectory="PreserveNewest" />
+        <Content Include="..\..\..\..\sqlite\conformance\sqlite-sqltests\boolean.sqltest"
+                 Link="Conformance\boolean.sqltest"
+                 CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 </Project>
