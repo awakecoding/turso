@@ -6,6 +6,23 @@ namespace Turso.Tests;
 public sealed class ManagedProviderAsyncParityTests
 {
     [Test]
+    public async Task ManagedSqliteOpenAsyncReturnsCanceledTaskWithoutOpeningConnection()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Task? open = null;
+        Assert.DoesNotThrow(() => open = connection.OpenAsync(cancellation.Token));
+        AssertCanceled(open!);
+
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+
+        await connection.OpenAsync();
+        connection.State.Should().Be(System.Data.ConnectionState.Open);
+    }
+
+    [Test]
     public async Task ManagedSqliteReaderAsyncOperationsHonorCancellationAndRemainUsable()
     {
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");

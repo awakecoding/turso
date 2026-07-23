@@ -3107,6 +3107,11 @@ public sealed class EmbeddedDatabase : IDisposable
     private static bool IsBinaryCollation(string? collation)
         => collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsStreamingSafeDistinctCollation(string? collation)
+        => IsBinaryCollation(collation)
+            || string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase);
+
     private static EmbeddedSqlException ForeignKeyMismatch(string childTable, string parentTable)
         => new($"foreign key mismatch - \"{childTable}\" referencing \"{parentTable}\"");
 
@@ -3653,15 +3658,20 @@ public sealed class EmbeddedDatabase : IDisposable
         return compiler.TryCompile(select, out compiled);
     }
 
-    // DISTINCT runs as rows stream from the cursor, whereas the evaluator first completes source filtering.
-    // Restrict the direct route to an unfiltered base scan of direct declared columns: this has no deferred
-    // expression failure, retains first-occurrence order, and maps each projection to its declared collation.
+    // DISTINCT runs as rows stream from the cursor, whereas the evaluator first materializes every filtered
+    // source row before it evaluates projections and de-duplicates. Restrict the direct route to direct declared
+    // columns with built-in declared collations plus an optional single declared-column comparison against a literal
+    // or parameter: neither stage can introduce a deferred expression failure after an earlier DISTINCT result has
+    // been yielded. Custom collations remain evaluator-owned because their callbacks can throw while de-duplicating.
+    // More complex predicates also remain evaluator-owned so their value and error timing are preserved.
     private VdbeRowEquality? CompileDistinctScanEquality(
         SelectStatement select,
         ScanTarget target,
         QueryContext context)
     {
-        if (!select.Distinct || select.Where is not null || select.Projections.Count == 0)
+        if (!select.Distinct
+            || select.Projections.Count == 0
+            || (select.Where is not null && !IsExactDistinctScanWherePredicate(select.Where, target)))
             return null;
 
         var table = context.Tables[target.TableName];
@@ -3677,11 +3687,27 @@ public sealed class EmbeddedDatabase : IDisposable
             if (index is null)
                 return null;
 
-            collations.Add(table.ColumnDefinitions[index.Value].Collation);
+            var collation = table.ColumnDefinitions[index.Value].Collation;
+            if (!IsStreamingSafeDistinctCollation(collation))
+                return null;
+
+            collations.Add(collation);
         }
 
         return (left, right) => RowsEqual(left, right, collations);
     }
+
+    private static bool IsExactDistinctScanWherePredicate(Expression expression, ScanTarget target)
+    {
+        if (expression is not BinaryExpression binary || !IsComparisonOperator(binary.Operator))
+            return false;
+
+        return (IsDeclaredScanColumnReference(binary.Left, target) && IsLiteralOrParameter(binary.Right))
+            || (IsDeclaredScanColumnReference(binary.Right, target) && IsLiteralOrParameter(binary.Left));
+    }
+
+    private static bool IsDeclaredScanColumnReference(Expression expression, ScanTarget target)
+        => expression is ColumnExpression column && target.ResolveColumnIndex(column.Name) is not null;
 
     // Builtin scalar functions whose evaluator implementation reads ONLY the already-evaluated argument
     // values — never the argument AST, the current row, the collation, or the query context — so applying
@@ -7220,6 +7246,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     }
 
                     break;
+                case ColumnExpression column:
+                    collations.Add(GetDeclaredColumnCollation(source, column.Name, context));
+                    break;
                 default:
                     collations.Add(GetCollation(projection.Expression));
                     break;
@@ -7229,6 +7258,23 @@ public sealed class EmbeddedDatabase : IDisposable
         return collations;
     }
 
+    private static string? GetDeclaredColumnCollation(
+        TableSource? source,
+        string columnName,
+        QueryContext context)
+    {
+        var separator = columnName.IndexOf('.');
+        var qualifier = separator < 0 ? null : columnName[..separator];
+        var name = separator < 0 ? columnName : columnName[(separator + 1)..];
+        var column = GetRawOutputColumns(source, context).FirstOrDefault(candidate =>
+            string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase)
+            && (qualifier is null
+                || string.Equals(candidate.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase)));
+        return column is null
+            ? null
+            : GetDeclaredOutputColumnCollation(source, column, context);
+    }
+
     private static string? GetDeclaredOutputColumnCollation(
         TableSource? source,
         OutputColumn column,
@@ -7236,6 +7282,16 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         switch (source)
         {
+            case NamedTableSource named when context.CommonTableExpressions.TryGetValue(named.Name, out var commonTableExpression):
+            {
+                var qualifier = named.Alias ?? named.Name;
+                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                    return null;
+
+                return column.Index < commonTableExpression.Columns.Length
+                    ? commonTableExpression.Collations?.ElementAtOrDefault(column.Index)
+                    : null;
+            }
             case NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table):
             {
                 var qualifier = named.Alias ?? named.Name;
@@ -7250,12 +7306,90 @@ public sealed class EmbeddedDatabase : IDisposable
 
                 return null;
             }
+            case NamedTableSource named when TryGetView(context, named.Name, out var view):
+            {
+                var qualifier = named.Alias ?? view.Name;
+                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                    return null;
+
+                var viewContext = EnterView(context, view.Name);
+                var columns = ResolveViewColumns(view, viewContext);
+                return column.Index >= columns.Length
+                    ? null
+                    : GetQueryOutputCollations(view.Query, viewContext).ElementAtOrDefault(column.Index);
+            }
+            case DerivedTableSource derived:
+            {
+                if (!string.Equals(column.Qualifier, derived.Alias, StringComparison.OrdinalIgnoreCase))
+                    return null;
+
+                var columns = DescribeQuery(derived.Query, context);
+                return column.Index >= columns.Length
+                    ? null
+                    : GetQueryOutputCollations(derived.Query, context).ElementAtOrDefault(column.Index);
+            }
             case JoinTableSource join:
-                return GetDeclaredOutputColumnCollation(join.Left, column, context)
-                    ?? GetDeclaredOutputColumnCollation(join.Right, column, context);
+            {
+                var leftWidth = GetSourceColumns(join.Left, context).Length;
+                return column.Index < leftWidth
+                    ? GetDeclaredOutputColumnCollation(join.Left, column, context)
+                    : GetDeclaredOutputColumnCollation(
+                        join.Right,
+                        column with { Index = column.Index - leftWidth },
+                        context);
+            }
             default:
                 return null;
         }
+    }
+
+    private static IReadOnlyList<string?> GetQueryOutputCollations(
+        QueryStatement query,
+        QueryContext context)
+    {
+        return query switch
+        {
+            SelectStatement select => GetDistinctProjectionCollations(
+                select.Projections,
+                GetOutputColumns(select.Source, context),
+                GetRawOutputColumns(select.Source, context),
+                select.Source,
+                context),
+            ValuesClause values when values.Rows.Count > 0
+                => values.Rows[0].Select(GetCollation).ToArray(),
+            CompoundSelectStatement compound when compound.Terms.Count > 0
+                => GetQueryOutputCollations(compound.Terms[0], context),
+            WithSelectStatement with => GetWithQueryOutputCollations(with, context),
+            _ => [],
+        };
+    }
+
+    private static IReadOnlyList<string?> GetWithQueryOutputCollations(
+        WithSelectStatement statement,
+        QueryContext context)
+    {
+        var commonTableExpressions = new Dictionary<string, SourceData>(
+            context.CommonTableExpressions,
+            StringComparer.OrdinalIgnoreCase);
+        var namesInCurrentClause = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var commonTableExpression in statement.CommonTableExpressions)
+        {
+            if (!namesInCurrentClause.Add(commonTableExpression.Name))
+                throw new EmbeddedSqlException($"duplicate WITH table name: {commonTableExpression.Name}");
+
+            var cteContext = context with { CommonTableExpressions = commonTableExpressions };
+            var columns = ResolveCommonTableExpressionColumns(
+                commonTableExpression,
+                DescribeQuery(commonTableExpression.Query, cteContext));
+            commonTableExpressions[commonTableExpression.Name] = new SourceData(
+                columns,
+                [],
+                GetQueryOutputCollations(commonTableExpression.Query, cteContext));
+        }
+
+        return GetQueryOutputCollations(
+            statement.Query,
+            context with { CommonTableExpressions = commonTableExpressions });
     }
 
     private void ValidateLimitZeroExpressions(
@@ -7757,7 +7891,8 @@ public sealed class EmbeddedDatabase : IDisposable
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, result.Columns);
         return new SourceData(
             columns,
-            result.Rows.Select(row => new SourceRow(columns, row.ToArray())).ToArray());
+            result.Rows.Select(row => new SourceRow(columns, row.ToArray())).ToArray(),
+            GetQueryOutputCollations(commonTableExpression.Query, cteContext));
     }
 
     // Safety cap on the number of rows a recursive CTE may materialize. SQLite streams
@@ -7817,6 +7952,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var anchor = MaterializeQueryResult(
             EvaluateRecursiveAnchor(compound, firstRecursiveIndex, parameters, cteContext, outerRow));
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, anchor.Columns);
+        var collations = GetQueryOutputCollations(commonTableExpression.Query, cteContext);
         var deduplicate = recursiveOperator == CompoundOperator.Union;
 
         // Route the linear single-term subset -- one already-validated recursive SELECT that scans the
@@ -7836,7 +7972,15 @@ public sealed class EmbeddedDatabase : IDisposable
             && IsLinearRecursiveTerm(recursiveTerms[0], name))
         {
             return RunRecursiveCteViaVdbe(
-                name, anchor.Rows, columns, recursiveTerms[0], deduplicate, parameters, cteContext, outerRow);
+                name,
+                anchor.Rows,
+                columns,
+                collations,
+                recursiveTerms[0],
+                deduplicate,
+                parameters,
+                cteContext,
+                outerRow);
         }
 
         var result = new List<SourceRow>();
@@ -7861,7 +8005,7 @@ public sealed class EmbeddedDatabase : IDisposable
                     cteContext.CommonTableExpressions,
                     StringComparer.OrdinalIgnoreCase)
                 {
-                    [name] = new SourceData(columns, workingSet),
+                    [name] = new SourceData(columns, workingSet, collations),
                 },
             };
 
@@ -7891,7 +8035,7 @@ public sealed class EmbeddedDatabase : IDisposable
             workingSet = produced;
         }
 
-        return new SourceData(columns, result);
+        return new SourceData(columns, result, collations);
     }
 
     // Whether a recursive term is the linear shape the recursive-worktable bytecode lowers exactly: its
@@ -7916,6 +8060,7 @@ public sealed class EmbeddedDatabase : IDisposable
         string name,
         IReadOnlyList<SqlValue[]> anchorRows,
         string[] columns,
+        IReadOnlyList<string?> collations,
         SelectStatement recursiveTerm,
         bool deduplicate,
         SqlValue[] parameters,
@@ -7923,7 +8068,7 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         var program = BuildRecursiveCteProgram(
-            name, anchorRows, columns, recursiveTerm, deduplicate, parameters, cteContext, outerRow);
+            name, anchorRows, columns, collations, recursiveTerm, deduplicate, parameters, cteContext, outerRow);
 
         var rows = new List<SourceRow>();
         try
@@ -7937,7 +8082,7 @@ public sealed class EmbeddedDatabase : IDisposable
                         rows.Add(new SourceRow(columns, MaterializeQueryRow(runtime.CurrentRow!)));
                         break;
                     case ResumableStatementStepResult.Done:
-                        return new SourceData(columns, rows);
+                        return new SourceData(columns, rows, collations);
                     default:
                         throw new EmbeddedSqlException("Recursive program yielded during evaluation.");
                 }
@@ -7967,6 +8112,7 @@ public sealed class EmbeddedDatabase : IDisposable
         string name,
         IReadOnlyList<SqlValue[]> anchorRows,
         string[] columns,
+        IReadOnlyList<string?> collations,
         SelectStatement recursiveTerm,
         bool deduplicate,
         SqlValue[] parameters,
@@ -7984,7 +8130,10 @@ public sealed class EmbeddedDatabase : IDisposable
 
         IReadOnlyList<SqlValue[]> Transform(SqlValue[] frontierRow)
         {
-            iterationTables[name] = new SourceData(columns, [new SourceRow(columns, frontierRow)]);
+            iterationTables[name] = new SourceData(
+                columns,
+                [new SourceRow(columns, frontierRow)],
+                collations);
             var termResult = MaterializeQueryResult(
                 ExecuteSelect(recursiveTerm, parameters, iterationContext, outerRow));
             if (termResult.Columns.Length != width)
@@ -8139,8 +8288,17 @@ public sealed class EmbeddedDatabase : IDisposable
         }
 
         var columns = ResolveCommonTableExpressionColumns(cte, anchor.Columns);
+        var collations = GetQueryOutputCollations(cte.Query, cteContext);
         program = BuildRecursiveCteProgram(
-            cte.Name, anchor.Rows, columns, recursiveTerm, deduplicate, parameters, cteContext, outerRow: null);
+            cte.Name,
+            anchor.Rows,
+            columns,
+            collations,
+            recursiveTerm,
+            deduplicate,
+            parameters,
+            cteContext,
+            outerRow: null);
         return true;
     }
 
@@ -9397,9 +9555,10 @@ public sealed class EmbeddedDatabase : IDisposable
         var commonTableExpressions = new Dictionary<string, SourceData>(
             context.CommonTableExpressions,
             StringComparer.OrdinalIgnoreCase);
+        var namesInCurrentClause = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var commonTableExpression in statement.CommonTableExpressions)
         {
-            if (commonTableExpressions.ContainsKey(commonTableExpression.Name))
+            if (!namesInCurrentClause.Add(commonTableExpression.Name))
                 throw new EmbeddedSqlException($"duplicate WITH table name: {commonTableExpression.Name}");
 
             var columns = ResolveCommonTableExpressionColumns(
@@ -9407,7 +9566,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 DescribeQuery(
                     commonTableExpression.Query,
                     context with { CommonTableExpressions = commonTableExpressions }));
-            commonTableExpressions.Add(commonTableExpression.Name, new SourceData(columns, []));
+            commonTableExpressions[commonTableExpression.Name] = new SourceData(columns, []);
         }
 
         return DescribeQuery(
@@ -17181,7 +17340,10 @@ internal sealed record SourceRow(
     }
 }
 
-internal sealed record SourceData(string[] Columns, IReadOnlyList<SourceRow> Rows);
+internal sealed record SourceData(
+    string[] Columns,
+    IReadOnlyList<SourceRow> Rows,
+    IReadOnlyList<string?>? Collations = null);
 
 internal abstract record ParsedStatement;
 

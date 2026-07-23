@@ -110,6 +110,27 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                     $"The managed local provider does not support check constraints on '{createTable.Name}'.");
             }
 
+            if (operation is CreateTableOperation { UniqueConstraints.Count: > 0 } createTableWithUniqueConstraint)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support unique constraints on '{createTableWithUniqueConstraint.Name}'. " +
+                    "Use a unique index instead.");
+            }
+
+            if (operation is AddUniqueConstraintOperation addUniqueConstraint)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support unique constraints ('{addUniqueConstraint.Name}' on '{addUniqueConstraint.Table}'). " +
+                    "Use a unique index instead.");
+            }
+
+            if (operation is DropUniqueConstraintOperation dropUniqueConstraint)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support unique constraints ('{dropUniqueConstraint.Name}' on '{dropUniqueConstraint.Table}'). " +
+                    "Use a unique index instead.");
+            }
+
             if (operation is AddCheckConstraintOperation addCheckConstraint)
             {
                 throw new NotSupportedException(

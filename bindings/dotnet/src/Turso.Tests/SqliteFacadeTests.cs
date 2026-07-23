@@ -70,7 +70,7 @@ public class SqliteFacadeTests
         await cancellation.CancelAsync();
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
 
-        Assert.ThrowsAsync<OperationCanceledException>(() => connection.OpenAsync(cancellation.Token))!
+        Assert.ThrowsAsync<TaskCanceledException>(() => connection.OpenAsync(cancellation.Token))!
             .CancellationToken.Should().Be(cancellation.Token);
 
         using var command = connection.CreateCommand();

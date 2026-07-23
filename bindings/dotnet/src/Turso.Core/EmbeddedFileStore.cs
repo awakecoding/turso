@@ -1229,8 +1229,9 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// maximum complete key, or split a full non-rightmost child when one new
     /// complete key fits strictly between its adjacent parent separators and the
     /// parent can accept the promoted separator. It can atomically insert or delete
-    /// one record in direct middle children of multiple compatible one-level index
-    /// roots when no parent separator changes, and it can insert one record into
+    /// one record in direct middle children, or append one strict maximum record to
+    /// direct right-most children, of multiple compatible one-level index roots when
+    /// no parent separator changes, and it can insert one record into
     /// the left-most direct child of exactly one compatible one-level index root.
     /// It can delete a singleton direct
     /// child when its parent retains at least two separators, transferring the
@@ -2922,7 +2923,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourceIndexRootPage,
             _usableSpace,
             _textEncoding);
-        if (parent.Cells.Count < 2
+        if (parent.Cells.Count == 0
             || parent.Cells.Any(cell => cell.Cell.Key.FirstOverflowPage is not null))
         {
             return false;
@@ -3050,8 +3051,16 @@ internal sealed class EmbeddedFileStore : IDisposable
         var route = parent.SearchChild(addedRecord);
         if (route.IsSeparatorKey
             || route.ChildIndex <= 0
-            || route.ChildIndex >= parent.Cells.Count
+            || route.ChildIndex >= childPages.Length
             || childPages[route.ChildIndex] != route.ChildPage)
+        {
+            return false;
+        }
+
+        var isRightmostChild = route.ChildIndex == parent.Cells.Count;
+        if (isRightmostChild
+            && (addedRecordIndex != targetRecords.Count - 1
+                || comparer.Compare(previousRecord!, addedRecord) >= 0))
         {
             return false;
         }
@@ -3064,12 +3073,15 @@ internal sealed class EmbeddedFileStore : IDisposable
             insertionIndex++;
         }
 
-        if ((insertionIndex > 0
+        if ((isRightmostChild && insertionIndex != routedRecords.Count)
+            || (insertionIndex > 0
              && comparer.Compare(routedRecords[insertionIndex - 1], addedRecord) >= 0)
             || (insertionIndex < routedRecords.Count
                 && comparer.Compare(addedRecord, routedRecords[insertionIndex]) >= 0)
-            || comparer.Compare(parent.GetRecord(route.ChildIndex - 1), addedRecord) >= 0
-            || comparer.Compare(addedRecord, parent.GetRecord(route.ChildIndex)) >= 0)
+            || (route.ChildIndex > 0
+                && comparer.Compare(parent.GetRecord(route.ChildIndex - 1), addedRecord) >= 0)
+            || (route.ChildIndex < parent.Cells.Count
+                && comparer.Compare(addedRecord, parent.GetRecord(route.ChildIndex)) >= 0))
         {
             return false;
         }

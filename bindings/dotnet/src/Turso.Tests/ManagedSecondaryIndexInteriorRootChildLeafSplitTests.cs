@@ -51,7 +51,6 @@ public sealed class ManagedSecondaryIndexInteriorRootChildLeafSplitTests
         }
         finally
         {
-            MsData.SqliteConnection.ClearAllPools();
             DeleteDatabase(path);
         }
     }
@@ -373,7 +372,9 @@ public sealed class ManagedSecondaryIndexInteriorRootChildLeafSplitTests
         File.Copy(path, verificationPath, overwrite: true);
         try
         {
-            using var sqlite = new MsData.SqliteConnection($"Data Source={verificationPath}");
+            // Avoid the global SQLite pool because parallel storage tests clear it while
+            // their own temporary databases are being removed.
+            using var sqlite = new MsData.SqliteConnection($"Data Source={verificationPath};Pooling=False");
             sqlite.Open();
             using (var integrity = sqlite.CreateCommand())
             {
@@ -388,7 +389,6 @@ public sealed class ManagedSecondaryIndexInteriorRootChildLeafSplitTests
         }
         finally
         {
-            MsData.SqliteConnection.ClearAllPools();
             DeleteDatabase(verificationPath);
         }
     }

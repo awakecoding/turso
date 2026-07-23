@@ -41,7 +41,6 @@ public sealed class ManagedAtomicMultiIndexInteriorLeafInsertionTests
         }
         finally
         {
-            MsData.SqliteConnection.ClearAllPools();
             DeleteDatabase(path);
         }
     }
@@ -97,6 +96,87 @@ public sealed class ManagedAtomicMultiIndexInteriorLeafInsertionTests
         }
     }
 
+    [Test]
+    public void MultiIndexRightmostLeafAppendPersistsOnlyRoutedLeavesAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("rightmost-integrity");
+        try
+        {
+            var target = SeedRightmostInsertionTopology(PhysicalFileSystem.Instance, path);
+            var before = ReadTopology(PhysicalFileSystem.Instance, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+                Execute(connection, InsertStatement(target.RowId));
+
+            var after = ReadTopology(PhysicalFileSystem.Instance, path);
+            AssertRightmostBoundedInsertion(before, after, target);
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Count(connection).Should().Be(target.RowCount + 1);
+                IdByCode(connection, target.RowId).Should().Be(target.RowId);
+            }
+
+            VerifyWithSqlite(path, target);
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void MultiIndexRightmostLeafAppendCommitsOnlyTheTableAndThreeRoutedLeaves()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        const string path = "multi-index-rightmost-leaf-insertion.db";
+        var target = SeedRightmostInsertionTopology(fileSystem, path);
+        var before = ReadTopology(fileSystem, path);
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
+            Execute(connection, InsertStatement(target.RowId));
+            (faults.GetOperationCount(FileSystemOperation.Write) - writesBefore).Should().Be(10);
+        }
+
+        AssertRightmostBoundedInsertion(before, ReadTopology(fileSystem, path), target);
+    }
+
+    [Test]
+    public void EveryInterruptedMultiIndexRightmostLeafAppendFrameRecoversThePriorCatalog()
+    {
+        for (var failedFrame = 1; failedFrame <= IndexNames.Length + 2; failedFrame++)
+        {
+            var faults = new DeterministicFaultInjector();
+            var fileSystem = new InMemoryFileSystem(faults);
+            var path = $"multi-index-rightmost-leaf-insertion-wal-{failedFrame}.db";
+            var target = SeedRightmostInsertionTopology(fileSystem, path);
+            var before = ReadTopology(fileSystem, path);
+
+            using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = database.Connect())
+            {
+                faults.FailOnOccurrence(
+                    FileSystemOperation.Write,
+                    faults.GetOperationCount(FileSystemOperation.Write) + failedFrame);
+                Assert.Throws<IOException>(() => Execute(connection, InsertStatement(target.RowId)));
+            }
+
+            using (var recovered = EmbeddedDatabase.OpenFile(path, fileSystem))
+            using (var connection = recovered.Connect())
+            {
+                Count(connection).Should().Be(target.RowCount);
+                CountByCode(connection, target.RowId).Should().Be(0);
+            }
+
+            AssertUnchanged(before, ReadTopology(fileSystem, path));
+        }
+    }
+
     private static InsertionTarget SeedInsertionTopology(IFileSystem fileSystem, string path)
     {
         CreateMinimumPageDatabase(fileSystem, path);
@@ -127,6 +207,38 @@ public sealed class ManagedAtomicMultiIndexInteriorLeafInsertionTests
 
         throw new InvalidOperationException(
             "Unable to create a bounded multi-index middle-child insertion topology.");
+    }
+
+    private static InsertionTarget SeedRightmostInsertionTopology(IFileSystem fileSystem, string path)
+    {
+        CreateMinimumPageDatabase(fileSystem, path);
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE target(id INTEGER PRIMARY KEY, code TEXT NOT NULL);");
+            Execute(connection, InsertStatement(Enumerable.Range(1, InitialRowCount).Select(value => (value * 2) - 1)));
+            foreach (var indexName in IndexNames)
+            {
+                Execute(
+                    connection,
+                    $"CREATE UNIQUE INDEX {indexName} ON target({RepeatedBinaryIndexColumns()});");
+            }
+        }
+
+        var rowCount = InitialRowCount;
+        for (var rowId = (InitialRowCount * 2) + 1; rowId <= 95; rowId += 2)
+        {
+            if (TryFindRightmostInsertionTarget(fileSystem, path, rowCount, rowId, out var target))
+                return target;
+
+            using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+            using var connection = database.Connect();
+            Execute(connection, InsertStatement(rowId));
+            rowCount++;
+        }
+
+        throw new InvalidOperationException(
+            "Unable to create a bounded multi-index rightmost-child insertion topology.");
     }
 
     private static bool TryFindInsertionTarget(
@@ -246,6 +358,107 @@ public sealed class ManagedAtomicMultiIndexInteriorLeafInsertionTests
         return true;
     }
 
+    private static bool TryFindRightmostInsertionTarget(
+        IFileSystem fileSystem,
+        string path,
+        int rowCount,
+        int rowId,
+        out InsertionTarget target)
+    {
+        target = null!;
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        if (header.FreelistPageCount != 0
+            || header.FirstFreelistTrunkPage != 0
+            || header.DatabaseSizeInPages != pager.CommittedPageCount)
+        {
+            return false;
+        }
+
+        var tableRootPage = FindRootPage(pager, header, "table", "target");
+        if (SqliteBtreePageHeader.Parse(pager.ReadCommittedPage(tableRootPage)).PageType
+            != SqliteBtreePageType.TableLeaf)
+        {
+            return false;
+        }
+
+        var targets = new List<IndexInsertionTarget>(IndexNames.Length);
+        foreach (var indexName in IndexNames)
+        {
+            if (!TryFindRightmostIndexInsertionTarget(pager, header, indexName, rowId, out var indexTarget))
+                return false;
+
+            targets.Add(indexTarget);
+        }
+
+        target = new InsertionTarget(rowId, rowCount, targets);
+        return true;
+    }
+
+    private static bool TryFindRightmostIndexInsertionTarget(
+        SqlitePager pager,
+        SqliteDatabaseHeader header,
+        string indexName,
+        int rowId,
+        out IndexInsertionTarget target)
+    {
+        target = null!;
+        var indexRootPage = FindRootPage(pager, header, "index", indexName);
+        var rootImage = pager.ReadCommittedPage(indexRootPage);
+        if (SqliteBtreePageHeader.Parse(rootImage).PageType != SqliteBtreePageType.IndexInterior)
+            return false;
+
+        var root = SqliteIndexInteriorPageView.Parse(
+            rootImage,
+            header.UsableSpace,
+            header.TextEncoding);
+        if (root.Cells.Count == 0 || root.Cells.Any(cell => cell.Cell.Key.FirstOverflowPage is not null))
+            return false;
+
+        var record = BuildIndexRecord(rowId, header.TextEncoding);
+        if (SqlitePayloadLayout.Calculate(
+                SqliteBtreePageType.IndexLeaf,
+                checked((ulong)record.Length),
+                header.UsableSpace).UsesOverflow)
+        {
+            return false;
+        }
+
+        var route = root.SearchChild(record);
+        if (route.IsSeparatorKey
+            || route.ChildIndex != root.Cells.Count
+            || route.ChildPage != root.Header.RightMostChildPage)
+        {
+            return false;
+        }
+
+        var leafImage = pager.ReadCommittedPage(route.ChildPage);
+        if (SqliteBtreePageHeader.Parse(leafImage).PageType != SqliteBtreePageType.IndexLeaf)
+            return false;
+
+        var leaf = SqliteIndexLeafPageView.Parse(
+            leafImage,
+            header.UsableSpace,
+            header.TextEncoding);
+        if (leaf.Cells.Count == 0 || leaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null))
+            return false;
+
+        var comparer = new SqliteIndexRecordComparer(header.TextEncoding);
+        var records = Enumerable.Range(0, leaf.Cells.Count).Select(leaf.GetRecord).ToList();
+        if (comparer.Compare(root.GetRecord(root.Cells.Count - 1), records[0]) >= 0
+            || comparer.Compare(records[^1], record) >= 0)
+        {
+            return false;
+        }
+
+        records.Add(record);
+        if (!FitsIndexLeaf(records, header, comparer))
+            return false;
+
+        target = new IndexInsertionTarget(indexName, indexRootPage, route.ChildPage);
+        return true;
+    }
+
     private static bool FitsIndexLeaf(
         IReadOnlyList<byte[]> records,
         SqliteDatabaseHeader header,
@@ -336,6 +549,20 @@ public sealed class ManagedAtomicMultiIndexInteriorLeafInsertionTests
         }
     }
 
+    private static void AssertRightmostBoundedInsertion(Topology before, Topology after, InsertionTarget target)
+    {
+        AssertBoundedInsertion(before, after, target);
+        foreach (var indexTarget in target.Indexes)
+        {
+            var beforeIndex = before.Indexes.Single(index => index.Name == indexTarget.Name);
+            var afterIndex = after.Indexes.Single(index => index.Name == indexTarget.Name);
+            indexTarget.LeafPage.Should().Be(beforeIndex.Children[^1].PageNumber);
+            afterIndex.Children[^1].PageNumber.Should().Be(indexTarget.LeafPage);
+            afterIndex.Children[^1].RowIds.Should()
+                .Equal(beforeIndex.Children[^1].RowIds.Append((long)target.RowId));
+        }
+    }
+
     private static void AssertUnchanged(Topology before, Topology after)
     {
         after.Header.Should().Be(before.Header);
@@ -409,7 +636,9 @@ public sealed class ManagedAtomicMultiIndexInteriorLeafInsertionTests
         File.Copy(path, verificationPath, overwrite: true);
         try
         {
-            using var sqlite = new MsData.SqliteConnection($"Data Source={verificationPath}");
+            // Avoid the global SQLite pool because parallel storage tests clear it while
+            // their own temporary databases are being removed.
+            using var sqlite = new MsData.SqliteConnection($"Data Source={verificationPath};Pooling=False");
             sqlite.Open();
             using (var integrity = sqlite.CreateCommand())
             {
@@ -435,7 +664,6 @@ public sealed class ManagedAtomicMultiIndexInteriorLeafInsertionTests
         }
         finally
         {
-            MsData.SqliteConnection.ClearAllPools();
             DeleteDatabase(verificationPath);
         }
     }

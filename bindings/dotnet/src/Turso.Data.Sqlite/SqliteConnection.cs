@@ -174,7 +174,9 @@ public partial class SqliteConnection : DbConnection
 
     public override Task OpenAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled(cancellationToken);
+
         Open();
         return Task.CompletedTask;
     }

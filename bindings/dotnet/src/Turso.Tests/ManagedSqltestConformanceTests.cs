@@ -444,6 +444,37 @@ public class ManagedSqltestConformanceTests
     public void ManagedBooleanSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("correlated-subquery-hash-join.sqltest", "correlated-subquery-with-join-missing-rows")]
+    [TestCase("correlated-subquery-hash-join.sqltest", "correlated-subquery-reversed-join")]
+    [TestCase("correlated-subquery-hash-join.sqltest", "correlated-subquery-with-join-multiple-cols")]
+    [TestCase("correlated-subquery-hash-join.sqltest", "correlated-subquery-single-outer-row")]
+    [TestCase("drop_index.sqltest", "drop-index-if-exists-2")]
+    [TestCase("drop_index.sqltest", "drop-index-user-unique-if-exists")]
+    [TestCase("drop_index.sqltest", "drop-index-no-index")]
+    [TestCase("delete-correlated-subquery.sqltest", "delete-correlated-empty-table")]
+    [TestCase("in-null-or.sqltest", "in-null-or-falsy")]
+    [TestCase("in-null-or.sqltest", "not-in-null-or-truthy")]
+    [TestCase("in-null-or.sqltest", "in-null-or-column-multiple-rows")]
+    [TestCase("in-null-or.sqltest", "in-match-or-null")]
+    [TestCase("in-null-or.sqltest", "in-null-column-or")]
+    [TestCase("distinct.sqltest", "distinct-select-null")]
+    [TestCase("distinct.sqltest", "distinct-count-null")]
+    [TestCase("distinct.sqltest", "distinct-order-by")]
+    [TestCase("distinct.sqltest", "distinct-collate-count")]
+    [TestCase("distinct.sqltest", "distinct-agg-group-by")]
+    [TestCase("distinct.sqltest", "distinct-expression")]
+    [TestCase("distinct.sqltest", "distinct-text-nocase")]
+    [TestCase("distinct.sqltest", "distinct-text-binary")]
+    [TestCase("distinct.sqltest", "distinct-offset-applies-after-dedup")]
+    [TestCase("distinct.sqltest", "distinct-where")]
+    [TestCase("distinct.sqltest", "distinct-multi-null-keys")]
+    [TestCase("distinct.sqltest", "distinct-empty")]
+    [TestCase("distinct.sqltest", "distinct-order-by-expression")]
+    [TestCase("distinct.sqltest", "distinct-agg-simple-count")]
+    [TestCase("distinct.sqltest", "distinct-exists-with-offset")]
+    public void ManagedAdditionalSqltestConformanceCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);
