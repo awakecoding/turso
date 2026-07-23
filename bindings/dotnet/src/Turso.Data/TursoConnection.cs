@@ -9,6 +9,7 @@ namespace Turso;
 public class TursoConnection : DbConnection
 {
     private TursoNativeDatabase? _nativeDatabase;
+    private TursoReplicaDatabase? _replicaDatabase;
     private IManagedDatabaseAdapter? _managedDatabase;
     private TursoRemoteClient? _remoteClient;
     private TursoConnectionOptions _connectionOptions;
@@ -135,6 +136,7 @@ public class TursoConnection : DbConnection
         finally
         {
             _nativeDatabase = null;
+            _replicaDatabase = null;
             _managedDatabase = null;
             _managedEncryptionFileSystem = null;
             try
@@ -212,7 +214,8 @@ public class TursoConnection : DbConnection
         if (!_connectionOptions.IsReplica)
             throw new NotSupportedException("Sync requires an embedded replica connection.");
 
-        throw new NotSupportedException("Embedded replica sync is not supported yet by the .NET provider.");
+        return (_replicaDatabase ?? throw new InvalidOperationException("Turso database is closed."))
+            .SyncAsync(cancellationToken);
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -388,7 +391,29 @@ public class TursoConnection : DbConnection
             throw new NotSupportedException("Local Provider=Managed is supported only for local database connections.");
 
         if (_connectionOptions.IsReplica)
-            throw new NotSupportedException("Embedded replica connections are not supported yet by the .NET provider. Use a remote URL without Replica Path for direct remote execution.");
+        {
+            if (_connectionOptions.SyncInterval > 0)
+            {
+                throw new NotSupportedException(
+                    "Sync Interval is not supported yet for embedded replica connections. Call Sync or SyncAsync explicitly.");
+            }
+
+            if (_connectionOptions.GetEncryptionCipher().HasValue
+                || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
+            {
+                throw new InvalidOperationException(
+                    "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
+            }
+
+            var replicaDatabase = TursoReplicaProvider.OpenReplica(
+                new TursoReplicaOptions(
+                    _connectionOptions.ReplicaPath,
+                    _connectionOptions.GetRemoteUri(),
+                    _connectionOptions.AuthToken));
+            _replicaDatabase = replicaDatabase;
+            _nativeDatabase = replicaDatabase;
+            return;
+        }
 
         if (_connectionOptions.SyncInterval > 0)
             throw new NotSupportedException("Sync Interval requires embedded replica support, which is not supported yet by the .NET provider.");
