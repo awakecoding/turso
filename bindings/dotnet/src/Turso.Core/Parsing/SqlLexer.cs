@@ -173,7 +173,7 @@ internal sealed class SqlLexer
             '.' => new SqlToken(TokenKind.Dot, ".", start),
             ';' => new SqlToken(TokenKind.Semicolon, ";", start),
             '+' => new SqlToken(TokenKind.Plus, "+", start),
-            '-' => new SqlToken(TokenKind.Minus, "-", start),
+            '-' => ReadMinusOrJsonArrow(start),
             '*' => new SqlToken(TokenKind.Asterisk, "*", start),
             '/' => new SqlToken(TokenKind.Slash, "/", start),
             '%' => new SqlToken(TokenKind.Percent, "%", start),
@@ -220,6 +220,16 @@ internal sealed class SqlLexer
         }
 
         throw new EmbeddedSqlException($"Unterminated SQL string at offset {start}.");
+    }
+
+    private SqlToken ReadMinusOrJsonArrow(int start)
+    {
+        if (!ConsumeCharacter('>'))
+            return new SqlToken(TokenKind.Minus, "-", start);
+
+        return ConsumeCharacter('>')
+            ? new SqlToken(TokenKind.JsonArrowText, "->>", start)
+            : new SqlToken(TokenKind.JsonArrow, "->", start);
     }
 
     private SqlToken ReadQuotedIdentifier(int start, char closingCharacter)
@@ -375,6 +385,8 @@ internal enum TokenKind
     Semicolon,
     Plus,
     Minus,
+    JsonArrow,
+    JsonArrowText,
     Asterisk,
     Slash,
     Percent,

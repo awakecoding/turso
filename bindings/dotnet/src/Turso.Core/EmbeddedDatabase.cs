@@ -9886,6 +9886,8 @@ public sealed class EmbeddedDatabase : IDisposable
             BinaryOperator.Divide => ApplyDivision(left, right),
             BinaryOperator.Modulo => ApplyModulo(left, right),
             BinaryOperator.Concatenate => ApplyConcatenation(left, right),
+            BinaryOperator.JsonArrow => SqliteJson.JsonArrow(left, right, textResult: false),
+            BinaryOperator.JsonArrowText => SqliteJson.JsonArrow(left, right, textResult: true),
             BinaryOperator.Equal => SqlValue.Integer(Compare(left, right, collation) == 0 ? 1 : 0),
             BinaryOperator.NotEqual => SqlValue.Integer(Compare(left, right, collation) != 0 ? 1 : 0),
             BinaryOperator.LessThan => SqlValue.Integer(Compare(left, right, collation) < 0 ? 1 : 0),
@@ -14150,6 +14152,24 @@ public sealed class EmbeddedDatabase : IDisposable
             return SqlValue.JsonText(result.ToString());
         }
 
+        internal static SqlValue JsonArrow(SqlValue value, SqlValue operand, bool textResult)
+        {
+            if (!TryGetArrowPath(operand, out var path))
+                return SqlValue.Null;
+
+            var root = ParseOrThrow(value);
+            var (found, node) = Navigate(root, path);
+            if (!found)
+                return SqlValue.Null;
+
+            if (!textResult)
+                return SqlValue.JsonText(Serialize(node));
+
+            return node.Kind is JKind.Array or JKind.Object
+                ? SqlValue.Text(Serialize(node))
+                : NodeToSql(node);
+        }
+
         internal static SqlValue JsonArray(IReadOnlyList<SqlValue> args)
         {
             var items = new List<JNode>(args.Count);
@@ -14808,6 +14828,32 @@ public sealed class EmbeddedDatabase : IDisposable
                 SqlValueKind.Real => value.AsReal().ToString("R", CultureInfo.InvariantCulture),
                 _ => string.Empty,
             };
+
+        private static bool TryGetArrowPath(SqlValue value, out string path)
+        {
+            switch (value.Kind)
+            {
+                case SqlValueKind.Integer:
+                {
+                    var index = value.AsInteger();
+                    path = index >= 0
+                        ? $"$[{index}]"
+                        : $"$[#{index}]";
+                    return true;
+                }
+                case SqlValueKind.Text:
+                {
+                    var nameOrPath = value.AsText();
+                    path = nameOrPath.Length == 0 || nameOrPath.StartsWith('$')
+                        ? nameOrPath
+                        : "$." + QuoteString(nameOrPath);
+                    return true;
+                }
+                default:
+                    path = string.Empty;
+                    return false;
+            }
+        }
 
         private static string TypeName(JNode node) => node.Kind switch
         {

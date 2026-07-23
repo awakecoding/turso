@@ -1558,10 +1558,17 @@ internal sealed class SqlParser
     private Expression ParseConcatenate()
     {
         var expression = ParseCollation();
-        while (Consume(TokenKind.Concatenate))
-            expression = new BinaryExpression(expression, BinaryOperator.Concatenate, ParseCollation());
-
-        return expression;
+        while (true)
+        {
+            if (Consume(TokenKind.Concatenate))
+                expression = new BinaryExpression(expression, BinaryOperator.Concatenate, ParseCollation());
+            else if (Consume(TokenKind.JsonArrow))
+                expression = new BinaryExpression(expression, BinaryOperator.JsonArrow, ParseCollation());
+            else if (Consume(TokenKind.JsonArrowText))
+                expression = new BinaryExpression(expression, BinaryOperator.JsonArrowText, ParseCollation());
+            else
+                return expression;
+        }
     }
 
     private Expression ParseCollation()

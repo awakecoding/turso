@@ -375,6 +375,8 @@ internal enum BinaryOperator
     Divide,
     Modulo,
     Concatenate,
+    JsonArrow,
+    JsonArrowText,
     And,
     Or,
     Is,
