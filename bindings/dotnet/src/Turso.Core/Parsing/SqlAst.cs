@@ -122,7 +122,9 @@ internal abstract record UpsertAction;
 
 internal sealed record DoNothingUpsertAction : UpsertAction;
 
-internal sealed record DoUpdateUpsertAction(IReadOnlyList<ColumnAssignment> Assignments) : UpsertAction;
+internal sealed record DoUpdateUpsertAction(
+    IReadOnlyList<ColumnAssignment> Assignments,
+    Expression? Where) : UpsertAction;
 
 internal sealed record UpsertClause(
     IReadOnlyList<UpsertTargetColumn> Target,

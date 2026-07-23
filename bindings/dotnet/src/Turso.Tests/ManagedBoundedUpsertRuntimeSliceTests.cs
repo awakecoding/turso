@@ -116,6 +116,60 @@ public sealed class ManagedBoundedUpsertRuntimeSliceTests
     }
 
     [Test]
+    public void ConditionalUpsertUpdateUsesTargetAndExcludedValuesAndSkipsFalseOrNullPredicates()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER);");
+        Execute(connection, "CREATE TABLE audit(event TEXT);");
+        Execute(
+            connection,
+            "CREATE TRIGGER item_update AFTER UPDATE ON items BEGIN INSERT INTO audit VALUES ('update'); END;");
+        Execute(connection, "INSERT INTO items VALUES (1, 5);");
+
+        ReadRows(
+                connection,
+                """
+                INSERT INTO items VALUES (1, 10)
+                ON CONFLICT(id) DO UPDATE SET value = excluded.value
+                WHERE excluded.value > items.value
+                RETURNING value;
+                """)
+            .Should()
+            .ContainSingle()
+            .Which
+            .Should()
+            .Equal(SqlValue.Integer(10));
+
+        using (var skipped = connection.Prepare(
+                   """
+                   INSERT INTO items VALUES (1, 8)
+                   ON CONFLICT(id) DO UPDATE SET value = excluded.value
+                   WHERE excluded.value > items.value
+                   RETURNING value;
+                   """))
+        {
+            skipped.Step().Should().Be(StatementStepResult.Done);
+            skipped.RowsAffected.Should().Be(0);
+        }
+
+        using (var skipped = connection.Prepare(
+                   """
+                   INSERT INTO items VALUES (1, 12)
+                   ON CONFLICT(id) DO UPDATE SET value = excluded.value
+                   WHERE NULL
+                   RETURNING value;
+                   """))
+        {
+            skipped.Step().Should().Be(StatementStepResult.Done);
+            skipped.RowsAffected.Should().Be(0);
+        }
+
+        AssertRows(ReadRows(connection, "SELECT value FROM items;"), [SqlValue.Integer(10)]);
+        AssertRows(ReadRows(connection, "SELECT event FROM audit;"), [SqlValue.Text("update")]);
+    }
+
+    [Test]
     public void UpsertConstraintFailureRollsBackTheWholeStatement()
     {
         using var database = new EmbeddedDatabase();
@@ -148,12 +202,6 @@ public sealed class ManagedBoundedUpsertRuntimeSliceTests
         Action targetless = () => Execute(connection, "INSERT INTO items VALUES (1, 'x', 2) ON CONFLICT DO NOTHING;");
         targetless.Should().Throw<EmbeddedSqlException>()
             .WithMessage("*requires a parenthesized PRIMARY KEY or UNIQUE conflict target*");
-
-        Action updateWhere = () => Execute(
-            connection,
-            "INSERT INTO items VALUES (1, 'one', 2) ON CONFLICT(id) DO UPDATE SET value = excluded.value WHERE value > 0;");
-        updateWhere.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*DO UPDATE WHERE clauses are not supported*");
 
         Execute(connection, "CREATE UNIQUE INDEX duplicate_code ON items(code);");
         Action ambiguous = () => Execute(

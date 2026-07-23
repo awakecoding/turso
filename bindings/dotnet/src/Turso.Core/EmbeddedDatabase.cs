@@ -1905,16 +1905,39 @@ public sealed class EmbeddedDatabase : IDisposable
                 "Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.");
         }
 
-        ValidateUpsertUpdateExpressions(statement.TableName, updateAction.Assignments);
+        ValidateUpsertUpdateExpressions(statement.TableName, updateAction.Assignments, updateAction.Where);
         var original = table.Rows[conflictPosition];
         var originalRowId = table.RowIds[conflictPosition];
+        var source = CreateUpsertSourceRow(
+            statement.TableName,
+            table,
+            original,
+            originalRowId,
+            candidate);
+        if (updateAction.Where is not null
+            && !IsTrue(Evaluate(updateAction.Where, parameters, source, context)))
+        {
+            return (
+                BuildUpsertReturningResult(
+                    statement,
+                    table,
+                    [],
+                    [],
+                    parameters,
+                    context,
+                    rowsAffected: 0,
+                    changed: false,
+                    lastInsertRowId: null),
+                null);
+        }
+
         var updated = BuildUpsertUpdatedRow(
             statement.TableName,
             table,
             updatePlan,
             original,
             originalRowId,
-            candidate,
+            source,
             parameters,
             context);
         var updatedRows = new List<SqlValue[]>(table.Rows);
@@ -2114,12 +2137,11 @@ public sealed class EmbeddedDatabase : IDisposable
         UpdatePlan plan,
         SqlValue[] original,
         long rowId,
-        SqlValue[] excluded,
+        SourceRow source,
         SqlValue[] parameters,
         QueryContext context)
     {
         var updated = original.ToArray();
-        var source = CreateUpsertSourceRow(tableName, table, original, rowId, excluded);
         foreach (var (index, value) in plan.ColumnAssignments)
             updated[index] = Evaluate(value, parameters, source, context);
 
@@ -2157,23 +2179,25 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private void ValidateUpsertUpdateExpressions(
         string tableName,
-        IReadOnlyList<ColumnAssignment> assignments)
+        IReadOnlyList<ColumnAssignment> assignments,
+        Expression? where)
     {
         foreach (var assignment in assignments)
-        {
-            if (ContainsAggregate(assignment.Value)
-                || ContainsWindowFunction(assignment.Value))
-            {
-                throw new EmbeddedSqlException(
-                    "Managed UPSERT DO UPDATE does not support aggregate or window expressions.");
-            }
-
             ValidateUpsertUpdateExpression(tableName, assignment.Value);
-        }
+
+        if (where is not null)
+            ValidateUpsertUpdateExpression(tableName, where);
     }
 
-    private static void ValidateUpsertUpdateExpression(string tableName, Expression expression)
+    private void ValidateUpsertUpdateExpression(string tableName, Expression expression)
     {
+        if (ContainsAggregate(expression)
+            || ContainsWindowFunction(expression))
+        {
+            throw new EmbeddedSqlException(
+                "Managed UPSERT DO UPDATE does not support aggregate or window expressions.");
+        }
+
         switch (expression)
         {
             case LiteralExpression:
@@ -15900,6 +15924,10 @@ public sealed class EmbeddedConnection : IDisposable
                     .Concat(insert.Upsert is { Action: DoUpdateUpsertAction update }
                         ? update.Assignments.Select(assignment => assignment.Value)
                         : Enumerable.Empty<Expression>())
+                    .Concat(insert.Upsert is { Action: DoUpdateUpsertAction conditionalUpdate }
+                            && conditionalUpdate.Where is { } where
+                        ? [where]
+                        : Enumerable.Empty<Expression>())
                     .Concat(insert.Returning?.Select(projection => projection.Expression)
                         ?? Enumerable.Empty<Expression>()),
                 name => insert with { TableName = name }),
@@ -16049,7 +16077,8 @@ public sealed class EmbeddedConnection : IDisposable
                 || insert.Rows.SelectMany(row => row).Any(ExpressionContainsSchemaQualification)
                 || (insert.Source is not null && QueryContainsSchemaQualification(insert.Source))
                 || (insert.Upsert is { Action: DoUpdateUpsertAction update }
-                    && update.Assignments.Any(assignment => ExpressionContainsSchemaQualification(assignment.Value)))
+                    && (update.Assignments.Any(assignment => ExpressionContainsSchemaQualification(assignment.Value))
+                        || ExpressionContainsSchemaQualification(update.Where)))
                 || (insert.Returning?.Any(projection => ExpressionContainsSchemaQualification(projection.Expression)) ?? false),
             UpdateStatement update => ManagedSchemaName.TrySplit(update.TableName, out _, out _)
                 || update.Assignments.Any(assignment => ExpressionContainsSchemaQualification(assignment.Value))

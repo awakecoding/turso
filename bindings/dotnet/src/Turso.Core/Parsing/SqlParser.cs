@@ -863,10 +863,11 @@ internal sealed class SqlParser
         }
         while (Consume(TokenKind.Comma));
 
+        Expression? where = null;
         if (ConsumeKeyword("WHERE"))
-            throw Error("UPSERT DO UPDATE WHERE clauses are not supported.");
+            where = ParseExpression();
 
-        return new UpsertClause(target, new DoUpdateUpsertAction(assignments));
+        return new UpsertClause(target, new DoUpdateUpsertAction(assignments, where));
     }
 
     private ParsedStatement ParseUpdate()
