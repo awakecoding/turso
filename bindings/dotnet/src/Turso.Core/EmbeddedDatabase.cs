@@ -4233,9 +4233,9 @@ public sealed class EmbeddedDatabase : IDisposable
     // all qualifying rows before its unconditional ResultRow reaches the offset/limit gates, so
     // the gates trim the already ordered stream exactly. The preflight is deliberately stricter
     // than the unbounded sorter route: only a single base table, non-DISTINCT non-aggregate
-    // projections made from bare columns, "*", or literals, and resolved column (or
-    // COLLATE-column) ORDER BY keys are admitted. This prevents aliases/ordinals that resolve to
-    // computed expressions from being mistaken for row-backed sort keys.
+    // projections made from bare columns, "*" / a resolved qualified star, or literals, and
+    // resolved column (or COLLATE-column) ORDER BY keys are admitted. This prevents
+    // aliases/ordinals that resolve to computed expressions from being mistaken for row-backed sort keys.
     private bool TryCompileLimitedSortedSelect(
         SelectStatement select,
         SqlValue[] parameters,
@@ -4446,12 +4446,13 @@ public sealed class EmbeddedDatabase : IDisposable
     // Lowers a single base-table ORDER BY pipeline into a sorter-backed VdbeProgram, or
     // returns false so the evaluator keeps ownership of shapes the sorted route cannot
     // preserve exactly. Supported: a single real base table, one or more projections that
-    // are bare columns, "*", or folded constants, an optional row-at-a-time WHERE, and one
-    // or more ORDER BY keys evaluable against the scanned row. LIMIT/OFFSET are accepted only
-    // through TryCompileLimitedSortedSelect, which strips the bounds and asks the bounded
-    // overload below for its stricter column-key subset. Deliberately excluded (kept on the
-    // evaluator): DISTINCT, GROUP BY/HAVING, qualified-star projections, and any ORDER BY key
-    // that needs a subquery/aggregate/window or an unbacked rowid.
+    // are bare columns, "*" / a resolved qualified star, or folded constants, an optional
+    // row-at-a-time WHERE, and one or more ORDER BY keys evaluable against the scanned row.
+    // LIMIT/OFFSET are accepted only through TryCompileLimitedSortedSelect, which strips the
+    // bounds and asks the bounded overload below for its stricter column-key subset.
+    // Deliberately excluded (kept on the evaluator): DISTINCT, GROUP BY/HAVING, an unresolved
+    // qualified star, and any ORDER BY key that needs a subquery/aggregate/window or an
+    // unbacked rowid.
     private bool TryCompileSortedSelect(
         SelectStatement select,
         SqlValue[] parameters,
@@ -4495,12 +4496,13 @@ public sealed class EmbeddedDatabase : IDisposable
         if (target is null)
             return false;
 
-        if (bounded && select.Projections.Any(projection => !IsBoundedSortedProjection(projection.Expression)))
+        if (bounded && select.Projections.Any(
+                projection => !IsBoundedSortedProjection(projection.Expression, target)))
             return false;
 
         // Lower every projection to a column read or folded constant, exactly as the
-        // unordered scan compiler does; anything else (e.g. computed expressions or
-        // qualified stars) declines the route.
+        // unordered scan compiler does; anything else (e.g. computed expressions or an
+        // unresolved qualified star) declines the route.
         var projections = new List<SortedScanColumn>();
         foreach (var projection in select.Projections)
         {
@@ -4553,8 +4555,13 @@ public sealed class EmbeddedDatabase : IDisposable
         return true;
     }
 
-    private static bool IsBoundedSortedProjection(Expression expression)
-        => expression is StarExpression or ColumnExpression or LiteralExpression;
+    private static bool IsBoundedSortedProjection(Expression expression, ScanTarget target)
+        => expression is StarExpression or ColumnExpression or LiteralExpression
+            || (expression is QualifiedStarExpression qualifiedStar
+                && string.Equals(
+                    qualifiedStar.Qualifier,
+                    target.Qualifier,
+                    StringComparison.OrdinalIgnoreCase));
 
     private static bool IsBoundedSortedOrderKey(OrderByTerm term, ScanTarget target)
     {
@@ -4566,8 +4573,9 @@ public sealed class EmbeddedDatabase : IDisposable
             && target.ResolveColumnIndex(column.Name) is not null;
     }
 
-    // Mirrors SelectStatementCompiler's projection lowering: bare columns and "*" become
-    // column reads, constant scalars fold to a literal, and everything else declines.
+    // Mirrors SelectStatementCompiler's projection lowering: bare columns and a star whose
+    // qualifier resolves to this sole source become column reads, constant scalars fold to a
+    // literal, and everything else declines.
     private bool TryLowerSortedProjection(
         Expression expression,
         ScanTarget target,
@@ -4587,7 +4595,19 @@ public sealed class EmbeddedDatabase : IDisposable
             case ColumnExpression column when target.ResolveColumnIndex(column.Name) is { } columnIndex:
                 projections.Add(SortedScanColumn.ForColumn(columnIndex));
                 return true;
+            case QualifiedStarExpression qualifiedStar
+                when string.Equals(
+                    qualifiedStar.Qualifier,
+                    target.Qualifier,
+                    StringComparison.OrdinalIgnoreCase):
+                if (target.Columns.Length == 0)
+                    return false;
+
+                for (var index = 0; index < target.Columns.Length; index++)
+                    projections.Add(SortedScanColumn.ForColumn(index));
+                return true;
             case QualifiedStarExpression:
+                // Preserve evaluator ownership of an unresolved qualifier and its diagnostic.
                 return false;
             default:
                 if (IsConstantScalarExpression(expression))

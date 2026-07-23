@@ -664,26 +664,30 @@ public class SqliteDataReader : DbDataReader
 
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(Read());
+        return cancellationToken.IsCancellationRequested
+            ? Task.FromCanceled<bool>(cancellationToken)
+            : Task.FromResult(Read());
     }
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(NextResult());
+        return cancellationToken.IsCancellationRequested
+            ? Task.FromCanceled<bool>(cancellationToken)
+            : Task.FromResult(NextResult());
     }
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(IsDBNull(ordinal));
+        return cancellationToken.IsCancellationRequested
+            ? Task.FromCanceled<bool>(cancellationToken)
+            : Task.FromResult(IsDBNull(ordinal));
     }
 
     public override Task<T> GetFieldValueAsync<T>(int ordinal, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(GetFieldValue<T>(ordinal));
+        return cancellationToken.IsCancellationRequested
+            ? Task.FromCanceled<T>(cancellationToken)
+            : Task.FromResult(GetFieldValue<T>(ordinal));
     }
 
     protected override void Dispose(bool disposing)

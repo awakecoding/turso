@@ -1,9 +1,35 @@
 using AwesomeAssertions;
+using Turso.Data.Sqlite;
 
 namespace Turso.Tests;
 
 public sealed class ManagedProviderAsyncParityTests
 {
+    [Test]
+    public async Task ManagedSqliteReaderAsyncOperationsHonorCancellationAndRemainUsable()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1 UNION ALL SELECT 2;";
+        using var reader = await command.ExecuteReaderAsync();
+
+        (await reader.ReadAsync()).Should().BeTrue();
+        (await reader.GetFieldValueAsync<long>(0)).Should().Be(1);
+        (await reader.IsDBNullAsync(0)).Should().BeFalse();
+
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        AssertCanceled(reader.ReadAsync(cancellation.Token));
+        AssertCanceled(reader.NextResultAsync(cancellation.Token));
+        AssertCanceled(reader.IsDBNullAsync(0, cancellation.Token));
+        AssertCanceled(reader.GetFieldValueAsync<long>(0, cancellation.Token));
+
+        (await reader.ReadAsync()).Should().BeTrue();
+    }
+
     [Test]
     public async Task ManagedTursoReaderAsyncOperationsHonorCancellationAndRemainUsable()
     {

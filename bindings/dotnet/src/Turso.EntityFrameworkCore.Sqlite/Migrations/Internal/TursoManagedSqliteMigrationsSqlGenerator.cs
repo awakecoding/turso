@@ -101,6 +101,13 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                     $"The managed local provider does not support check constraints on '{addCheckConstraint.Table}'.");
             }
 
+            if (operation is SqlOperation)
+            {
+                throw new NotSupportedException(
+                    "The managed local provider does not support raw SQL migration operations. " +
+                    "Use modeled migration operations so managed-local compatibility can be validated before schema mutation.");
+            }
+
             if (operation is CreateIndexOperation { Filter: not null } createIndex)
             {
                 throw new NotSupportedException(

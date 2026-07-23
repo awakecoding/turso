@@ -44,13 +44,13 @@ public class QualifiedStarSqlRoutingTests
         Execute(connection, "CREATE TABLE sales(id INTEGER, amount INTEGER);");
         Execute(connection, "INSERT INTO sales VALUES (2, 20), (1, 10);");
 
-        // The direct scan has no sorter. ORDER BY keeps this shape with the evaluator.
+        // A resolved qualified star expands to the base table's declared columns before sorting.
         var ordered = ReadRows(connection, "SELECT s.* FROM sales AS s ORDER BY s.id;");
         ordered.Should().HaveCount(2);
         ordered[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(10));
         ordered[1].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(20));
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT s.* FROM sales AS s ORDER BY s.id;"));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT s.* FROM sales AS s ORDER BY s.id;"))
+            .Should().Contain("OpenSorter").And.Contain("SorterSort");
 
         // Once an alias is present, SQLite does not permit the underlying table name as a qualifier.
         // Declining lets the evaluator retain that exact diagnostic.
@@ -59,6 +59,49 @@ public class QualifiedStarSqlRoutingTests
         error.Message.Should().Be("no such table: sales");
         Assert.Throws<EmbeddedSqlException>(
             () => ReadRows(connection, "EXPLAIN SELECT sales.* FROM sales AS s;"));
+    }
+
+    [Test]
+    public void OrderedBoundedQualifiedStarRoutesThroughSorterAndMatchesSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE sales(id INTEGER, amount INTEGER, note TEXT);",
+            "INSERT INTO sales VALUES (1, 20, 'first'), (2, 10, 'second'), (3, 20, 'last'), (4, 5, 'skip');",
+        ];
+        const string query =
+            "SELECT s.* FROM sales AS s WHERE s.amount >= 10 ORDER BY s.amount DESC, s.id LIMIT 2 OFFSET 1;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var managed = ReadRows(connection, query);
+        managed.Should().HaveCount(2);
+        managed[0].Should().Equal(SqlValue.Integer(3), SqlValue.Integer(20), SqlValue.Text("last"));
+        managed[1].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(10), SqlValue.Text("second"));
+        AssertMatchesSqlite(managed, setup, query);
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Equal(
+            "LoadConstant", "LoadConstant",
+            "OpenReadCursor", "OpenSorter", "Rewind", "Filter",
+            "Column", "Column", "Column", "SorterInsert", "Next", "CloseCursor",
+            "SorterSort", "SorterData", "Copy", "Copy", "Copy",
+            "OffsetGate", "LimitGate", "ResultRow", "SorterNext", "CloseSorter", "Halt");
+    }
+
+    [Test]
+    public void OrderedQualifiedStarWithUnresolvedQualifierFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE sales(id INTEGER, amount INTEGER);");
+        Execute(connection, "INSERT INTO sales VALUES (1, 10);");
+
+        const string query = "SELECT sales.* FROM sales AS s ORDER BY s.id LIMIT 1;";
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query))!
+            .Message.Should().Be("no such table: sales");
     }
 
     private static void AssertMatchesSqlite(
