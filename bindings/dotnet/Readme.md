@@ -60,9 +60,9 @@ The RID-specific package carries the matching `Turso.Data.Native` provider assem
 
 ## Maintainer packaging
 
-`make restore`, `make build`, `make test`, and `make pack` use the managed-only release path. `make test` validates the packed provider by restoring and running the source-free `ManagedPackageConsumer` sample. Use the explicitly opt-in `make test-native` for the full source test suite, including dynamic native-companion coverage. `make validate-managed-package` runs the same packaged-provider validation directly.
+`make restore`, `make build`, `make test`, and `make pack` use the isolated managed-only release path. They neither build Rust nor consume `rs_compiled` native assets. `make test` validates the packed provider by restoring and running the source-free `ManagedPackageConsumer` sample, which rejects restored native companion packages. Use the explicitly opt-in `make test-native` for the full source test suite, including dynamic native-companion coverage. `make validate-managed-package` runs the same packaged-provider validation directly.
 
-Native distribution is intentionally explicit: `make pack-native` creates the dynamic native companion packages after their runtime assets have been built. `Turso.Raw` carries its managed `Turso.Core` and `Turso.Data` closure for `net8.0`, `net9.0`, and `net10.0` alongside the runtime assets. `make pack-nativeaot-static` creates the RID-specific static-linking companions. `make pack-release` combines those optional companion steps with the managed packages for a full distribution cut.
+Native distribution is intentionally explicit: `make pack-native` creates the dynamic native companion packages after their runtime assets have been built. `Turso.Raw` carries its managed `Turso.Core` and `Turso.Data` closure for `net8.0`, `net9.0`, and `net10.0` alongside the runtime assets. `make pack-nativeaot-static` creates the RID-specific static-linking companions. `make pack-release` deliberately combines those optional companion steps with the managed packages for a full distribution cut; it is not the primary managed release path.
 
 ## Getting started
 

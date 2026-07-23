@@ -119,4 +119,51 @@ public sealed class ManagedProviderIndexSchemaMetadataTests
         columns[1].IsUnique.Should().BeFalse();
         columns[1].AllowDBNull.Should().BeTrue();
     }
+
+    [Test]
+    public void ReaderSchemaIsAvailableBeforeReadingManagedRows()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery("""
+            CREATE TABLE products(
+                id INTEGER PRIMARY KEY,
+                sku TEXT NOT NULL
+            );
+            INSERT INTO products VALUES (1, 'SKU-1');
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT id, sku FROM products;");
+
+        var schema = reader.GetSchemaTable();
+
+        schema.Rows.Cast<DataRow>()
+            .Select(row => (
+                (string)row[SchemaTableColumn.ColumnName],
+                (Type)row[SchemaTableColumn.DataType],
+                (int)row[SchemaTableColumn.ProviderType]))
+            .Should().Equal(
+                ("id", typeof(long), (int)SqliteType.Integer),
+                ("sku", typeof(string), (int)SqliteType.Text));
+        reader.Read().Should().BeTrue();
+    }
+
+    [Test]
+    public void ReaderSchemaSamplesTypelessColumnsAfterANullCurrentRow()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery("""
+            CREATE TABLE values_table(value);
+            INSERT INTO values_table VALUES (NULL), ('text');
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT value FROM values_table;");
+        reader.Read().Should().BeTrue();
+
+        var schema = reader.GetSchemaTable();
+
+        schema.Rows[0][SchemaTableColumn.DataType].Should().Be(typeof(string));
+        schema.Rows[0][SchemaTableColumn.ProviderType].Should().Be((int)SqliteType.Text);
+    }
 }

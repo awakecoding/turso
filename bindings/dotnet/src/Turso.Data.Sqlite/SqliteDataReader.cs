@@ -468,13 +468,14 @@ public class SqliteDataReader : DbDataReader
             var baseColumnName = ResolveBaseColumnName(selection, columnName, tableColumns);
             SchemaColumnInfo? columnInfo = null;
             var hasBaseColumn = baseColumnName is not null && tableName is not null && tableColumns.TryGetValue(baseColumnName, out columnInfo);
-            var valueType = ReadValue(i).Kind;
-            if (valueType is ReaderValueKind.Empty or ReaderValueKind.Null)
-                valueType = GetSampleValueType(i);
-
             var info = hasBaseColumn
                 ? columnInfo ?? throw new InvalidOperationException(Properties.Resources.NoData)
                 : null;
+            var valueType = _hasCurrentRow ? ReadValue(i).Kind : ReaderValueKind.Empty;
+            if (valueType == ReaderValueKind.Empty && !string.IsNullOrEmpty(info?.TypeName))
+                valueType = GetValueKindFromTypeName(info.TypeName);
+            else if (valueType is ReaderValueKind.Empty or ReaderValueKind.Null)
+                valueType = GetSampleValueType(i);
             var dataTypeName = info is not null
                 ? StripTypeLength(info.TypeName)
                 : GetDataTypeNameFromValueType(valueType, selection);
@@ -983,6 +984,20 @@ public class SqliteDataReader : DbDataReader
             : null;
     }
 
+    private static string GetDataTypeNameFromValueType(ReaderValueKind valueType, string selection)
+    {
+        if (valueType == ReaderValueKind.Blob && Regex.IsMatch(selection, @"[+\-*/]"))
+            return "INTEGER";
+
+        return valueType switch
+        {
+            ReaderValueKind.Integer => "INTEGER",
+            ReaderValueKind.Real => "REAL",
+            ReaderValueKind.Text => "TEXT",
+            _ => "BLOB"
+        };
+    }
+
     private ReaderValueKind GetSampleValueType(int ordinal)
     {
         using var statement = _command.PrepareSingleStatement(_currentSql);
@@ -998,18 +1013,17 @@ public class SqliteDataReader : DbDataReader
         return ReaderValueKind.Blob;
     }
 
-    private static string GetDataTypeNameFromValueType(ReaderValueKind valueType, string selection)
+    private static ReaderValueKind GetValueKindFromTypeName(string typeName)
     {
-        if (valueType == ReaderValueKind.Blob && Regex.IsMatch(selection, @"[+\-*/]"))
-            return "INTEGER";
+        var normalized = StripTypeLength(typeName).ToUpperInvariant();
+        if (normalized.Contains("INT"))
+            return ReaderValueKind.Integer;
+        if (normalized.Contains("CHAR") || normalized.Contains("CLOB") || normalized.Contains("TEXT"))
+            return ReaderValueKind.Text;
+        if (normalized.Contains("REAL") || normalized.Contains("FLOA") || normalized.Contains("DOUB"))
+            return ReaderValueKind.Real;
 
-        return valueType switch
-        {
-            ReaderValueKind.Integer => "INTEGER",
-            ReaderValueKind.Real => "REAL",
-            ReaderValueKind.Text => "TEXT",
-            _ => "BLOB"
-        };
+        return ReaderValueKind.Blob;
     }
 
     [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]

@@ -3980,7 +3980,7 @@ public sealed class EmbeddedDatabase : IDisposable
     // Routed entirely through the VDBE:
     //  - the base (the same SELECT with LIMIT/OFFSET stripped) lowers via the direct-scan /
     //    constant-projection compiler, aggregate route, bounded sorted-scan route, or the
-    //    deliberately small inner equi-join route. Each emits through unconditional ResultRow
+    //    deliberately small direct join route. Each emits through unconditional ResultRow
     //    instructions, which is exactly what the gate can bound: OFFSET skips leading candidates
     //    without charging LIMIT, then LIMIT caps the survivors, matching the evaluator's
     //    OFFSET-then-LIMIT ApplyDistinctLimit order.
@@ -3989,8 +3989,8 @@ public sealed class EmbeddedDatabase : IDisposable
     //    LIMIT treated as unbounded), so the gated program yields the identical row window.
     //
     // Deliberately kept on the evaluator (fallback):
-    //  - ORDER BY outside the bounded sorted-scan subset; joins outside the narrow inner
-    //    equi-join shape; DISTINCT, aggregate/window shapes, non-base sources, computed
+    //  - ORDER BY outside the bounded sorted-scan subset; joins outside the narrow direct
+    //    equi-join or cross-join shape; DISTINCT, aggregate/window shapes, non-base sources, computed
     //    projections, and non-column order keys all need semantics this pipeline does not
     //    represent exactly.
     //  - DISTINCT: the base carries DISTINCT, which every gate-able route rejects, so the
@@ -4029,13 +4029,13 @@ public sealed class EmbeddedDatabase : IDisposable
 
         // Gate only the row-count-preserving routes whose unconditional ResultRows the builder
         // can bound exactly. The join branch below is intentionally stricter than the existing
-        // unbounded join route: bounded joins currently claim only explicit INNER or LEFT equi-joins
-        // over two base tables with direct projections. A narrowly validated LEFT WHERE runs after
-        // null extension inside the reusable nested loop.
+        // unbounded join route: bounded joins claim only direct INNER/LEFT equi-joins or INNER
+        // cross joins over two base tables with direct projections. A narrowly validated LEFT
+        // WHERE runs after null extension inside the reusable nested loop.
         var baseSelect = select with { Limit = null, Offset = null };
         if (!TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase)
             && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase)
-            && !TryCompileLimitedEquiJoinSelect(baseSelect, parameters, context, outerRow, out compiledBase))
+            && !TryCompileLimitedJoinSelect(baseSelect, parameters, context, outerRow, out compiledBase))
         {
             return false;
         }
@@ -4052,11 +4052,11 @@ public sealed class EmbeddedDatabase : IDisposable
     // Bounded joins are deliberately a smaller contract than TryCompileJoinSelect. A LIMIT/OFFSET gate is
     // mechanically valid over every unconditional ResultRow that JoinProgramBuilder emits, including the
     // mutually-exclusive matched and null-extension emission sites of a LEFT join. This route claims two base
-    // tables, an explicit equality between one direct column from each side, and direct column/literal
-    // projections. INNER joins may add a direct post-join WHERE. LEFT joins may add only a direct,
-    // collation-free comparison over the combined input row, which the nested-loop program applies after
-    // null extension.
-    private bool TryCompileLimitedEquiJoinSelect(
+    // tables, direct column/literal projections, and either an explicit equality between one direct column from
+    // each side or an INNER cross join with no ON condition. INNER joins may add a direct post-join WHERE.
+    // LEFT joins may add only a direct, collation-free comparison over the combined input row, which the
+    // nested-loop program applies after null extension.
+    private bool TryCompileLimitedJoinSelect(
         SelectStatement select,
         SqlValue[] parameters,
         QueryContext context,
@@ -4069,7 +4069,6 @@ public sealed class EmbeddedDatabase : IDisposable
             {
                 Natural: false,
                 UsingColumns: null,
-                Condition: { } condition,
             } join
             || join.Kind is not (JoinKind.Inner or JoinKind.Left))
         {
@@ -4080,13 +4079,28 @@ public sealed class EmbeddedDatabase : IDisposable
         var rightTarget = ResolveScanTarget(join.Right, context);
         if (leftTarget is null
             || rightTarget is null
-            || !IsDirectEquiJoinEquality(condition, leftTarget, rightTarget)
             || select.Projections.Any(projection =>
                 !IsDirectJoinProjection(projection.Expression, leftTarget, rightTarget))
             || (select.Where is not null
                 && (join.Kind == JoinKind.Left
                     ? !IsExactLeftOuterJoinWherePredicate(select.Where, leftTarget, rightTarget)
                     : !IsDirectJoinWherePredicate(select.Where, leftTarget, rightTarget))))
+        {
+            return false;
+        }
+
+        // A conditionless INNER join is the parser representation of both CROSS JOIN and the
+        // comma operator. The reusable nested-loop builder emits its pair stream without a
+        // predicate, so applying a direct WHERE before its unconditional ResultRow has the same
+        // pair order and LIMIT/OFFSET window as the evaluator. A conditionless LEFT join has no
+        // useful SQL spelling in this route; keep it on the evaluator rather than broadening the
+        // supported surface accidentally.
+        if (join.Condition is null)
+        {
+            if (join.Kind != JoinKind.Inner)
+                return false;
+        }
+        else if (!IsDirectEquiJoinEquality(join.Condition, leftTarget, rightTarget))
         {
             return false;
         }

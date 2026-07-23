@@ -463,6 +463,28 @@ public class TursoEfCoreTests
     }
 
     [Test]
+    public async Task ManagedEnsureCreatedRejectsFilteredIndexesBeforeSchemaMutation()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        await connection.OpenAsync();
+
+        var options = new DbContextOptionsBuilder<FilteredIndexContext>()
+            .UseTurso(connection)
+            .Options;
+        await using var context = new FilteredIndexContext(options);
+
+        var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
+
+        await ensureCreated.Should().ThrowAsync<NotSupportedException>()
+            .WithMessage("*filtered indexes*");
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table';";
+
+        (await command.ExecuteScalarAsync()).Should().Be(0L);
+    }
+
+    [Test]
     public async Task EmptyDecimalSumReturnsZeroForManagedProvider()
     {
         using var database = TemporaryDatabase.Create();
@@ -698,6 +720,23 @@ public class TursoEfCoreTests
         public long ParentId { get; set; }
 
         public CascadeParent Parent { get; set; } = null!;
+    }
+
+    private sealed class FilteredIndexContext(DbContextOptions<FilteredIndexContext> options) : DbContext(options)
+    {
+        public DbSet<FilteredIndexItem> Items => Set<FilteredIndexItem>();
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+            => modelBuilder.Entity<FilteredIndexItem>()
+                .HasIndex(item => item.IsActive)
+                .HasFilter("\"IsActive\" = 1");
+    }
+
+    private sealed class FilteredIndexItem
+    {
+        public long Id { get; set; }
+
+        public bool IsActive { get; set; }
     }
 
     private sealed class CompositeForeignKeyContext(DbContextOptions<CompositeForeignKeyContext> options) : DbContext(options)

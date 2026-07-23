@@ -10,6 +10,15 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
     IRelationalAnnotationProvider migrationsAnnotations)
     : SqliteMigrationsSqlGenerator(dependencies, migrationsAnnotations)
 {
+    public override IReadOnlyList<MigrationCommand> Generate(
+        IReadOnlyList<MigrationOperation> operations,
+        IModel? model = null,
+        MigrationsSqlGenerationOptions options = MigrationsSqlGenerationOptions.Default)
+    {
+        ValidateOperations(operations);
+        return base.Generate(operations, model, options);
+    }
+
     protected override void ColumnDefinition(
         string? schema,
         string table,
@@ -74,5 +83,17 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
             $"The managed local provider does not support foreign key referential actions for '{operation.Name}' " +
             $"on '{operation.Table}' (ON DELETE {operation.OnDelete}, ON UPDATE {operation.OnUpdate}). " +
             "Configure both actions as NoAction.");
+    }
+
+    private static void ValidateOperations(IReadOnlyList<MigrationOperation> operations)
+    {
+        foreach (var operation in operations)
+        {
+            if (operation is CreateIndexOperation { Filter: not null } createIndex)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support filtered indexes ('{createIndex.Name}' on '{createIndex.Table}').");
+            }
+        }
     }
 }

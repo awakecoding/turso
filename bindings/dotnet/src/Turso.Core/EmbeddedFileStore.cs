@@ -1216,9 +1216,9 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// from a compatible one-level root with at least three children, returning
     /// that retired child to a new exact freelist. A deletion that changes a
     /// non-rightmost child's maximum rowid replaces its parent separator in the
-    /// same transaction. In an unindexed tree with exactly two or three interior
-    /// levels, the same guarded deletion updates the nearest separator that owns
-    /// the changed subtree maximum. It can also append one
+    /// same transaction. In an unindexed tree, a validated ancestor path updates
+    /// the nearest separator that owns the changed subtree maximum at arbitrary
+    /// depth. It can also append one
     /// maximum-rowid record to the right-most table leaf and split that leaf
     /// when its parent has room for the new separator. When that one-level
     /// unindexed table root is full, it can promote the root while splitting
@@ -1232,7 +1232,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// adjacent separator into its surviving sibling before freelisting the
     /// retired page. All routing changes retain their catalog rootpage and are
     /// published with the replacement table page in one WAL transaction whose
-    /// final frame is page one. Any overflow ownership change, unsupported deep
+    /// final frame is page one. Any overflow ownership change, unproven
     /// topology, rebalance, unsupported index coordination,
     /// root-type change, multi-table mutation, or nonempty freelist returns false
     /// before a write so the complete catalog rewrite remains the safe fallback.
@@ -1333,7 +1333,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                           schemaPage,
                           existingPage,
                           currentHeader)
-                       || TryPersistBoundedTableInteriorDeepLeafMutation(
+                       || TryPersistValidatedTableInteriorArbitraryDepthLeafMutation(
                           tableName,
                           table,
                           persisted.Tables[tableName],
@@ -2921,7 +2921,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         return true;
     }
 
-    private bool TryPersistBoundedTableInteriorDeepLeafMutation(
+    private bool TryPersistValidatedTableInteriorArbitraryDepthLeafMutation(
         string tableName,
         EmbeddedTable table,
         EmbeddedTable persistedTable,
@@ -3117,15 +3117,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         BoundedTableInteriorPathEntry? separatorOwner = null;
         if (change.IsDelete && sourceLeaf.Cells[^1].Cell.RowId == change.RowId)
         {
-            for (var pathIndex = targetPath.Length - 1; pathIndex >= 0; pathIndex--)
-            {
-                var candidate = targetPath[pathIndex];
-                if (candidate.ChildIndex >= candidate.Page.Cells.Count)
-                    continue;
-
-                separatorOwner = candidate;
-                break;
-            }
+            if (!TryFindValidatedTableInteriorSeparatorOwner(targetPath, out separatorOwner))
+                return false;
 
             if (separatorOwner is not null
                 && !TryReplaceTableInteriorSeparator(
@@ -3180,6 +3173,35 @@ internal sealed class EmbeddedFileStore : IDisposable
         mutation.CommitTo(_pager);
         CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        return true;
+    }
+
+    private static bool TryFindValidatedTableInteriorSeparatorOwner(
+        IReadOnlyList<BoundedTableInteriorPathEntry> path,
+        out BoundedTableInteriorPathEntry? separatorOwner)
+    {
+        separatorOwner = null;
+        for (var pathIndex = path.Count - 1; pathIndex >= 0; pathIndex--)
+        {
+            var candidate = path[pathIndex];
+            if (candidate.ChildIndex < 0 || candidate.ChildIndex > candidate.Page.Cells.Count)
+                return false;
+
+            if (candidate.ChildIndex == candidate.Page.Cells.Count)
+            {
+                if (candidate.Page.Header.RightMostChildPage != candidate.ChildPage)
+                    return false;
+
+                continue;
+            }
+
+            if (candidate.Page.Cells[candidate.ChildIndex].Cell.LeftChildPage != candidate.ChildPage)
+                return false;
+
+            separatorOwner = candidate;
+            return true;
+        }
+
         return true;
     }
 

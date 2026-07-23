@@ -750,7 +750,9 @@ jobs:
           }
 
   publish-managed-to-nuget:
-    needs: [package-managed, validate-nativeaot-static-package]
+    # The primary package must remain releasable even when an explicitly
+    # optional native companion cannot be built or validated.
+    needs: package-managed
     if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
     runs-on: ubuntu-latest
     timeout-minutes: 10

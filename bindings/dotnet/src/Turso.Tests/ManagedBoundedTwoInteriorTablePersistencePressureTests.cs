@@ -20,6 +20,8 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
     private const int FourthInteriorMutationRowCount = 17;
     private const int FourthInteriorMutationPayloadLength = 10;
     private const long FourthInteriorMutationFirstRowId = 9_000_000_000_000_000_000L;
+    private const int FifthInteriorMutationRowCount = 33;
+    private const int FifthInteriorMutationPayloadLength = 1;
     private const string BoundedMutationEncryptionKey =
         "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
 
@@ -758,6 +760,61 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         }
     }
 
+    [Test]
+    public void FifthInteriorLevelMaximumDeletePropagatesToTheRootReopensAndPassesSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("five-interior-root-separator");
+        try
+        {
+            CreateBoundedFifthInteriorTable(path, PhysicalFileSystem.Instance);
+            var target = FindArbitraryDepthRootBoundaryTarget(
+                PhysicalFileSystem.Instance,
+                path,
+                expectedHeight: 6);
+            Dictionary<uint, byte[]> descendantsBefore;
+            using (var pager = SqlitePager.Open(
+                       PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                descendantsBefore = target.DescendantInteriorPages.ToDictionary(
+                    pageNumber => pageNumber,
+                    pager.ReadCommittedPage);
+            }
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+                Execute(connection, $"DELETE FROM t WHERE id = {target.DeletedRowId};");
+
+            AssertArbitraryDepthRootBoundaryDeletion(
+                PhysicalFileSystem.Instance,
+                path,
+                target,
+                descendantsBefore,
+                expectedHeight: 6);
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path, readOnly: true))
+            using (var connection = reopened.Connect())
+            {
+                QueryCount(connection).Should().Be(FifthInteriorMutationRowCount - 1);
+                QueryText(connection, target.ReplacementSeparator)
+                    .Should()
+                    .Be(new string('x', FifthInteriorMutationPayloadLength));
+            }
+
+            VerifyNestedMutationWithSqlite(
+                path,
+                FifthInteriorMutationRowCount - 1,
+                target.DeletedRowId);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     private static void CreateBoundedNestedTable(string path, IFileSystem fileSystem)
     {
         var header = SqliteDatabaseHeader.CreateDefault() with { PageSize = BoundedMutationPageSize };
@@ -798,13 +855,43 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
     }
 
     private static void CreateBoundedFourthInteriorTable(string path, IFileSystem fileSystem)
+        => CreateBoundedInteriorTable(
+            path,
+            fileSystem,
+            interiorLevelCount: 4,
+            rowCount: FourthInteriorMutationRowCount,
+            payloadLength: FourthInteriorMutationPayloadLength,
+            firstRowId: FourthInteriorMutationFirstRowId,
+            salt1: 0x99AA_BBCC,
+            salt2: 0xDDEE_FF00);
+
+    private static void CreateBoundedFifthInteriorTable(string path, IFileSystem fileSystem)
+        => CreateBoundedInteriorTable(
+            path,
+            fileSystem,
+            interiorLevelCount: 5,
+            rowCount: FifthInteriorMutationRowCount,
+            payloadLength: FifthInteriorMutationPayloadLength,
+            firstRowId: 1,
+            salt1: 0x2468_ACE0,
+            salt2: 0x1357_9BDF);
+
+    private static void CreateBoundedInteriorTable(
+        string path,
+        IFileSystem fileSystem,
+        int interiorLevelCount,
+        int rowCount,
+        int payloadLength,
+        long firstRowId,
+        uint salt1,
+        uint salt2)
     {
         var header = SqliteDatabaseHeader.CreateDefault() with { PageSize = BoundedMutationPageSize };
         using (SqlitePager.Create(
                    fileSystem,
                    path,
                    path + "-wal",
-                   SqliteWalHeader.Create(header.PageSize, salt1: 0x99AA_BBCC, salt2: 0xDDEE_FF00),
+                   SqliteWalHeader.Create(header.PageSize, salt1, salt2),
                    header))
         {
         }
@@ -814,9 +901,9 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         {
             Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT);");
             Execute(connection, BuildPressureInsert(
-                FourthInteriorMutationRowCount,
-                FourthInteriorMutationPayloadLength,
-                FourthInteriorMutationFirstRowId));
+                rowCount,
+                payloadLength,
+                firstRowId));
         }
 
         using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: false);
@@ -824,27 +911,35 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         var rootPage = FindTableRootPage(pager.ReadCommittedPage(1), sourceHeader);
         var sourceRootPage = pager.ReadCommittedPage(rootPage);
         var sourceRoot = SqliteTableLeafPageView.Parse(sourceRootPage, sourceHeader.UsableSpace);
+        var leafCount = 1 << interiorLevelCount;
         if (rootPage != 2
             || sourceHeader.DatabaseSizeInPages != rootPage
-            || sourceRoot.Cells.Count != FourthInteriorMutationRowCount
+            || sourceRoot.Cells.Count != rowCount
+            || rowCount != leafCount + 1
             || sourceRoot.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null))
         {
             throw new InvalidOperationException(
-                "The bounded four-interior test requires a single non-overflow table root leaf.");
+                "The bounded interior test requires a single non-overflow table root leaf.");
         }
 
-        var leafGroups = new List<IReadOnlyList<SqliteTableLeafCell>>(16);
-        for (var cellIndex = 0; cellIndex < 7; cellIndex++)
-            leafGroups.Add([sourceRoot.Cells[cellIndex].Cell]);
-        leafGroups.Add([sourceRoot.Cells[7].Cell, sourceRoot.Cells[8].Cell]);
-        for (var cellIndex = 9; cellIndex < sourceRoot.Cells.Count; cellIndex++)
-            leafGroups.Add([sourceRoot.Cells[cellIndex].Cell]);
+        var leafGroups = new List<IReadOnlyList<SqliteTableLeafCell>>(leafCount);
+        var sourceCellIndex = 0;
+        for (var leafIndex = 0; leafIndex < leafCount; leafIndex++)
+        {
+            var cellCount = leafIndex == (leafCount / 2) - 1 ? 2 : 1;
+            leafGroups.Add(sourceRoot.Cells
+                .Skip(sourceCellIndex)
+                .Take(cellCount)
+                .Select(cell => cell.Cell)
+                .ToArray());
+            sourceCellIndex += cellCount;
+        }
 
-        if (leafGroups.Count != 16)
-            throw new InvalidOperationException("The bounded four-interior test requires sixteen table leaves.");
+        if (sourceCellIndex != sourceRoot.Cells.Count)
+            throw new InvalidOperationException("The bounded interior test did not consume its source root leaf.");
 
         var pageImages = new List<(uint PageNumber, byte[] Page)>();
-        var children = new List<FourInteriorTreeChild>(leafGroups.Count);
+        var children = new List<BoundedInteriorTreeChild>(leafGroups.Count);
         var nextPageNumber = checked(sourceHeader.DatabaseSizeInPages + 1);
         foreach (var leafGroup in leafGroups)
         {
@@ -856,15 +951,15 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
 
             var pageNumber = nextPageNumber++;
             pageImages.Add((pageNumber, builder.Build()));
-            children.Add(new FourInteriorTreeChild(pageNumber, leafGroup[^1].RowId));
+            children.Add(new BoundedInteriorTreeChild(pageNumber, leafGroup[^1].RowId));
         }
 
-        for (var level = 0; level < 3; level++)
+        for (var level = 1; level < interiorLevelCount; level++)
         {
             if (children.Count < 2 || children.Count % 2 != 0)
-                throw new InvalidOperationException("The bounded four-interior test cannot pair its table children.");
+                throw new InvalidOperationException("The bounded interior test cannot pair its table children.");
 
-            var parents = new List<FourInteriorTreeChild>(children.Count / 2);
+            var parents = new List<BoundedInteriorTreeChild>(children.Count / 2);
             for (var childIndex = 0; childIndex < children.Count; childIndex += 2)
             {
                 var left = children[childIndex];
@@ -877,14 +972,14 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
 
                 var pageNumber = nextPageNumber++;
                 pageImages.Add((pageNumber, builder.Build()));
-                parents.Add(new FourInteriorTreeChild(pageNumber, right.MaximumRowId));
+                parents.Add(new BoundedInteriorTreeChild(pageNumber, right.MaximumRowId));
             }
 
             children = parents;
         }
 
         if (children.Count != 2)
-            throw new InvalidOperationException("The bounded four-interior test requires two root children.");
+            throw new InvalidOperationException("The bounded interior test requires two root children.");
 
         var rootBuilder = new SqliteTableInteriorPageBuilder(
             sourceHeader.PageSize,
@@ -911,6 +1006,80 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         transaction.WritePage(rootPage, replacementRootPage);
         transaction.WritePage(1, replacementSchemaPage);
         transaction.Commit();
+    }
+
+    private static ArbitraryDepthRootBoundaryTarget FindArbitraryDepthRootBoundaryTarget(
+        IFileSystem fileSystem,
+        string path,
+        int expectedHeight)
+    {
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        var rootPage = FindTableRootPage(pager.ReadCommittedPage(1), header);
+        ReadTableHeight(pager, header, rootPage, new HashSet<uint>()).Should().Be(expectedHeight);
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(rootPage),
+            header.UsableSpace);
+
+        for (var rootChildIndex = 0; rootChildIndex < root.Cells.Count; rootChildIndex++)
+        {
+            var descendantInteriorPages = new List<uint>();
+            var pageNumber = root.Cells[rootChildIndex].Cell.LeftChildPage;
+            while (SqliteBtreePageHeader.Parse(pager.ReadCommittedPage(pageNumber)).PageType
+                   == SqliteBtreePageType.TableInterior)
+            {
+                descendantInteriorPages.Add(pageNumber);
+                var interior = SqliteTableInteriorPageView.Parse(
+                    pager.ReadCommittedPage(pageNumber),
+                    header.UsableSpace);
+                pageNumber = interior.Header.RightMostChildPage;
+            }
+
+            var leaf = SqliteTableLeafPageView.Parse(
+                pager.ReadCommittedPage(pageNumber),
+                header.UsableSpace);
+            if (leaf.Cells.Count < 2)
+                continue;
+
+            var deletedRowId = leaf.Cells[^1].Cell.RowId;
+            deletedRowId.Should().Be(root.Cells[rootChildIndex].Cell.RowId);
+            return new ArbitraryDepthRootBoundaryTarget(
+                rootPage,
+                rootChildIndex,
+                descendantInteriorPages,
+                pageNumber,
+                deletedRowId,
+                leaf.Cells[^2].Cell.RowId);
+        }
+
+        throw new InvalidOperationException(
+            "Unable to create an arbitrary-depth table with a root-owned multi-cell boundary leaf.");
+    }
+
+    private static void AssertArbitraryDepthRootBoundaryDeletion(
+        IFileSystem fileSystem,
+        string path,
+        ArbitraryDepthRootBoundaryTarget target,
+        IReadOnlyDictionary<uint, byte[]> descendantsBefore,
+        int expectedHeight)
+    {
+        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+        header.FirstFreelistTrunkPage.Should().Be(0);
+        header.FreelistPageCount.Should().Be(0);
+        var root = SqliteTableInteriorPageView.Parse(
+            pager.ReadCommittedPage(target.RootPage),
+            header.UsableSpace);
+        root.Cells[target.RootChildIndex].Cell.RowId.Should().Be(target.ReplacementSeparator);
+        foreach (var (pageNumber, sourcePage) in descendantsBefore)
+            pager.ReadCommittedPage(pageNumber).Should().Equal(sourcePage);
+
+        var leaf = SqliteTableLeafPageView.Parse(
+            pager.ReadCommittedPage(target.LeafPage),
+            header.UsableSpace);
+        leaf.Search(target.DeletedRowId).IsExact.Should().BeFalse();
+        leaf.Cells[^1].Cell.RowId.Should().Be(target.ReplacementSeparator);
+        ReadTableHeight(pager, header, target.RootPage, new HashSet<uint>()).Should().Be(expectedHeight);
     }
 
     private static FourthInteriorLeafTarget FindFourthInteriorRootBoundaryTarget(
@@ -1455,5 +1624,13 @@ public sealed class ManagedBoundedTwoInteriorTablePersistencePressureTests
         long DeletedRowId,
         long ReplacementSeparator);
 
-    private sealed record FourInteriorTreeChild(uint PageNumber, long MaximumRowId);
+    private sealed record ArbitraryDepthRootBoundaryTarget(
+        uint RootPage,
+        int RootChildIndex,
+        IReadOnlyList<uint> DescendantInteriorPages,
+        uint LeafPage,
+        long DeletedRowId,
+        long ReplacementSeparator);
+
+    private sealed record BoundedInteriorTreeChild(uint PageNumber, long MaximumRowId);
 }

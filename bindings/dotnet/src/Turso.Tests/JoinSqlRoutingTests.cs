@@ -627,16 +627,66 @@ public class JoinSqlRoutingTests
     }
 
     [Test]
-    public void BoundedCrossComputedAndAmbiguousJoinShapesFallBackToEvaluator()
+    public void BoundedCrossJoinWithDirectWhereRoutesAndMatchesEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE a(x INTEGER);");
+        Execute(connection, "CREATE TABLE b(y INTEGER);");
+        Execute(connection, "INSERT INTO a VALUES (1), (2);");
+        Execute(connection, "INSERT INTO b VALUES (10), (20), (30);");
+
+        const string routedSql =
+            "SELECT a.x AS left_value, b.y AS right_value, 7 AS marker FROM a CROSS JOIN b WHERE a.x < b.y LIMIT 3 OFFSET 1;";
+        var routed = ReadRows(connection, routedSql);
+        routed.Select(row => (row[0], row[1], row[2])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(20), SqlValue.Integer(7)),
+            (SqlValue.Integer(1), SqlValue.Integer(30), SqlValue.Integer(7)),
+            (SqlValue.Integer(2), SqlValue.Integer(10), SqlValue.Integer(7)));
+        ColumnNames(connection, routedSql).Should().Equal("left_value", "right_value", "marker");
+
+        // The computed projection remains evaluator-owned and supplies a behavioral oracle for
+        // the direct-column routed stream.
+        var evaluated = ReadRows(
+            connection,
+            "SELECT a.x + 0 AS left_value, b.y AS right_value, 7 AS marker FROM a CROSS JOIN b WHERE a.x < b.y LIMIT 3 OFFSET 1;");
+        routed.Select(row => (row[0], row[1], row[2]))
+            .Should().Equal(evaluated.Select(row => (row[0], row[1], row[2])));
+
+        var opcodes = Opcodes(ReadRows(connection, $"EXPLAIN {routedSql}")).ToList();
+        opcodes.Should().Contain("FilterRegisters")
+            .And.Contain("OffsetGate")
+            .And.Contain("LimitGate")
+            .And.NotContain("JumpIf");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
+            connection,
+            "EXPLAIN SELECT a.x + 0 AS left_value, b.y AS right_value, 7 AS marker FROM a CROSS JOIN b WHERE a.x < b.y LIMIT 3 OFFSET 1;"));
+    }
+
+    [Test]
+    public void BoundedCommaJoinRoutesThroughTheCrossJoinPipeline()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE a(x INTEGER);");
+        Execute(connection, "CREATE TABLE b(y INTEGER);");
+        Execute(connection, "INSERT INTO a VALUES (1), (2);");
+        Execute(connection, "INSERT INTO b VALUES (10), (20);");
+
+        var rows = ReadRows(connection, "SELECT a.x, b.y FROM a, b WHERE a.x >= 2 LIMIT 2;");
+
+        rows.Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(2), SqlValue.Integer(10)),
+            (SqlValue.Integer(2), SqlValue.Integer(20)));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT a.x, b.y FROM a, b WHERE a.x >= 2 LIMIT 2;"))
+            .Should().Contain("FilterRegisters").And.Contain("LimitGate").And.NotContain("JumpIf");
+    }
+
+    [Test]
+    public void BoundedComputedAndAmbiguousJoinShapesFallBackToEvaluator()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
         Execute(connection, "INSERT INTO users VALUES (3, 'cy');");
 
-        ReadRows(
-                connection,
-                "SELECT u.name, o.amount FROM users u CROSS JOIN orders o LIMIT 1;")
-            .Should().ContainSingle();
         ReadRows(
                 connection,
                 "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id + 0 = o.user_id LIMIT 1;")
@@ -649,11 +699,10 @@ public class JoinSqlRoutingTests
                 connection,
                 "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;")
             .Should().ContainSingle();
-        // Bounded lowering requires an outer equi-join with direct columns, so the evaluator retains
-        // ownership of cross joins and computed ON/WHERE predicates.
+        // Bounded lowering admits only direct equi or conditionless cross joins with direct
+        // projections and WHERE predicates, so computed ON/WHERE shapes stay evaluator-owned.
         foreach (var sql in new[]
         {
-            "EXPLAIN SELECT u.name, o.amount FROM users u CROSS JOIN orders o LIMIT 1;",
             "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id + 0 = o.user_id LIMIT 1;",
             "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;",
             "EXPLAIN SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;",

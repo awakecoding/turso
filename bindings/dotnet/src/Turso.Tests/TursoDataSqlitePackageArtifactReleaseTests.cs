@@ -36,8 +36,12 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                     .Should()
                     .NotContain(entry =>
                         entry.FullName.StartsWith("runtimes/", StringComparison.OrdinalIgnoreCase) ||
+                        entry.FullName.StartsWith("build/", StringComparison.OrdinalIgnoreCase) ||
+                        entry.FullName.StartsWith("buildTransitive/", StringComparison.OrdinalIgnoreCase) ||
+                        entry.FullName.StartsWith("native/", StringComparison.OrdinalIgnoreCase) ||
                         entry.FullName.Contains("turso_sdk_kit", StringComparison.OrdinalIgnoreCase) ||
-                        entry.FullName.Contains("Turso.Raw", StringComparison.OrdinalIgnoreCase),
+                        entry.FullName.Contains("Turso.Raw", StringComparison.OrdinalIgnoreCase) ||
+                        entry.FullName.Contains("Turso.Data.Native", StringComparison.OrdinalIgnoreCase),
                         "the managed package must not carry native implementation assets or assemblies");
 
                 var nuspecEntry = archive.Entries.Single(entry =>
@@ -50,9 +54,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                     .Where(id => id is not null)
                     .ToArray();
                 nativeDependencies.Should().NotContain(
-                    dependency => dependency == "Turso.Raw" ||
-                                  dependency == "Turso.Data.Native" ||
-                                  dependency == "Turso.Data.Sqlite.Native",
+                    dependency => IsNativeCompanionPackage($"{dependency}/"),
                     "the managed package must not restore an optional native companion");
             }
 
@@ -496,8 +498,32 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             """);
 
         RunDotnet(consumerDirectory, "restore", projectPath, "--source", packageDirectory);
+        AssertManagedConsumerRestoresNoNativeCompanions(consumerDirectory);
         RunDotnet(consumerDirectory, "run", "--no-restore", "--project", projectPath);
     }
+
+    private static void AssertManagedConsumerRestoresNoNativeCompanions(string consumerDirectory)
+    {
+        using var assetsStream = File.OpenRead(Path.Combine(consumerDirectory, "obj", "project.assets.json"));
+        using var assets = JsonDocument.Parse(assetsStream);
+        var nativePackages = assets.RootElement
+            .GetProperty("libraries")
+            .EnumerateObject()
+            .Select(library => library.Name)
+            .Where(IsNativeCompanionPackage)
+            .ToArray();
+
+        Assert.That(
+            nativePackages,
+            Is.Empty,
+            "a consumer of Turso.Data.Sqlite alone must not restore an optional native companion");
+    }
+
+    private static bool IsNativeCompanionPackage(string packageIdentity)
+        => packageIdentity.StartsWith("Turso.Raw/", StringComparison.OrdinalIgnoreCase) ||
+           packageIdentity.StartsWith("Turso.Data.Native/", StringComparison.OrdinalIgnoreCase) ||
+           packageIdentity.StartsWith("Turso.Data.Sqlite.Native/", StringComparison.OrdinalIgnoreCase) ||
+           packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot.", StringComparison.OrdinalIgnoreCase);
 
     private static void RunDotnet(string workingDirectory, params string[] arguments)
     {
