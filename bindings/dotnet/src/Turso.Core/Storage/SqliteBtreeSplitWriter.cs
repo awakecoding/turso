@@ -6,9 +6,9 @@ namespace Turso.Core.Storage;
 /// An immutable B-tree mutation staged against one committed pager view.
 /// </summary>
 /// <remarks>
-/// The mutation writes every new page before every modified routing image. Its
-/// final image is the WAL commit frame, so callers must place the catalog or
-/// parent image that first exposes appended pages last. An interrupted write
+/// The mutation writes every new page before every modified routing image. When
+/// page one changes it is required to be the final image and WAL commit frame,
+/// so an interrupted write
 /// therefore cannot route readers to an absent child. It can replace existing
 /// pages or append new pages, but never shrinks, rebalances, or reclaims pages.
 /// </remarks>
@@ -127,6 +127,14 @@ public sealed class SqliteBtreeSplitMutation
                 throw new ArgumentException("Every split write image must be exactly one page.", nameof(_writeImages));
             if (!writePageNumbers.Add(writeImage.PageNumber))
                 throw new ArgumentException("Split write images must target distinct pages.", nameof(_writeImages));
+        }
+
+        var pageOneIndex = Array.FindIndex(_writeImages, image => image.PageNumber == 1);
+        if (pageOneIndex >= 0 && pageOneIndex != _writeImages.Length - 1)
+        {
+            throw new ArgumentException(
+                "A split mutation that writes page 1 must make it the final WAL image.",
+                nameof(_writeImages));
         }
 
         for (var pageNumber = SourceDatabaseSizeInPages + 1;

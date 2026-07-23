@@ -622,6 +622,7 @@ public class SqliteDataReader : DbDataReader
 
                 if (SqliteCommand.CountsRowsAffected(sql))
                     _recordsAffected += statement.RowsAffected;
+                _command.MarkTransactionCompletedExternally(sql);
                 statement.Dispose();
             }
         }
@@ -1169,6 +1170,7 @@ public class SqliteDataReader : DbDataReader
 
                 if (SqliteCommand.CountsRowsAffected(rewrittenSql))
                     _recordsAffected += statement.RowsAffected;
+                _command.MarkTransactionCompletedExternally(sql);
             }
         }
         finally

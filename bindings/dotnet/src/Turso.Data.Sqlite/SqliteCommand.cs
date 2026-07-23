@@ -140,7 +140,7 @@ public class SqliteCommand : DbCommand
         }
 
         reader.Close();
-        MarkTransactionCompletedExternally();
+        MarkTransactionCompletedExternally(CommandText);
 
         return reader.RecordsAffected;
     }
@@ -150,7 +150,7 @@ public class SqliteCommand : DbCommand
         using var reader = Execute("ExecuteScalar");
         var result = reader.Read() ? reader.GetValue(0) : null;
         reader.Close();
-        MarkTransactionCompletedExternally();
+        MarkTransactionCompletedExternally(CommandText);
         return result;
     }
 
@@ -262,6 +262,7 @@ public class SqliteCommand : DbCommand
 
                 if (CountsRowsAffected(statements[i]))
                     recordsAffected += statement.RowsAffected;
+                MarkTransactionCompletedExternally(statements[i]);
                 statement.Dispose();
             }
         }
@@ -304,10 +305,10 @@ public class SqliteCommand : DbCommand
         _hasOpenReader = false;
     }
 
-    private void MarkTransactionCompletedExternally()
+    internal void MarkTransactionCompletedExternally(string commandText)
     {
-        if (IsTransactionControlCommand(CommandText))
-            Connection?.Transaction?.MarkCompletedExternally(IsRollbackCommand(CommandText));
+        if (IsTransactionControlCommand(commandText))
+            Connection?.Transaction?.MarkCompletedExternally(IsRollbackCommand(commandText));
     }
 
     internal SqliteStatementAdapter PrepareSingleStatement(string sql)

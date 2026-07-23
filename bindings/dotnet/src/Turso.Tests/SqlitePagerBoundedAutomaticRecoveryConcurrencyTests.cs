@@ -101,6 +101,93 @@ public sealed class SqlitePagerBoundedAutomaticRecoveryConcurrencyTests
         reopened.ReadCommittedPage(2).Should().Equal(replacementPage);
     }
 
+    [Test]
+    public void AutomaticRecoveryReleaseFaultFaultsOnlyOwnerAndReleasesPeerCheckpoint()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        var coordinator = new RecoveryReleaseFaultCoordinator();
+        var locks = new SqlitePagerLockManager(coordinator);
+        const string databasePath = "automatic-recovery-release-fault.db";
+        const string walPath = databasePath + "-wal";
+        var committedPage = CreatePage(SqlitePageSize.Default, 0x17);
+
+        using var recoveringPager = SqlitePager.Create(
+            fileSystem,
+            databasePath,
+            walPath,
+            CreateWalHeader(),
+            lockManager: locks);
+        CommitPageTwo(recoveringPager, committedPage);
+        using var checkpointPager = SqlitePager.Open(
+            fileSystem,
+            databasePath,
+            walPath,
+            lockManager: locks);
+        var recoveryReleasesBeforeFault = coordinator.RecoveryLeaseReleaseCount;
+        using (var wal = SqliteWalFile.Open(fileSystem, walPath))
+        {
+            wal.AppendFrame(2, CreatePage(SqlitePageSize.Default, 0x28));
+            wal.Flush();
+        }
+
+        coordinator.FailNextRecoveryRelease = true;
+
+        Assert.Throws<IOException>(
+            () => recoveringPager.BeginTransaction(targetDatabaseSizeInPages: 2));
+
+        recoveringPager.State.Should().Be(SqlitePagerState.Faulted);
+        coordinator.RecoveryLeaseReleaseCount.Should().Be(recoveryReleasesBeforeFault + 1);
+        locks.State.Should().Be(SqlitePagerLockState.Unlocked);
+
+        checkpointPager.CheckpointToMainStoreAndResetWal().RetainedCommittedFrameCount.Should().Be(0);
+        using var reopened = SqlitePager.Open(fileSystem, databasePath, walPath, lockManager: locks);
+        reopened.RecoveryInfo.IsDurablyCheckpointedMainStore.Should().BeTrue();
+        reopened.ReadCommittedPage(2).Should().Equal(committedPage);
+    }
+
+    [Test]
+    public void ManualRecoveryReleaseFaultFaultsOnlyOwnerAndReleasesPeerCheckpoint()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        var coordinator = new RecoveryReleaseFaultCoordinator();
+        var locks = new SqlitePagerLockManager(coordinator);
+        const string databasePath = "manual-recovery-release-fault.db";
+        const string walPath = databasePath + "-wal";
+        var committedPage = CreatePage(SqlitePageSize.Default, 0x39);
+
+        using var recoveringPager = SqlitePager.Create(
+            fileSystem,
+            databasePath,
+            walPath,
+            CreateWalHeader(),
+            lockManager: locks);
+        CommitPageTwo(recoveringPager, committedPage);
+        using var checkpointPager = SqlitePager.Open(
+            fileSystem,
+            databasePath,
+            walPath,
+            lockManager: locks);
+        var recoveryReleasesBeforeFault = coordinator.RecoveryLeaseReleaseCount;
+        using (var wal = SqliteWalFile.Open(fileSystem, walPath))
+        {
+            wal.AppendFrame(2, CreatePage(SqlitePageSize.Default, 0x4A));
+            wal.Flush();
+        }
+
+        coordinator.FailNextRecoveryRelease = true;
+
+        Assert.Throws<IOException>(() => recoveringPager.RecoverUncommittedWalTail());
+
+        recoveringPager.State.Should().Be(SqlitePagerState.Faulted);
+        coordinator.RecoveryLeaseReleaseCount.Should().Be(recoveryReleasesBeforeFault + 1);
+        locks.State.Should().Be(SqlitePagerLockState.Unlocked);
+
+        checkpointPager.CheckpointToMainStoreAndResetWal().RetainedCommittedFrameCount.Should().Be(0);
+        using var reopened = SqlitePager.Open(fileSystem, databasePath, walPath, lockManager: locks);
+        reopened.RecoveryInfo.IsDurablyCheckpointedMainStore.Should().BeTrue();
+        reopened.ReadCommittedPage(2).Should().Equal(committedPage);
+    }
+
     private static void CommitPageTwo(SqlitePager pager, byte[] pageTwo)
     {
         var pageOne = pager.ReadCommittedPage(1);
@@ -148,6 +235,47 @@ public sealed class SqlitePagerBoundedAutomaticRecoveryConcurrencyTests
         {
             public void Dispose()
             {
+            }
+        }
+    }
+
+    private sealed class RecoveryReleaseFaultCoordinator : ISqlitePagerLockCoordinator
+    {
+        private int _failNextRecoveryRelease;
+
+        internal bool FailNextRecoveryRelease
+        {
+            set => Volatile.Write(ref _failNextRecoveryRelease, value ? 1 : 0);
+        }
+
+        internal int RecoveryLeaseReleaseCount { get; private set; }
+
+        public IDisposable Acquire(SqlitePagerLockOperation operation, TimeSpan timeout) => new Lease();
+
+        public IDisposable AcquireRecovery(TimeSpan timeout) => new RecoveryLease(this);
+
+        private sealed class Lease : IDisposable
+        {
+            public void Dispose()
+            {
+            }
+        }
+
+        private sealed class RecoveryLease : IDisposable
+        {
+            private RecoveryReleaseFaultCoordinator? _owner;
+
+            internal RecoveryLease(RecoveryReleaseFaultCoordinator owner) => _owner = owner;
+
+            public void Dispose()
+            {
+                var owner = Interlocked.Exchange(ref _owner, null);
+                if (owner is null)
+                    return;
+
+                owner.RecoveryLeaseReleaseCount++;
+                if (Interlocked.Exchange(ref owner._failNextRecoveryRelease, 0) != 0)
+                    throw new IOException("Injected recovery lease release failure.");
             }
         }
     }

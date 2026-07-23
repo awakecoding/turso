@@ -455,12 +455,13 @@ public sealed class SqlitePager : IDisposable
                 if (_lockManager.UsesFileBackedWalLocks
                     && HasUncommittedOrInvalidTail(_recoveryInfo))
                 {
-                    using var recoveryLock = _lockManager.EnterRecoveryLock(
+                    var recoveryLock = _lockManager.EnterRecoveryLock(
                         SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
                         configuredBusyTimeout);
                     try
                     {
-                        RecoverUncommittedTailUnderWriterLock(writerLock);
+                        using (recoveryLock)
+                            RecoverUncommittedTailUnderWriterLock(writerLock);
                     }
                     catch
                     {
@@ -489,7 +490,8 @@ public sealed class SqlitePager : IDisposable
     /// Discards an uncommitted, partial, or corrupt WAL tail without publishing a
     /// new transaction. The recovery runs while holding the managed writer and
     /// recovery locks, so it honors the supplied busy timeout and cannot race a
-    /// managed writer or recovery operation.
+    /// managed writer or recovery operation. A recovery-lease release failure
+    /// faults this pager, while the writer lease still releases its local owner.
     /// </summary>
     public void RecoverUncommittedWalTail(TimeSpan? busyTimeout = null)
     {
@@ -498,35 +500,55 @@ public sealed class SqlitePager : IDisposable
             ? null
             : Stopwatch.StartNew();
         using var writerLock = _lockManager.EnterWriter(configuredBusyTimeout);
-        using var recoveryLock = _lockManager.EnterRecoveryLock(
+        var recoveryLock = _lockManager.EnterRecoveryLock(
             SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
             configuredBusyTimeout);
-        lock (_gate)
+        try
         {
-            ThrowIfDisposed();
-            ThrowIfReadOnly();
-            if (_state != SqlitePagerState.Ready)
-                throw new InvalidOperationException($"Cannot recover a SQLite WAL while the pager is {_state}.");
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                ThrowIfReadOnly();
+                if (_state != SqlitePagerState.Ready)
+                    throw new InvalidOperationException($"Cannot recover a SQLite WAL while the pager is {_state}.");
 
+                try
+                {
+                    var recovery = _wal.ScanRecovery();
+                    InitializeCommittedView(recovery);
+                    _lockGeneration = _lockManager.Generation;
+                    if (!HasUncommittedOrInvalidTail(recovery))
+                        return;
+
+                    _wal.RecoverToLastCommittedFrame();
+                    recovery = _wal.ScanRecovery();
+                    if (HasUncommittedOrInvalidTail(recovery))
+                        throw new InvalidDataException("SQLite WAL recovery did not remove its uncommitted or invalid tail.");
+
+                    InitializeCommittedView(recovery);
+                    _lockGeneration = writerLock.PublishStorageChange();
+                }
+                catch
+                {
+                    TransitionToFaulted();
+                    throw;
+                }
+            }
+        }
+        finally
+        {
             try
             {
-                var recovery = _wal.ScanRecovery();
-                InitializeCommittedView(recovery);
-                _lockGeneration = _lockManager.Generation;
-                if (!HasUncommittedOrInvalidTail(recovery))
-                    return;
-
-                _wal.RecoverToLastCommittedFrame();
-                recovery = _wal.ScanRecovery();
-                if (HasUncommittedOrInvalidTail(recovery))
-                    throw new InvalidDataException("SQLite WAL recovery did not remove its uncommitted or invalid tail.");
-
-                InitializeCommittedView(recovery);
-                _lockGeneration = writerLock.PublishStorageChange();
+                recoveryLock?.Dispose();
             }
             catch
             {
-                TransitionToFaulted();
+                lock (_gate)
+                {
+                    if (_state != SqlitePagerState.Disposed)
+                        TransitionToFaulted();
+                }
+
                 throw;
             }
         }

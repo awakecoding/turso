@@ -31,6 +31,7 @@ MANAGED_PACKAGE_OUTPUT_ABSOLUTE = $(abspath $(MANAGED_PACKAGE_OUTPUT))
 MANAGED_NATIVEAOT_OUTPUT ?= ./artifacts/managed-nativeaot-smoke
 MANAGED_NATIVEAOT_PACKAGES ?= $(MANAGED_PACKAGE_OUTPUT)/.nuget-packages
 MANAGED_NATIVEAOT_NUGET_CONFIG = ./samples/ManagedNativeAot/obj/managed-nativeaot.nuget.config
+MANAGED_CLOSURE_VALIDATOR = pwsh -NoLogo -NoProfile -File ./scripts/Validate-ManagedPackageClosure.ps1
 
 ifeq ($(OS),Windows_NT)
 	MANAGED_NATIVEAOT_RID ?= win-x64
@@ -172,18 +173,13 @@ pack-managed: restore-managed validate-managed-project-closure
 	$(MAKE) validate-managed-packed-closure
 
 validate-managed-project-closure:
-	@if grep -E -i '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit)' ./Directory.Build.props ./Directory.Build.targets ./Turso.slnx || grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit)' ./src/Turso.Core ./src/Turso.Data ./src/Turso.Data.Sqlite ./src/Turso.EntityFrameworkCore.Sqlite ./src/Turso.Platform.Client ./src/Turso.Serverless.Client ./samples/ManagedPackageConsumer ./samples/ManagedNativeAot; then \
-		echo "Managed package, solution, and NativeAOT build configurations must not reference native Turso packages, assets, or Rust tooling"; \
+	@if grep -E -i '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./Directory.Build.props ./Directory.Build.targets ./Turso.slnx || grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./src/Turso.Core ./src/Turso.Data ./src/Turso.Data.Sqlite ./src/Turso.EntityFrameworkCore.Sqlite ./src/Turso.Platform.Client ./src/Turso.Serverless.Client ./samples/ManagedPackageConsumer ./samples/ManagedNativeAot; then \
+		echo "Managed package, solution, and NativeAOT build configurations must not reference native Turso packages, P/Invoke assets, or Rust tooling"; \
 		exit 1; \
 	fi
 
 validate-managed-packed-closure:
-	@for package in "$(MANAGED_PACKAGE_OUTPUT)"/*.nupkg; do \
-		if unzip -p "$$package" '*.nuspec' | grep -E -i '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit)'; then \
-			echo "Managed package $$package must not declare a native or Rust dependency"; \
-			exit 1; \
-		fi; \
-	done
+	$(MANAGED_CLOSURE_VALIDATOR) -PackageDirectory "$(MANAGED_PACKAGE_OUTPUT)"
 
 validate-managed-package: validate-managed-project-closure
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
@@ -193,10 +189,7 @@ validate-managed-package: validate-managed-project-closure
 	dotnet build --no-restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
 	dotnet run --no-build --no-restore --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
 	dotnet publish --configuration Debug --no-build --no-restore --output "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)" ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
-	@if find "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)" -type f \( -iname 'Turso.Raw.dll' -o -iname 'Turso.Data.Native.dll' -o -iname 'turso_sdk_kit.dll' -o -iname 'libturso_sdk_kit.so' -o -iname 'libturso_sdk_kit.dylib' -o -iname 'libturso_sdk_kit.a' \) -print -quit | grep -q .; then \
-		echo "Managed package publish output must not contain native companion assets"; \
-		exit 1; \
-	fi
+	$(MANAGED_CLOSURE_VALIDATOR) -ProjectAssetsFile ./samples/ManagedPackageConsumer/obj/project.assets.json -PublishOutput "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)"
 
 validate-managed-nativeaot: validate-managed-project-closure
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
@@ -207,18 +200,7 @@ validate-managed-nativeaot: validate-managed-project-closure
 	dotnet restore --runtime "$(MANAGED_NATIVEAOT_RID)" ./samples/ManagedNativeAot/ManagedNativeAotSmoke.csproj --configfile "$(MANAGED_NATIVEAOT_NUGET_CONFIG)" --packages "$(MANAGED_NATIVEAOT_PACKAGES)" -p:TursoPackageVersion=0.0.0-managed-local
 	dotnet publish -c Release -r "$(MANAGED_NATIVEAOT_RID)" --self-contained true --no-restore -o "$(MANAGED_NATIVEAOT_OUTPUT)" ./samples/ManagedNativeAot/ManagedNativeAotSmoke.csproj -p:TursoPackageVersion=0.0.0-managed-local
 	"$(MANAGED_NATIVEAOT_EXECUTABLE)"
-	@if ! grep -E -i '"Turso\.Data\.Sqlite/' ./samples/ManagedNativeAot/obj/project.assets.json; then \
-		echo "Managed NativeAOT validation must restore the primary managed Turso package"; \
-		exit 1; \
-	fi
-	@if grep -E -i '"Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)/' ./samples/ManagedNativeAot/obj/project.assets.json; then \
-		echo "Managed NativeAOT restore closure must not include a native Turso package"; \
-		exit 1; \
-	fi
-	@if find "$(MANAGED_NATIVEAOT_OUTPUT)" -type f ! -name 'ManagedNativeAotSmoke' ! -name 'ManagedNativeAotSmoke.exe' ! -name '*.pdb' ! -name '*.dbg' ! -name '*.xml' -print -quit | grep -q .; then \
-		echo "Managed NativeAOT publish output must contain only the executable, symbols, and documentation"; \
-		exit 1; \
-	fi
+	$(MANAGED_CLOSURE_VALIDATOR) -ProjectAssetsFile ./samples/ManagedNativeAot/obj/project.assets.json -PublishOutput "$(MANAGED_NATIVEAOT_OUTPUT)" -NativeAot
 
 pack-native:
 	dotnet restore ./src/Turso.Data.Native/Turso.Data.Native.csproj

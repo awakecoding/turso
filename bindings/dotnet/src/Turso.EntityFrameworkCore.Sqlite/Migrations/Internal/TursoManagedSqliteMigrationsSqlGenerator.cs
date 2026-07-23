@@ -168,6 +168,12 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                     $"The managed local provider does not support renaming indexes ('{renameIndex.Name}' on '{renameIndex.Table}').");
             }
 
+            if (operation is RenameTableOperation renameTable)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support renaming tables ('{renameTable.Name}' to '{renameTable.NewName}').");
+            }
+
             if (operation is CreateIndexOperation { IsDescending: { } sortOrders } descendingIndex
                 && (sortOrders.Length == 0 || sortOrders.Any(static descending => descending)))
             {

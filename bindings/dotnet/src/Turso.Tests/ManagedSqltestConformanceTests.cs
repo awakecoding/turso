@@ -660,6 +660,18 @@ public class ManagedSqltestConformanceTests
     public void ManagedDropTableSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("foreign_keys.sqltest", "fk-update-child-to-null-ok")]
+    [TestCase("foreign_keys.sqltest", "fk-delete-parent-ok-when-no-child")]
+    [TestCase("foreign_keys.sqltest", "fk-composite-pk-missing")]
+    [TestCase("foreign_keys.sqltest", "fk-composite-update-child-missing")]
+    [TestCase("foreign_keys.sqltest", "fk-composite-unique-missing")]
+    [TestCase("foreign_keys.sqltest", "fk-update-child-noop-ok")]
+    [TestCase("foreign_keys.sqltest", "fk-delete-parent-composite-scan")]
+    [TestCase("foreign_keys.sqltest", "fk-update-child-to-existing-ok")]
+    [TestCase("foreign_keys.sqltest", "fk-composite-pk-delete-violate")]
+    public void ManagedForeignKeySqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

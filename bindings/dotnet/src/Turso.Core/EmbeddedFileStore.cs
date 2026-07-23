@@ -1245,8 +1245,9 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// published with the replacement table page in one WAL transaction whose
     /// final frame is page one. Any overflow ownership change, unproven
     /// topology, rebalance, unsupported index coordination,
-    /// root-type change, multi-table mutation, or nonempty freelist returns false
-    /// before a write so the complete catalog rewrite remains the safe fallback.
+    /// root-type change, multi-table mutation, or an unvalidated freelist
+    /// partition returns false before a write so the complete catalog rewrite
+    /// remains the safe fallback.
     /// </remarks>
     private bool TryPersistBoundedTableLeafMutation(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
@@ -1255,8 +1256,6 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         var schemaPage = _pager.ReadCommittedPage(SchemaRootPage);
         var currentHeader = SqliteDatabaseHeader.Parse(schemaPage);
-        if (currentHeader.FreelistPageCount != 0 || currentHeader.FirstFreelistTrunkPage != 0)
-            return false;
 
         if (!HasCurrentSchemaShape(tables, views, triggers))
             return false;
@@ -1327,6 +1326,12 @@ internal sealed class EmbeddedFileStore : IDisposable
         var existingPageType = SqliteBtreePageHeader.Parse(existingPage).PageType;
         if (existingPageType == SqliteBtreePageType.TableInterior)
         {
+            if (currentHeader.FreelistPageCount != 0
+                || currentHeader.FirstFreelistTrunkPage != 0)
+            {
+                return false;
+            }
+
             return indexes.Length == 0
                    && (TryPersistBoundedTableInteriorNestedLeafMutation(
                           tableName,
@@ -1403,6 +1408,13 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (existingLeaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null))
             return false;
 
+        if (indexes.Length == 0
+            && (currentHeader.FreelistPageCount != 0
+                || currentHeader.FirstFreelistTrunkPage != 0))
+        {
+            return false;
+        }
+
         if (!TryBuildBoundedTableLeafImage(tableName, table, existingPage, out var replacementPage))
         {
             return indexes.Length == 0
@@ -1422,6 +1434,25 @@ internal sealed class EmbeddedFileStore : IDisposable
                 return (Definition: index, RootPage: indexRootPage, SourcePage: _pager.ReadCommittedPage(indexRootPage));
             })
             .ToArray();
+        if (currentHeader.FreelistPageCount != 0
+            || currentHeader.FirstFreelistTrunkPage != 0)
+        {
+            return indexRootImages.Length == 1
+                   && SqliteBtreePageHeader.Parse(indexRootImages[0].SourcePage).PageType
+                       == SqliteBtreePageType.IndexInterior
+                   && TryPersistValidatedSecondaryIndexNestedLeafInsertion(
+                       table,
+                       persisted.Tables[tableName],
+                       indexRootImages[0].Definition,
+                       rootPage,
+                       replacementPage,
+                       indexRootImages[0].RootPage,
+                       indexRootImages[0].SourcePage,
+                       schemaPage,
+                       existingPage,
+                       currentHeader);
+        }
+
         if (indexRootImages.Length > 1
             && indexRootImages.All(index =>
                 SqliteBtreePageHeader.Parse(index.SourcePage).PageType == SqliteBtreePageType.IndexInterior))
@@ -2078,8 +2109,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         ReadOnlySpan<byte> sourceTablePage,
         SqliteDatabaseHeader currentHeader)
     {
-        if (currentHeader.FreelistPageCount != 0
-            || currentHeader.FirstFreelistTrunkPage != 0)
+        SqliteFreelist freelist;
+        try
+        {
+            freelist = SqliteFreelist.Read(
+                currentHeader,
+                currentHeader.DatabaseSizeInPages,
+                _pager.ReadCommittedPage);
+        }
+        catch (InvalidDataException)
         {
             return false;
         }
@@ -2100,6 +2138,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         var existingRecords = new List<byte[]>();
         byte[]? previousRecord = null;
         int? leafDepth = null;
+        var overflowReader = new SqliteOverflowChainReader(_pager, currentHeader);
 
         bool AddRecord(byte[] record)
         {
@@ -2108,6 +2147,46 @@ internal sealed class EmbeddedFileStore : IDisposable
 
             existingRecords.Add(record);
             previousRecord = record;
+            return true;
+        }
+
+        bool AddOverflowPages(SqliteIndexLeafCell cell)
+        {
+            ulong overflowLength;
+            try
+            {
+                overflowLength = GetOverflowLength(
+                    cell.PayloadLength,
+                    cell.LocalPayload.Length,
+                    "nested secondary-index");
+            }
+            catch (InvalidDataException)
+            {
+                return false;
+            }
+
+            if (overflowLength == 0)
+                return cell.FirstOverflowPage is null;
+            if (cell.FirstOverflowPage is not { } firstOverflowPage)
+                return false;
+
+            try
+            {
+                foreach (var overflowPage in overflowReader.Traverse(firstOverflowPage, overflowLength))
+                {
+                    if (!ownedPages.Add(overflowPage))
+                        return false;
+
+                    sourceTreePages.Add(new SqlitePageImage(
+                        overflowPage,
+                        _pager.ReadCommittedPage(overflowPage)));
+                }
+            }
+            catch (InvalidDataException)
+            {
+                return false;
+            }
+
             return true;
         }
 
@@ -2127,9 +2206,12 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 case SqliteBtreePageType.IndexLeaf:
                 {
-                    var leaf = SqliteIndexLeafPageView.Parse(sourcePage, _usableSpace, _textEncoding);
+                    var leaf = SqliteIndexLeafPageView.Parse(
+                        sourcePage,
+                        _usableSpace,
+                        _textEncoding,
+                        overflowReader: overflowReader);
                     if (leaf.Cells.Count == 0
-                        || leaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
                         || (leafDepth is { } expectedDepth && expectedDepth != depth))
                     {
                         return false;
@@ -2138,6 +2220,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                     leafDepth ??= depth;
                     for (var recordIndex = 0; recordIndex < leaf.Cells.Count; recordIndex++)
                     {
+                        if (!AddOverflowPages(leaf.Cells[recordIndex].Cell))
+                            return false;
+
                         var record = leaf.GetRecord(recordIndex);
                         if (!AddRecord(record))
                             return false;
@@ -2152,9 +2237,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                     var interior = SqliteIndexInteriorPageView.Parse(
                         sourcePage,
                         _usableSpace,
-                        _textEncoding);
-                    if (interior.Cells.Count == 0
-                        || interior.Cells.Any(cell => cell.Cell.Key.FirstOverflowPage is not null))
+                        _textEncoding,
+                        overflowReader: overflowReader);
+                    if (interior.Cells.Count == 0)
                     {
                         return false;
                     }
@@ -2179,6 +2264,9 @@ internal sealed class EmbeddedFileStore : IDisposable
 
                         if (childIndex < interior.Cells.Count)
                         {
+                            if (!AddOverflowPages(interior.Cells[childIndex].Cell.Key))
+                                return false;
+
                             var separator = interior.GetRecord(childIndex);
                             if (comparer.Compare(childMaximum, separator) >= 0
                                 || !AddRecord(separator))
@@ -2206,6 +2294,16 @@ internal sealed class EmbeddedFileStore : IDisposable
             || existingRecords.Count == 0)
         {
             return false;
+        }
+
+        foreach (var freelistPage in freelist.PageNumbers)
+        {
+            if (!ownedPages.Add(freelistPage))
+                return false;
+
+            sourceTreePages.Add(new SqlitePageImage(
+                freelistPage,
+                _pager.ReadCommittedPage(freelistPage)));
         }
 
         var persistedRecords = BuildIndexRecords(
@@ -2281,7 +2379,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                     var interior = SqliteIndexInteriorPageView.Parse(
                         sourcePage,
                         _usableSpace,
-                        _textEncoding);
+                        _textEncoding,
+                        overflowReader: overflowReader);
                     var route = interior.SearchChild(addedRecord);
                     if (route.IsSeparatorKey || route.ChildPage == 0)
                         return false;
@@ -2292,7 +2391,11 @@ internal sealed class EmbeddedFileStore : IDisposable
 
                 case SqliteBtreePageType.IndexLeaf:
                     sourceLeafPage = sourcePage;
-                    sourceLeaf = SqliteIndexLeafPageView.Parse(sourcePage, _usableSpace, _textEncoding);
+                    sourceLeaf = SqliteIndexLeafPageView.Parse(
+                        sourcePage,
+                        _usableSpace,
+                        _textEncoding,
+                        overflowReader: overflowReader);
                     goto RoutedToLeaf;
 
                 default:
@@ -2309,7 +2412,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         var insertion = sourceLeaf.Search(addedRecord);
-        if (insertion.IsExact)
+        if (insertion.IsExact
+            || sourceLeaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null))
             return false;
 
         var replacementRecords = new List<byte[]>(sourceLeaf.Cells.Count + 1);

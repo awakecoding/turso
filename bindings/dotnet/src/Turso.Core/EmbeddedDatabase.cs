@@ -3774,6 +3774,7 @@ public sealed class EmbeddedDatabase : IDisposable
         "COALESCE",
         "HEX",
         "IFNULL",
+        "INSTR",
         "LENGTH",
         "LOWER",
         "TYPEOF",
