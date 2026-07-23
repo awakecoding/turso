@@ -530,6 +530,11 @@ public sealed class SqlitePager : IDisposable
             ThrowIfDisposed();
             ThrowIfReadOnly();
             SynchronizeCommittedView();
+            if (HasUncommittedOrInvalidTail(_recoveryInfo))
+            {
+                throw new InvalidOperationException(
+                    "Cannot checkpoint a SQLite WAL with an uncommitted or invalid tail; recover it under the writer lock first.");
+            }
             if (_state != SqlitePagerState.Ready)
                 throw new InvalidOperationException($"Cannot checkpoint while the SQLite pager is {_state}.");
             _state = SqlitePagerState.Checkpointing;
@@ -798,7 +803,8 @@ public sealed class SqlitePager : IDisposable
         if (!_lockManager.UsesFileBackedWalLocks || !HasUncommittedOrInvalidTail(_recoveryInfo))
             return;
 
-        var recovery = _wal.RecoverToLastCommittedFrame();
+        _wal.RecoverToLastCommittedFrame();
+        var recovery = _wal.ScanRecovery();
         if (HasUncommittedOrInvalidTail(recovery))
             throw new InvalidDataException("SQLite WAL recovery did not remove its uncommitted or invalid tail.");
 

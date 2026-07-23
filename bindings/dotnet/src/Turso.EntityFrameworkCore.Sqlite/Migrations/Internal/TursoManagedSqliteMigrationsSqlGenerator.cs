@@ -137,6 +137,12 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                     $"The managed local provider does not support check constraints on '{addCheckConstraint.Table}'.");
             }
 
+            if (operation is DropCheckConstraintOperation dropCheckConstraint)
+            {
+                throw new NotSupportedException(
+                    $"The managed local provider does not support dropping check constraints ('{dropCheckConstraint.Name}' on '{dropCheckConstraint.Table}').");
+            }
+
             if (operation is SqlOperation)
             {
                 throw new NotSupportedException(

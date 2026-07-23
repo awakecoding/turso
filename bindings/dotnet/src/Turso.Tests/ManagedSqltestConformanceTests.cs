@@ -494,6 +494,43 @@ public class ManagedSqltestConformanceTests
     public void ManagedNextUpstreamSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
         => RunSqltestCase(fileName, testName);
 
+    [TestCase("column_name_case.sqltest", "select_star_headers")]
+    [TestCase("column_name_case.sqltest", "case_insensitive_column_reference")]
+    [TestCase("column_name_case.sqltest", "insert_with_mixed_case_column_names")]
+    [TestCase("column_name_case.sqltest", "update_with_mixed_case_column_names")]
+    [TestCase("column_name_case.sqltest", "create_index_on_mixed_case_column")]
+    public void ManagedColumnNameCaseSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
+    [TestCase("compare.sqltest", "compare-eq-int-int-1")]
+    [TestCase("compare.sqltest", "compare-eq-int-int-2")]
+    [TestCase("compare.sqltest", "compare-eq-int-null")]
+    [TestCase("compare.sqltest", "compare-eq-float-float-1")]
+    [TestCase("compare.sqltest", "compare-eq-float-float-2")]
+    [TestCase("compare.sqltest", "compare-eq-float-null")]
+    [TestCase("compare.sqltest", "compare-eq-text-text-1")]
+    [TestCase("compare.sqltest", "compare-eq-text-text-2")]
+    [TestCase("compare.sqltest", "compare-eq-text-null")]
+    [TestCase("compare.sqltest", "compare-eq-null-int")]
+    [TestCase("compare.sqltest", "compare-eq-null-float")]
+    [TestCase("compare.sqltest", "compare-eq-null-text")]
+    [TestCase("compare.sqltest", "compare-eq-null-null")]
+    [TestCase("compare.sqltest", "compare-neq-int-int-1")]
+    [TestCase("compare.sqltest", "compare-neq-int-int-2")]
+    [TestCase("compare.sqltest", "compare-neq-int-null")]
+    [TestCase("compare.sqltest", "compare-neq-float-float-1")]
+    [TestCase("compare.sqltest", "compare-neq-float-float-2")]
+    [TestCase("compare.sqltest", "compare-neq-float-null")]
+    [TestCase("compare.sqltest", "compare-neq-text-text-1")]
+    [TestCase("compare.sqltest", "compare-neq-text-text-2")]
+    [TestCase("compare.sqltest", "compare-neq-text-null")]
+    [TestCase("compare.sqltest", "compare-neq-null-int")]
+    [TestCase("compare.sqltest", "compare-neq-null-float")]
+    [TestCase("compare.sqltest", "compare-neq-null-text")]
+    [TestCase("compare.sqltest", "compare-neq-null-null")]
+    public void ManagedComparisonSqltestCasesRunWithoutNativeFallback(string fileName, string testName)
+        => RunSqltestCase(fileName, testName);
+
     private static void RunSqltestCase(string fileName, string testName)
     {
         var testCase = SqltestCase.Load(fileName, testName);

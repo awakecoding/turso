@@ -29,7 +29,7 @@ MANAGED_PACKAGE_OUTPUT_ARG = $(if $(MANAGED_PACKAGE_OUTPUT),--output "$(MANAGED_
 MANAGED_PACKAGE_VERSION_ARG = $(if $(MANAGED_PACKAGE_VERSION),-p:PackageVersion=$(MANAGED_PACKAGE_VERSION))
 
 all:
-	echo "make [restore|build|test|pack|validate-managed-package|build-native|test-native|pack-native|pack-nativeaot-static|pack-release|benchmark]"
+	echo "make [restore|build|test|pack|validate-managed-package|validate-managed-nativeaot|build-native|test-native|pack-native|pack-nativeaot-static|pack-release|benchmark]"
 
 build-rust-windows64:
 	cargo build -p turso_sdk_kit --target-dir ./rs_compiled --target x86_64-pc-windows-msvc $(RUST_RELEASE_OPT)
@@ -120,7 +120,7 @@ build-dotnet:
 # The default restore/build/test/pack path is managed-only: it neither invokes
 # Cargo nor requires rs_compiled native runtime assets. Native distribution
 # targets remain explicit below.
-.PHONY: restore build test pack restore-managed build-managed test-managed pack-managed validate-managed-package build-native test-native pack-native pack-nativeaot-static pack-release
+.PHONY: restore build test pack restore-managed build-managed test-managed pack-managed validate-managed-package validate-managed-nativeaot build-native test-native pack-native pack-nativeaot-static pack-release
 restore: restore-managed
 
 restore-managed:
@@ -153,6 +153,15 @@ validate-managed-package:
 	dotnet publish --configuration Debug --no-build --no-restore --output "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)" ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
 	@if find "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)" -type f \( -iname 'Turso.Raw.dll' -o -iname 'Turso.Data.Native.dll' -o -iname 'turso_sdk_kit.dll' -o -iname 'libturso_sdk_kit.so' -o -iname 'libturso_sdk_kit.dylib' -o -iname 'libturso_sdk_kit.a' \) -print -quit | grep -q .; then \
 		echo "Managed package publish output must not contain native companion assets"; \
+		exit 1; \
+	fi
+
+validate-managed-nativeaot:
+	rm -rf ./samples/ManagedNativeAot/bin ./samples/ManagedNativeAot/obj ./artifacts/managed-nativeaot-smoke
+	dotnet publish -c Release -r win-x64 --self-contained true -o ./artifacts/managed-nativeaot-smoke ./samples/ManagedNativeAot/ManagedNativeAotSmoke.csproj
+	./artifacts/managed-nativeaot-smoke/ManagedNativeAotSmoke.exe
+	@if find "./artifacts/managed-nativeaot-smoke" -type f \( -iname 'Turso.Raw.dll' -o -iname 'Turso.Data.Native.dll' -o -iname 'Turso.Data.Sqlite.Native.dll' -o -iname 'Turso.Data.Sqlite.NativeAot.*.dll' -o -iname 'turso_sdk_kit.dll' -o -iname 'libturso_sdk_kit.so' -o -iname 'libturso_sdk_kit.dylib' -o -iname 'libturso_sdk_kit.a' \) -print -quit | grep -q .; then \
+		echo "Managed NativeAOT publish output must not contain native companion assets"; \
 		exit 1; \
 	fi
 

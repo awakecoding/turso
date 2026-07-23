@@ -40,6 +40,17 @@ namespace Turso.Core.Compilation;
 public static class ArithmeticProgramBuilder
 {
     /// <summary>
+    /// Describes one output column for an arithmetic scan. Exactly one projection must be
+    /// <see cref="ArithmeticResult"/>; every other projection reads one source column.
+    /// </summary>
+    public readonly record struct ScanProjection(bool IsArithmeticResult, int ColumnIndex)
+    {
+        public static ScanProjection ForColumn(int columnIndex) => new(false, columnIndex);
+
+        public static ScanProjection ArithmeticResult() => new(true, 0);
+    }
+
+    /// <summary>
     /// Builds a source-less program that, for a single row of operand cells, applies
     /// <paramref name="op"/> to them and emits its result as a one-column result row. Constant cells emit
     /// <c>LoadConstant</c>; parameter cells emit <c>LoadParameter</c>, so a program with parameter operands
@@ -130,34 +141,80 @@ public static class ArithmeticProgramBuilder
         IReadOnlyList<SqlValue[]> rows,
         IReadOnlyList<int>? passthroughColumns = null)
     {
+        var passthrough = passthroughColumns ?? [];
+        var projections = new ScanProjection[passthrough.Count + 1];
+        for (var index = 0; index < passthrough.Count; index++)
+            projections[index] = ScanProjection.ForColumn(passthrough[index]);
+        projections[^1] = ScanProjection.ArithmeticResult();
+
+        return BuildOverScanWithProjectionOrder(
+            op,
+            tableName,
+            columnCount,
+            operandColumns,
+            rows,
+            projections);
+    }
+
+    /// <summary>
+    /// Builds an arithmetic scan whose direct-column projections and arithmetic result occur
+    /// in the supplied output order. The projection list must contain exactly one arithmetic
+    /// result and otherwise only source-column reads.
+    /// </summary>
+    public static CompoundTerm BuildOverScanWithProjectionOrder(
+        ArithmeticOperator op,
+        string tableName,
+        int columnCount,
+        IReadOnlyList<int> operandColumns,
+        IReadOnlyList<SqlValue[]> rows,
+        IReadOnlyList<ScanProjection> projections)
+    {
         ArgumentNullException.ThrowIfNull(tableName);
         ArgumentNullException.ThrowIfNull(operandColumns);
         ArgumentNullException.ThrowIfNull(rows);
+        ArgumentNullException.ThrowIfNull(projections);
         if (tableName.Length == 0)
             throw new ArgumentException("A scanned table needs a name.", nameof(tableName));
         if (columnCount <= 0)
             throw new ArgumentException("A scanned table needs a positive column count.", nameof(columnCount));
+        if (projections.Count == 0)
+            throw new ArgumentException("An arithmetic scan needs at least one output projection.", nameof(projections));
 
         var arity = RequireArity(op, operandColumns.Count);
-        var passthrough = passthroughColumns ?? [];
-        RequireColumnsInRange(passthrough, columnCount, nameof(passthroughColumns));
         RequireColumnsInRange(operandColumns, columnCount, nameof(operandColumns));
 
-        var passthroughCount = passthrough.Count;
+        var resultIndex = -1;
+        for (var index = 0; index < projections.Count; index++)
+        {
+            if (projections[index].IsArithmeticResult)
+            {
+                if (resultIndex >= 0)
+                    throw new ArgumentException("An arithmetic scan needs exactly one arithmetic result.", nameof(projections));
 
-        // Layout: passthrough columns fill the output prefix r[0..passthroughCount-1]; the arithmetic result
-        // occupies r[passthroughCount] (the final output column); the operands are read into the scratch
-        // block r[passthroughCount+1 .. passthroughCount+arity], which sits outside both the result register
-        // and the emitted output range, so writing the result never overlaps an operand read.
-        var resultRegister = new Register(passthroughCount);
-        var operandStart = new Register(passthroughCount + 1);
+                resultIndex = index;
+            }
+            else
+            {
+                RequireColumnsInRange([projections[index].ColumnIndex], columnCount, nameof(projections));
+            }
+        }
+
+        if (resultIndex < 0)
+            throw new ArgumentException("An arithmetic scan needs exactly one arithmetic result.", nameof(projections));
+
+        // Output registers mirror the requested projection order. Operand reads occupy a
+        // scratch block after that output range, so computing the arithmetic result cannot
+        // overwrite an operand even when the result appears between direct projections.
+        var resultRegister = new Register(resultIndex);
+        var operandStart = new Register(projections.Count);
         var operandRange = new RegisterRange(operandStart, arity);
-        var outputRange = new RegisterRange(new Register(0), passthroughCount + 1);
-        var registerCount = passthroughCount + 1 + arity;
+        var outputRange = new RegisterRange(new Register(0), projections.Count);
+        var registerCount = projections.Count + arity;
 
         var cursor = new Cursor(0);
         const int loopStart = 2;
-        var bodyLength = passthroughCount + arity + 2; // column reads + arithmetic + result row
+        var directColumnCount = projections.Count(projection => !projection.IsArithmeticResult);
+        var bodyLength = directColumnCount + arity + 2; // column reads + arithmetic + result row
         var nextAddr = loopStart + bodyLength;
         var closeAddr = nextAddr + 1;
 
@@ -167,11 +224,15 @@ public static class ArithmeticProgramBuilder
             new RewindCursorInstruction(cursor, new ProgramCounter(closeAddr)),
         };
 
-        for (var j = 0; j < passthroughCount; j++)
-            instructions.Add(new ColumnInstruction(cursor, passthrough[j], new Register(j)));
+        for (var index = 0; index < projections.Count; index++)
+        {
+            var projection = projections[index];
+            if (!projection.IsArithmeticResult)
+                instructions.Add(new ColumnInstruction(cursor, projection.ColumnIndex, new Register(index)));
+        }
 
         for (var i = 0; i < arity; i++)
-            instructions.Add(new ColumnInstruction(cursor, operandColumns[i], new Register(passthroughCount + 1 + i)));
+            instructions.Add(new ColumnInstruction(cursor, operandColumns[i], new Register(projections.Count + i)));
 
         instructions.Add(new ArithmeticInstruction(resultRegister, op, operandRange));
         instructions.Add(new ResultRowInstruction(outputRange));

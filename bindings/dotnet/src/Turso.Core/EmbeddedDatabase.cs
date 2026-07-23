@@ -3998,10 +3998,11 @@ public sealed class EmbeddedDatabase : IDisposable
         return true;
     }
 
-    // The scan builder emits leading passthrough columns followed by one arithmetic result. Its operands are
-    // deliberately restricted to declared columns: literal/parameter operands need a distinct per-row load
-    // shape, and nested expressions need their own register lowering. Preflighting the live operand cells keeps
-    // text/blob numeric-affinity behavior and its evaluator timing outside this direct path.
+    // The scan builder can place its one arithmetic result among direct declared-column projections. Its operands
+    // remain deliberately restricted to declared columns: literal/parameter operands need a distinct per-row load
+    // shape, and nested expressions need their own register lowering. Preflighting every live operand cell and
+    // arithmetic evaluation keeps text/blob numeric-affinity behavior and late evaluator errors outside this direct
+    // path before the VDBE can yield an earlier row.
     private bool TryCompileArithmeticOverScan(
         SelectStatement select,
         QueryContext context,
@@ -4016,8 +4017,25 @@ public sealed class EmbeddedDatabase : IDisposable
         if (target is null || target.Columns.Length == 0)
             return false;
 
-        var arithmeticIndex = select.Projections.Count - 1;
-        if (select.Projections[arithmeticIndex].Expression is not BinaryExpression binary
+        var arithmeticIndex = -1;
+        BinaryExpression? binary = null;
+        for (var index = 0; index < select.Projections.Count; index++)
+        {
+            if (select.Projections[index].Expression is not BinaryExpression candidate
+                || !TryMapArithmeticOperator(candidate.Operator, out _))
+            {
+                continue;
+            }
+
+            if (arithmeticIndex >= 0)
+                return false;
+
+            arithmeticIndex = index;
+            binary = candidate;
+        }
+
+        if (arithmeticIndex < 0
+            || binary is null
             || !TryMapArithmeticOperator(binary.Operator, out var op)
             || !TryResolveScanColumnOrdinal(binary.Left, target, out var left)
             || !TryResolveScanColumnOrdinal(binary.Right, target, out var right))
@@ -4025,25 +4043,37 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        var passthrough = new List<int>(arithmeticIndex);
+        var projections = new List<ArithmeticProgramBuilder.ScanProjection>(select.Projections.Count);
         for (var index = 0; index < arithmeticIndex; index++)
         {
             if (!TryResolveScanColumnOrdinal(select.Projections[index].Expression, target, out var column))
                 return false;
 
-            passthrough.Add(column);
+            projections.Add(ArithmeticProgramBuilder.ScanProjection.ForColumn(column));
+        }
+
+        projections.Add(ArithmeticProgramBuilder.ScanProjection.ArithmeticResult());
+
+        for (var index = arithmeticIndex + 1; index < select.Projections.Count; index++)
+        {
+            if (!TryResolveScanColumnOrdinal(select.Projections[index].Expression, target, out var column))
+                return false;
+
+            projections.Add(ArithmeticProgramBuilder.ScanProjection.ForColumn(column));
         }
 
         if (!HasOnlyNumericOrNullArithmeticOperands(target.Rows, left, right))
             return false;
 
-        var term = ArithmeticProgramBuilder.BuildOverScan(
+        ValidateArithmeticScanBeforeStreaming(target, binary, context);
+
+        var term = ArithmeticProgramBuilder.BuildOverScanWithProjectionOrder(
             op,
             target.TableName,
             target.Columns.Length,
             [left, right],
             target.Rows,
-            passthrough);
+            projections);
         compiled = new CompiledSelect(term.Program, term.CursorSources);
         return true;
     }
@@ -4063,6 +4093,16 @@ public sealed class EmbeddedDatabase : IDisposable
         }
 
         return true;
+    }
+
+    private void ValidateArithmeticScanBeforeStreaming(
+        ScanTarget target,
+        BinaryExpression expression,
+        QueryContext context)
+    {
+        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, target.Columns);
+        foreach (var row in target.Rows)
+            _ = Evaluate(expression, EmptyParameters, new SourceRow(target.Columns, row, qualifiedColumns), context);
     }
 
     // Maps the arithmetic BinaryOperators to their ArithmeticOperator opcode. Only the numeric family the
