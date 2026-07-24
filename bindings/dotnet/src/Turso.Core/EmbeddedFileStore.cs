@@ -7138,7 +7138,14 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         if (table.TableLevelPrimaryKey is not null && !table.HasRowidAlias)
-            ValidatePrimaryKeyIndexPrerequisites(name, table, "a table-level PRIMARY KEY", allowDescending: true);
+        {
+            ValidatePrimaryKeyIndexPrerequisites(
+                name,
+                table,
+                "a table-level PRIMARY KEY",
+                allowDescending: true,
+                allowBuiltInCollations: true);
+        }
 
         var columns = table.ColumnDefinitions;
         var primaryKeyCount = 0;

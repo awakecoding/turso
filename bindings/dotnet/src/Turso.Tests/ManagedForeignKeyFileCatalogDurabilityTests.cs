@@ -149,6 +149,65 @@ public sealed class ManagedForeignKeyFileCatalogDurabilityTests
     }
 
     [Test]
+    public void FailLimitedCascadePublishesOnlySqliteRetainedRowsAcrossReopen()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "foreign-key-fail-limited-cascade.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA foreign_keys=ON;");
+            Execute(connection, "CREATE TABLE parent(id INTEGER PRIMARY KEY, priority INTEGER);");
+            Execute(
+                connection,
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, "
+                    + "parent_id INTEGER REFERENCES parent(id) ON UPDATE CASCADE ON DELETE CASCADE);");
+            Execute(connection, "CREATE INDEX parent_priority ON parent(priority DESC);");
+            Execute(connection, "INSERT INTO parent VALUES (1, 1), (2, 2), (3, 3);");
+            Execute(connection, "INSERT INTO child VALUES (10, 1), (20, 2), (30, 3);");
+
+            Execute(
+                connection,
+                "UPDATE parent SET id=101 ORDER BY priority ASC NULLS LAST LIMIT 1;");
+            Assert.Throws<EmbeddedSqlException>(() => Execute(
+                connection,
+                "INSERT OR FAIL INTO parent VALUES (4, 4), (2, 20), (5, 5);"))!
+                .Message.Should().Contain("UNIQUE constraint failed");
+            ScalarText(
+                connection,
+                "SELECT group_concat(id || ':' || priority, ',') "
+                    + "FROM (SELECT id, priority FROM parent ORDER BY id);")
+                .Should().Be("2:2,3:3,4:4,101:1");
+            ScalarText(
+                connection,
+                "SELECT group_concat(id || ':' || parent_id, ',') "
+                    + "FROM (SELECT id, parent_id FROM child ORDER BY id);")
+                .Should().Be("10:101,20:2,30:3");
+
+            Assert.Throws<EmbeddedSqlException>(() => Execute(
+                connection,
+                "INSERT OR FAIL INTO child VALUES (40, 101), (50, 404), (60, 101);"))!
+                .Message.Should().Be("FOREIGN KEY constraint failed");
+            ScalarInteger(connection, "SELECT COUNT(*) FROM child WHERE id >= 40;").Should().Be(0);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Execute(reopenedConnection, "PRAGMA foreign_keys=ON;");
+        ScalarText(
+            reopenedConnection,
+            "SELECT group_concat(id || ':' || priority, ',') "
+                + "FROM (SELECT id, priority FROM parent ORDER BY id);")
+            .Should().Be("2:2,3:3,4:4,101:1");
+        ScalarText(
+            reopenedConnection,
+            "SELECT group_concat(id || ':' || parent_id, ',') "
+                + "FROM (SELECT id, parent_id FROM child ORDER BY id);")
+            .Should().Be("10:101,20:2,30:3");
+    }
+
+    [Test]
     public void CorruptedPersistedForeignKeyCatalogFailsClosedDuringReopen()
     {
         var fileSystem = new InMemoryFileSystem();
@@ -280,20 +339,20 @@ public sealed class ManagedForeignKeyFileCatalogDurabilityTests
         return value;
     }
 
-    private static string ScalarText(EmbeddedConnection connection, string sql)
-    {
-        using var statement = connection.Prepare(sql);
-        statement.Step().Should().Be(StatementStepResult.Row);
-        var value = statement.GetValue(0).AsText();
-        statement.Step().Should().Be(StatementStepResult.Done);
-        return value;
-    }
-
     private static SqlValue Value(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);
         statement.Step().Should().Be(StatementStepResult.Row);
         var value = statement.GetValue(0);
+        statement.Step().Should().Be(StatementStepResult.Done);
+        return value;
+    }
+
+    private static string ScalarText(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        var value = statement.GetValue(0).AsText();
         statement.Step().Should().Be(StatementStepResult.Done);
         return value;
     }

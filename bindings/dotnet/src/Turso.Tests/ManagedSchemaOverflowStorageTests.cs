@@ -269,6 +269,113 @@ public sealed class ManagedSchemaOverflowStorageTests
     }
 
     [Test]
+    public void CombinedWithoutRowidForeignKeyCatalogSurvivesMigrationBackupAndReopen()
+    {
+        var sourcePath = CreateDatabasePath("combined-catalog-source");
+        var destinationPath = CreateDatabasePath("combined-catalog-destination");
+        var payload = LargeValue('m', SmallPageSchemaPayloadLength);
+        try
+        {
+            using (var source = OpenManagedProvider(sourcePath))
+            using (var destination = OpenManagedProvider(destinationPath))
+            {
+                Execute(source, "PRAGMA foreign_keys=ON;");
+                Execute(
+                    source,
+                    $"""
+                    CREATE TABLE parent(
+                        tenant TEXT COLLATE NOCASE,
+                        sequence INTEGER,
+                        payload TEXT COLLATE RTRIM NOT NULL DEFAULT '{payload}',
+                        normalized TEXT COLLATE NOCASE AS (lower(payload)) STORED UNIQUE,
+                        PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC)
+                    ) WITHOUT ROWID;
+                    """);
+                Execute(
+                    source,
+                    $"""
+                    CREATE TABLE child(
+                        tenant TEXT COLLATE NOCASE,
+                        sequence INTEGER,
+                        normalized TEXT COLLATE NOCASE,
+                        note TEXT NOT NULL DEFAULT '{payload}',
+                        PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                        FOREIGN KEY(tenant, sequence) REFERENCES parent(tenant, sequence)
+                            ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+                        FOREIGN KEY(normalized) REFERENCES parent(normalized)
+                    ) WITHOUT ROWID;
+                    """);
+                Execute(
+                    source,
+                    "CREATE INDEX parent_payload_tenant "
+                        + "ON parent(payload COLLATE RTRIM DESC, tenant COLLATE BINARY ASC);");
+                Execute(
+                    source,
+                    "CREATE INDEX parent_tenant ON parent(tenant COLLATE NOCASE ASC);");
+                Execute(source, "INSERT INTO parent(tenant, sequence, payload) VALUES ('alpha', 1, 'Key');");
+                Execute(source, "INSERT INTO child(tenant, sequence, normalized) VALUES ('ALPHA', 1, 'KEY');");
+                Execute(source, "PRAGMA journal_mode=DELETE;");
+                Execute(source, $"PRAGMA page_size={SqlitePageSize.Minimum};");
+                Execute(source, "VACUUM;");
+
+                source.BackupDatabase(destination);
+            }
+
+            FindSchemaCell(PhysicalFileSystem.Instance, destinationPath, "parent")
+                .OverflowPages.Should().NotBeEmpty();
+            FindSchemaCell(PhysicalFileSystem.Instance, destinationPath, "child")
+                .OverflowPages.Should().NotBeEmpty();
+
+            using (var reopened = EmbeddedDatabase.OpenFile(destinationPath))
+            using (var connection = reopened.Connect())
+            {
+                Execute(connection, "PRAGMA foreign_keys=ON;");
+                ScalarText(connection, "SELECT sql FROM sqlite_schema WHERE name='parent';")
+                    .Should().Contain("COLLATE NOCASE")
+                    .And.Contain("\"sequence\" DESC")
+                    .And.Contain("STORED")
+                    .And.Contain(payload);
+                ScalarText(connection, "SELECT sql FROM sqlite_schema WHERE name='child';")
+                    .Should().Contain("ON UPDATE CASCADE")
+                    .And.Contain("ON DELETE CASCADE")
+                    .And.Contain("DEFERRABLE INITIALLY DEFERRED")
+                    .And.Contain(payload);
+
+                Execute(
+                    connection,
+                    "UPDATE parent SET tenant='beta', sequence=2 WHERE tenant='alpha' AND sequence=1;");
+                ScalarText(connection, "SELECT tenant || ':' || sequence FROM child;")
+                    .Should().Be("beta:2");
+            }
+
+            using (var sqlite = new NativeSqliteConnection($"Data Source={destinationPath};Pooling=False"))
+            {
+                sqlite.Open();
+                ExecuteScalarText(
+                    sqlite,
+                    """
+                    SELECT group_concat(name || ':' || coll || ':' || desc || ':' || key, ',')
+                    FROM pragma_index_xinfo('parent_payload_tenant');
+                    """).Should().Be(
+                        "payload:RTRIM:1:1,tenant:BINARY:0:1,tenant:NOCASE:0:0,sequence:BINARY:1:0");
+                ExecuteScalarText(
+                    sqlite,
+                    """
+                    SELECT group_concat(name || ':' || coll || ':' || desc || ':' || key, ',')
+                    FROM pragma_index_xinfo('parent_tenant');
+                    """).Should().Be("tenant:NOCASE:0:1,sequence:BINARY:1:0");
+                ExecuteScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            }
+        }
+        finally
+        {
+            NativeSqliteConnection.ClearAllPools();
+            DeleteDatabase(sourcePath);
+            DeleteDatabase(destinationPath);
+        }
+    }
+
+    [Test]
     public void AttachedDatabasePersistsAndRefreshesAnOverflowingSchema()
     {
         var fileSystem = new InMemoryFileSystem();
