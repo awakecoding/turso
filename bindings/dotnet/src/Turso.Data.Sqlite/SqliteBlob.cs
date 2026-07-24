@@ -17,8 +17,20 @@ public class SqliteBlob : Stream
     private bool _disposed;
 
     public SqliteBlob(SqliteConnection connection, string tableName, string columnName, long rowId, bool readOnly = false)
+        : this(connection, "main", tableName, columnName, rowId, readOnly)
+    {
+    }
+
+    public SqliteBlob(
+        SqliteConnection connection,
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowId,
+        bool readOnly = false)
     {
         ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(databaseName);
         ArgumentNullException.ThrowIfNull(tableName);
         ArgumentNullException.ThrowIfNull(columnName);
         if (connection.State != ConnectionState.Open)
@@ -33,7 +45,7 @@ public class SqliteBlob : Stream
         {
             try
             {
-                _managedBlob = connection.ManagedConnection.OpenBlob("main", tableName, columnName, rowId, readOnly);
+                _managedBlob = connection.ManagedConnection.OpenBlob(databaseName, tableName, columnName, rowId, readOnly);
             }
             catch (ManagedBlobException exception)
             {
@@ -47,6 +59,9 @@ public class SqliteBlob : Stream
             connection.ManagedBlobOpened(this);
             return;
         }
+
+        if (!string.Equals(databaseName, "main", StringComparison.OrdinalIgnoreCase))
+            throw new SqliteException(Properties.Resources.SqliteNativeError(1, $"unknown database: {databaseName}"), 1);
 
         _stream = new MemoryStream(GetBlobValue(connection, tableName, columnName, rowId), writable: true);
     }

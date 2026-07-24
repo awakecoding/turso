@@ -1,3 +1,5 @@
+using Turso.Core.Parsing;
+
 namespace Turso.Core;
 
 public interface IManagedIncrementalBlobAdapter : IDisposable
@@ -237,7 +239,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
     private static void EnsureTable(IManagedConnectionAdapter connection, string tableName)
     {
         using var statement = connection.Prepare(
-            "SELECT type, name FROM sqlite_master WHERE sql IS NOT NULL;");
+            "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL;");
         while (statement.Step() == StatementStepResult.Row)
         {
             var name = statement.GetValue(1);
@@ -254,6 +256,15 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             var objectType = type.AsText();
             if (string.Equals(objectType, "table", StringComparison.OrdinalIgnoreCase))
             {
+                var sql = statement.GetValue(2);
+                if (sql.Kind != SqlValueKind.Text)
+                    throw new InvalidOperationException("sqlite_master returned non-text table SQL.");
+                var parsed = SqlParser.Parse(sql.AsText(), SqlParameterMap.Parse(sql.AsText()));
+                if (parsed is not CreateTableStatement createTable)
+                    throw new InvalidOperationException("sqlite_master returned table SQL that is not CREATE TABLE.");
+                if (createTable.WithoutRowid)
+                    throw new ManagedBlobException(SqliteError, $"cannot open table without rowid: {tableName}");
+
                 return;
             }
 
