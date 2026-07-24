@@ -259,6 +259,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private sealed record GroupedResult(SourceRow Representative, IReadOnlyList<SourceRow> Rows, SqlValue[] Values);
 
+    private sealed record LimitedDmlCandidate(int Position, SqlValue[] OrderValues);
+
     internal sealed record QueryContext(
         Dictionary<string, EmbeddedTable> Tables,
         IReadOnlyDictionary<string, SourceData> CommonTableExpressions,
@@ -3242,6 +3244,19 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         var plan = PrepareUpdate(statement, table);
+        var selectedPositions = statement.Limit is null
+            ? null
+            : SelectLimitedDmlPositions(
+                statement.TableName,
+                table,
+                statement.Where,
+                statement.EffectiveOrderBy,
+                statement.Limit,
+                statement.Offset,
+                statement.Assignments.Select(assignment => assignment.Value),
+                statement.Returning,
+                parameters,
+                context);
         var rows = table.Rows.Select(row => row.ToArray()).ToList();
         var rowIds = table.RowIds.Count == table.Rows.Count
             ? table.RowIds.ToList()
@@ -3257,7 +3272,12 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             var row = table.Rows[position];
             var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
-            if (statement.Where is not null)
+            if (selectedPositions is not null)
+            {
+                if (!selectedPositions.Contains(position))
+                    continue;
+            }
+            else if (statement.Where is not null)
             {
                 var source = new SourceRow(
                     table.Columns,
@@ -3311,22 +3331,130 @@ public sealed class EmbeddedDatabase : IDisposable
             rowsAffected++;
         }
 
-        CommitUpdates(context, statement.TableName, table, table.Rows, rows, rowIds, plan, updatedPositions);
+        ExecutionResult? returningResult = null;
+        CommitUpdates(
+            context,
+            statement.TableName,
+            table,
+            table.Rows,
+            rows,
+            rowIds,
+            plan,
+            updatedPositions,
+            statement.Returning is null
+                ? null
+                : () => returningResult = BuildReturningResult(
+                    statement.Returning,
+                    statement.TableName,
+                    table,
+                    updatedRows!,
+                    updatedRowIds!,
+                    rowsAffected,
+                    rowsAffected > 0,
+                    parameters,
+                    context));
         if (statement.Returning is not null)
-        {
-            return BuildReturningResult(
-                statement.Returning,
-                statement.TableName,
-                table,
-                updatedRows!,
-                updatedRowIds!,
-                rowsAffected,
-                rowsAffected > 0,
-                parameters,
-                context);
-        }
+            return returningResult!;
 
         return new ExecutionResult([], [], rowsAffected, rowsAffected > 0);
+    }
+
+    private HashSet<int> SelectLimitedDmlPositions(
+        string tableName,
+        EmbeddedTable table,
+        Expression? where,
+        IReadOnlyList<OrderByTerm> orderBy,
+        Expression limitExpression,
+        Expression? offsetExpression,
+        IEnumerable<Expression> mutationExpressions,
+        IReadOnlyList<Projection>? returning,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        ValidateOrderByCollations(orderBy);
+        var validationRow = new SourceRow(
+            table.Columns,
+            Enumerable.Repeat(SqlValue.Null, table.Columns.Length).ToArray(),
+            RowId: table.HasRowid ? 1 : null,
+            RowIdQualifier: tableName);
+        ValidateColumnReferences(where, validationRow);
+        foreach (var expression in mutationExpressions)
+            ValidateColumnReferences(expression, validationRow);
+        foreach (var term in orderBy)
+            ValidateColumnReferences(term.Expression, validationRow);
+        if (returning is not null)
+        {
+            foreach (var projection in returning)
+            {
+                if (projection.Expression is not (StarExpression or QualifiedStarExpression))
+                    ValidateColumnReferences(projection.Expression, validationRow);
+            }
+        }
+
+        var limit = RequireLimitInteger(Evaluate(limitExpression, parameters, null, context));
+        var offset = offsetExpression is null
+            ? 0
+            : Math.Max(0, RequireLimitInteger(Evaluate(offsetExpression, parameters, null, context)));
+        if (limit == 0)
+            return [];
+
+        var candidates = new List<LimitedDmlCandidate>();
+        for (var position = 0; position < table.Rows.Count; position++)
+        {
+            var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
+            var source = new SourceRow(
+                table.Columns,
+                table.Rows[position],
+                RowId: table.HasRowid ? rowid : null,
+                RowIdQualifier: tableName);
+            if (where is not null && !IsTrue(Evaluate(where, parameters, source, context)))
+                continue;
+
+            var orderValues = new SqlValue[orderBy.Count];
+            for (var index = 0; index < orderBy.Count; index++)
+                orderValues[index] = Evaluate(orderBy[index].Expression, parameters, source, context);
+            candidates.Add(new LimitedDmlCandidate(position, orderValues));
+        }
+
+        if (orderBy.Count > 0)
+        {
+            candidates.Sort((left, right) =>
+            {
+                for (var index = 0; index < orderBy.Count; index++)
+                {
+                    var term = orderBy[index];
+                    var comparison = CompareForOrdering(
+                        left.OrderValues[index],
+                        right.OrderValues[index],
+                        term,
+                        GetCollation(term.Expression));
+                    if (comparison == 0)
+                        continue;
+                    return comparison;
+                }
+
+                return left.Position.CompareTo(right.Position);
+            });
+        }
+
+        var selected = new HashSet<int>();
+        long skipped = 0;
+        long taken = 0;
+        foreach (var candidate in candidates)
+        {
+            if (skipped < offset)
+            {
+                skipped++;
+                continue;
+            }
+            if (limit >= 0 && taken >= limit)
+                break;
+
+            selected.Add(candidate.Position);
+            taken++;
+        }
+
+        return selected;
     }
 
     // Resolves the UPDATE's column and rowid assignments. Extracted so the evaluated loop
@@ -3452,7 +3580,8 @@ public sealed class EmbeddedDatabase : IDisposable
         List<SqlValue[]> rows,
         List<long> rowIds,
         UpdatePlan plan,
-        IReadOnlyList<int> updatedPositions)
+        IReadOnlyList<int> updatedPositions,
+        Action? beforeMutation = null)
     {
         ValidateRowIdsUnique(tableName, table, rowIds, plan.AliasIndex);
         table.ValidateRows(tableName, rows);
@@ -3467,6 +3596,7 @@ public sealed class EmbeddedDatabase : IDisposable
             rows,
             plan,
             updatedPositions);
+        beforeMutation?.Invoke();
         var originalRowIds = table.HasRowid
             ? updatedPositions.Select(position => table.RowIds[position]).ToArray()
             : [];
@@ -3928,6 +4058,19 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
+        var selectedPositions = statement.Limit is null
+            ? null
+            : SelectLimitedDmlPositions(
+                statement.TableName,
+                table,
+                statement.Where,
+                statement.EffectiveOrderBy,
+                statement.Limit,
+                statement.Offset,
+                [],
+                statement.Returning,
+                parameters,
+                context);
         var rows = new List<SqlValue[]>(table.Rows.Count);
         var rowIds = new List<long>(table.Rows.Count);
         var deletedRows = new List<SqlValue[]>();
@@ -3942,7 +4085,10 @@ public sealed class EmbeddedDatabase : IDisposable
                 row,
                 RowId: table.HasRowid ? rowid : null,
                 RowIdQualifier: statement.TableName);
-            if (statement.Where is null || IsTrue(Evaluate(statement.Where, parameters, source, context)))
+            var shouldDelete = selectedPositions is not null
+                ? selectedPositions.Contains(position)
+                : statement.Where is null || IsTrue(Evaluate(statement.Where, parameters, source, context));
+            if (shouldDelete)
             {
                 rowsAffected++;
                 deletedRows.Add(row);
@@ -3957,6 +4103,18 @@ public sealed class EmbeddedDatabase : IDisposable
         if (rowsAffected > 0)
             ValidateForeignKeysAfterDelete(context, statement.TableName, table, table.Rows, rows, deletedRows);
 
+        var returningResult = statement.Returning is null
+            ? null
+            : BuildReturningResult(
+                statement.Returning,
+                statement.TableName,
+                table,
+                deletedRows,
+                deletedRowIds,
+                rowsAffected,
+                rowsAffected > 0,
+                parameters,
+                context);
         table.Rows.Clear();
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
@@ -3967,18 +4125,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 RecordBlobMutation(statement.TableName, rowId);
         }
         if (statement.Returning is not null)
-        {
-            return BuildReturningResult(
-                statement.Returning,
-                statement.TableName,
-                table,
-                deletedRows,
-                deletedRowIds,
-                rowsAffected,
-                rowsAffected > 0,
-                parameters,
-                context);
-        }
+            return returningResult!;
 
         return new ExecutionResult([], [], rowsAffected, rowsAffected > 0);
     }
@@ -6679,7 +6826,10 @@ public sealed class EmbeddedDatabase : IDisposable
         columns = [];
         hasReturning = false;
 
-        if (context.CommonTableExpressions.Count != 0
+        if (statement.Limit is not null
+            || statement.Offset is not null
+            || statement.EffectiveOrderBy.Count != 0
+            || context.CommonTableExpressions.Count != 0
             || IsSchemaTable(statement.TableName)
             || !context.Tables.TryGetValue(statement.TableName, out var table))
         {
@@ -6784,7 +6934,10 @@ public sealed class EmbeddedDatabase : IDisposable
         columns = [];
         hasReturning = false;
 
-        if (context.CommonTableExpressions.Count != 0
+        if (statement.Limit is not null
+            || statement.Offset is not null
+            || statement.EffectiveOrderBy.Count != 0
+            || context.CommonTableExpressions.Count != 0
             || IsSchemaTable(statement.TableName)
             || !context.Tables.TryGetValue(statement.TableName, out var table))
         {
@@ -8823,8 +8976,14 @@ public sealed class EmbeddedDatabase : IDisposable
                 + (insert.Returning?.Sum(projection => CountReferencesInExpression(projection.Expression, name)) ?? 0),
             UpdateStatement update => update.Assignments.Sum(assignment => CountReferencesInExpression(assignment.Value, name))
                 + (update.Where is null ? 0 : CountReferencesInExpression(update.Where, name))
+                + update.EffectiveOrderBy.Sum(term => CountReferencesInExpression(term.Expression, name))
+                + (update.Limit is null ? 0 : CountReferencesInExpression(update.Limit, name))
+                + (update.Offset is null ? 0 : CountReferencesInExpression(update.Offset, name))
                 + (update.Returning?.Sum(projection => CountReferencesInExpression(projection.Expression, name)) ?? 0),
             DeleteStatement delete => (delete.Where is null ? 0 : CountReferencesInExpression(delete.Where, name))
+                + delete.EffectiveOrderBy.Sum(term => CountReferencesInExpression(term.Expression, name))
+                + (delete.Limit is null ? 0 : CountReferencesInExpression(delete.Limit, name))
+                + (delete.Offset is null ? 0 : CountReferencesInExpression(delete.Offset, name))
                 + (delete.Returning?.Sum(projection => CountReferencesInExpression(projection.Expression, name)) ?? 0),
             _ => 0,
         };
@@ -17146,11 +17305,19 @@ public sealed class EmbeddedConnection : IDisposable
                 foreach (var assignment in update.Assignments)
                     CollectExpressionSchemas(assignment.Value, schemas, commonTableExpressions);
                 CollectExpressionSchemas(update.Where, schemas, commonTableExpressions);
+                foreach (var orderBy in update.EffectiveOrderBy)
+                    CollectExpressionSchemas(orderBy.Expression, schemas, commonTableExpressions);
+                CollectExpressionSchemas(update.Limit, schemas, commonTableExpressions);
+                CollectExpressionSchemas(update.Offset, schemas, commonTableExpressions);
                 CollectProjectionSchemas(update.Returning, schemas, commonTableExpressions);
                 break;
             case DeleteStatement delete:
                 AddPersistentObjectSchema(delete.TableName, schemas);
                 CollectExpressionSchemas(delete.Where, schemas, commonTableExpressions);
+                foreach (var orderBy in delete.EffectiveOrderBy)
+                    CollectExpressionSchemas(orderBy.Expression, schemas, commonTableExpressions);
+                CollectExpressionSchemas(delete.Limit, schemas, commonTableExpressions);
+                CollectExpressionSchemas(delete.Offset, schemas, commonTableExpressions);
                 CollectProjectionSchemas(delete.Returning, schemas, commonTableExpressions);
                 break;
             case WithDmlStatement with:
@@ -17401,12 +17568,18 @@ public sealed class EmbeddedConnection : IDisposable
                     Value = RewriteExpressionSchema(assignment.Value, schema, commonTableExpressions),
                 }).ToArray(),
                 Where = RewriteNullableExpression(update.Where, schema, commonTableExpressions),
+                OrderBy = RewriteOrderBy(update.EffectiveOrderBy, schema, commonTableExpressions),
+                Limit = RewriteNullableExpression(update.Limit, schema, commonTableExpressions),
+                Offset = RewriteNullableExpression(update.Offset, schema, commonTableExpressions),
                 Returning = RewriteProjections(update.Returning, schema, commonTableExpressions),
             },
             DeleteStatement delete => delete with
             {
                 TableName = RewritePersistentObjectName(delete.TableName, schema),
                 Where = RewriteNullableExpression(delete.Where, schema, commonTableExpressions),
+                OrderBy = RewriteOrderBy(delete.EffectiveOrderBy, schema, commonTableExpressions),
+                Limit = RewriteNullableExpression(delete.Limit, schema, commonTableExpressions),
+                Offset = RewriteNullableExpression(delete.Offset, schema, commonTableExpressions),
                 Returning = RewriteProjections(delete.Returning, schema, commonTableExpressions),
             },
             WithDmlStatement with => RewriteWithDmlSchema(with, schema, commonTableExpressions),
@@ -17728,9 +17901,15 @@ public sealed class EmbeddedConnection : IDisposable
             UpdateStatement update => ManagedSchemaName.TrySplit(update.TableName, out _, out _)
                 || update.Assignments.Any(assignment => ExpressionContainsSchemaQualification(assignment.Value))
                 || ExpressionContainsSchemaQualification(update.Where)
+                || update.EffectiveOrderBy.Any(term => ExpressionContainsSchemaQualification(term.Expression))
+                || ExpressionContainsSchemaQualification(update.Limit)
+                || ExpressionContainsSchemaQualification(update.Offset)
                 || (update.Returning?.Any(projection => ExpressionContainsSchemaQualification(projection.Expression)) ?? false),
             DeleteStatement delete => ManagedSchemaName.TrySplit(delete.TableName, out _, out _)
                 || ExpressionContainsSchemaQualification(delete.Where)
+                || delete.EffectiveOrderBy.Any(term => ExpressionContainsSchemaQualification(term.Expression))
+                || ExpressionContainsSchemaQualification(delete.Limit)
+                || ExpressionContainsSchemaQualification(delete.Offset)
                 || (delete.Returning?.Any(projection => ExpressionContainsSchemaQualification(projection.Expression)) ?? false),
             WithDmlStatement with => with.CommonTableExpressions.Any(commonTableExpression =>
                     ManagedSchemaName.TrySplit(commonTableExpression.Name, out _, out _)

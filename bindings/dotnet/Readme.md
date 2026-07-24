@@ -201,6 +201,8 @@ Managed `INSERT`, `UPDATE`, and `DELETE` reuse the same generic expression lower
 
 The compiled program first scans predicates and buffers all mutations, then evaluates buffered `RETURNING` rows in source and projection order, and commits only after projection succeeds. This retains predicate/assignment user-callback timing, keeps projection errors statement-atomic, and remains resumable across returned rows. Subqueries, aggregates/windows, `CASE`, `CAST`, concatenation/comparison projections, volatile or context-dependent functions, and shadowed user functions remain evaluator-owned. DML with a cancellation-capable token, foreign-key enforcement, open incremental blobs, conflict algorithms, source `INSERT`, CTE scope, or schema tables also falls back.
 
+The managed SQL contract enables SQLite's optional single-table `UPDATE`/`DELETE` `ORDER BY ... LIMIT` grammar independently of the bundled native SQLite compile options. `LIMIT ... OFFSET ...` and `LIMIT offset, count` accept bound parameters, negative limits are unbounded, and negative offsets clamp to zero. `RETURNING`, when present, precedes `ORDER BY`; ordering chooses the affected subset but does not reorder mutation or `RETURNING` output. Limited DML stays evaluator-owned so selection expressions run before source-ordered buffered mutation and statement-atomic projection. UPDATE conflict algorithms, UPDATE-FROM, row-value assignments, target aliases, `INDEXED BY`/`NOT INDEXED`, `ORDER BY` without `LIMIT`, and limited DML inside trigger bodies are rejected during parsing.
+
 ## Getting started
 
 ```C#
