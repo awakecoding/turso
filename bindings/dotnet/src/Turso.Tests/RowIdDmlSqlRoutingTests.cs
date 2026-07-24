@@ -18,8 +18,9 @@ public class RowIdDmlSqlRoutingTests
                 SqlValue.Integer(99),
                 SqlValue.Integer(2)))
             .Should().Equal(
-                "OpenWriteCursor", "Rewind", "FilterRowId", "Update", "RowId", "Column", "ResultRow",
-                "Next", "Commit", "CloseCursor", "Halt");
+                "OpenWriteCursor", "Rewind", "FilterRowId", "Update", "Next", "OpenReadCursor",
+                "Rewind", "RowId", "Column", "ResultRow", "Next", "CloseCursor", "Commit",
+                "CloseCursor", "Halt");
 
         using (var statement = connection.Prepare("UPDATE t SET value = ?1 WHERE rowid = ?2 RETURNING rowid, value;"))
         {

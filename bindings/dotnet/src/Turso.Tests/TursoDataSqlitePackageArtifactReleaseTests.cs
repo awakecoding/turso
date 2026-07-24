@@ -889,6 +889,10 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 lastError = exception;
                 Thread.Sleep(100);
             }
+            catch (UnauthorizedAccessException) when (attempt < 9)
+            {
+                Thread.Sleep(100);
+            }
         }
 
         throw lastError ?? new IOException($"Unable to delete package directory '{packageDirectory}'.");
