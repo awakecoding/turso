@@ -12,7 +12,7 @@ using Turso.Core;
 
 namespace Turso.Data.Sqlite;
 
-public class SqliteDataReader : DbDataReader
+public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 {
     private readonly SqliteCommand _command;
     private readonly SqliteConnection _connection;
@@ -26,6 +26,7 @@ public class SqliteDataReader : DbDataReader
     private bool _hasCurrentRow;
     private bool _hasPrefetchedRow;
     private bool _hadResultSet;
+    private bool _hadRecordsAffectedStatement;
     private bool _currentStatementRowsAffectedCounted;
 
     private enum ReaderValueKind
@@ -89,7 +90,35 @@ public class SqliteDataReader : DbDataReader
         public static ReaderValue FromManaged(ManagedResultValue value) => new(value);
     }
 
-    internal SqliteDataReader(SqliteCommand command, SqliteStatementAdapter statement, string currentSql, List<string> remainingSql, int recordsAffected, CommandBehavior behavior, Action closeCallback)
+    internal SqliteDataReader(
+        SqliteCommand command,
+        SqliteStatementAdapter statement,
+        string currentSql,
+        List<string> remainingSql,
+        int recordsAffected,
+        CommandBehavior behavior,
+        Action closeCallback)
+        : this(
+            command,
+            statement,
+            currentSql,
+            remainingSql,
+            recordsAffected,
+            hadRecordsAffectedStatement: false,
+            behavior,
+            closeCallback)
+    {
+    }
+
+    internal SqliteDataReader(
+        SqliteCommand command,
+        SqliteStatementAdapter statement,
+        string currentSql,
+        List<string> remainingSql,
+        int recordsAffected,
+        bool hadRecordsAffectedStatement,
+        CommandBehavior behavior,
+        Action closeCallback)
     {
         _command = command;
         _connection = command.Connection
@@ -99,9 +128,10 @@ public class SqliteDataReader : DbDataReader
         _hadResultSet = true;
         _remainingSql = remainingSql;
         _recordsAffected = recordsAffected;
+        _hadRecordsAffectedStatement = hadRecordsAffectedStatement;
         _behavior = behavior;
         _closeCallback = closeCallback;
-        _connection.ReaderOpened(this);
+        ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
     internal SqliteDataReader(SqliteCommand command, int recordsAffected, CommandBehavior behavior, Action closeCallback)
@@ -112,7 +142,7 @@ public class SqliteDataReader : DbDataReader
         _recordsAffected = recordsAffected;
         _behavior = behavior;
         _closeCallback = closeCallback;
-        _connection.ReaderOpened(this);
+        ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
     public override int Depth => 0;
@@ -154,7 +184,7 @@ public class SqliteDataReader : DbDataReader
     {
         get
         {
-            if (_recordsAffected > 0)
+            if (_recordsAffected > 0 || _hadRecordsAffectedStatement)
                 return _recordsAffected;
 
             return _statement is null ? _hadResultSet ? -1 : _recordsAffected : -1;
@@ -630,7 +660,10 @@ public class SqliteDataReader : DbDataReader
                 }
 
                 if (SqliteCommand.CountsRowsAffected(sql))
+                {
+                    _hadRecordsAffectedStatement = true;
                     _recordsAffected += statement.RowsAffected;
+                }
                 _command.MarkTransactionCompletedExternally(sql);
                 statement.Dispose();
             }
@@ -716,7 +749,7 @@ public class SqliteDataReader : DbDataReader
 
     public override void Close() => CloseCore();
 
-    internal void CloseFromConnection()
+    void IConnectionOwnedReader.CloseFromConnection()
     {
         if (_isClosed)
             return;
@@ -782,7 +815,7 @@ public class SqliteDataReader : DbDataReader
             return;
 
         _closeCallback();
-        _connection.ReaderClosed(this);
+        ((ILocalReaderConnection)_connection).ReaderClosed(this);
         if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
             _connection.Close();
 
@@ -826,6 +859,7 @@ public class SqliteDataReader : DbDataReader
             && !_currentStatementRowsAffectedCounted
             && SqliteCommand.CountsRowsAffected(_currentSql))
         {
+            _hadRecordsAffectedStatement = true;
             _recordsAffected += GetStatement().RowsAffected;
             _currentStatementRowsAffectedCounted = true;
         }
@@ -1181,7 +1215,10 @@ public class SqliteDataReader : DbDataReader
                 }
 
                 if (SqliteCommand.CountsRowsAffected(rewrittenSql))
+                {
+                    _hadRecordsAffectedStatement = true;
                     _recordsAffected += statement.RowsAffected;
+                }
                 _command.MarkTransactionCompletedExternally(sql);
             }
         }

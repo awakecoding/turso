@@ -128,18 +128,22 @@ public class ManagedFileStorageTests
     }
 
     [Test]
-    public void RejectsUniqueColumnBeforeAnyBytesArePersisted()
+    public void PersistsUniqueColumnAndEnforcesItAfterReopen()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var database = EmbeddedDatabase.OpenFile("reject-unique.db", fileSystem);
-        using var connection = database.Connect();
+        using (var database = EmbeddedDatabase.OpenFile("unique-column.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(id INTEGER, code TEXT UNIQUE);");
+            Execute(connection, "INSERT INTO t VALUES (1, 'one');");
+        }
 
-        var act = () => Execute(connection, "CREATE TABLE t(id INTEGER, code TEXT UNIQUE);");
-        act.Should().Throw<EmbeddedSqlException>().WithMessage("*UNIQUE*");
-
-        // The table must not exist after the reject, in memory or on disk.
-        var missing = () => Query(connection, "SELECT * FROM t;");
-        missing.Should().Throw<EmbeddedSqlException>();
+        using var reopened = EmbeddedDatabase.OpenFile("unique-column.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        var duplicate = () => Execute(reopenedConnection, "INSERT INTO t VALUES (2, 'one');");
+        duplicate.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("UNIQUE constraint failed: t.code");
+        Query(reopenedConnection, "SELECT id, code FROM t;").Should().HaveCount(1);
     }
 
     [Test]

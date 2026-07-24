@@ -365,6 +365,10 @@ internal sealed class SqlParser
         Expect(TokenKind.LeftParen);
         var columns = new List<EmbeddedColumn>();
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null;
+        InsertConflictAlgorithm? tablePrimaryKeyConflictAlgorithm = null;
+        string? tablePrimaryKeyConstraintName = null;
+        var uniqueConstraints = new List<TableUniqueConstraint>();
+        var checkConstraints = new List<CheckConstraint>();
         do
         {
             if (IsTableConstraintStart())
@@ -377,9 +381,20 @@ internal sealed class SqlParser
                             throw Error("table has more than one primary key");
 
                         tablePrimaryKey = primaryKey.Columns;
+                        tablePrimaryKeyConflictAlgorithm = primaryKey.ConflictAlgorithm;
+                        tablePrimaryKeyConstraintName = primaryKey.Name;
                         break;
                     case ForeignKeyTableConstraint foreignKey:
                         AttachTableForeignKey(columns, foreignKey.Definition);
+                        break;
+                    case UniqueTableConstraint unique:
+                        uniqueConstraints.Add(new TableUniqueConstraint(
+                            unique.Name,
+                            unique.Columns,
+                            unique.ConflictAlgorithm));
+                        break;
+                    case CheckTableConstraint check:
+                        checkConstraints.Add(new CheckConstraint(check.Name, check.Expression, check.Sql));
                         break;
                 }
 
@@ -402,42 +417,51 @@ internal sealed class SqlParser
             withoutRowid = true;
         }
 
-        return new CreateTableStatement(name, columns, ifNotExists, withoutRowid, tablePrimaryKey);
+        return new CreateTableStatement(
+            name,
+            columns,
+            ifNotExists,
+            withoutRowid,
+            tablePrimaryKey,
+            uniqueConstraints,
+            checkConstraints,
+            tablePrimaryKeyConflictAlgorithm,
+            tablePrimaryKeyConstraintName);
     }
 
     private abstract record TableConstraint;
 
-    private sealed record PrimaryKeyTableConstraint(IReadOnlyList<TablePrimaryKeyColumn> Columns) : TableConstraint;
+    private sealed record PrimaryKeyTableConstraint(
+        string? Name,
+        IReadOnlyList<TablePrimaryKeyColumn> Columns,
+        InsertConflictAlgorithm? ConflictAlgorithm) : TableConstraint;
 
     private sealed record ForeignKeyTableConstraint(ForeignKeyDefinition Definition) : TableConstraint;
 
-    // Parses the single-column table constraints the managed FK slice can preserve.
+    private sealed record UniqueTableConstraint(
+        string? Name,
+        IReadOnlyList<TablePrimaryKeyColumn> Columns,
+        InsertConflictAlgorithm? ConflictAlgorithm) : TableConstraint;
+
+    private sealed record CheckTableConstraint(string? Name, Expression Expression, string Sql) : TableConstraint;
+
     private TableConstraint ParseTableConstraint()
     {
+        string? constraintName = null;
         if (ConsumeKeyword("CONSTRAINT"))
-            ExpectIdentifier();
+            constraintName = ExpectIdentifier();
 
         if (ConsumeKeyword("PRIMARY"))
         {
             ExpectKeyword("KEY");
-            Expect(TokenKind.LeftParen);
-            var keyColumns = new List<TablePrimaryKeyColumn>();
-            do
-            {
-                var columnName = ExpectIdentifier();
-                string? collation = null;
-                if (ConsumeKeyword("COLLATE"))
-                    collation = ExpectIdentifier();
+            var keyColumns = ParseTableConstraintColumns();
+            return new PrimaryKeyTableConstraint(constraintName, keyColumns, ParseConflictClause());
+        }
 
-                var descending = false;
-                if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
-                    descending = true;
-
-                keyColumns.Add(new TablePrimaryKeyColumn(columnName, descending, collation));
-            }
-            while (Consume(TokenKind.Comma));
-            Expect(TokenKind.RightParen);
-            return new PrimaryKeyTableConstraint(keyColumns);
+        if (ConsumeKeyword("UNIQUE"))
+        {
+            var keyColumns = ParseTableConstraintColumns();
+            return new UniqueTableConstraint(constraintName, keyColumns, ParseConflictClause());
         }
 
         if (ConsumeKeyword("FOREIGN"))
@@ -453,12 +477,35 @@ internal sealed class SqlParser
         }
 
         if (ConsumeKeyword("CHECK"))
-            throw Error("CHECK constraints are not supported by the managed engine.");
+        {
+            var (expression, sql) = ParseParenthesizedSchemaExpression("CHECK");
+            _ = ParseConflictClause();
+            return new CheckTableConstraint(constraintName, expression, sql);
+        }
 
-        if (ConsumeKeyword("UNIQUE"))
-            throw Error("Table-level UNIQUE constraints are not supported by the managed engine.");
+        throw Error("Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY after table constraint name.");
+    }
 
-        throw Error($"Unsupported table constraint: {_lexer.Current.Text}.");
+    private IReadOnlyList<TablePrimaryKeyColumn> ParseTableConstraintColumns()
+    {
+        Expect(TokenKind.LeftParen);
+        var columns = new List<TablePrimaryKeyColumn>();
+        do
+        {
+            var columnName = ExpectIdentifier();
+            string? collation = null;
+            if (ConsumeKeyword("COLLATE"))
+                collation = ExpectIdentifier();
+
+            var descending = false;
+            if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
+                descending = true;
+
+            columns.Add(new TablePrimaryKeyColumn(columnName, descending, collation));
+        }
+        while (Consume(TokenKind.Comma));
+        Expect(TokenKind.RightParen);
+        return columns;
     }
 
     private static void AttachTableForeignKey(List<EmbeddedColumn> columns, ForeignKeyDefinition foreignKey)
@@ -1640,9 +1687,21 @@ internal sealed class SqlParser
 
                 _lexer.Next();
                 if (Consume(TokenKind.Dot))
-                    return new ColumnExpression(token.Text + "." + ExpectIdentifier());
+                {
+                    var columnName = ExpectIdentifier();
+                    return new ColumnExpression(
+                        token.Text + "." + columnName,
+                        token.Text,
+                        columnName);
+                }
                 if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
                     return new LiteralExpression(SqlValue.Null);
+                if (string.Equals(token.Text, "CURRENT_DATE", StringComparison.OrdinalIgnoreCase))
+                    return new CurrentTimeExpression(CurrentTimeKind.Date);
+                if (string.Equals(token.Text, "CURRENT_TIME", StringComparison.OrdinalIgnoreCase))
+                    return new CurrentTimeExpression(CurrentTimeKind.Time);
+                if (string.Equals(token.Text, "CURRENT_TIMESTAMP", StringComparison.OrdinalIgnoreCase))
+                    return new CurrentTimeExpression(CurrentTimeKind.Timestamp);
                 if (string.Equals(token.Text, "CASE", StringComparison.OrdinalIgnoreCase))
                     return ParseCaseExpression();
                 if (string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) && Consume(TokenKind.LeftParen))
@@ -1803,38 +1862,48 @@ internal sealed class SqlParser
     private EmbeddedColumn ParseColumnDefinition()
     {
         var name = ExpectIdentifier();
-        string? declaredType = null;
-        if (_lexer.Current.Kind == TokenKind.Identifier && !IsColumnConstraintKeyword(_lexer.Current.Text))
-        {
-            declaredType = _lexer.Current.Text;
-            _lexer.Next();
-        }
-
-        if (_lexer.Current.Kind == TokenKind.LeftParen)
-            SkipParenthesized();
+        var declaredType = ParseDeclaredType();
 
         var primaryKey = false;
         var primaryKeyDescending = false;
         var notNull = false;
         var unique = false;
         SqlValue? defaultValue = null;
+        Expression? defaultExpression = null;
+        string? defaultSql = null;
         string? collation = null;
         Expression? generationExpression = null;
         var generatedStored = false;
         string? generationSql = null;
         ForeignKeyDefinition? foreignKey = null;
+        var checks = new List<CheckConstraint>();
+        InsertConflictAlgorithm? primaryKeyConflictAlgorithm = null;
+        InsertConflictAlgorithm? notNullConflictAlgorithm = null;
+        InsertConflictAlgorithm? uniqueConflictAlgorithm = null;
+        string? primaryKeyConstraintName = null;
+        string? notNullConstraintName = null;
+        string? uniqueConstraintName = null;
+        string? pendingConstraintName = null;
         while (_lexer.Current.Kind == TokenKind.Identifier)
         {
+            if (ConsumeKeyword("CONSTRAINT"))
+            {
+                pendingConstraintName = ExpectIdentifier();
+                continue;
+            }
             if (ConsumeKeyword("PRIMARY"))
             {
                 ExpectKeyword("KEY");
                 primaryKey = true;
+                primaryKeyConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
 
                 // A trailing ASC keeps the rowid-alias behavior; DESC disqualifies the
                 // column from aliasing the rowid, matching SQLite.
                 if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
                     primaryKeyDescending = true;
 
+                primaryKeyConflictAlgorithm = ParseConflictClause();
                 continue;
             }
             if (ConsumeKeyword("AUTOINCREMENT"))
@@ -1845,17 +1914,26 @@ internal sealed class SqlParser
                 // rowid assignment, which would diverge from SQLite.
                 throw Error("AUTOINCREMENT is not supported: the managed engine does not implement sqlite_sequence semantics");
             }
-            if (ConsumeKeyword("NULL"))
-                continue;
             if (ConsumeKeyword("NOT"))
             {
                 ExpectKeyword("NULL");
                 notNull = true;
+                notNullConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
+                notNullConflictAlgorithm = ParseConflictClause();
+                continue;
+            }
+            if (ConsumeKeyword("NULL"))
+            {
+                pendingConstraintName = null;
                 continue;
             }
             if (ConsumeKeyword("UNIQUE"))
             {
                 unique = true;
+                uniqueConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
+                uniqueConflictAlgorithm = ParseConflictClause();
                 continue;
             }
             if (ConsumeKeyword("COLLATE"))
@@ -1865,11 +1943,17 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("DEFAULT"))
             {
-                var expression = ParseExpression();
-                if (expression is not LiteralExpression literal)
-                    throw Error("Only constant DEFAULT values are supported.");
-
-                defaultValue = literal.Value;
+                var startOffset = _lexer.Current.Offset;
+                var expression = _lexer.Current.Kind == TokenKind.LeftParen
+                    ? ParseExpression()
+                    : ParsePrimary();
+                var endOffset = _lexer.Current.Offset;
+                defaultSql = _sql[startOffset..endOffset].Trim();
+                if (TryGetLiteralDefault(expression, out var literalValue))
+                    defaultValue = literalValue;
+                else
+                    defaultExpression = expression;
+                pendingConstraintName = null;
                 continue;
             }
             // GENERATED ALWAYS AS (expr) and the bare AS (expr) shorthand both declare a
@@ -1893,26 +1977,24 @@ internal sealed class SqlParser
                     throw Error($"multiple foreign key constraints on column {name} are not supported");
 
                 foreignKey = ParseForeignKeyReference(name);
+                pendingConstraintName = null;
                 continue;
             }
             if (ConsumeKeyword("FOREIGN"))
                 throw Error("FOREIGN KEY constraints must be table-level.");
             if (ConsumeKeyword("CHECK"))
-                throw Error("CHECK constraints are not supported by the managed engine.");
-            if (ConsumeKeyword("CONSTRAINT"))
             {
-                ExpectIdentifier();
+                var (expression, sql) = ParseParenthesizedSchemaExpression("CHECK");
+                checks.Add(new CheckConstraint(pendingConstraintName, expression, sql));
+                pendingConstraintName = null;
                 continue;
             }
 
-            if (CurrentIsKeyword("ON"))
-            {
-                throw Error(
-                    "Column constraint ON CONFLICT clauses are not supported by the managed engine.");
-            }
-
-            throw Error($"Unsupported column constraint clause: {_lexer.Current.Text}.");
+            throw Error($"Unsupported column constraint '{_lexer.Current.Text}'.");
         }
+
+        if (pendingConstraintName is not null)
+            throw Error($"Expected a constraint after CONSTRAINT {pendingConstraintName}.");
 
         return new EmbeddedColumn(
             name,
@@ -1926,7 +2008,78 @@ internal sealed class SqlParser
             generatedStored,
             generationSql,
             collation,
-            foreignKey);
+            foreignKey,
+            checks,
+            defaultExpression,
+            defaultSql,
+            primaryKeyConflictAlgorithm,
+            notNullConflictAlgorithm,
+            uniqueConflictAlgorithm,
+            primaryKeyConstraintName,
+            notNullConstraintName,
+            uniqueConstraintName);
+    }
+
+    private string? ParseDeclaredType()
+    {
+        if (_lexer.Current.Kind is TokenKind.Comma or TokenKind.RightParen)
+            return null;
+        if (_lexer.Current.Kind == TokenKind.Identifier && IsColumnConstraintKeyword(_lexer.Current.Text))
+            return null;
+
+        var startOffset = _lexer.Current.Offset;
+        var depth = 0;
+        while (_lexer.Current.Kind != TokenKind.End)
+        {
+            if (depth == 0)
+            {
+                if (_lexer.Current.Kind is TokenKind.Comma or TokenKind.RightParen)
+                    break;
+                if (_lexer.Current.Kind == TokenKind.Identifier && IsColumnConstraintKeyword(_lexer.Current.Text))
+                    break;
+            }
+
+            if (_lexer.Current.Kind == TokenKind.LeftParen)
+                depth++;
+            else if (_lexer.Current.Kind == TokenKind.RightParen)
+                depth--;
+            _lexer.Next();
+        }
+
+        return _sql[startOffset.._lexer.Current.Offset].Trim();
+    }
+
+    private (Expression Expression, string Sql) ParseParenthesizedSchemaExpression(string constraint)
+    {
+        Expect(TokenKind.LeftParen);
+        var startOffset = _lexer.Current.Offset;
+        var expression = ParseExpression();
+        var endOffset = _lexer.Current.Offset;
+        Expect(TokenKind.RightParen);
+        var sql = _sql[startOffset..endOffset].Trim();
+        if (sql.Length == 0)
+            throw Error($"{constraint} constraint requires an expression.");
+        return (expression, sql);
+    }
+
+    private InsertConflictAlgorithm? ParseConflictClause()
+    {
+        if (!ConsumeKeyword("ON"))
+            return null;
+
+        ExpectKeyword("CONFLICT");
+        if (ConsumeKeyword("ROLLBACK"))
+            return InsertConflictAlgorithm.Rollback;
+        if (ConsumeKeyword("ABORT"))
+            return InsertConflictAlgorithm.Abort;
+        if (ConsumeKeyword("FAIL"))
+            return InsertConflictAlgorithm.Fail;
+        if (ConsumeKeyword("IGNORE"))
+            return InsertConflictAlgorithm.Ignore;
+        if (ConsumeKeyword("REPLACE"))
+            return InsertConflictAlgorithm.Replace;
+
+        throw Error("Expected ROLLBACK, ABORT, FAIL, IGNORE, or REPLACE after ON CONFLICT.");
     }
 
     // Parses the "(expr) [STORED|VIRTUAL]" body shared by GENERATED ALWAYS AS and the bare
@@ -1970,6 +2123,35 @@ internal sealed class SqlParser
             || keyword.Equals("PRIMARY", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("REFERENCES", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("UNIQUE", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryGetLiteralDefault(Expression expression, out SqlValue value)
+    {
+        if (expression is LiteralExpression literal)
+        {
+            value = literal.Value;
+            return true;
+        }
+
+        if (expression is BinaryExpression
+            {
+                Left: LiteralExpression { Value.Kind: SqlValueKind.Integer } zero,
+                Operator: BinaryOperator.Subtract,
+                Right: LiteralExpression right,
+            }
+            && zero.Value.AsInteger() == 0)
+        {
+            value = right.Value.Kind switch
+            {
+                SqlValueKind.Integer => SqlValue.Integer(-right.Value.AsInteger()),
+                SqlValueKind.Real => SqlValue.Real(-right.Value.AsReal()),
+                _ => default,
+            };
+            return right.Value.Kind is SqlValueKind.Integer or SqlValueKind.Real;
+        }
+
+        value = default;
+        return false;
     }
 
     private void SkipParenthesized()

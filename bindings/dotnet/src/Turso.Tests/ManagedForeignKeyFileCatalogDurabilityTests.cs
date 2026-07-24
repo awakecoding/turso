@@ -167,7 +167,7 @@ public sealed class ManagedForeignKeyFileCatalogDurabilityTests
         var payload = page.AsSpan(payloadOffset, childCell.Cell.LocalPayload.Length);
         var markerOffset = payload.IndexOf("REFERENCES"u8);
         markerOffset.Should().BeGreaterThanOrEqualTo(0);
-        payload[markerOffset] = (byte)'X';
+        payload[markerOffset] = (byte)')';
 
         file.Write(0, page);
         file.FlushToDisk();

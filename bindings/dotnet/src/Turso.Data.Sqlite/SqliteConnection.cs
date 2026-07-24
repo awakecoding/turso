@@ -8,7 +8,7 @@ using Turso.Core.Storage;
 
 namespace Turso.Data.Sqlite;
 
-public partial class SqliteConnection : DbConnection
+public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 {
     private const int SQLITE_ERROR = 1;
     private const int SQLITE_CANTOPEN = 14;
@@ -21,7 +21,7 @@ public partial class SqliteConnection : DbConnection
     private SqliteConnectionStringBuilder _connectionOptions = new();
     private bool _disposed;
     private int? _defaultTimeout;
-    private readonly HashSet<SqliteDataReader> _openReaders = [];
+    private readonly HashSet<IConnectionOwnedReader> _openReaders = [];
     private readonly object _readerGate = new();
     private readonly ManualResetEventSlim _noOpenReaders = new(initialState: true);
     private readonly HashSet<SqliteBlob> _openManagedBlobs = [];
@@ -100,6 +100,11 @@ public partial class SqliteConnection : DbConnection
         ? ConnectionState.Closed
         : ConnectionState.Open;
 
+    public TursoConnectionCapabilities Capabilities
+        => TursoConnectionCapabilities.ForSqlite(_connectionOptions.EffectiveLocalProvider);
+
+    public override bool CanCreateBatch => Capabilities.CanCreateBatch;
+
     protected override DbProviderFactory DbProviderFactory => SqliteFactory.Instance;
 
     public override void Open()
@@ -107,6 +112,11 @@ public partial class SqliteConnection : DbConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_database is not null || _managedDatabase is not null)
             throw new InvalidOperationException("The connection is already open.");
+        if (TursoConnectionCapabilities.IsRemoteDataSource(_connectionOptions.DataSource))
+        {
+            throw new NotSupportedException(
+                "Turso.Data.Sqlite supports only local database connections. Use TursoConnection for remote Hrana or embedded replica connections.");
+        }
         ValidateManagedSharedCacheOptions();
         if (!string.IsNullOrEmpty(_connectionOptions.Password))
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
@@ -438,7 +448,7 @@ public partial class SqliteConnection : DbConnection
 
     public virtual void EnableExtensions(bool enable = true)
     {
-        if (enable && IsManagedProvider)
+        if (enable && !Capabilities.SupportsExtensions)
             throw new NotSupportedException(Properties.Resources.ManagedExtensionsNotSupported);
 
         _extensionsEnabled = enable;
@@ -449,7 +459,7 @@ public partial class SqliteConnection : DbConnection
     public virtual void LoadExtension(string file, string? proc = null)
     {
         ArgumentNullException.ThrowIfNull(file);
-        if (IsManagedProvider)
+        if (!Capabilities.SupportsExtensions)
             throw new NotSupportedException(Properties.Resources.ManagedExtensionsNotSupported);
         if (proc is not null)
             throw new NotSupportedException("Custom extension entry points are not yet supported by the Turso SQLite-compatible provider.");
@@ -494,8 +504,29 @@ public partial class SqliteConnection : DbConnection
 
     protected override DbCommand CreateDbCommand() => CreateCommand();
 
+    protected override DbBatch CreateDbBatch() => new SqliteBatch(this);
+
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
         => BeginTransaction(isolationLevel);
+
+    protected override async ValueTask<DbTransaction> BeginDbTransactionAsync(
+        IsolationLevel isolationLevel,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection(nameof(BeginTransaction)));
+        if (Transaction is not null)
+            throw new InvalidOperationException(Properties.Resources.ParallelTransactionsNotSupported);
+
+        return Transaction = await SqliteTransaction
+            .CreateAsync(
+                this,
+                isolationLevel,
+                deferred: isolationLevel == IsolationLevel.ReadUncommitted,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     protected override void Dispose(bool disposing)
     {
@@ -525,7 +556,7 @@ public partial class SqliteConnection : DbConnection
         get
         {
             lock (_readerGate)
-                return _openReaders.Count != 0;
+                return _openReaders.Any(static reader => reader is SqliteDataReader);
         }
     }
 
@@ -535,24 +566,29 @@ public partial class SqliteConnection : DbConnection
 
     internal bool RecursiveTriggers => _recursiveTriggers;
 
-    internal void ReaderOpened(SqliteDataReader reader)
+    void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
         lock (_readerGate)
         {
             if (!_openReaders.Add(reader))
                 throw new InvalidOperationException("The data reader is already registered with this connection.");
-            _noOpenReaders.Reset();
+            if (reader is SqliteDataReader)
+                _noOpenReaders.Reset();
         }
     }
 
-    internal void ReaderClosed(SqliteDataReader reader)
+    void ILocalReaderConnection.ReaderClosed(IConnectionOwnedReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
         lock (_readerGate)
         {
-            if (_openReaders.Remove(reader) && _openReaders.Count == 0)
+            if (_openReaders.Remove(reader)
+                && reader is SqliteDataReader
+                && !_openReaders.Any(static openReader => openReader is SqliteDataReader))
+            {
                 _noOpenReaders.Set();
+            }
         }
     }
 
@@ -860,7 +896,7 @@ public partial class SqliteConnection : DbConnection
 
     private void CloseOpenReaders()
     {
-        SqliteDataReader[] readers;
+        IConnectionOwnedReader[] readers;
         lock (_readerGate)
             readers = _openReaders.ToArray();
         foreach (var reader in readers)

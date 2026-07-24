@@ -11,7 +11,11 @@ internal sealed record CreateTableStatement(
     IReadOnlyList<EmbeddedColumn> Columns,
     bool IfNotExists,
     bool WithoutRowid = false,
-    IReadOnlyList<TablePrimaryKeyColumn>? PrimaryKeyColumns = null) : ParsedStatement;
+    IReadOnlyList<TablePrimaryKeyColumn>? PrimaryKeyColumns = null,
+    IReadOnlyList<TableUniqueConstraint>? UniqueConstraints = null,
+    IReadOnlyList<CheckConstraint>? CheckConstraints = null,
+    InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm = null,
+    string? PrimaryKeyConstraintName = null) : ParsedStatement;
 
 internal sealed record DropTableStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -307,12 +311,25 @@ internal sealed record EmbeddedColumn(
     string? GenerationSql = null,
     string? Collation = null,
     ForeignKeyDefinition? ForeignKey = null,
-    bool HasCheckConstraint = false)
+    IReadOnlyList<CheckConstraint>? Checks = null,
+    Expression? DefaultExpression = null,
+    string? DefaultSql = null,
+    InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm = null,
+    InsertConflictAlgorithm? NotNullConflictAlgorithm = null,
+    InsertConflictAlgorithm? UniqueConflictAlgorithm = null,
+    string? PrimaryKeyConstraintName = null,
+    string? NotNullConstraintName = null,
+    string? UniqueConstraintName = null)
 {
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether
     // the value may be persisted (STORED) or must be recomputed (VIRTUAL).
     public bool IsGenerated => GenerationExpression is not null;
+
+    public IReadOnlyList<CheckConstraint> CheckConstraints { get; } =
+        Array.AsReadOnly((Checks ?? []).ToArray());
+
+    public bool HasDefault => DefaultValue.HasValue || DefaultExpression is not null;
 }
 
 // A column participating in a table-level PRIMARY KEY(...) clause, preserving the
@@ -320,19 +337,49 @@ internal sealed record EmbeddedColumn(
 // lose SQLite's comparison semantics.
 internal sealed record TablePrimaryKeyColumn(string Name, bool Descending, string? Collation = null);
 
+internal sealed record TableUniqueConstraint(
+    string? Name,
+    IReadOnlyList<TablePrimaryKeyColumn> Columns,
+    InsertConflictAlgorithm? ConflictAlgorithm = null);
+
+internal sealed record CheckConstraint(string? Name, Expression Expression, string Sql);
+
 internal sealed record ForeignKeyDefinition(string ChildColumn, string ParentTable, string ParentColumn);
 
 internal sealed record EmbeddedIndexColumn(string Name, int ColumnIndex, string? Collation, bool Descending);
 
-internal sealed record EmbeddedIndex(string Name, bool Unique, IReadOnlyList<EmbeddedIndexColumn> Columns);
+internal enum EmbeddedIndexOrigin
+{
+    Explicit,
+    UniqueConstraint,
+}
+
+internal sealed record EmbeddedIndex(
+    string Name,
+    bool Unique,
+    IReadOnlyList<EmbeddedIndexColumn> Columns,
+    EmbeddedIndexOrigin Origin = EmbeddedIndexOrigin.Explicit,
+    InsertConflictAlgorithm? ConflictAlgorithm = null);
 
 internal abstract record Expression;
 
 internal sealed record LiteralExpression(SqlValue Value) : Expression;
 
+internal enum CurrentTimeKind
+{
+    Date,
+    Time,
+    Timestamp,
+}
+
+internal sealed record CurrentTimeExpression(CurrentTimeKind Kind) : Expression;
+
 internal sealed record ParameterExpression(int Index) : Expression;
 
-internal sealed record ColumnExpression(string Name) : Expression;
+internal sealed record ColumnExpression(
+    string Name,
+    string? Qualifier = null,
+    string? UnqualifiedName = null) : Expression;
 
 internal sealed record FunctionExpression(
     string Name,

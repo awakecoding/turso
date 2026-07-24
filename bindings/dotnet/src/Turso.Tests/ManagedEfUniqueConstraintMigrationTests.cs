@@ -10,7 +10,7 @@ namespace Turso.Tests;
 public class ManagedEfUniqueConstraintMigrationTests
 {
     [Test]
-    public async Task EnsureCreatedRejectsAlternateKeysBeforeSchemaMutation()
+    public async Task EnsureCreatedPersistsAlternateKeysAsUniqueConstraints()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         await connection.OpenAsync();
@@ -20,15 +20,13 @@ public class ManagedEfUniqueConstraintMigrationTests
             .Options;
         await using var context = new AlternateKeyContext(options);
 
-        var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
-
-        await ensureCreated.Should().ThrowAsync<NotSupportedException>()
-            .WithMessage("*unique constraints*");
+        (await context.Database.EnsureCreatedAsync()).Should().BeTrue();
 
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table';";
+        command.CommandText = "SELECT \"sql\" FROM \"sqlite_master\" WHERE \"name\" = 'Items';";
 
-        (await command.ExecuteScalarAsync()).Should().Be(0L);
+        (await command.ExecuteScalarAsync()).Should().BeOfType<string>()
+            .Which.Should().Contain("CONSTRAINT \"AK_Items_Email\" UNIQUE");
     }
 
     [Test]

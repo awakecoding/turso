@@ -286,6 +286,7 @@ public class SqliteCommand : DbCommand
             throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
 
         var recordsAffected = 0;
+        var hadRecordsAffectedStatement = false;
         var statements = SplitStatements(CommandText);
         try
         {
@@ -304,7 +305,15 @@ public class SqliteCommand : DbCommand
                 if (statement.ColumnCount > 0)
                 {
                     _hasOpenReader = true;
-                    return new SqliteDataReader(this, statement, statements[i], statements.Skip(i + 1).ToList(), recordsAffected, behavior, CloseReader);
+                    return new SqliteDataReader(
+                        this,
+                        statement,
+                        statements[i],
+                        statements.Skip(i + 1).ToList(),
+                        recordsAffected,
+                        hadRecordsAffectedStatement,
+                        behavior,
+                        CloseReader);
                 }
 
                 while (statement.Read(cancellationToken))
@@ -312,7 +321,10 @@ public class SqliteCommand : DbCommand
                 }
 
                 if (CountsRowsAffected(statements[i]))
+                {
+                    hadRecordsAffectedStatement = true;
                     recordsAffected += statement.RowsAffected;
+                }
                 MarkTransactionCompletedExternally(statements[i]);
                 statement.Dispose();
             }
@@ -368,8 +380,9 @@ public class SqliteCommand : DbCommand
 
     internal void MarkTransactionCompletedExternally(string commandText)
     {
-        if (IsTransactionControlCommand(commandText))
-            Connection?.Transaction?.MarkCompletedExternally(IsRollbackCommand(commandText));
+        var completion = SqlTransactionControl.GetCompletion(commandText);
+        if (completion != SqlTransactionCompletion.None)
+            Connection?.Transaction?.MarkCompletedExternally(completion == SqlTransactionCompletion.Rollback);
     }
 
     internal SqliteStatementAdapter PrepareSingleStatement(string sql)
@@ -556,55 +569,27 @@ public class SqliteCommand : DbCommand
 
     private static bool IsReaderBlockingCommand(string commandText)
         => SplitStatements(commandText).Any(statement =>
-            IsWriteStatement(statement)
-            || TrimLeadingSqlTrivia(statement).StartsWith("ATTACH", StringComparison.OrdinalIgnoreCase)
-            || TrimLeadingSqlTrivia(statement).StartsWith("DETACH", StringComparison.OrdinalIgnoreCase));
+        {
+            var firstKeyword = SqlTransactionControl.GetFirstKeyword(statement);
+            return IsWriteStatement(statement)
+                   || firstKeyword?.Equals("ATTACH", StringComparison.OrdinalIgnoreCase) == true
+                   || firstKeyword?.Equals("DETACH", StringComparison.OrdinalIgnoreCase) == true;
+        });
 
     private static bool IsWriteStatement(string statement)
     {
-        var trimmed = TrimLeadingSqlTrivia(statement);
-        return trimmed.StartsWith("CREATE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("DROP", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("ALTER", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("VACUUM", StringComparison.OrdinalIgnoreCase)
-               || IsWithDmlStatement(trimmed);
-    }
-
-    private static string TrimLeadingSqlTrivia(string statement)
-    {
-        var offset = 0;
-        while (offset < statement.Length)
-        {
-            while (offset < statement.Length && char.IsWhiteSpace(statement[offset]))
-                offset++;
-            if (offset + 1 >= statement.Length)
-                break;
-
-            if (statement[offset] == '-' && statement[offset + 1] == '-')
-            {
-                offset += 2;
-                while (offset < statement.Length && statement[offset] is not ('\r' or '\n'))
-                    offset++;
-                continue;
-            }
-
-            if (statement[offset] == '/' && statement[offset + 1] == '*')
-            {
-                var end = statement.IndexOf("*/", offset + 2, StringComparison.Ordinal);
-                if (end < 0)
-                    return string.Empty;
-                offset = end + 2;
-                continue;
-            }
-
-            break;
-        }
-
-        return statement[offset..];
+        var firstKeyword = SqlTransactionControl.GetFirstKeyword(statement);
+        return firstKeyword is not null
+               && (firstKeyword.Equals("CREATE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("DROP", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("ALTER", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("UPDATE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("DELETE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("REPLACE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("VACUUM", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("WITH", StringComparison.OrdinalIgnoreCase)
+                   && IsWithDmlStatement(statement));
     }
 
     internal bool TryHandleFacadeStatement(string sql, out string rewrittenSql)
@@ -677,17 +662,66 @@ public class SqliteCommand : DbCommand
         if (string.IsNullOrWhiteSpace(firstStatement))
             return false;
 
-        var trimmed = firstStatement.TrimStart();
-        return trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase)
-               || IsWithDmlStatement(trimmed);
+        var firstKeyword = SqlTransactionControl.GetFirstKeyword(firstStatement);
+        return firstKeyword is not null
+               && (firstKeyword.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("UPDATE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("DELETE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("REPLACE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("WITH", StringComparison.OrdinalIgnoreCase)
+                   && IsWithDmlStatement(firstStatement));
     }
 
-    private static bool IsWithDmlStatement(string trimmedStatement)
-        => trimmedStatement.StartsWith("WITH", StringComparison.OrdinalIgnoreCase)
-           && Regex.IsMatch(trimmedStatement, @"\)\s*(INSERT|UPDATE|DELETE|REPLACE)\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    private static bool IsWithDmlStatement(string statement)
+    {
+        var offset = 0;
+        if (!TryReadScriptToken(statement, ref offset, out var token)
+            || !IsKeyword(statement, token, "WITH"))
+        {
+            return false;
+        }
+
+        var parenthesisDepth = 0;
+        var completedCte = false;
+        while (TryReadScriptToken(statement, ref offset, out token))
+        {
+            if (token.Kind == ScriptTokenKind.Semicolon)
+                return false;
+            if (token.Kind == ScriptTokenKind.Other && token.Length == 1)
+            {
+                switch (statement[token.Offset])
+                {
+                    case '(':
+                        parenthesisDepth++;
+                        continue;
+                    case ')' when parenthesisDepth > 0:
+                        parenthesisDepth--;
+                        completedCte |= parenthesisDepth == 0;
+                        continue;
+                    case ',' when parenthesisDepth == 0:
+                        completedCte = false;
+                        continue;
+                }
+            }
+
+            if (parenthesisDepth != 0 || !completedCte)
+                continue;
+            if (IsKeyword(statement, token, "INSERT")
+                || IsKeyword(statement, token, "UPDATE")
+                || IsKeyword(statement, token, "DELETE")
+                || IsKeyword(statement, token, "REPLACE"))
+            {
+                return true;
+            }
+            if (IsKeyword(statement, token, "SELECT")
+                || IsKeyword(statement, token, "VALUES"))
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
 
     private static List<string> SplitStatements(string commandText)
     {

@@ -188,6 +188,12 @@ The managed engine lowers generic source-less and single-table SELECT projection
 
 The tree-walking evaluator remains the explicit fallback for expression families not yet represented by this lowering, including comparison/logical/concatenation expressions, `CASE` and `CAST`, volatile, collation-sensitive, or context-dependent functions, shadowing user-defined functions, complex scan predicates whose streaming error order would differ, computed `DISTINCT` or `ORDER BY` projections, parameterized compound terms, computed or otherwise error-capable `INTERSECT`/`EXCEPT` terms, and compounds whose custom collation callbacks cannot be invoked at evaluator-equivalent points.
 
+### Managed DML bytecode
+
+Managed `INSERT`, `UPDATE`, and `DELETE` reuse the same generic expression lowering for `RETURNING`: literals, late-bound parameters, affected-row columns or rowid, qualified stars/columns, nested numeric arithmetic with SQLite affinity, value-only `COLLATE`, and the allow-listed built-ins above compile. `UPDATE` and `DELETE` predicates may use the evaluator's row-local scalar expression subset, including nested arithmetic, logical/comparison operators, and scalar functions, because the VDBE filter invokes that evaluator at the original per-row position.
+
+The compiled program first scans predicates and buffers all mutations, then evaluates buffered `RETURNING` rows in source and projection order, and commits only after projection succeeds. This retains predicate/assignment user-callback timing, keeps projection errors statement-atomic, and remains resumable across returned rows. Subqueries, aggregates/windows, `CASE`, `CAST`, concatenation/comparison projections, volatile or context-dependent functions, and shadowed user functions remain evaluator-owned. DML with a cancellation-capable token, foreign-key enforcement, open incremental blobs, conflict algorithms, source `INSERT`, CTE scope, or schema tables also falls back.
+
 ## Getting started
 
 ```C#
@@ -248,7 +254,7 @@ var name = await command.ExecuteScalarAsync();
 
 Remote mode uses the Hrana HTTP `/v2/pipeline` protocol. `libsql://` URLs default to HTTPS; `Tls=False` maps them to HTTP for local development. `ws://` and `wss://` URLs are accepted and mapped to the equivalent HTTP pipeline endpoint. `Auth Token` requires HTTPS unless the host is `localhost` or loopback.
 
-Remote mode also supports ADO.NET `DbBatch` for latency-sensitive workloads that should be sent in one Hrana batch:
+Local and remote connections support ADO.NET `DbBatch`:
 
 ```C#
 await using var batch = connection.CreateBatch();
@@ -267,6 +273,42 @@ batch.BatchCommands.Add(select);
 
 await using var reader = await batch.ExecuteReaderAsync();
 ```
+
+Local batches execute each batch command in order on one connection and expose command boundaries through `DbDataReader.NextResult()`. Each command has its own parameters and affected-row count. Local batches do not create an implicit transaction: completed commands remain committed if a later command fails unless the batch is associated with an explicit transaction. Transaction association is refreshed between commands, so commands after an explicit `COMMIT` or full `ROLLBACK` run outside the completed transaction. Closing or disposing a reader drains the remaining commands; `Cancel()` or cancellation stops before the next command. Remote batches preserve the existing single Hrana batch request.
+
+## Facade capability matrix
+
+`TursoConnection.Capabilities` and `SqliteConnection.Capabilities` expose the same
+executable contract used by provider feature gates. `CanCreateBatch` is sourced from
+that contract, so generic ADO.NET callers and the provider cannot drift.
+
+| Capability | `TursoConnection` managed local | `TursoConnection` native local | `TursoConnection` remote Hrana | `TursoConnection` embedded replica | `SqliteConnection` managed local | `SqliteConnection` native local |
+| --- | --- | --- | --- | --- | --- | --- |
+| `DbBatch` / `CanCreateBatch` | Yes, sequential | Yes, sequential | Yes, one Hrana batch | No | Yes, sequential | Yes, sequential |
+| Async open, command, reader, transaction, batch | Yes, worker-backed local I/O | Yes, worker-backed local I/O | Yes, HTTP I/O | Yes, replica/native I/O | Yes, worker-backed local I/O | Yes, worker-backed local I/O |
+| Transactions | Yes | Yes | Yes | Yes | Yes | Yes |
+| Savepoints | Yes | Yes | Yes | Yes | Yes | Yes |
+| `BackupDatabase` | No facade API | No facade API | No | No | Yes | Yes |
+| `SqliteBlob` fixed-length incremental I/O | No facade API | No facade API | No | No | Yes, managed handle | Yes, SQL-backed compatibility |
+| Scalar UDFs / aggregates / collations | No facade API | No facade API | No | No | Yes | Yes |
+| Loadable extensions | No facade API | No facade API | No | No | No | Yes, disabled by default |
+| `ATTACH` / `DETACH` | Yes, with managed limits | Yes | No | No | Yes, with managed limits | Yes |
+| Managed connection pooling | Eligible unencrypted files when `Pooling=True` | No | No | No | Eligible unencrypted files | No |
+| Explicit `Sync` | No | No | No | Yes | No | No |
+
+`Turso.Data.Sqlite` is a local-only migration facade; remote URLs fail before they
+can be interpreted as file paths. Use `TursoConnection` for Hrana and embedded
+replicas. `TursoConnection` also rejects `Pooling=True` before provider or network
+access unless the target is an eligible unencrypted managed file. The SQLite facade
+continues to accept its default `Pooling=True` keyword for native compatibility, but
+native handles are not pooled. Memory, shared-memory, encrypted, callback-bearing,
+remote, and replica connections are never pooled.
+
+Remote Hrana and embedded replicas reject `ATTACH` and `DETACH` before network or
+native execution; syncing or routing an attached database is not implied. Native
+SQLite compatibility remains explicit: the SQLite facade keeps its native UDF,
+aggregate, collation, extension, backup, blob, and attachment behavior, while
+`Turso.Raw` and native handles are unchanged and no fake SQLite handle is exposed.
 
 Provider factories are available through `TursoFactory.Instance`:
 
