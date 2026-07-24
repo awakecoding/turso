@@ -94,6 +94,49 @@ public sealed class ManagedConnectionPoolingTests
     }
 
     [Test]
+    public void PooledWithoutRowidCatalogReopensAndRollsBackReturnedTransactions()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using var connection = Open(path);
+            connection.ExecuteNonQuery("""
+                CREATE TABLE entry(
+                    tenant TEXT,
+                    sequence INTEGER,
+                    value TEXT,
+                    computed INTEGER GENERATED ALWAYS AS (sequence * 2) VIRTUAL,
+                    PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                    UNIQUE(value)
+                ) WITHOUT ROWID;
+                CREATE INDEX entry_computed ON entry(computed DESC);
+                INSERT INTO entry(tenant, sequence, value) VALUES
+                    ('alpha', 1, 'one'),
+                    ('Alpha', 2, 'two');
+                """);
+            var physical = connection.ManagedConnection;
+            connection.Close();
+            connection.Open();
+            connection.ManagedConnection.Should().BeSameAs(physical);
+            connection.ExecuteScalar<long>("SELECT computed FROM entry WHERE value = 'two';").Should().Be(4);
+
+            using var transaction = connection.BeginTransaction();
+            connection.ExecuteNonQuery("UPDATE entry SET sequence = 9 WHERE value = 'one';");
+            connection.Close();
+            transaction.Connection.Should().BeNull();
+
+            connection.Open();
+            connection.ExecuteScalar<long>("SELECT sequence FROM entry WHERE value = 'one';").Should().Be(1);
+            connection.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_schema WHERE name = 'entry_computed';")
+                .Should().Be(1);
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void ClearPoolInvalidatesIdleAndRentedGenerations()
     {
         var path = CreateDatabasePath();

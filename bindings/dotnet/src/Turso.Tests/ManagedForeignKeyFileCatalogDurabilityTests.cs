@@ -60,6 +60,154 @@ public sealed class ManagedForeignKeyFileCatalogDurabilityTests
     }
 
     [Test]
+    public void CompositeActionsAndDeferralRoundTripAcrossReopenAndFailedCommitRepair()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "foreign-key-full-roundtrip.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA foreign_keys = ON;");
+            Execute(connection, "CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));");
+            Execute(
+                connection,
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, "
+                    + "FOREIGN KEY(a, b) REFERENCES parent "
+                    + "ON UPDATE CASCADE ON DELETE SET NULL MATCH FULL DEFERRABLE INITIALLY DEFERRED);");
+            Execute(connection, "INSERT INTO parent VALUES (1, 2);");
+            Execute(connection, "INSERT INTO child VALUES (10, 1, 2);");
+        }
+
+        using (var reopened = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = reopened.Connect())
+        {
+            var schema = ScalarText(connection, "SELECT sql FROM sqlite_schema WHERE name = 'child';");
+            schema.Should().Contain("FOREIGN KEY (\"a\", \"b\")")
+                .And.Contain("REFERENCES \"parent\"")
+                .And.Contain("ON DELETE SET NULL")
+                .And.Contain("ON UPDATE CASCADE")
+                .And.Contain("MATCH \"FULL\"")
+                .And.Contain("DEFERRABLE INITIALLY DEFERRED");
+
+            Execute(connection, "PRAGMA foreign_keys = ON;");
+            Execute(connection, "UPDATE parent SET a = 3, b = 4;");
+            ScalarInteger(connection, "SELECT a FROM child WHERE id = 10;").Should().Be(3);
+            ScalarInteger(connection, "SELECT b FROM child WHERE id = 10;").Should().Be(4);
+
+            Execute(connection, "BEGIN;");
+            Execute(connection, "INSERT INTO child VALUES (11, 9, 9);");
+            Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "COMMIT;"))!
+                .Message.Should().Be("FOREIGN KEY constraint failed");
+            Execute(connection, "INSERT INTO parent VALUES (9, 9);");
+            Execute(connection, "COMMIT;");
+
+            Execute(connection, "DELETE FROM parent WHERE a = 3 AND b = 4;");
+            Value(connection, "SELECT a FROM child WHERE id = 10;").Should().Be(SqlValue.Null);
+            Value(connection, "SELECT b FROM child WHERE id = 10;").Should().Be(SqlValue.Null);
+        }
+
+        using var verified = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var verifiedConnection = verified.Connect();
+        Execute(verifiedConnection, "PRAGMA foreign_keys = ON;");
+        ScalarInteger(verifiedConnection, "SELECT COUNT(*) FROM child;").Should().Be(2);
+        Execute(verifiedConnection, "DELETE FROM parent WHERE a = 9 AND b = 9;");
+        Value(verifiedConnection, "SELECT a FROM child WHERE id = 11;").Should().Be(SqlValue.Null);
+    }
+
+    [Test]
+    public void LargeCompositeForeignKeyCatalogSurvivesInteriorPagesAndReopen()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "foreign-key-large-catalog.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));");
+            for (var index = 0; index < 48; index++)
+            {
+                Execute(
+                    connection,
+                    $"CREATE TABLE child_{index:D2}(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, "
+                        + $"CONSTRAINT fk_child_{index:D2}_parent FOREIGN KEY(a, b) REFERENCES parent "
+                        + "ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);");
+            }
+            Execute(connection, "INSERT INTO parent VALUES (1, 2);");
+            Execute(connection, "INSERT INTO child_47 VALUES (47, 1, 2);");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Execute(reopenedConnection, "PRAGMA foreign_keys = ON;");
+        ScalarInteger(reopenedConnection, "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table';").Should().Be(49);
+        ScalarText(reopenedConnection, "SELECT sql FROM sqlite_schema WHERE name = 'child_47';")
+            .Should().Contain("fk_child_47_parent")
+            .And.Contain("ON UPDATE CASCADE");
+        Execute(reopenedConnection, "UPDATE parent SET a = 3, b = 4;");
+        ScalarInteger(reopenedConnection, "SELECT a FROM child_47;").Should().Be(3);
+        ScalarInteger(reopenedConnection, "SELECT b FROM child_47;").Should().Be(4);
+    }
+
+    [Test]
+    public void FailLimitedCascadePublishesOnlySqliteRetainedRowsAcrossReopen()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "foreign-key-fail-limited-cascade.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA foreign_keys=ON;");
+            Execute(connection, "CREATE TABLE parent(id INTEGER PRIMARY KEY, priority INTEGER);");
+            Execute(
+                connection,
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, "
+                    + "parent_id INTEGER REFERENCES parent(id) ON UPDATE CASCADE ON DELETE CASCADE);");
+            Execute(connection, "CREATE INDEX parent_priority ON parent(priority DESC);");
+            Execute(connection, "INSERT INTO parent VALUES (1, 1), (2, 2), (3, 3);");
+            Execute(connection, "INSERT INTO child VALUES (10, 1), (20, 2), (30, 3);");
+
+            Execute(
+                connection,
+                "UPDATE parent SET id=101 ORDER BY priority ASC NULLS LAST LIMIT 1;");
+            Assert.Throws<EmbeddedSqlException>(() => Execute(
+                connection,
+                "INSERT OR FAIL INTO parent VALUES (4, 4), (2, 20), (5, 5);"))!
+                .Message.Should().Contain("UNIQUE constraint failed");
+            ScalarText(
+                connection,
+                "SELECT group_concat(id || ':' || priority, ',') "
+                    + "FROM (SELECT id, priority FROM parent ORDER BY id);")
+                .Should().Be("2:2,3:3,4:4,101:1");
+            ScalarText(
+                connection,
+                "SELECT group_concat(id || ':' || parent_id, ',') "
+                    + "FROM (SELECT id, parent_id FROM child ORDER BY id);")
+                .Should().Be("10:101,20:2,30:3");
+
+            Assert.Throws<EmbeddedSqlException>(() => Execute(
+                connection,
+                "INSERT OR FAIL INTO child VALUES (40, 101), (50, 404), (60, 101);"))!
+                .Message.Should().Be("FOREIGN KEY constraint failed");
+            ScalarInteger(connection, "SELECT COUNT(*) FROM child WHERE id >= 40;").Should().Be(0);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Execute(reopenedConnection, "PRAGMA foreign_keys=ON;");
+        ScalarText(
+            reopenedConnection,
+            "SELECT group_concat(id || ':' || priority, ',') "
+                + "FROM (SELECT id, priority FROM parent ORDER BY id);")
+            .Should().Be("2:2,3:3,4:4,101:1");
+        ScalarText(
+            reopenedConnection,
+            "SELECT group_concat(id || ':' || parent_id, ',') "
+                + "FROM (SELECT id, parent_id FROM child ORDER BY id);")
+            .Should().Be("10:101,20:2,30:3");
+    }
+
+    [Test]
     public void CorruptedPersistedForeignKeyCatalogFailsClosedDuringReopen()
     {
         var fileSystem = new InMemoryFileSystem();
@@ -102,7 +250,7 @@ public sealed class ManagedForeignKeyFileCatalogDurabilityTests
     }
 
     [Test]
-    public void UnsupportedForeignKeyFormsAreRejectedWithoutPublishingAFileCatalogEntry()
+    public void FullForeignKeyFormsPersistWhileUnsafeQualifiedFormsAreNotPublished()
     {
         var fileSystem = new InMemoryFileSystem();
         const string path = "foreign-key-file-catalog-gating.db";
@@ -110,35 +258,38 @@ public sealed class ManagedForeignKeyFileCatalogDurabilityTests
         using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
         using (var connection = database.Connect())
         {
-            Execute(connection, "CREATE TABLE parent(id INTEGER PRIMARY KEY);");
-
-            Assert.Throws<EmbeddedSqlException>(() => Execute(
+            Execute(connection, "CREATE TABLE parent(id INTEGER, code INTEGER, PRIMARY KEY(id, code));");
+            Execute(
                 connection,
-                "CREATE TABLE composite(a INTEGER, b INTEGER, FOREIGN KEY(a, b) REFERENCES parent(id, id));"))!
-                .Message.Should().Contain("Composite foreign key constraints are not supported");
-            Assert.Throws<EmbeddedSqlException>(() => Execute(
+                "CREATE TABLE composite(a INTEGER, b INTEGER, "
+                    + "FOREIGN KEY(a, b) REFERENCES parent ON UPDATE CASCADE ON DELETE SET NULL);");
+            Execute(
                 connection,
-                "CREATE TABLE actions(parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE);"))!
-                .Message.Should().Contain("Foreign key actions, MATCH, and deferral are not supported");
+                "CREATE TABLE actions(parent_id INTEGER, parent_code INTEGER, "
+                    + "FOREIGN KEY(parent_id, parent_code) REFERENCES parent(id, code) "
+                    + "MATCH FULL DEFERRABLE INITIALLY DEFERRED);");
+            Execute(
+                connection,
+                "CREATE TABLE unnamed_parent_column(parent_id INTEGER, parent_code INTEGER, "
+                    + "FOREIGN KEY(parent_id, parent_code) REFERENCES parent);");
             Assert.Throws<EmbeddedSqlException>(() => Execute(
                 connection,
                 "CREATE TABLE qualified(parent_id INTEGER REFERENCES main.parent(id));"))!
                 .Message.Should().Contain("Schema-qualified foreign keys are not supported");
-            Assert.Throws<EmbeddedSqlException>(() => Execute(
-                connection,
-                "CREATE TABLE unnamed_parent_column(parent_id INTEGER REFERENCES parent);"))!
-                .Message.Should().Contain("Foreign key references must name exactly one parent column");
 
-            ScalarInteger(connection, "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table';").Should().Be(1);
+            ScalarInteger(connection, "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table';").Should().Be(4);
         }
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
         using var reopenedConnection = reopened.Connect();
-        Execute(reopenedConnection, "CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));");
+        Execute(
+            reopenedConnection,
+            "CREATE TABLE child(parent_id INTEGER, parent_code INTEGER, "
+                + "FOREIGN KEY(parent_id, parent_code) REFERENCES parent);");
         Execute(reopenedConnection, "PRAGMA foreign_keys = ON;");
-        Execute(reopenedConnection, "INSERT INTO parent VALUES (1);");
-        Execute(reopenedConnection, "INSERT INTO child VALUES (1);");
-        Assert.Throws<EmbeddedSqlException>(() => Execute(reopenedConnection, "INSERT INTO child VALUES (2);"))!
+        Execute(reopenedConnection, "INSERT INTO parent VALUES (1, 10);");
+        Execute(reopenedConnection, "INSERT INTO child VALUES (1, 10);");
+        Assert.Throws<EmbeddedSqlException>(() => Execute(reopenedConnection, "INSERT INTO child VALUES (2, 20);"))!
             .Message.Should().Be("FOREIGN KEY constraint failed");
     }
 
@@ -184,6 +335,15 @@ public sealed class ManagedForeignKeyFileCatalogDurabilityTests
         using var statement = connection.Prepare(sql);
         statement.Step().Should().Be(StatementStepResult.Row);
         var value = statement.GetValue(0).AsInteger();
+        statement.Step().Should().Be(StatementStepResult.Done);
+        return value;
+    }
+
+    private static SqlValue Value(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        var value = statement.GetValue(0);
         statement.Step().Should().Be(StatementStepResult.Done);
         return value;
     }

@@ -276,7 +276,7 @@ public sealed class ManagedInsertOrConflictResolutionSliceTests
 
         Action foreignKey = () => Execute(connection, "INSERT OR IGNORE INTO child_items VALUES (1);");
         foreignKey.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*does not support tables with FOREIGN KEY constraints*");
+            .WithMessage("FOREIGN KEY constraint failed");
         ReadRows(connection, "SELECT parent_id FROM child_items;").Should().BeEmpty();
 
         Execute(connection, "CREATE TABLE checked_items(id INTEGER UNIQUE, value INTEGER CHECK (value > 0));");

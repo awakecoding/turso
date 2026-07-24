@@ -85,6 +85,78 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
     }
 
     [Test]
+    public void AttachedWithoutRowidCatalogCommitsRollsBackAndReopens()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var main = EmbeddedDatabase.OpenFile("attach-without-rowid-main.db", fileSystem))
+        using (var connection = main.Connect())
+        {
+            Execute(connection, "ATTACH DATABASE 'attach-without-rowid-aux.db' AS aux;");
+            Execute(connection, """
+                CREATE TABLE aux.entry(
+                    tenant TEXT,
+                    sequence INTEGER,
+                    value TEXT,
+                    computed INTEGER GENERATED ALWAYS AS (sequence + 1) VIRTUAL,
+                    PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                    UNIQUE(value)
+                ) WITHOUT ROWID;
+                """);
+            Execute(connection, "CREATE INDEX aux.entry_computed ON entry(computed DESC);");
+            Execute(connection, "BEGIN;");
+            Execute(connection, "INSERT INTO aux.entry(tenant, sequence, value) VALUES ('alpha', 1, 'one');");
+            Execute(connection, "INSERT INTO aux.entry(tenant, sequence, value) VALUES ('Alpha', 2, 'two');");
+            Execute(connection, "COMMIT;");
+
+            Execute(connection, "BEGIN;");
+            Execute(connection, "UPDATE aux.entry SET sequence = 9 WHERE value = 'one';");
+            Execute(connection, "INSERT INTO aux.entry(tenant, sequence, value) VALUES ('beta', 3, 'rolled-back');");
+            Execute(connection, "ROLLBACK;");
+            var attachedRows = ReadRows(
+                connection,
+                "SELECT tenant, sequence, value, computed FROM aux.entry ORDER BY sequence DESC;");
+            attachedRows.Should().HaveCount(2);
+            attachedRows[0].Should().Equal(
+                SqlValue.Text("Alpha"),
+                SqlValue.Integer(2),
+                SqlValue.Text("two"),
+                SqlValue.Integer(3));
+            attachedRows[1].Should().Equal(
+                SqlValue.Text("alpha"),
+                SqlValue.Integer(1),
+                SqlValue.Text("one"),
+                SqlValue.Integer(2));
+            Execute(connection, "DETACH aux;");
+        }
+
+        using (var reopened = EmbeddedDatabase.OpenFile("attach-without-rowid-aux.db", fileSystem))
+        using (var connection = reopened.Connect())
+        {
+            var reopenedRows = ReadRows(
+                connection,
+                "SELECT tenant, sequence, value, computed FROM entry ORDER BY sequence DESC;");
+            reopenedRows.Should().HaveCount(2);
+            reopenedRows[0].Should().Equal(
+                SqlValue.Text("Alpha"),
+                SqlValue.Integer(2),
+                SqlValue.Text("two"),
+                SqlValue.Integer(3));
+            reopenedRows[1].Should().Equal(
+                SqlValue.Text("alpha"),
+                SqlValue.Integer(1),
+                SqlValue.Text("one"),
+                SqlValue.Integer(2));
+            ReadRows(connection, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'entry_computed';")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1));
+        }
+
+        fileSystem.DeleteFile("attach-without-rowid-main.db");
+        fileSystem.DeleteFile("attach-without-rowid-main.db-wal");
+        fileSystem.DeleteFile("attach-without-rowid-aux.db");
+        fileSystem.DeleteFile("attach-without-rowid-aux.db-wal");
+    }
+
+    [Test]
     public void DirectManagedAttachRoutesLimitedDmlAndPreservesOneDatabaseWrites()
     {
         var fileSystem = new InMemoryFileSystem();
@@ -251,6 +323,7 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
                 staleCommit.Should().Throw<EmbeddedSqlException>().WithMessage("database is locked");
                 Execute(connection, "ROLLBACK;");
             }
+
             AssertRows(
                 ReadRows(connection, "SELECT id FROM main.items ORDER BY id;"),
                 [SqlValue.Integer(9)]);
@@ -276,6 +349,54 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
 
         var writeAttached = () => Execute(readOnlyConnection, "INSERT INTO aux.items VALUES (2);");
         writeAttached.Should().Throw<EmbeddedSqlException>().WithMessage("attempt to write a readonly database");
+    }
+
+    [Test]
+    public void AttachedForeignKeysStayWithinTheirDatabaseAndPreserveSingleWriterSafety()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var main = EmbeddedDatabase.OpenFile("attach-fk-main.db", fileSystem))
+        using (var connection = main.Connect())
+        {
+            Execute(connection, "ATTACH DATABASE 'attach-fk-aux.db' AS aux;");
+            Execute(connection, "PRAGMA foreign_keys = ON;");
+            Execute(connection, "CREATE TABLE main.parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));");
+            Execute(connection, "CREATE TABLE aux.parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));");
+            Execute(
+                connection,
+                "CREATE TABLE aux.child(a INTEGER, b INTEGER, "
+                    + "FOREIGN KEY(a, b) REFERENCES parent ON UPDATE CASCADE ON DELETE CASCADE);");
+            Execute(connection, "INSERT INTO main.parent VALUES (1, 2);");
+            Execute(connection, "INSERT INTO aux.parent VALUES (1, 2);");
+            Execute(connection, "INSERT INTO aux.child VALUES (1, 2);");
+
+            Action crossDatabaseReference = () => Execute(
+                connection,
+                "CREATE TABLE aux.cross_database(a INTEGER REFERENCES main.parent(a));");
+            crossDatabaseReference.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("Schema-qualified foreign keys are not supported*");
+            ReadRows(connection, "SELECT COUNT(*) FROM aux.sqlite_schema WHERE name = 'cross_database';")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+
+            Execute(connection, "BEGIN;");
+            Execute(connection, "UPDATE aux.parent SET a = 3, b = 4;");
+            ReadRows(connection, "SELECT a, b FROM aux.child;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(3), SqlValue.Integer(4));
+            Action secondDatabaseWrite = () => Execute(connection, "DELETE FROM main.parent;");
+            secondDatabaseWrite.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*cannot modify more than one database*atomically*");
+            Execute(connection, "COMMIT;");
+            Execute(connection, "DETACH aux;");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile("attach-fk-aux.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Execute(reopenedConnection, "PRAGMA foreign_keys = ON;");
+        ReadRows(reopenedConnection, "SELECT a, b FROM child;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(3), SqlValue.Integer(4));
+        Execute(reopenedConnection, "DELETE FROM parent;");
+        ReadRows(reopenedConnection, "SELECT COUNT(*) FROM child;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
     }
 
     [Test]
