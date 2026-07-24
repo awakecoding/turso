@@ -76,6 +76,14 @@ public static class Resources
 
     public static string ManagedBackupMixedProvidersNotSupported => "BackupDatabase does not support copying between managed and native providers.";
 
+    public static string ManagedBackupAttachedDatabasesNotSupported => "BackupDatabase supports only the main database when Local Provider=Managed.";
+
+    public static string ManagedBackupSameConnectionNotSupported => "BackupDatabase requires distinct source and destination connections when Local Provider=Managed.";
+
+    public static string ManagedBackupDestinationMustBeEmpty => "BackupDatabase requires an empty destination when Local Provider=Managed.";
+
+    public static string ManagedBackupPhysicalFileIdentityNotSupported => "BackupDatabase cannot safely copy between two physical files when Local Provider=Managed because the managed file system does not expose stable physical file identity.";
+
     public static string ManagedBackupSchemaObjectNotSupported(object? type) => $"BackupDatabase does not support schema object type '{type}' when Local Provider=Managed.";
 
     public static string ManagedBackupRowidNotAccessible(object? table) => $"BackupDatabase cannot preserve rowids for table '{table}' when Local Provider=Managed because all rowid aliases are declared columns.";

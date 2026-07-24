@@ -46,6 +46,8 @@ internal static class SqliteManagedBackup
                 => new NotSupportedException(Properties.Resources.ManagedBackupRowidNotAccessible(exception.ObjectName)),
             ManagedSnapshotFailure.ColumnCountMismatch
                 => new InvalidOperationException(Properties.Resources.ManagedBackupColumnCountMismatch(exception.ObjectName)),
+            ManagedSnapshotFailure.PhysicalFileIdentityUnavailable
+                => new NotSupportedException(Properties.Resources.ManagedBackupPhysicalFileIdentityNotSupported),
             _ => throw new InvalidOperationException($"Unknown managed snapshot failure {exception.Failure}."),
         };
     }

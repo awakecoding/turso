@@ -149,14 +149,13 @@ public sealed class ManagedBackupSnapshotTests
     }
 
     [Test]
-    public void ManagedBackupPersistsActiveSourceSnapshotAfterSourceRollbackAndReopen()
+    public void ManagedBackupCopiesActiveFileSourceSnapshotBeforeSourceRollbackAndReopen()
     {
         var sourcePath = CreateManagedDatabasePath();
-        var destinationPath = CreateManagedDatabasePath();
         try
         {
             using (var source = OpenManagedConnection(sourcePath))
-            using (var destination = OpenManagedConnection(destinationPath))
+            using (var destination = OpenManagedConnection())
             {
                 source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('committed');");
                 using var transaction = source.BeginTransaction();
@@ -164,17 +163,15 @@ public sealed class ManagedBackupSnapshotTests
 
                 source.BackupDatabase(destination);
                 transaction.Rollback();
+                destination.ExecuteScalar<long>("SELECT COUNT(*) FROM source_data;").Should().Be(2);
             }
 
             using var reopenedSource = OpenManagedConnection(sourcePath);
-            using var reopenedDestination = OpenManagedConnection(destinationPath);
             reopenedSource.ExecuteScalar<long>("SELECT COUNT(*) FROM source_data;").Should().Be(1);
-            reopenedDestination.ExecuteScalar<long>("SELECT COUNT(*) FROM source_data;").Should().Be(2);
         }
         finally
         {
             DeleteManagedDatabase(sourcePath);
-            DeleteManagedDatabase(destinationPath);
         }
     }
 
@@ -215,32 +212,109 @@ public sealed class ManagedBackupSnapshotTests
     public void ManagedBackupAllowsUnrelatedActiveAttachments()
     {
         var sourcePath = CreateManagedDatabasePath();
-        var destinationPath = CreateManagedDatabasePath();
         var sourceAttachmentPath = CreateManagedDatabasePath();
-        var destinationAttachmentPath = CreateManagedDatabasePath();
         try
         {
             using var source = OpenManagedConnection(sourcePath);
-            using var destination = OpenManagedConnection(destinationPath);
+            using var destination = OpenManagedConnection();
             source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
-            destination.ExecuteNonQuery("CREATE TABLE destination_data(value TEXT); INSERT INTO destination_data VALUES ('destination');");
             source.ExecuteNonQuery($"ATTACH DATABASE '{sourceAttachmentPath}' AS source_aux;");
-            destination.ExecuteNonQuery($"ATTACH DATABASE '{destinationAttachmentPath}' AS destination_aux;");
             source.ExecuteNonQuery("CREATE TABLE source_aux.marker(value TEXT); INSERT INTO source_aux.marker VALUES ('source attachment');");
-            destination.ExecuteNonQuery("CREATE TABLE destination_aux.marker(value TEXT); INSERT INTO destination_aux.marker VALUES ('destination attachment');");
 
             source.BackupDatabase(destination);
 
             destination.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("source");
             source.ExecuteScalar<string>("SELECT value FROM source_aux.marker;").Should().Be("source attachment");
-            destination.ExecuteScalar<string>("SELECT value FROM destination_aux.marker;").Should().Be("destination attachment");
         }
         finally
         {
             DeleteManagedDatabase(sourcePath);
-            DeleteManagedDatabase(destinationPath);
             DeleteManagedDatabase(sourceAttachmentPath);
-            DeleteManagedDatabase(destinationAttachmentPath);
+        }
+    }
+
+    [Test]
+    public void ManagedBackupCopiesFreshAttachedSourceIntoMemory()
+    {
+        var sourcePath = CreateManagedDatabasePath();
+        var attachmentPath = CreateManagedDatabasePath();
+        try
+        {
+            using var source = OpenManagedConnection(sourcePath);
+            using var destination = OpenManagedConnection();
+            source.ExecuteNonQuery($"ATTACH DATABASE '{attachmentPath}' AS source_aux;");
+            source.ExecuteNonQuery("CREATE TABLE source_aux.marker(value TEXT); INSERT INTO source_aux.marker VALUES ('attached');");
+
+            source.BackupDatabase(destination, "main", "source_aux");
+
+            destination.ExecuteScalar<string>("SELECT value FROM marker;").Should().Be("attached");
+        }
+        finally
+        {
+            DeleteManagedDatabase(sourcePath);
+            DeleteManagedDatabase(attachmentPath);
+        }
+    }
+
+    [Test]
+    public void ManagedBackupCopiesMemorySourceIntoAttachedFileDestination()
+    {
+        var destinationPath = CreateManagedDatabasePath();
+        var attachmentPath = CreateManagedDatabasePath();
+        try
+        {
+            using var source = OpenManagedConnection();
+            using var destination = OpenManagedConnection(destinationPath);
+            source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
+            destination.ExecuteNonQuery("CREATE TABLE main_data(value TEXT); INSERT INTO main_data VALUES ('main');");
+            destination.ExecuteNonQuery($"ATTACH DATABASE '{attachmentPath}' AS destination_aux;");
+            destination.ExecuteNonQuery("CREATE TABLE destination_aux.old_data(value TEXT); INSERT INTO destination_aux.old_data VALUES ('old');");
+
+            source.BackupDatabase(destination, "destination_aux", "main");
+
+            destination.ExecuteScalar<string>("SELECT value FROM destination_aux.source_data;").Should().Be("source");
+            destination.ExecuteScalar<string>("SELECT value FROM main_data;").Should().Be("main");
+            destination.ExecuteScalar<long>(
+                "SELECT COUNT(*) FROM destination_aux.sqlite_master WHERE name = 'old_data';").Should().Be(0);
+        }
+        finally
+        {
+            DeleteManagedDatabase(destinationPath);
+            DeleteManagedDatabase(attachmentPath);
+        }
+    }
+
+    [Test]
+    public void ManagedBackupRefreshesDurableSourceCatalogAndHeaderBeforeSnapshot()
+    {
+        var sourcePath = CreateManagedDatabasePath();
+        try
+        {
+            using var source = OpenManagedConnection(sourcePath);
+            using var destination = OpenManagedConnection();
+            source.ExecuteNonQuery(
+                "CREATE TABLE source_data(value TEXT);"
+                + " INSERT INTO source_data VALUES ('first');");
+
+            long siblingSchemaVersion;
+            using (var sibling = OpenManagedConnection(sourcePath))
+            {
+                sibling.ExecuteNonQuery(
+                    "INSERT INTO source_data VALUES ('sibling');"
+                    + " CREATE TABLE sibling_data(value TEXT);"
+                    + " INSERT INTO sibling_data VALUES ('new catalog');");
+                siblingSchemaVersion = sibling.ExecuteScalar<long>("PRAGMA schema_version;");
+            }
+
+            source.BackupDatabase(destination);
+
+            destination.ExecuteScalar<long>("SELECT COUNT(*) FROM source_data;").Should().Be(2);
+            destination.ExecuteScalar<string>("SELECT value FROM sibling_data;").Should().Be("new catalog");
+            destination.ExecuteScalar<long>("PRAGMA schema_version;").Should().Be(siblingSchemaVersion);
+        }
+        finally
+        {
+            DeleteManagedDatabase(sourcePath);
         }
     }
 
@@ -266,11 +340,10 @@ public sealed class ManagedBackupSnapshotTests
     [Test]
     public void ManagedBackupAtomicallyReplacesAndPersistsAFileBackedDestination()
     {
-        var sourcePath = CreateManagedDatabasePath();
         var destinationPath = CreateManagedDatabasePath();
         try
         {
-            using (var source = OpenManagedConnection(sourcePath))
+            using (var source = OpenManagedConnection())
             using (var destination = OpenManagedConnection(destinationPath))
             {
                 source.ExecuteNonQuery("CREATE TABLE data(value TEXT, payload BLOB);");
@@ -299,7 +372,6 @@ public sealed class ManagedBackupSnapshotTests
         }
         finally
         {
-            DeleteManagedDatabase(sourcePath);
             DeleteManagedDatabase(destinationPath);
         }
     }
@@ -307,11 +379,10 @@ public sealed class ManagedBackupSnapshotTests
     [Test]
     public void ManagedBackupFailurePreservesFileDestinationAcrossReopen()
     {
-        var sourcePath = CreateManagedDatabasePath();
         var destinationPath = CreateManagedDatabasePath();
         try
         {
-            using (var source = OpenManagedConnection(sourcePath))
+            using (var source = OpenManagedConnection())
             using (var destination = OpenManagedConnection(destinationPath))
             {
                 source.ExecuteNonQuery("CREATE TABLE inaccessible(rowid TEXT, _rowid_ TEXT, oid TEXT);");
@@ -332,8 +403,65 @@ public sealed class ManagedBackupSnapshotTests
         }
         finally
         {
+            DeleteManagedDatabase(destinationPath);
+        }
+    }
+
+    [Test]
+    public void ManagedBackupRejectsDistinctPhysicalFilesWithoutChangingDestination()
+    {
+        var sourcePath = CreateManagedDatabasePath();
+        var destinationPath = CreateManagedDatabasePath();
+        try
+        {
+            using (var source = OpenManagedConnection(sourcePath))
+            using (var destination = OpenManagedConnection(destinationPath))
+            {
+                source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
+                destination.ExecuteNonQuery("CREATE TABLE preserved(value TEXT); INSERT INTO preserved VALUES ('destination');");
+
+                source.Invoking(connection => connection.BackupDatabase(destination))
+                    .Should().Throw<NotSupportedException>()
+                    .WithMessage(Data.Sqlite.Properties.Resources.ManagedBackupPhysicalFileIdentityNotSupported);
+
+                destination.ExecuteScalar<string>("SELECT value FROM preserved;").Should().Be("destination");
+            }
+
+            using var reopened = OpenManagedConnection(destinationPath);
+            reopened.ExecuteScalar<string>("SELECT value FROM preserved;").Should().Be("destination");
+            reopened.ExecuteScalar<long>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'source_data';").Should().Be(0);
+        }
+        finally
+        {
             DeleteManagedDatabase(sourcePath);
             DeleteManagedDatabase(destinationPath);
+        }
+    }
+
+    [Test]
+    public void ManagedBackupRejectsSameConnectionPhysicalDatabasesWithoutChangingEither()
+    {
+        var mainPath = CreateManagedDatabasePath();
+        var attachmentPath = CreateManagedDatabasePath();
+        try
+        {
+            using var connection = OpenManagedConnection(mainPath);
+            connection.ExecuteNonQuery("CREATE TABLE main_data(value TEXT); INSERT INTO main_data VALUES ('main');");
+            connection.ExecuteNonQuery($"ATTACH DATABASE '{attachmentPath}' AS auxiliary;");
+            connection.ExecuteNonQuery("CREATE TABLE auxiliary.preserved(value TEXT); INSERT INTO auxiliary.preserved VALUES ('auxiliary');");
+
+            connection.Invoking(value => value.BackupDatabase(value, "auxiliary", "main"))
+                .Should().Throw<NotSupportedException>()
+                .WithMessage(Data.Sqlite.Properties.Resources.ManagedBackupPhysicalFileIdentityNotSupported);
+
+            connection.ExecuteScalar<string>("SELECT value FROM main_data;").Should().Be("main");
+            connection.ExecuteScalar<string>("SELECT value FROM auxiliary.preserved;").Should().Be("auxiliary");
+        }
+        finally
+        {
+            DeleteManagedDatabase(mainPath);
+            DeleteManagedDatabase(attachmentPath);
         }
     }
 

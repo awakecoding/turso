@@ -92,6 +92,7 @@ public enum ManagedSnapshotFailure
     UnsupportedSchemaObject,
     RowidNotAccessible,
     ColumnCountMismatch,
+    PhysicalFileIdentityUnavailable,
 }
 
 public sealed class ManagedSnapshotException : Exception
@@ -396,18 +397,36 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         var destinationConnection = managedDestination.GetConnection();
         if (sourceConnection.ReferencesSameDatabase(sourceName, destinationConnection, destinationName))
             throw new EmbeddedSqlException("source and destination must be distinct");
+        if (sourceConnection.CannotProveDistinctSnapshotFiles(
+                sourceName,
+                destinationConnection,
+                destinationName))
+        {
+            throw new ManagedSnapshotException(
+                ManagedSnapshotFailure.PhysicalFileIdentityUnavailable);
+        }
         if (destinationConnection.HasActiveTransaction)
             throw new ManagedSnapshotException(ManagedSnapshotFailure.DestinationBusy);
 
         ManagedConnectionAdapter? sourceSnapshot = null;
+        EmbeddedDatabase? sourceSnapshotOwner = null;
         ManagedConnectionAdapter? destinationSnapshot = null;
         try
         {
             var sourceTransactionActive = sourceConnection.HasActiveTransaction
                                           && sourceName.Equals("main", StringComparison.OrdinalIgnoreCase);
-            var snapshotSource = sourceTransactionActive
-                ? this
-                : sourceSnapshot = Wrap(sourceConnection.OpenDatabaseConnection(sourceName));
+            ManagedConnectionAdapter snapshotSource;
+            if (sourceTransactionActive)
+            {
+                snapshotSource = this;
+            }
+            else
+            {
+                var snapshot = sourceConnection.OpenSnapshotConnection(sourceName);
+                sourceSnapshotOwner = snapshot.Owner;
+                snapshotSource = sourceSnapshot = Wrap(snapshot.Connection);
+            }
+
             destinationSnapshot = Wrap(destinationConnection.OpenDatabaseConnection(destinationName));
             ManagedSnapshot.Copy(snapshotSource, destinationSnapshot, sourceTransactionActive);
         }
@@ -415,6 +434,7 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         {
             destinationSnapshot?.Dispose();
             sourceSnapshot?.Dispose();
+            sourceSnapshotOwner?.Dispose();
         }
     }
 

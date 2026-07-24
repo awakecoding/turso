@@ -147,11 +147,10 @@ public class ManagedProviderRoutingTests
     [Test]
     public void ManagedFileBackupReplacesNonemptyDestination()
     {
-        var sourcePath = CreateManagedDatabasePath();
         var destinationPath = CreateManagedDatabasePath();
         try
         {
-            using var source = new SqliteConnection($"Data Source={sourcePath};Local Provider=Managed");
+            using var source = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
             using var destination = new SqliteConnection($"Data Source={destinationPath};Local Provider=Managed");
             source.Open();
             destination.Open();
@@ -166,7 +165,6 @@ public class ManagedProviderRoutingTests
         }
         finally
         {
-            DeleteManagedDatabase(sourcePath);
             DeleteManagedDatabase(destinationPath);
         }
     }
@@ -232,7 +230,7 @@ public class ManagedProviderRoutingTests
     }
 
     [Test]
-    public void ManagedBackupCopiesNamedAttachedDatabasesAndSupportsSameConnection()
+    public void ManagedBackupRejectsPhysicalAttachedPairsWithoutChangingThem()
     {
         var sourcePath = CreateManagedDatabasePath();
         var destinationPath = CreateManagedDatabasePath();
@@ -249,9 +247,10 @@ public class ManagedProviderRoutingTests
             source.ExecuteNonQuery("CREATE TABLE source_aux.attached_data(value TEXT); INSERT INTO source_aux.attached_data VALUES ('attached');");
             destination.ExecuteNonQuery("CREATE TABLE old_data(value TEXT); INSERT INTO old_data VALUES ('old');");
 
-            source.BackupDatabase(destination, "main", "source_aux");
-
-            destination.ExecuteScalar<string>("SELECT value FROM attached_data;").Should().Be("attached");
+            source.Invoking(connection => connection.BackupDatabase(destination, "main", "source_aux"))
+                .Should().Throw<NotSupportedException>()
+                .WithMessage(Data.Sqlite.Properties.Resources.ManagedBackupPhysicalFileIdentityNotSupported);
+            destination.ExecuteScalar<string>("SELECT value FROM old_data;").Should().Be("old");
             source.ExecuteNonQuery("CREATE TABLE main_data(value TEXT); INSERT INTO main_data VALUES ('main');");
             using var reader = source.ExecuteReader("SELECT value FROM main_data;");
             reader.Read().Should().BeTrue();
@@ -262,10 +261,10 @@ public class ManagedProviderRoutingTests
             activeReader!.SqliteErrorCode.Should().Be(5);
             source.ExecuteScalar<string>("SELECT value FROM source_aux.attached_data;").Should().Be("attached");
             reader.Dispose();
-            source.BackupDatabase(source, "source_aux", "main");
-            source.ExecuteScalar<string>("SELECT value FROM source_aux.main_data;").Should().Be("main");
-            source.ExecuteScalar<long>(
-                "SELECT COUNT(*) FROM source_aux.sqlite_master WHERE type = 'table' AND name = 'attached_data';").Should().Be(0);
+            source.Invoking(connection => connection.BackupDatabase(connection, "source_aux", "main"))
+                .Should().Throw<NotSupportedException>()
+                .WithMessage(Data.Sqlite.Properties.Resources.ManagedBackupPhysicalFileIdentityNotSupported);
+            source.ExecuteScalar<string>("SELECT value FROM source_aux.attached_data;").Should().Be("attached");
         }
         finally
         {

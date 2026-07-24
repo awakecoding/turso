@@ -143,6 +143,53 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
     }
 
     [Test]
+    public void CoreSnapshotPublishesFromCommitMetadataWithoutPostCommitRead()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        using var sourceDatabase = ManagedDatabaseAdapter.OpenFile("source.db", fileSystem);
+        using var destinationDatabase = ManagedDatabaseAdapter.OpenFile("destination.db", fileSystem);
+        using var source = sourceDatabase.Connect();
+        using var destination = destinationDatabase.Connect();
+        PrepareReplacementPair(source, destination);
+
+        faults.FailNextAfter(FileSystemOperation.SetLength, FileSystemOperation.Read);
+
+        source.CopySnapshotTo(destination);
+
+        Scalar(destination, "SELECT COUNT(*) FROM source_data;").Should().Be(1);
+        Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'preserved';").Should().Be(0);
+        faults.ClearScheduled();
+    }
+
+    [Test]
+    public void CoreSnapshotKeepsCommittedClassificationWhenCheckpointMaintenanceAndReadFail()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        using (var sourceDatabase = ManagedDatabaseAdapter.OpenFile("source.db", fileSystem))
+        using (var destinationDatabase = ManagedDatabaseAdapter.OpenFile("destination.db", fileSystem))
+        using (var source = sourceDatabase.Connect())
+        using (var destination = destinationDatabase.Connect())
+        {
+            PrepareReplacementPair(source, destination);
+
+            faults.FailNextAfter(FileSystemOperation.SetLength, FileSystemOperation.Read);
+            faults.FailNext(FileSystemOperation.SetLength);
+
+            Assert.Throws<EmbeddedPostCommitMaintenanceException>(
+                () => source.CopySnapshotTo(destination));
+            Scalar(destination, "SELECT COUNT(*) FROM source_data;").Should().Be(1);
+            faults.ClearScheduled();
+        }
+
+        using var reopenedDatabase = ManagedDatabaseAdapter.OpenFile("destination.db", fileSystem);
+        using var reopened = reopenedDatabase.Connect();
+        Scalar(reopened, "SELECT COUNT(*) FROM source_data;").Should().Be(1);
+        Scalar(reopened, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'preserved';").Should().Be(0);
+    }
+
+    [Test]
     public void CoreSnapshotRejectsSamePhysicalFileAcrossFileSystemInstances()
     {
         var directory = Path.Combine(AppContext.BaseDirectory, "managed-backup-core-tests");
@@ -179,6 +226,24 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
         }
     }
 
+    [Test]
+    public void CoreSnapshotRejectsUnknownFileSystemIdentityWithoutChangingDestination()
+    {
+        var fileSystem = new UnknownIdentityFileSystem(new InMemoryFileSystem());
+        using var sourceDatabase = ManagedDatabaseAdapter.OpenFile("source.db", fileSystem);
+        using var destinationDatabase = ManagedDatabaseAdapter.OpenFile("destination.db", fileSystem);
+        using var source = sourceDatabase.Connect();
+        using var destination = destinationDatabase.Connect();
+        PrepareReplacementPair(source, destination);
+
+        var exception = Assert.Throws<ManagedSnapshotException>(
+            () => source.CopySnapshotTo(destination));
+
+        exception!.Failure.Should().Be(ManagedSnapshotFailure.PhysicalFileIdentityUnavailable);
+        Scalar(destination, "SELECT COUNT(*) FROM preserved;").Should().Be(1);
+        Scalar(destination, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'source_data';").Should().Be(0);
+    }
+
     private static SqliteConnection OpenManagedConnection()
     {
         var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
@@ -194,6 +259,16 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
         }
     }
 
+    private static void PrepareReplacementPair(
+        IManagedConnectionAdapter source,
+        IManagedConnectionAdapter destination)
+    {
+        Execute(source, "CREATE TABLE source_data(value TEXT);");
+        Execute(source, "INSERT INTO source_data VALUES ('source');");
+        Execute(destination, "CREATE TABLE preserved(value TEXT);");
+        Execute(destination, "INSERT INTO preserved VALUES ('destination');");
+    }
+
     private static long Scalar(IManagedConnectionAdapter connection, string sql)
     {
         using var statement = connection.Prepare(sql);
@@ -206,5 +281,15 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
         var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)
             ?? throw new InvalidOperationException($"Expected {instance.GetType().Name}.{fieldName}.");
         return field.GetValue(instance);
+    }
+
+    private sealed class UnknownIdentityFileSystem(IFileSystem inner) : IFileSystem
+    {
+        public bool FileExists(string path) => inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+            => inner.OpenFile(path, mode, readOnly);
+
+        public void DeleteFile(string path) => inner.DeleteFile(path);
     }
 }
