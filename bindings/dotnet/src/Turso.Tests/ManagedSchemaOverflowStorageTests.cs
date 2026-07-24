@@ -121,7 +121,8 @@ public sealed class ManagedSchemaOverflowStorageTests
         using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
         using (var connection = database.Connect())
         {
-            Execute(connection, BuildLargeTableSql("events", payload));
+            Execute(connection, BuildLargeMutableTableSql("events", payload));
+            Execute(connection, BuildLargeConstraintTableSql("metadata", payload));
             Execute(connection, "CREATE TABLE \"audit\" (\"note\" TEXT NOT NULL);");
             Execute(connection, BuildLargeIndexSql(firstIndexName, "events", "required"));
             Execute(connection, BuildLargeViewSql("large_view", payload));
@@ -129,6 +130,7 @@ public sealed class ManagedSchemaOverflowStorageTests
 
             var schemaVersionAfterCreate = ScalarInteger(connection, "PRAGMA schema_version;");
             Execute(connection, "INSERT INTO \"events\" (\"id\") VALUES (1);");
+            Execute(connection, "INSERT INTO \"metadata\" (\"id\") VALUES (1);");
             ScalarInteger(connection, "PRAGMA schema_version;").Should().Be(schemaVersionAfterCreate);
             ScalarInteger(connection, "SELECT COUNT(*) FROM audit;").Should().Be(1);
 
@@ -137,7 +139,7 @@ public sealed class ManagedSchemaOverflowStorageTests
             Execute(connection, "ALTER TABLE \"events\" RENAME TO \"events_renamed\";");
             Execute(connection, $"DROP INDEX {QuoteIdentifier(firstIndexName)};");
             Execute(connection, "DROP VIEW \"large_view\";");
-            Execute(connection, BuildLargeTableSql("events_rebuild", payload));
+            Execute(connection, BuildLargeMutableTableSql("events_rebuild", payload));
             Execute(
                 connection,
                 """
@@ -162,10 +164,11 @@ public sealed class ManagedSchemaOverflowStorageTests
             finalSchemaVersion = ScalarInteger(connection, "PRAGMA schema_version;");
             finalSchemaVersion.Should().BeGreaterThan(schemaVersionAfterCreate);
             ScalarInteger(connection, "SELECT COUNT(*) FROM audit;").Should().Be(2);
-            ScalarInteger(connection, "SELECT doubled FROM events_final WHERE id = 1;").Should().Be(14);
+            ScalarInteger(connection, "SELECT base FROM events_final WHERE id = 1;").Should().Be(7);
+            ScalarInteger(connection, "SELECT doubled FROM metadata WHERE id = 1;").Should().Be(14);
         }
 
-        foreach (var name in new[] { "events_final", secondIndexName, "large_view", "large_trigger" })
+        foreach (var name in new[] { "events_final", "metadata", secondIndexName, "large_view", "large_trigger" })
             FindSchemaCell(fileSystem, path, name).OverflowPages.Should().NotBeEmpty();
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
@@ -173,14 +176,21 @@ public sealed class ManagedSchemaOverflowStorageTests
         ScalarInteger(reopenedConnection, "PRAGMA schema_version;").Should().Be(finalSchemaVersion);
         ScalarInteger(reopenedConnection, "SELECT length(required) FROM events_final WHERE id = 2;")
             .Should().Be(payload.Length);
-        ScalarInteger(reopenedConnection, "SELECT doubled FROM events_final WHERE id = 2;").Should().Be(14);
-        var tableSql = ScalarText(
+        ScalarInteger(reopenedConnection, "SELECT base FROM events_final WHERE id = 2;").Should().Be(7);
+        ScalarInteger(reopenedConnection, "SELECT doubled FROM metadata WHERE id = 1;").Should().Be(14);
+        ScalarInteger(
             reopenedConnection,
-            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'events_final';");
-        tableSql.Should().Contain("INTEGER PRIMARY KEY");
-        tableSql.Should().Contain("NOT NULL");
-        tableSql.Should().Contain("DEFAULT");
-        tableSql.Should().Contain("STORED");
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'metadata' AND sql IS NULL;")
+            .Should().Be(1);
+        var metadataSql = ScalarText(
+            reopenedConnection,
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'metadata';");
+        metadataSql.Should().Contain("PRIMARY KEY")
+            .And.Contain("\"code\" DESC")
+            .And.Contain("CHECK")
+            .And.Contain("NOT NULL")
+            .And.Contain("DEFAULT")
+            .And.Contain("STORED");
     }
 
     [Test]
@@ -225,15 +235,17 @@ public sealed class ManagedSchemaOverflowStorageTests
             using (var destination = OpenManagedProvider(destinationPath))
             {
                 Execute(source, BuildLargeTableSql("backup_data", payload));
+                Execute(source, BuildLargeConstraintTableSql("backup_constraints", payload));
                 Execute(source, "CREATE TABLE \"audit\" (\"note\" TEXT);");
                 Execute(source, BuildLargeViewSql("backup_view", payload));
                 Execute(source, BuildLargeTriggerSql("backup_trigger", "backup_data", payload));
                 Execute(source, "INSERT INTO backup_data(id) VALUES (1);");
+                Execute(source, "INSERT INTO backup_constraints(id) VALUES (1);");
 
                 source.BackupDatabase(destination);
             }
 
-            foreach (var name in new[] { "backup_data", "backup_view", "backup_trigger" })
+            foreach (var name in new[] { "backup_data", "backup_constraints", "backup_view", "backup_trigger" })
                 FindSchemaCell(PhysicalFileSystem.Instance, destinationPath, name).OverflowPages.Should().NotBeEmpty();
 
             using (var reopened = EmbeddedDatabase.OpenFile(destinationPath, readOnly: true))
@@ -243,6 +255,7 @@ public sealed class ManagedSchemaOverflowStorageTests
                     .Should().Be(payload.Length);
                 ScalarText(connection, "SELECT note FROM audit;").Should().Be(payload);
                 ScalarText(connection, "SELECT value FROM backup_view;").Should().Be(payload);
+                ScalarInteger(connection, "SELECT doubled FROM backup_constraints;").Should().Be(14);
             }
 
             VerifyIntegrityWithSqlite(destinationPath);
@@ -303,7 +316,7 @@ public sealed class ManagedSchemaOverflowStorageTests
                 ExecuteScalarText(sqlite, "PRAGMA journal_mode=DELETE;").Should().Be("delete");
                 Execute(sqlite, $"PRAGMA page_size={migratedPageSize};");
                 Execute(sqlite, "VACUUM;");
-                Execute(sqlite, "ALTER TABLE wide RENAME COLUMN required TO migrated_required;");
+                Execute(sqlite, "UPDATE wide SET base = 8;");
                 ExecuteScalarText(sqlite, "PRAGMA journal_mode=WAL;").Should().Be("wal");
             }
             NativeSqliteConnection.ClearAllPools();
@@ -313,13 +326,16 @@ public sealed class ManagedSchemaOverflowStorageTests
             using (var connection = database.Connect())
             {
                 ScalarInteger(connection, "PRAGMA page_size;").Should().Be(migratedPageSize);
-                ScalarInteger(connection, "SELECT length(migrated_required) FROM wide;")
+                ScalarInteger(connection, "SELECT length(required) FROM wide;")
                     .Should().Be(payload.Length);
-                Execute(connection, "ALTER TABLE wide RENAME COLUMN migrated_required TO required;");
+                ScalarInteger(connection, "SELECT doubled FROM wide;").Should().Be(16);
+                Execute(connection, "UPDATE wide SET base = 7;");
+                Execute(connection, BuildLargeViewSql("migration_view", payload));
             }
 
             ReadHeader(PhysicalFileSystem.Instance, path).PageSize.Should().Be(migratedPageSize);
             FindSchemaCell(PhysicalFileSystem.Instance, path, "wide").OverflowPages.Should().NotBeEmpty();
+            FindSchemaCell(PhysicalFileSystem.Instance, path, "migration_view").OverflowPages.Should().NotBeEmpty();
             VerifyLargeTableWithSqlite(path, migratedPageSize, expectedSql: null, payload.Length);
         }
         finally
@@ -427,6 +443,20 @@ public sealed class ManagedSchemaOverflowStorageTests
            + $"\"required\" TEXT NOT NULL DEFAULT '{defaultValue}', "
            + "\"base\" INTEGER NOT NULL DEFAULT 7, "
            + "\"doubled\" INTEGER AS (\"base\" * 2) STORED)";
+
+    private static string BuildLargeMutableTableSql(string name, string defaultValue)
+        => $"CREATE TABLE {QuoteQualifiedIdentifier(name)} ("
+           + "\"id\" INTEGER PRIMARY KEY, "
+           + $"\"required\" TEXT NOT NULL DEFAULT '{defaultValue}', "
+           + "\"base\" INTEGER NOT NULL DEFAULT 7)";
+
+    private static string BuildLargeConstraintTableSql(string name, string defaultValue)
+        => $"CREATE TABLE {QuoteIdentifier(name)} ("
+           + "\"id\" INTEGER NOT NULL, "
+           + $"\"code\" TEXT NOT NULL DEFAULT '{defaultValue}', "
+           + "\"base\" INTEGER NOT NULL DEFAULT 7 CHECK (\"base\" > 0), "
+           + "\"doubled\" INTEGER AS (\"base\" * 2) STORED, "
+           + $"CONSTRAINT {QuoteIdentifier(name + "_pk")} PRIMARY KEY (\"id\", \"code\" DESC))";
 
     private static string BuildLargeIndexSql(string name, string tableName, string columnName)
         => $"CREATE INDEX {QuoteIdentifier(name)} ON {QuoteIdentifier(tableName)} ({QuoteIdentifier(columnName)})";
