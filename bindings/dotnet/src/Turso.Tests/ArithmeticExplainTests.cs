@@ -91,6 +91,25 @@ public class ArithmeticExplainTests
         rendered[2][1].Should().Be(SqlValue.Text(nameof(VdbeOpcode.Arithmetic)));
     }
 
+    [Test]
+    public void DescribesNumericAffinity()
+    {
+        var affinity = new VdbeNumericAffinity
+        {
+            Name = "numeric",
+            Apply = value => value,
+        };
+
+        var (p1, p2, p3, p4, comment) = VdbeExplain.Describe(
+            new NumericAffinityInstruction(new Register(4), affinity));
+
+        p1.Should().Be(4);
+        p2.Should().Be(0);
+        p3.Should().Be(0);
+        p4.Should().Be("numeric");
+        comment.Should().Be("r[4]=numeric(r[4])");
+    }
+
     private static string? Symbol(ArithmeticOperator op)
         => VdbeExplain.Describe(
             new ArithmeticInstruction(new Register(2), op, new RegisterRange(new Register(0), 2))).P4;

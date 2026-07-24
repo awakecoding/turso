@@ -11,6 +11,35 @@ namespace Turso.Tests;
 
 public class TursoEfCoreTests
 {
+    [TestCase("libsql://example-org.turso.io")]
+    [TestCase("https://example-org.turso.io")]
+    [TestCase("http://localhost:8080")]
+    [TestCase("wss://example-org.turso.io")]
+    [TestCase("ws://localhost:8080")]
+    public void UseTursoRejectsRemoteConnectionStringsDuringConfiguration(string dataSource)
+    {
+        var configure = () => new DbContextOptionsBuilder<TestDbContext>()
+            .UseTurso($"Data Source={dataSource}");
+
+        configure.Should()
+            .Throw<NotSupportedException>()
+            .WithMessage("*only local Turso databases*retry and transaction semantics*");
+    }
+
+    [Test]
+    public void UseTursoRejectsRemoteConnectionsDuringConfiguration()
+    {
+        using var connection = new SqliteConnection(
+            "Data Source=libsql://example-org.turso.io");
+
+        var configure = () => new DbContextOptionsBuilder<TestDbContext>()
+            .UseTurso(connection);
+
+        configure.Should()
+            .Throw<NotSupportedException>()
+            .WithMessage("*only local Turso databases*retry and transaction semantics*");
+    }
+
     [Test]
     public async Task UseTursoCreatesTursoConnectionAndCreatesSchema()
     {

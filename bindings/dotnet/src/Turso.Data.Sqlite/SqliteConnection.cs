@@ -17,16 +17,21 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     private TursoNativeDatabase? _database;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private ManagedConnectionPoolLease? _managedPoolLease;
     private SqliteConnectionStringBuilder _connectionOptions = new();
     private bool _disposed;
     private int? _defaultTimeout;
     private readonly HashSet<IConnectionOwnedReader> _openReaders = [];
+    private readonly object _readerGate = new();
+    private readonly ManualResetEventSlim _noOpenReaders = new(initialState: true);
     private readonly HashSet<SqliteBlob> _openManagedBlobs = [];
+    private readonly HashSet<SqliteCommand> _openCommands = [];
     private string? _dataSource;
     private bool _readOnly;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
     private bool _recursiveTriggers;
     private bool _readUncommitted;
+    private bool _managedSharedMemory;
     private string? _sharedMemoryPath;
     private bool _extensionsEnabled;
     private readonly List<(string File, string? Proc)> _pendingExtensions = [];
@@ -80,7 +85,13 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     internal bool ReadUncommitted
     {
         get => _readUncommitted;
-        set => _readUncommitted = value;
+        set
+        {
+            if (value && _managedSharedMemory)
+                throw new NotSupportedException(Properties.Resources.ManagedSharedCacheReadUncommittedNotSupported);
+
+            _readUncommitted = value;
+        }
     }
 
     public override string ServerVersion => "3.0.0";
@@ -98,18 +109,15 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_database is not null || _managedDatabase is not null)
             throw new InvalidOperationException("The connection is already open.");
-        if (_connectionOptions.EffectiveLocalProvider == TursoLocalProvider.Managed
-            && _connectionOptions.Cache == SqliteCacheMode.Shared)
-        {
-            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheNotSupported);
-        }
+        ValidateManagedSharedCacheOptions();
         if (!string.IsNullOrEmpty(_connectionOptions.Password))
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
 
         var originalState = State;
         var filename = NormalizeDataSource(_connectionOptions);
         var readOnly = _connectionOptions.Mode == SqliteOpenMode.ReadOnly;
-        var sharedMemoryPath = IsSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
+        var managedSharedMemory = IsManagedSharedMemoryConfiguration(_connectionOptions);
+        var sharedMemoryPath = IsNativeSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
         TursoEncryptionOptions? managedEncryption = null;
         try
         {
@@ -117,17 +125,34 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             {
                 managedEncryption = _connectionOptions.CreateManagedEncryptionOptions();
                 if (managedEncryption is not null
-                    && filename.Equals(":memory:", StringComparison.Ordinal))
+                    && (_connectionOptions.Mode == SqliteOpenMode.Memory
+                        || filename.Equals(":memory:", StringComparison.Ordinal)))
                 {
                     throw new NotSupportedException(Properties.Resources.ManagedMemoryEncryptionNotSupported);
                 }
 
-                _managedDatabase = OpenManagedDatabase(
-                    filename,
-                    readOnly,
-                    managedEncryption,
-                    out var managedEncryptionFileSystem);
-                _managedEncryptionFileSystem = managedEncryptionFileSystem;
+                if (managedSharedMemory)
+                {
+                    _managedDatabase = ManagedSharedMemoryDatabase.Open(filename);
+                    _managedSharedMemory = true;
+                }
+                else if (CanUseManagedPooling(filename, managedEncryption))
+                {
+                    var poolKey = ManagedConnectionPoolKey.Create(filename, readOnly);
+                    _managedPoolLease = ManagedConnectionPool.Rent(
+                        poolKey,
+                        () => OpenManagedDatabase(filename, readOnly, encryption: null, out _));
+                    _managedDatabase = _managedPoolLease.Database;
+                }
+                else
+                {
+                    _managedDatabase = OpenManagedDatabase(
+                        filename,
+                        readOnly,
+                        managedEncryption,
+                        out var managedEncryptionFileSystem);
+                    _managedEncryptionFileSystem = managedEncryptionFileSystem;
+                }
             }
             else
             {
@@ -179,8 +204,18 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
 
-        Open();
-        return Task.CompletedTask;
+        return Task.Run(
+            () =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Open();
+                if (!cancellationToken.IsCancellationRequested)
+                    return;
+
+                Close();
+                cancellationToken.ThrowIfCancellationRequested();
+            },
+            CancellationToken.None);
     }
 
     public override void Close()
@@ -189,19 +224,23 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             return;
 
         var originalState = State;
+        var reusable = false;
         try
         {
             CloseOpenManagedBlobs();
             CloseOpenReaders();
             Transaction?.Dispose();
+            ResetOpenCommands();
+            reusable = !HasManagedCallbacks;
         }
         finally
         {
-            DisposeDatabaseAndManagedEncryptionFileSystem();
+            DisposeDatabaseAndManagedEncryptionFileSystem(reusable);
             _dataSource = null;
             _readOnly = false;
             _recursiveTriggers = false;
             _readUncommitted = false;
+            _managedSharedMemory = false;
             if (_sharedMemoryPath is not null)
             {
                 ReleaseSharedMemoryFile(_sharedMemoryPath);
@@ -269,11 +308,14 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     public static void ClearAllPools()
     {
+        ManagedConnectionPool.ClearAll();
     }
 
     public static void ClearPool(SqliteConnection connection)
     {
         ArgumentNullException.ThrowIfNull(connection);
+        if (connection.TryGetManagedPoolKey(out var key))
+            ManagedConnectionPool.Clear(key);
     }
 
     public new virtual SqliteTransaction BeginTransaction()
@@ -461,8 +503,11 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_disposed)
+        {
             Close();
+            _noOpenReaders.Dispose();
+        }
 
         _disposed = true;
         base.Dispose(disposing);
@@ -477,7 +522,16 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     internal bool UsesManagedDatabase => IsManagedConnection;
 
-    internal bool HasOpenReader => _openReaders.Any(static reader => reader is SqliteDataReader);
+    internal bool IsManagedSharedMemory => _managedSharedMemory;
+
+    internal bool HasOpenReader
+    {
+        get
+        {
+            lock (_readerGate)
+                return _openReaders.Any(static reader => reader is SqliteDataReader);
+        }
+    }
 
     internal bool IsReadOnly => _readOnly;
 
@@ -488,15 +542,31 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
-        if (!_openReaders.Add(reader))
-            throw new InvalidOperationException("The data reader is already registered with this connection.");
+        lock (_readerGate)
+        {
+            if (!_openReaders.Add(reader))
+                throw new InvalidOperationException("The data reader is already registered with this connection.");
+            if (reader is SqliteDataReader)
+                _noOpenReaders.Reset();
+        }
     }
 
     void ILocalReaderConnection.ReaderClosed(IConnectionOwnedReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
-        _openReaders.Remove(reader);
+        lock (_readerGate)
+        {
+            if (_openReaders.Remove(reader)
+                && reader is SqliteDataReader
+                && !_openReaders.Any(static openReader => openReader is SqliteDataReader))
+            {
+                _noOpenReaders.Set();
+            }
+        }
     }
+
+    internal bool WaitForNoOpenReader(TimeSpan timeout, CancellationToken cancellationToken)
+        => _noOpenReaders.Wait(timeout, cancellationToken);
 
     internal void ManagedBlobOpened(SqliteBlob blob)
     {
@@ -509,6 +579,18 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     {
         ArgumentNullException.ThrowIfNull(blob);
         _openManagedBlobs.Remove(blob);
+    }
+
+    internal void CommandOpened(SqliteCommand command)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        _openCommands.Add(command);
+    }
+
+    internal void CommandClosed(SqliteCommand command)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        _openCommands.Remove(command);
     }
 
     internal void ExecuteNonQuery(string sql)
@@ -706,6 +788,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         DisposeDatabaseAndManagedEncryptionFileSystem();
         _dataSource = null;
         _readOnly = false;
+        _managedSharedMemory = false;
         _sharedMemoryPath = null;
         if (sharedMemoryPath is not null)
             ReleaseSharedMemoryFile(sharedMemoryPath);
@@ -754,13 +837,15 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         }
     }
 
-    private void DisposeDatabaseAndManagedEncryptionFileSystem()
+    private void DisposeDatabaseAndManagedEncryptionFileSystem(bool pooledReusable = false)
     {
         var database = _database;
         var managedDatabase = _managedDatabase;
+        var managedPoolLease = _managedPoolLease;
         var managedEncryptionFileSystem = _managedEncryptionFileSystem;
         _database = null;
         _managedDatabase = null;
+        _managedPoolLease = null;
         _managedEncryptionFileSystem = null;
         try
         {
@@ -770,7 +855,10 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         {
             try
             {
-                managedDatabase?.Dispose();
+                if (managedPoolLease is not null)
+                    managedPoolLease.Release(pooledReusable);
+                else
+                    managedDatabase?.Dispose();
             }
             finally
             {
@@ -781,7 +869,10 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     private void CloseOpenReaders()
     {
-        foreach (var reader in _openReaders.ToArray())
+        IConnectionOwnedReader[] readers;
+        lock (_readerGate)
+            readers = _openReaders.ToArray();
+        foreach (var reader in readers)
             reader.CloseFromConnection();
     }
 
@@ -789,6 +880,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     {
         foreach (var blob in _openManagedBlobs.ToArray())
             blob.CloseFromConnection();
+    }
+
+    private void ResetOpenCommands()
+    {
+        foreach (var command in _openCommands.ToArray())
+            command.ResetFromConnection();
     }
 
     private static void ValidateRestrictions(string collectionName, string?[]? restrictionValues, int maxRestrictions)
@@ -948,7 +1045,9 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     private static bool IsSqlIdentifierPart(char value)
         => char.IsLetterOrDigit(value) || value == '_' || value == '$';
 
-    private static string NormalizeDataSource(SqliteConnectionStringBuilder options)
+    private static string NormalizeDataSource(
+        SqliteConnectionStringBuilder options,
+        bool validateFileExists = true)
     {
         var dataSource = options.DataSource;
         if (string.IsNullOrEmpty(dataSource))
@@ -961,10 +1060,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             return dataSource;
         if (options.Mode == SqliteOpenMode.Memory)
             return options.Cache == SqliteCacheMode.Shared && dataSource.Length > 0
-                ? GetSharedMemoryFile(dataSource)
+                ? options.EffectiveLocalProvider == TursoLocalProvider.Managed
+                    ? dataSource
+                    : GetSharedMemoryFile(dataSource)
                 : ":memory:";
         if (dataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
-            return NormalizeUriDataSource(dataSource);
+            return NormalizeUriDataSource(dataSource, validateFileExists);
 
         const string dataDirectory = "|DataDirectory|";
         if (dataSource.StartsWith(dataDirectory, StringComparison.OrdinalIgnoreCase))
@@ -978,13 +1079,15 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             ? dataSource
             : Path.Combine(AppContext.BaseDirectory, dataSource);
 
-        if ((options.Mode == SqliteOpenMode.ReadOnly || options.Mode == SqliteOpenMode.ReadWrite) && !File.Exists(filename))
+        if (validateFileExists
+            && (options.Mode == SqliteOpenMode.ReadOnly || options.Mode == SqliteOpenMode.ReadWrite)
+            && !File.Exists(filename))
             throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_CANTOPEN, "unable to open database file"), SQLITE_CANTOPEN);
 
         return filename;
     }
 
-    private static string NormalizeUriDataSource(string dataSource)
+    private static string NormalizeUriDataSource(string dataSource, bool validateFileExists)
     {
         var queryStart = dataSource.IndexOf('?', StringComparison.Ordinal);
         var path = queryStart < 0 ? dataSource[5..] : dataSource[5..queryStart];
@@ -1003,7 +1106,9 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
                 throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_ERROR, "no such access mode: " + mode), SQLITE_ERROR);
             if (mode.Equals("memory", StringComparison.OrdinalIgnoreCase))
                 return ":memory:";
-            if ((mode.Equals("ro", StringComparison.OrdinalIgnoreCase) || mode.Equals("rw", StringComparison.OrdinalIgnoreCase)) && !File.Exists(path))
+            if (validateFileExists
+                && (mode.Equals("ro", StringComparison.OrdinalIgnoreCase) || mode.Equals("rw", StringComparison.OrdinalIgnoreCase))
+                && !File.Exists(path))
                 throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_CANTOPEN, "unable to open database file"), SQLITE_CANTOPEN);
         }
 
@@ -1028,8 +1133,66 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 
-    private static bool IsSharedMemory(SqliteConnectionStringBuilder options)
-        => options.Mode == SqliteOpenMode.Memory && options.Cache == SqliteCacheMode.Shared && options.DataSource.Length > 0;
+    private static bool IsManagedSharedMemoryConfiguration(SqliteConnectionStringBuilder options)
+        => options.EffectiveLocalProvider == TursoLocalProvider.Managed
+           && options.Mode == SqliteOpenMode.Memory
+           && options.Cache == SqliteCacheMode.Shared
+           && !string.IsNullOrWhiteSpace(options.DataSource)
+           && !options.DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNativeSharedMemory(SqliteConnectionStringBuilder options)
+        => options.EffectiveLocalProvider != TursoLocalProvider.Managed
+           && options.Mode == SqliteOpenMode.Memory
+           && options.Cache == SqliteCacheMode.Shared
+           && options.DataSource.Length > 0;
+
+    private void ValidateManagedSharedCacheOptions()
+    {
+        if (_connectionOptions.EffectiveLocalProvider != TursoLocalProvider.Managed
+            || _connectionOptions.Cache != SqliteCacheMode.Shared)
+        {
+            return;
+        }
+
+        if (!IsManagedSharedMemoryConfiguration(_connectionOptions))
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheNotSupported);
+        if (HasManagedCallbacks)
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheCallbacksNotSupported);
+    }
+
+    private bool CanUseManagedPooling(string filename, TursoEncryptionOptions? encryption)
+        => _connectionOptions.Pooling
+           && encryption is null
+           && !HasManagedCallbacks
+           && _connectionOptions.Mode != SqliteOpenMode.Memory
+           && !filename.Equals(":memory:", StringComparison.Ordinal);
+
+    private bool TryGetManagedPoolKey(out ManagedConnectionPoolKey key)
+    {
+        key = default;
+        if (_connectionOptions.EffectiveLocalProvider != TursoLocalProvider.Managed
+            || !_connectionOptions.Pooling
+            || _connectionOptions.HasEncryptionOptions
+            || _connectionOptions.Mode == SqliteOpenMode.Memory
+            || _connectionOptions.Cache == SqliteCacheMode.Shared)
+        {
+            return false;
+        }
+
+        var filename = NormalizeDataSource(_connectionOptions, validateFileExists: false);
+        if (filename.Equals(":memory:", StringComparison.Ordinal))
+            return false;
+
+        key = ManagedConnectionPoolKey.Create(
+            filename,
+            _connectionOptions.Mode == SqliteOpenMode.ReadOnly);
+        return true;
+    }
+
+    private bool HasManagedCallbacks
+        => _scalarFunctions.Count != 0
+           || _aggregateFunctions.Count != 0
+           || _collations.Count != 0;
 
     private static string RegisterSharedMemoryFile(string path)
     {

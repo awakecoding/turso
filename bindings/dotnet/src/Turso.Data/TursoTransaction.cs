@@ -5,7 +5,7 @@ namespace Turso;
 
 public class TursoTransaction : DbTransaction
 {
-    private readonly TursoConnection _connection;
+    private TursoConnection? _connection;
     private readonly IsolationLevel _isolationLevel;
     private bool _completed;
 
@@ -27,7 +27,7 @@ public class TursoTransaction : DbTransaction
     {
         if (!_completed)
         {
-            if (_connection.State == System.Data.ConnectionState.Closed)
+            if (_connection is null || _connection.State == System.Data.ConnectionState.Closed)
                 CompleteTransaction();
             else
                 Rollback();
@@ -51,11 +51,12 @@ public class TursoTransaction : DbTransaction
     public override void Commit()
     {
         ThrowIfCompleted();
-        if (_connection.IsRemote)
+        var connection = GetConnection();
+        if (connection.IsRemote)
         {
             try
             {
-                _connection.CommitRemoteTransaction();
+                connection.CommitRemoteTransaction();
             }
             catch (TursoRemoteSqlException)
             {
@@ -68,12 +69,12 @@ public class TursoTransaction : DbTransaction
             }
 
             CompleteTransaction();
-            _connection.CloseRemoteSessionIfStateless();
+            connection.CloseRemoteSessionIfStateless();
             return;
         }
         else
         {
-            _connection.ExecuteNonQuery("COMMIT;");
+            connection.ExecuteNonQuery("COMMIT;");
             CompleteTransaction();
         }
     }
@@ -81,24 +82,25 @@ public class TursoTransaction : DbTransaction
     public override void Rollback()
     {
         ThrowIfCompleted();
-        if (_connection.IsRemote)
+        var connection = GetConnection();
+        if (connection.IsRemote)
         {
             try
             {
-                _connection.RollbackRemoteTransaction();
+                connection.RollbackRemoteTransaction();
             }
             finally
             {
                 CompleteTransaction();
             }
 
-            _connection.CloseRemoteSessionIfStateless();
+            connection.CloseRemoteSessionIfStateless();
             return;
         }
 
         try
         {
-            _connection.ExecuteNonQuery("ROLLBACK;");
+            connection.ExecuteNonQuery("ROLLBACK;");
         }
         finally
         {
@@ -108,10 +110,14 @@ public class TursoTransaction : DbTransaction
 
     private void CompleteTransaction()
     {
+        var connection = _connection;
+        if (connection is null)
+            return;
         if (_isolationLevel == IsolationLevel.ReadUncommitted)
-            _connection.ReadUncommitted = false;
+            connection.ReadUncommitted = false;
         _completed = true;
-        _connection.TransactionCompleted(this);
+        _connection = null;
+        connection.TransactionCompleted(this);
     }
 
     private void ThrowIfCompleted()
@@ -119,6 +125,9 @@ public class TursoTransaction : DbTransaction
         if (_completed)
             throw new InvalidOperationException("This transaction has already completed.");
     }
+
+    private TursoConnection GetConnection()
+        => _connection ?? throw new InvalidOperationException("This transaction has already completed.");
 
     private static IsolationLevel NormalizeIsolationLevel(IsolationLevel isolationLevel)
     {

@@ -2,11 +2,6 @@ using Turso.Core.Execution;
 
 namespace Turso.Core.Compilation;
 
-/// <summary>
-/// Raised when a statement cannot be lowered into the currently supported
-/// bytecode opcode subset. Callers may catch this to fall back to another
-/// execution strategy, or surface it as a hard error for <c>EXPLAIN</c>.
-/// </summary>
 public sealed class StatementCompilationException : InvalidOperationException
 {
     public StatementCompilationException(string message) : base(message)
@@ -15,29 +10,10 @@ public sealed class StatementCompilationException : InvalidOperationException
 }
 
 /// <summary>
-/// Lowers a coherent subset of <see cref="SelectStatement"/> into a
-/// <see cref="VdbeProgram"/> built from the supported opcode subset. Two shapes
-/// are handled:
-/// <list type="bullet">
-///   <item>
-///     a source-less projection list whose expressions fold to compile-time
-///     constants, emitted as <c>LoadConstant</c> / <c>ResultRow</c> / <c>Halt</c>; and
-///   </item>
-///   <item>
-///     a single base-table scan projecting bare or qualifying stars, bare columns, and/or constants, with an
-///     optional <c>WHERE</c> filter, emitted as a real cursor loop
-///     (<c>OpenReadCursor</c>, <c>Rewind</c>, <c>Column</c>, <c>Filter</c>,
-///     <c>ResultRow</c>, <c>Next</c>, <c>CloseCursor</c>, <c>Halt</c>).
-///   </item>
-/// </list>
+/// Lowers source-less projections and single-table scans into executable VDBE programs. Projection
+/// expressions support constants, late-bound parameters, columns/rowid, nested arithmetic, and supported
+/// scalar functions; unsupported expression families cause the whole statement to remain on the evaluator.
 /// </summary>
-/// <remarks>
-/// The compiler intentionally rejects anything it cannot represent so the caller
-/// can retain the existing tree-walking evaluator for unsupported statements. It
-/// does not own SQL semantics: constant detection/folding, table resolution, and
-/// predicate evaluation are supplied by the caller so the emitted program matches
-/// the evaluator exactly.
-/// </remarks>
 internal sealed class SelectStatementCompiler
 {
     private readonly Func<Expression, bool> _isConstant;
@@ -46,6 +22,9 @@ internal sealed class SelectStatementCompiler
     private readonly Func<Expression, ScanTarget, VdbeRowPredicate?> _compilePredicate;
     private readonly Func<Expression, ScanTarget, VdbeRowIdPredicate?> _compileRowIdPredicate;
     private readonly Func<SelectStatement, ScanTarget, VdbeRowEquality?> _compileDistinctEquality;
+    private readonly Func<FunctionExpression, VdbeScalarFunction?> _compileScalarFunction;
+    private readonly VdbeNumericAffinity _numericAffinity;
+    private readonly VdbeNumericAffinity _moduloAffinity;
 
     public SelectStatementCompiler(
         Func<Expression, bool> isConstant,
@@ -53,7 +32,10 @@ internal sealed class SelectStatementCompiler
         Func<TableSource, ScanTarget?> resolveScanTarget,
         Func<Expression, ScanTarget, VdbeRowPredicate?> compilePredicate,
         Func<Expression, ScanTarget, VdbeRowIdPredicate?> compileRowIdPredicate,
-        Func<SelectStatement, ScanTarget, VdbeRowEquality?> compileDistinctEquality)
+        Func<SelectStatement, ScanTarget, VdbeRowEquality?> compileDistinctEquality,
+        Func<FunctionExpression, VdbeScalarFunction?> compileScalarFunction,
+        VdbeNumericAffinity numericAffinity,
+        VdbeNumericAffinity moduloAffinity)
     {
         ArgumentNullException.ThrowIfNull(isConstant);
         ArgumentNullException.ThrowIfNull(fold);
@@ -61,58 +43,31 @@ internal sealed class SelectStatementCompiler
         ArgumentNullException.ThrowIfNull(compilePredicate);
         ArgumentNullException.ThrowIfNull(compileRowIdPredicate);
         ArgumentNullException.ThrowIfNull(compileDistinctEquality);
+        ArgumentNullException.ThrowIfNull(compileScalarFunction);
+        ArgumentNullException.ThrowIfNull(numericAffinity);
+        ArgumentNullException.ThrowIfNull(moduloAffinity);
         _isConstant = isConstant;
         _fold = fold;
         _resolveScanTarget = resolveScanTarget;
         _compilePredicate = compilePredicate;
         _compileRowIdPredicate = compileRowIdPredicate;
         _compileDistinctEquality = compileDistinctEquality;
+        _compileScalarFunction = compileScalarFunction;
+        _numericAffinity = numericAffinity;
+        _moduloAffinity = moduloAffinity;
     }
 
-    /// <summary>
-    /// Attempts to lower <paramref name="statement"/> into a runnable program.
-    /// Returns <see langword="false"/> (leaving <paramref name="compiled"/> null)
-    /// when the statement falls outside the supported subset.
-    /// </summary>
     public bool TryCompile(SelectStatement statement, out CompiledSelect compiled)
     {
         ArgumentNullException.ThrowIfNull(statement);
         return statement.Source is null
-            ? TryCompileConstant(statement, out compiled)
+            ? TryCompileSourceLess(statement, out compiled)
             : TryCompileScan(statement, out compiled);
     }
 
-    private bool TryCompileConstant(SelectStatement statement, out CompiledSelect compiled)
+    private bool TryCompileSourceLess(SelectStatement statement, out CompiledSelect compiled)
     {
         compiled = null!;
-        if (!IsConstantProjection(statement))
-            return false;
-
-        var registerCount = statement.Projections.Count;
-        var instructions = new List<VdbeInstruction>(registerCount + 2);
-
-        // Fold each projection to a constant and load it into its own register.
-        for (var index = 0; index < registerCount; index++)
-        {
-            instructions.Add(new LoadConstantInstruction(
-                new Register(index),
-                _fold(statement.Projections[index].Expression)));
-        }
-
-        // Emit the single result row spanning the loaded registers, then halt.
-        instructions.Add(new ResultRowInstruction(new RegisterRange(new Register(0), registerCount)));
-        instructions.Add(new HaltInstruction());
-
-        compiled = new CompiledSelect(
-            new VdbeProgram(registerCount, cursorCount: 0, instructions),
-            []);
-        return true;
-    }
-
-    // A source-less SELECT with no clauses beyond a projection list whose every
-    // projection is a compile-time-constant scalar expression.
-    private bool IsConstantProjection(SelectStatement statement)
-    {
         if (statement.Where is not null
             || statement.Having is not null
             || statement.Distinct
@@ -120,29 +75,38 @@ internal sealed class SelectStatementCompiler
             || statement.OrderBy.Count != 0
             || statement.Limit is not null
             || statement.Offset is not null
-            || statement.Projections.Count == 0)
+            || statement.Projections.Count == 0
+            || statement.Projections.Any(projection =>
+                projection.Expression is StarExpression or QualifiedStarExpression))
         {
             return false;
         }
 
-        foreach (var projection in statement.Projections)
+        var outputCount = statement.Projections.Count;
+        var body = new List<VdbeInstruction>();
+        var emitter = CreateEmitter(target: null, cursor: null, outputCount, body);
+        for (var index = 0; index < outputCount; index++)
         {
-            if (projection.Expression is StarExpression or QualifiedStarExpression
-                || !_isConstant(projection.Expression))
-            {
+            if (!emitter.TryEmit(statement.Projections[index].Expression, new Register(index)))
                 return false;
-            }
         }
 
+        body.Add(new ResultRowInstruction(new RegisterRange(new Register(0), outputCount)));
+        body.Add(new HaltInstruction());
+        compiled = new CompiledSelect(
+            new VdbeProgram(
+                emitter.RegisterCount,
+                cursorCount: 0,
+                body,
+                parameterSlotCount: emitter.ParameterIndices.Count),
+            [],
+            emitter.ParameterIndices);
         return true;
     }
 
     private bool TryCompileScan(SelectStatement statement, out CompiledSelect compiled)
     {
         compiled = null!;
-
-        // The scan subset covers only the row-at-a-time pipeline. Clauses that
-        // reshape or reorder the result set stay with the tree-walking evaluator.
         if (statement.Having is not null
             || statement.GroupBy.Count != 0
             || statement.OrderBy.Count != 0
@@ -165,15 +129,7 @@ internal sealed class SelectStatementCompiler
                 return false;
         }
 
-        // Lower every projection into a column read or a folded constant load.
-        var projectionOps = new List<ProjectionOp>();
-        foreach (var projection in statement.Projections)
-        {
-            if (!TryLowerProjection(projection.Expression, target, projectionOps))
-                return false;
-        }
-
-        if (projectionOps.Count == 0)
+        if (!TryExpandProjections(statement.Projections, target, out var projections))
             return false;
 
         VdbeRowPredicate? predicate = null;
@@ -182,105 +138,32 @@ internal sealed class SelectStatementCompiler
         {
             predicate = _compilePredicate(statement.Where, target);
             if (predicate is null)
-            {
                 rowIdPredicate = _compileRowIdPredicate(statement.Where, target);
-            }
-
             if (predicate is null && rowIdPredicate is null)
                 return false;
         }
 
-        var program = BuildScanProgram(target, projectionOps, predicate, rowIdPredicate, distinctEquality);
-        compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows, target.RowIds)]);
-        return true;
-    }
-
-    private bool TryLowerProjection(Expression expression, ScanTarget target, List<ProjectionOp> ops)
-    {
-        switch (expression)
-        {
-            case StarExpression:
-                // "*" expands to every column of the single scanned table, in order.
-                if (target.Columns.Length == 0)
-                    return false;
-
-                for (var index = 0; index < target.Columns.Length; index++)
-                    ops.Add(ProjectionOp.ForColumn(index));
-                return true;
-            case ColumnExpression column when target.ResolveColumnIndex(column.Name) is { } columnIndex:
-                ops.Add(ProjectionOp.ForColumn(columnIndex));
-                return true;
-            case ColumnExpression column when IsTargetRowIdReference(column, target):
-                ops.Add(ProjectionOp.ForRowId());
-                return true;
-            case QualifiedStarExpression qualifiedStar
-                when string.Equals(qualifiedStar.Qualifier, target.Qualifier, StringComparison.OrdinalIgnoreCase):
-                // A single scan has exactly one raw output shape, so its resolved qualifier expands
-                // to the same declared-column sequence as the evaluator.
-                if (target.Columns.Length == 0)
-                    return false;
-
-                for (var index = 0; index < target.Columns.Length; index++)
-                    ops.Add(ProjectionOp.ForColumn(index));
-                return true;
-            case QualifiedStarExpression:
-                // An unmatched qualifier must reach the evaluator, which owns its diagnostic.
-                return false;
-            default:
-                if (_isConstant(expression))
-                {
-                    ops.Add(ProjectionOp.ForConstant(_fold(expression)));
-                    return true;
-                }
-
-                return false;
-        }
-    }
-
-    private static bool IsTargetRowIdReference(ColumnExpression column, ScanTarget target)
-    {
-        if (!target.HasRowId || target.ResolveColumnIndex(column.Name) is not null)
-            return false;
-
-        var separator = column.Name.IndexOf('.');
-        var bareName = separator < 0 ? column.Name : column.Name[(separator + 1)..];
-        return EmbeddedTable.IsRowidAliasName(bareName)
-            && (separator < 0
-                || string.Equals(
-                    column.Name[..separator],
-                    target.Qualifier,
-                    StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static VdbeProgram BuildScanProgram(
-        ScanTarget target,
-        IReadOnlyList<ProjectionOp> projectionOps,
-        VdbeRowPredicate? predicate,
-        VdbeRowIdPredicate? rowIdPredicate,
-        VdbeRowEquality? distinctEquality)
-    {
-        if (predicate is not null && rowIdPredicate is not null)
-            throw new ArgumentException("A scan can have either a row predicate or a rowid predicate.");
-
         var cursor = new Cursor(0);
-        var registerCount = projectionOps.Count;
-        var filterCount = predicate is null && rowIdPredicate is null ? 0 : 1;
+        var body = new List<VdbeInstruction>();
+        var emitter = CreateEmitter(target, cursor, projections.Count, body);
+        for (var index = 0; index < projections.Count; index++)
+        {
+            var projection = projections[index];
+            if (projection.ColumnIndex is { } columnIndex)
+            {
+                body.Add(new ColumnInstruction(cursor, columnIndex, new Register(index)));
+            }
+            else if (!emitter.TryEmit(projection.Expression!, new Register(index)))
+            {
+                return false;
+            }
+        }
 
-        // Fixed layout so jump targets can be computed up front:
-        //   0            OpenReadCursor
-        //   1            Rewind        -> closeAddr (empty table)
-        //   loopStart    [Filter       -> nextAddr]  (when WHERE present)
-        //   bodyStart..  Column / LoadConstant per output register
-        //   resultRow    ResultRow r[0..registerCount-1]
-        //   nextAddr     Next          -> loopStart
-        //   closeAddr    CloseCursor
-        //   haltAddr     Halt
-        var loopStart = 2;
-        var bodyStart = loopStart + filterCount;
-        var resultRowAddr = bodyStart + registerCount;
+        const int loopStart = 2;
+        var filterCount = predicate is null && rowIdPredicate is null ? 0 : 1;
+        var resultRowAddr = loopStart + filterCount + body.Count;
         var nextAddr = resultRowAddr + 1;
         var closeAddr = nextAddr + 1;
-
         var instructions = new List<VdbeInstruction>(closeAddr + 2)
         {
             new OpenReadCursorInstruction(cursor, target.TableName, target.Columns.Length),
@@ -304,48 +187,252 @@ internal sealed class SelectStatementCompiler
                 $"skip row when WHERE is false, goto {nextAddr}"));
         }
 
-        for (var register = 0; register < registerCount; register++)
-        {
-            var op = projectionOps[register];
-            instructions.Add(op.Kind switch
-            {
-                ProjectionKind.Column => new ColumnInstruction(cursor, op.ColumnIndex, new Register(register)),
-                ProjectionKind.RowId => new RowIdInstruction(cursor, new Register(register)),
-                ProjectionKind.Constant => new LoadConstantInstruction(new Register(register), op.Constant),
-                _ => throw new InvalidOperationException($"Unsupported projection kind {op.Kind}."),
-            });
-        }
-
-        var resultRange = new RegisterRange(new Register(0), registerCount);
+        instructions.AddRange(body);
+        var output = new RegisterRange(new Register(0), projections.Count);
         instructions.Add(distinctEquality is null
-            ? new ResultRowInstruction(resultRange)
-            : new DistinctResultRowInstruction(resultRange, distinctEquality, DistinctSetIndex: 0));
+            ? new ResultRowInstruction(output)
+            : new DistinctResultRowInstruction(output, distinctEquality, DistinctSetIndex: 0));
         instructions.Add(new NextInstruction(cursor, new ProgramCounter(loopStart)));
         instructions.Add(new CloseCursorInstruction(cursor));
         instructions.Add(new HaltInstruction());
 
-        return new VdbeProgram(
-            registerCount,
-            cursorCount: 1,
+        compiled = new CompiledSelect(
+            new VdbeProgram(
+                emitter.RegisterCount,
+                cursorCount: 1,
+                instructions,
+                distinctSetCount: distinctEquality is null ? 0 : 1,
+                parameterSlotCount: emitter.ParameterIndices.Count),
+            [new VdbeCursorSource(target.Rows, target.RowIds)],
+            emitter.ParameterIndices);
+        return true;
+    }
+
+    private ProjectionEmitter CreateEmitter(
+        ScanTarget? target,
+        Cursor? cursor,
+        int outputCount,
+        List<VdbeInstruction> instructions)
+        => new(
+            target,
+            cursor,
+            outputCount,
             instructions,
-            distinctSetCount: distinctEquality is null ? 0 : 1);
+            _isConstant,
+            _fold,
+            _compileScalarFunction,
+            _numericAffinity,
+            _moduloAffinity);
+
+    private static bool TryExpandProjections(
+        IReadOnlyList<Projection> source,
+        ScanTarget target,
+        out List<ProjectionSource> expanded)
+    {
+        expanded = new List<ProjectionSource>();
+        foreach (var projection in source)
+        {
+            switch (projection.Expression)
+            {
+                case StarExpression:
+                    if (target.Columns.Length == 0)
+                        return false;
+                    for (var index = 0; index < target.Columns.Length; index++)
+                        expanded.Add(ProjectionSource.ForColumn(index));
+                    break;
+                case QualifiedStarExpression qualified
+                    when string.Equals(qualified.Qualifier, target.Qualifier, StringComparison.OrdinalIgnoreCase):
+                    if (target.Columns.Length == 0)
+                        return false;
+                    for (var index = 0; index < target.Columns.Length; index++)
+                        expanded.Add(ProjectionSource.ForColumn(index));
+                    break;
+                case QualifiedStarExpression:
+                    return false;
+                default:
+                    expanded.Add(ProjectionSource.ForExpression(projection.Expression));
+                    break;
+            }
+        }
+
+        return expanded.Count != 0;
     }
 
-    // One emitted output register: either a column read from the cursor row or a
-    // folded compile-time constant.
-    private enum ProjectionKind
+    private static bool IsTargetRowIdReference(ColumnExpression column, ScanTarget target)
     {
-        Column,
-        RowId,
-        Constant,
+        if (!target.HasRowId || target.ResolveColumnIndex(column.Name) is not null)
+            return false;
+
+        var separator = column.Name.IndexOf('.');
+        var bareName = separator < 0 ? column.Name : column.Name[(separator + 1)..];
+        return EmbeddedTable.IsRowidAliasName(bareName)
+            && (separator < 0
+                || string.Equals(
+                    column.Name[..separator],
+                    target.Qualifier,
+                    StringComparison.OrdinalIgnoreCase));
     }
 
-    private readonly record struct ProjectionOp(ProjectionKind Kind, int ColumnIndex, SqlValue Constant)
+    private readonly record struct ProjectionSource(Expression? Expression, int? ColumnIndex)
     {
-        public static ProjectionOp ForColumn(int columnIndex) => new(ProjectionKind.Column, columnIndex, default);
+        public static ProjectionSource ForExpression(Expression expression) => new(expression, null);
 
-        public static ProjectionOp ForRowId() => new(ProjectionKind.RowId, 0, default);
+        public static ProjectionSource ForColumn(int columnIndex) => new(null, columnIndex);
+    }
 
-        public static ProjectionOp ForConstant(SqlValue value) => new(ProjectionKind.Constant, 0, value);
+    private sealed class ProjectionEmitter
+    {
+        private readonly ScanTarget? _target;
+        private readonly Cursor? _cursor;
+        private readonly List<VdbeInstruction> _instructions;
+        private readonly Func<Expression, bool> _isConstant;
+        private readonly Func<Expression, SqlValue> _fold;
+        private readonly Func<FunctionExpression, VdbeScalarFunction?> _compileScalarFunction;
+        private readonly VdbeNumericAffinity _numericAffinity;
+        private readonly VdbeNumericAffinity _moduloAffinity;
+        private readonly Dictionary<int, int> _parameterSlots = [];
+        private readonly List<int> _parameterIndices = [];
+        private int _nextRegister;
+
+        public ProjectionEmitter(
+            ScanTarget? target,
+            Cursor? cursor,
+            int firstScratchRegister,
+            List<VdbeInstruction> instructions,
+            Func<Expression, bool> isConstant,
+            Func<Expression, SqlValue> fold,
+            Func<FunctionExpression, VdbeScalarFunction?> compileScalarFunction,
+            VdbeNumericAffinity numericAffinity,
+            VdbeNumericAffinity moduloAffinity)
+        {
+            _target = target;
+            _cursor = cursor;
+            _nextRegister = firstScratchRegister;
+            _instructions = instructions;
+            _isConstant = isConstant;
+            _fold = fold;
+            _compileScalarFunction = compileScalarFunction;
+            _numericAffinity = numericAffinity;
+            _moduloAffinity = moduloAffinity;
+        }
+
+        public int RegisterCount => _nextRegister;
+
+        public IReadOnlyList<int> ParameterIndices => _parameterIndices;
+
+        public bool TryEmit(Expression expression, Register destination)
+        {
+            if (_isConstant(expression))
+            {
+                _instructions.Add(new LoadConstantInstruction(destination, _fold(expression)));
+                return true;
+            }
+
+            switch (expression)
+            {
+                case LiteralExpression literal:
+                    _instructions.Add(new LoadConstantInstruction(destination, literal.Value));
+                    return true;
+                case ParameterExpression parameter:
+                    _instructions.Add(new LoadParameterInstruction(
+                        destination,
+                        new ParameterSlot(GetParameterSlot(parameter.Index))));
+                    return true;
+                case ColumnExpression column when _target is not null && _cursor is not null:
+                    if (_target.ResolveColumnIndex(column.Name) is { } columnIndex)
+                    {
+                        _instructions.Add(new ColumnInstruction(_cursor.Value, columnIndex, destination));
+                        return true;
+                    }
+
+                    if (IsTargetRowIdReference(column, _target))
+                    {
+                        _instructions.Add(new RowIdInstruction(_cursor.Value, destination));
+                        return true;
+                    }
+
+                    return false;
+                case BinaryExpression binary when TryMapArithmeticOperator(binary.Operator, out var arithmetic):
+                    var operands = Allocate(2);
+                    if (!TryEmit(binary.Left, operands.Start)
+                        || !TryEmit(binary.Right, new Register(operands.Start.Index + 1)))
+                    {
+                        return false;
+                    }
+
+                    var affinity = arithmetic == ArithmeticOperator.Modulo ? _moduloAffinity : _numericAffinity;
+                    _instructions.Add(new NumericAffinityInstruction(operands.Start, affinity));
+                    _instructions.Add(new NumericAffinityInstruction(
+                        new Register(operands.Start.Index + 1),
+                        affinity));
+                    _instructions.Add(new ArithmeticInstruction(destination, arithmetic, operands));
+                    return true;
+                case FunctionExpression function:
+                    var scalar = _compileScalarFunction(function);
+                    if (scalar is null)
+                        return false;
+
+                    var arguments = Allocate(function.Arguments.Count);
+                    for (var index = 0; index < function.Arguments.Count; index++)
+                    {
+                        if (!TryEmit(
+                                function.Arguments[index],
+                                new Register(arguments.Start.Index + index)))
+                        {
+                            return false;
+                        }
+                    }
+
+                    _instructions.Add(new FunctionInstruction(destination, scalar, arguments));
+                    return true;
+                case CollationExpression collation:
+                    return TryEmit(collation.Expression, destination);
+                default:
+                    return false;
+            }
+        }
+
+        private RegisterRange Allocate(int count)
+        {
+            var start = new Register(_nextRegister);
+            _nextRegister += count;
+            return new RegisterRange(start, count);
+        }
+
+        private int GetParameterSlot(int parameterIndex)
+        {
+            if (_parameterSlots.TryGetValue(parameterIndex, out var slot))
+                return slot;
+
+            slot = _parameterIndices.Count;
+            _parameterSlots.Add(parameterIndex, slot);
+            _parameterIndices.Add(parameterIndex);
+            return slot;
+        }
+
+        private static bool TryMapArithmeticOperator(BinaryOperator op, out ArithmeticOperator arithmetic)
+        {
+            switch (op)
+            {
+                case BinaryOperator.Add:
+                    arithmetic = ArithmeticOperator.Add;
+                    return true;
+                case BinaryOperator.Subtract:
+                    arithmetic = ArithmeticOperator.Subtract;
+                    return true;
+                case BinaryOperator.Multiply:
+                    arithmetic = ArithmeticOperator.Multiply;
+                    return true;
+                case BinaryOperator.Divide:
+                    arithmetic = ArithmeticOperator.Divide;
+                    return true;
+                case BinaryOperator.Modulo:
+                    arithmetic = ArithmeticOperator.Modulo;
+                    return true;
+                default:
+                    arithmetic = default;
+                    return false;
+            }
+        }
     }
 }

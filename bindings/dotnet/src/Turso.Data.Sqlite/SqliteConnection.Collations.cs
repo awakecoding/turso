@@ -9,6 +9,8 @@ public partial class SqliteConnection
     private void RegisterCollation(string name, Func<string, string, int>? comparison)
     {
         ArgumentNullException.ThrowIfNull(name);
+        if (comparison is not null && IsManagedSharedMemory)
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheCallbacksNotSupported);
         if (comparison is null)
         {
             _collations.Remove(name);

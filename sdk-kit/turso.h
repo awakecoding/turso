@@ -5,6 +5,30 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define TURSO_ABI_VERSION 1u
+
+typedef enum
+{
+    TURSO_ABI_TYPE_STATUS_CODE = 1,
+    TURSO_ABI_TYPE_VALUE_TYPE = 2,
+    TURSO_ABI_TYPE_EXTENSION_VALUE_TYPE = 3,
+    TURSO_ABI_TYPE_DATABASE_CONFIG = 4,
+    TURSO_ABI_TYPE_EXTENSION_VALUE = 5,
+    TURSO_ABI_TYPE_EXTENSION_VALUE_DATA = 6,
+} turso_abi_type_t;
+
+/** Returns the ABI contract version implemented by this library. */
+uint32_t turso_abi_version(void);
+
+/** Returns sizeof(type), or SIZE_MAX when type is not a turso_abi_type_t value. */
+size_t turso_abi_sizeof(uint32_t type);
+
+/**
+ * Returns offsetof(type, field), or SIZE_MAX when type/field is invalid.
+ * Fields are numbered in declaration order starting at zero.
+ */
+size_t turso_abi_offsetof(uint32_t type, uint32_t field);
+
 /// SAFETY: slice with non-null ptr must points to the valid memory range [ptr..ptr + len)
 /// ownership of the slice is not transferred - so its either caller owns the data or turso
 /// as the owner doesn't change - there is no method to free the slice reference - because:
@@ -165,6 +189,13 @@ typedef struct turso_database turso_database_t;
 /// opaque pointer to the TursoConnection instance
 /// SAFETY: the connection must be used exclusive and can't be accessed concurrently
 typedef struct turso_connection turso_connection_t;
+
+/**
+ * Requests interruption of work currently executing on the connection.
+ * This is the only connection function that may be called concurrently with
+ * another connection or statement operation.
+ */
+void turso_connection_interrupt(const turso_connection_t *connection);
 
 /// opaque pointer to the TursoStatement instance
 /// SAFETY: the statement must be used exclusive and can't be accessed concurrently

@@ -16,6 +16,7 @@ public class SqliteCommand : DbCommand
     private string _commandText = string.Empty;
     private int _commandTimeout = 30;
     private bool _hasOpenReader;
+    private readonly CommandCancellationController _cancellation = new();
 
     public SqliteCommand()
     {
@@ -91,9 +92,16 @@ public class SqliteCommand : DbCommand
         set
         {
             ThrowIfReaderOpen(nameof(Connection));
+            if (ReferenceEquals(_connection, value))
+                return;
+
+            _statement?.Dispose();
+            _statement = null;
+            _connection?.CommandClosed(this);
             _connection = value;
             if (value is not null)
             {
+                value.CommandOpened(this);
                 _commandTimeout = value.DefaultTimeout;
                 _transaction ??= value.Transaction;
             }
@@ -128,13 +136,12 @@ public class SqliteCommand : DbCommand
                             ?? (value is null ? null : throw new ArgumentException("Transaction must be a SqliteTransaction.", nameof(value)));
     }
 
-    public override void Cancel()
-    {
-    }
+    public override void Cancel() => _cancellation.Cancel();
 
     public override int ExecuteNonQuery()
     {
-        using var reader = Execute("ExecuteNonQuery");
+        using var reader = _cancellation.Run(
+            token => Execute("ExecuteNonQuery", CommandBehavior.Default, token));
         while (reader.Read())
         {
         }
@@ -147,7 +154,8 @@ public class SqliteCommand : DbCommand
 
     public override object? ExecuteScalar()
     {
-        using var reader = Execute("ExecuteScalar");
+        using var reader = _cancellation.Run(
+            token => Execute("ExecuteScalar", CommandBehavior.Default, token));
         var result = reader.Read() ? reader.GetValue(0) : null;
         reader.Close();
         MarkTransactionCompletedExternally(CommandText);
@@ -185,46 +193,80 @@ public class SqliteCommand : DbCommand
 
     protected override DbParameter CreateDbParameter() => new SqliteParameter();
 
-    public new SqliteDataReader ExecuteReader() => Execute("ExecuteReader");
+    public new SqliteDataReader ExecuteReader()
+        => _cancellation.Run(token => Execute("ExecuteReader", CommandBehavior.Default, token));
 
-    public new SqliteDataReader ExecuteReader(CommandBehavior behavior) => Execute("ExecuteReader", behavior);
+    public new SqliteDataReader ExecuteReader(CommandBehavior behavior)
+        => _cancellation.Run(token => Execute("ExecuteReader", behavior, token));
 
-    protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => Execute("ExecuteReader", behavior);
+    protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
+        => _cancellation.Run<DbDataReader>(token => Execute("ExecuteReader", behavior, token));
 
-    public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
-        => CompleteAsync(ExecuteNonQuery, cancellationToken);
+    public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+    {
+        await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken)
+            .ConfigureAwait(false);
+        do
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+            }
+        }
+        while (await reader.NextResultAsync(cancellationToken).ConfigureAwait(false));
 
-    public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
-        => CompleteAsync(ExecuteScalar, cancellationToken);
+        MarkTransactionCompletedExternally(CommandText);
+        return reader.RecordsAffected;
+    }
+
+    public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
+    {
+        await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken)
+            .ConfigureAwait(false);
+        var result = await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? reader.GetValue(0)
+            : null;
+        do
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+            }
+        }
+        while (await reader.NextResultAsync(cancellationToken).ConfigureAwait(false));
+
+        MarkTransactionCompletedExternally(CommandText);
+        return result;
+    }
 
     protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
-        => CompleteAsync<DbDataReader>(() => Execute("ExecuteReader", behavior), cancellationToken);
-
-    private static Task<T> CompleteAsync<T>(Func<T> operation, CancellationToken cancellationToken)
-    {
-        if (cancellationToken.IsCancellationRequested)
-            return Task.FromCanceled<T>(cancellationToken);
-
-        try
-        {
-            return Task.FromResult(operation());
-        }
-        catch (Exception exception)
-        {
-            return Task.FromException<T>(exception);
-        }
-    }
+        => _cancellation.RunAsync<DbDataReader>(
+            token => Execute("ExecuteReader", behavior, token),
+            cancellationToken);
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
+        {
             _statement?.Dispose();
+            _statement = null;
+            _connection?.CommandClosed(this);
+        }
 
         base.Dispose(disposing);
     }
 
-    private SqliteDataReader Execute(string method, CommandBehavior behavior = CommandBehavior.Default)
+    internal void ResetFromConnection()
     {
+        _statement?.Dispose();
+        _statement = null;
+        _hasOpenReader = false;
+    }
+
+    private SqliteDataReader Execute(
+        string method,
+        CommandBehavior behavior = CommandBehavior.Default,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         EnsureExecutable(method);
         if (IsEmptyCommand(CommandText))
         {
@@ -234,8 +276,11 @@ public class SqliteCommand : DbCommand
 
         if (Connection?.HasOpenReader == true && IsWriteCommand(CommandText))
         {
-            Thread.Sleep(TimeSpan.FromSeconds(CommandTimeout));
-            throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
+            var timeout = CommandTimeout == 0
+                ? Timeout.InfiniteTimeSpan
+                : TimeSpan.FromSeconds(CommandTimeout);
+            if (!Connection.WaitForNoOpenReader(timeout, cancellationToken))
+                throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
         }
         if (Connection?.IsReadOnly == true && IsWriteCommand(CommandText))
             throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
@@ -250,7 +295,13 @@ public class SqliteCommand : DbCommand
                 if (TryHandleFacadeStatement(statements[i], out var sql))
                     continue;
 
+                cancellationToken.ThrowIfCancellationRequested();
                 var statement = PrepareSingleStatement(sql);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    statement.Dispose();
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
                 if (statement.ColumnCount > 0)
                 {
                     _hasOpenReader = true;
@@ -265,7 +316,7 @@ public class SqliteCommand : DbCommand
                         CloseReader);
                 }
 
-                while (statement.Read())
+                while (statement.Read(cancellationToken))
                 {
                 }
 
@@ -317,11 +368,21 @@ public class SqliteCommand : DbCommand
         _hasOpenReader = false;
     }
 
+    internal T RunOperation<T>(
+        Func<CancellationToken, T> operation,
+        CancellationToken cancellationToken = default)
+        => _cancellation.Run(operation, cancellationToken);
+
+    internal Task<T> RunOperationAsync<T>(
+        Func<CancellationToken, T> operation,
+        CancellationToken cancellationToken = default)
+        => _cancellation.RunAsync(operation, cancellationToken);
+
     internal void MarkTransactionCompletedExternally(string commandText)
     {
-        var completion = TransactionSqlParser.GetCompletionKind(commandText);
-        if (completion != TransactionCompletionKind.None)
-            Connection?.Transaction?.MarkCompletedExternally(completion == TransactionCompletionKind.Rollback);
+        var completion = SqlTransactionControl.GetCompletion(commandText);
+        if (completion != SqlTransactionCompletion.None)
+            Connection?.Transaction?.MarkCompletedExternally(completion == SqlTransactionCompletion.Rollback);
     }
 
     internal SqliteStatementAdapter PrepareSingleStatement(string sql)
@@ -498,23 +559,28 @@ public class SqliteCommand : DbCommand
     }
 
     private static bool IsTransactionControlCommand(string commandText)
-        => TransactionSqlParser.GetCompletionKind(commandText) != TransactionCompletionKind.None;
+        => SqlTransactionControl.GetCompletion(commandText) != SqlTransactionCompletion.None;
+
+    private static bool IsRollbackCommand(string commandText)
+        => SqlTransactionControl.GetCompletion(commandText) == SqlTransactionCompletion.Rollback;
 
     private static bool IsWriteCommand(string commandText)
         => SplitStatements(commandText).Any(IsWriteStatement);
 
     private static bool IsWriteStatement(string statement)
     {
-        var trimmed = statement.TrimStart();
-        return trimmed.StartsWith("CREATE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("DROP", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("ALTER", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("VACUUM", StringComparison.OrdinalIgnoreCase)
-               || IsWithDmlStatement(trimmed);
+        var firstKeyword = SqlTransactionControl.GetFirstKeyword(statement);
+        return firstKeyword is not null
+               && (firstKeyword.Equals("CREATE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("DROP", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("ALTER", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("UPDATE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("DELETE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("REPLACE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("VACUUM", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("WITH", StringComparison.OrdinalIgnoreCase)
+                   && IsWithDmlStatement(statement));
     }
 
     internal bool TryHandleFacadeStatement(string sql, out string rewrittenSql)
@@ -577,18 +643,8 @@ public class SqliteCommand : DbCommand
         else
             return false;
 
-        enabled = ParsePragmaEnabled(value);
+        enabled = TursoCommand.ParsePragmaEnabled(value);
         return true;
-    }
-
-    private static bool ParsePragmaEnabled(string value)
-    {
-        value = value.Trim('\'', '"');
-        return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var number)
-            ? number != 0
-            : value.Equals("ON", StringComparison.OrdinalIgnoreCase)
-              || value.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
-              || value.Equals("YES", StringComparison.OrdinalIgnoreCase);
     }
 
     internal static bool CountsRowsAffected(string commandText)
@@ -597,7 +653,7 @@ public class SqliteCommand : DbCommand
         if (string.IsNullOrWhiteSpace(firstStatement))
             return false;
 
-        var firstKeyword = TransactionSqlParser.GetFirstKeyword(firstStatement);
+        var firstKeyword = SqlTransactionControl.GetFirstKeyword(firstStatement);
         return firstKeyword is not null
                && (firstKeyword.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
                    || firstKeyword.Equals("UPDATE", StringComparison.OrdinalIgnoreCase)

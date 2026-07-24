@@ -16,7 +16,11 @@ public sealed class ManagedIncrementalBlobBoundaryTests
         GetPrivateField(connection, "_database").Should().BeNull();
         ((object?)connection.Handle).Should().BeNull();
 
-        using var blob = new SqliteBlob(connection, "data", "value", 1);
+        using var blob = new SqliteBlob(
+            connection,
+            tableName: "data",
+            columnName: "value",
+            rowid: 1);
         blob.Length.Should().Be(3);
 
         var read = new byte[4];
@@ -61,6 +65,60 @@ public sealed class ManagedIncrementalBlobBoundaryTests
         var aborted = Assert.Throws<SqliteException>(() => blob.Write([3], 0, 1));
         aborted!.SqliteErrorCode.Should().Be(4);
         connection.ExecuteScalar<long>("SELECT COUNT(*) FROM data;").Should().Be(0);
+    }
+
+    [Test]
+    public void ManagedBlobDatabaseNameOverloadSupportsMainAndAttachments()
+    {
+        var mainPath = CreateDatabasePath();
+        var attachmentPath = CreateDatabasePath();
+        try
+        {
+            using var connection = new SqliteConnection($"Data Source={mainPath};Local Provider=Managed");
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE data(value BLOB); INSERT INTO data(rowid, value) VALUES (1, X'0102');");
+            connection.ExecuteNonQuery(
+                $"ATTACH DATABASE '{attachmentPath}' AS aux;"
+                + "CREATE TABLE aux.data(value BLOB);"
+                + "INSERT INTO aux.data(rowid, value) VALUES (1, X'0405');");
+
+            using (var blob = new SqliteBlob(connection, "main", "data", "value", 1))
+            {
+                blob.Position = 1;
+                blob.Write([3], 0, 1);
+            }
+
+            using (var blob = new SqliteBlob(connection, "aux", "data", "value", 1))
+            {
+                blob.Position = 1;
+                blob.Write([6], 0, 1);
+            }
+
+            connection.ExecuteScalar<byte[]>("SELECT value FROM main.data WHERE rowid = 1;").Should().Equal(1, 3);
+            connection.ExecuteScalar<byte[]>("SELECT value FROM aux.data WHERE rowid = 1;").Should().Equal(4, 6);
+        }
+        finally
+        {
+            DeleteDatabase(mainPath);
+            DeleteDatabase(attachmentPath);
+        }
+    }
+
+    [Test]
+    public void ManagedBlobRejectsWithoutRowidTablesWithoutChangingStoredValues()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            "CREATE TABLE data(id INTEGER PRIMARY KEY, value BLOB) WITHOUT ROWID;"
+            + "INSERT INTO data VALUES (1, X'0102');");
+
+        var error = Assert.Throws<SqliteException>(() => new SqliteBlob(connection, "data", "value", 1));
+
+        error!.SqliteErrorCode.Should().Be(1);
+        error.Message.Should().Be(
+            Data.Sqlite.Properties.Resources.SqliteNativeError(1, "cannot open table without rowid: data"));
+        connection.ExecuteScalar<byte[]>("SELECT value FROM data WHERE id = 1;").Should().Equal(1, 2);
     }
 
     [Test]
@@ -250,5 +308,22 @@ public sealed class ManagedIncrementalBlobBoundaryTests
         var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic)
             ?? throw new InvalidOperationException($"Expected {instance.GetType().Name}.{fieldName}.");
         return field.GetValue(instance);
+    }
+
+    private static string CreateDatabasePath()
+    {
+        var directory = Path.Combine(AppContext.BaseDirectory, "managed-incremental-blob-boundary-tests");
+        Directory.CreateDirectory(directory);
+        return Path.Combine(directory, $"{Guid.NewGuid():N}.db");
+    }
+
+    private static void DeleteDatabase(string path)
+    {
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+        {
+            var candidate = path + suffix;
+            if (File.Exists(candidate))
+                File.Delete(candidate);
+        }
     }
 }
