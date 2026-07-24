@@ -78,6 +78,47 @@ public sealed class ManagedForeignKeyFullSemanticsTests
     }
 
     [Test]
+    public void LimitedParentDmlUsesExplicitNullOrderingForActionsAndDeferral()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "PRAGMA foreign_keys = ON");
+        Execute(connection, "CREATE TABLE parent(id INTEGER PRIMARY KEY, priority INTEGER)");
+        Execute(
+            connection,
+            "CREATE TABLE child(parent_id INTEGER REFERENCES parent(id) "
+                + "ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)");
+        Execute(connection, "INSERT INTO parent VALUES (1, NULL), (2, 10), (3, 20)");
+        Execute(connection, "INSERT INTO child VALUES (1), (2), (3)");
+
+        Execute(
+            connection,
+            "UPDATE parent SET id = id + 100 "
+                + "ORDER BY priority ASC NULLS LAST LIMIT 1");
+        Execute(
+            connection,
+            "DELETE FROM parent "
+                + "ORDER BY priority ASC NULLS FIRST LIMIT 1");
+        ReadRows(connection, "SELECT parent_id FROM child ORDER BY parent_id")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(3, 102);
+
+        Execute(
+            connection,
+            "CREATE TABLE guarded_child(parent_id INTEGER "
+                + "REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)");
+        Execute(connection, "INSERT INTO guarded_child VALUES (3)");
+        Execute(connection, "BEGIN");
+        Execute(connection, "DELETE FROM parent ORDER BY priority DESC NULLS LAST LIMIT 1");
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "COMMIT"))!
+            .Message.Should().Be("FOREIGN KEY constraint failed");
+        Execute(connection, "ROLLBACK");
+        ReadRows(connection, "SELECT id FROM parent ORDER BY id")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(3, 102);
+    }
+
+    [Test]
     public void SetDefaultFailureRollsBackParentAndChildrenLikeSqlite()
     {
         AssertErrorAndStateMatchesSqlite(

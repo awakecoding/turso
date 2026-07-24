@@ -85,6 +85,46 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
     }
 
     [Test]
+    public void DirectManagedAttachRoutesLimitedDmlAndPreservesOneDatabaseWrites()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var main = EmbeddedDatabase.OpenFile("attach-limited-main.db", fileSystem);
+        using var connection = main.Connect();
+        Execute(connection, "CREATE TABLE main.items(id INTEGER PRIMARY KEY, value TEXT);");
+        Execute(connection, "INSERT INTO main.items VALUES (1, 'main');");
+        Execute(connection, "ATTACH DATABASE 'attach-limited-aux.db' AS aux;");
+        Execute(connection, "CREATE TABLE aux.items(id INTEGER PRIMARY KEY, rank INTEGER, value TEXT);");
+        Execute(connection, "INSERT INTO aux.items VALUES (1, NULL, 'one'), (2, 1, 'two'), (3, 2, 'three');");
+
+        Execute(
+            connection,
+            "UPDATE aux.items SET value = 'selected' ORDER BY rank ASC NULLS LAST LIMIT 1;");
+        ReadRows(connection, "SELECT id FROM aux.items WHERE value = 'selected';")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(2));
+
+        var crossDatabaseOrder = () => Execute(
+            connection,
+            "UPDATE aux.items SET value = 'rejected' "
+            + "ORDER BY (SELECT count(*) FROM main.items) LIMIT 1;");
+        crossDatabaseOrder.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("Cross-database statements are not supported by managed ATTACH;*");
+        ReadRows(connection, "SELECT count(*) FROM aux.items WHERE value = 'rejected';")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+
+        Execute(connection, "BEGIN;");
+        Execute(connection, "UPDATE main.items SET value = 'pending' ORDER BY id LIMIT 1;");
+        var secondDatabaseWrite = () => Execute(connection, "DELETE FROM aux.items ORDER BY id LIMIT 1;");
+        secondDatabaseWrite.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("*cannot modify more than one database*atomically*");
+        Execute(connection, "ROLLBACK;");
+
+        ReadRows(connection, "SELECT value FROM main.items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("main"));
+        ReadRows(connection, "SELECT count(*) FROM aux.items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(3));
+    }
+
+    [Test]
     public void DirectManagedAttachRejectsUnsafeAliasesUnknownSchemasAndCrossDatabaseQueries()
     {
         var fileSystem = new InMemoryFileSystem();

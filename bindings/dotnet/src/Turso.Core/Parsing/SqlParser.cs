@@ -1019,33 +1019,72 @@ internal sealed class SqlParser
 
     private ParsedStatement ParseUpdate()
     {
+        if (CurrentIsKeyword("OR"))
+            throw Error("Managed UPDATE conflict algorithms are not supported.");
+
         var tableName = ParseSchemaQualifiedName();
+        RejectUnsupportedDmlTargetSuffix("UPDATE");
         ExpectKeyword("SET");
         var assignments = new List<ColumnAssignment>();
         do
         {
+            if (_lexer.Current.Kind == TokenKind.LeftParen)
+                throw Error("Managed UPDATE does not support row-value assignments.");
+
             var column = ExpectIdentifier();
             Expect(TokenKind.Equal);
             assignments.Add(new ColumnAssignment(column, ParseExpression()));
         }
         while (Consume(TokenKind.Comma));
 
+        if (CurrentIsKeyword("FROM"))
+            throw Error("Managed UPDATE FROM is not supported.");
+
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
             where = ParseExpression();
 
-        return new UpdateStatement(tableName, assignments, where, ParseReturning());
+        var returning = ParseReturning();
+        var (orderBy, limit, offset) = ParseLimitedDmlTail("UPDATE");
+        return new UpdateStatement(tableName, assignments, where, returning, orderBy, limit, offset);
     }
 
     private ParsedStatement ParseDelete()
     {
         ExpectKeyword("FROM");
         var tableName = ParseSchemaQualifiedName();
+        RejectUnsupportedDmlTargetSuffix("DELETE");
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
             where = ParseExpression();
 
-        return new DeleteStatement(tableName, where, ParseReturning());
+        var returning = ParseReturning();
+        var (orderBy, limit, offset) = ParseLimitedDmlTail("DELETE");
+        return new DeleteStatement(tableName, where, returning, orderBy, limit, offset);
+    }
+
+    private void RejectUnsupportedDmlTargetSuffix(string statementKind)
+    {
+        if (CurrentIsKeyword("AS"))
+            throw Error($"Managed {statementKind} target aliases are not supported.");
+        if (CurrentIsKeyword("INDEXED") || CurrentIsKeyword("NOT"))
+            throw Error($"Managed {statementKind} does not support INDEXED BY or NOT INDEXED.");
+    }
+
+    private (IReadOnlyList<OrderByTerm> OrderBy, Expression? Limit, Expression? Offset)
+        ParseLimitedDmlTail(string statementKind)
+    {
+        if (_inTriggerBody && (CurrentIsKeyword("ORDER") || CurrentIsKeyword("LIMIT")))
+        {
+            throw Error(
+                $"ORDER BY and LIMIT are not available on {statementKind} statements inside trigger bodies.");
+        }
+
+        var (orderBy, limit, offset) = ParseOrderByAndLimit();
+        if (orderBy.Count > 0 && limit is null)
+            throw Error($"ORDER BY without LIMIT on {statementKind} is not supported.");
+
+        return (orderBy, limit, offset);
     }
 
     // Parses an optional RETURNING clause shared by INSERT/UPDATE/DELETE. RETURNING is
@@ -1238,11 +1277,7 @@ internal sealed class SqlParser
             ExpectKeyword("BY");
             do
             {
-                var expression = ParseExpression();
-                var descending = ConsumeKeyword("DESC");
-                if (!descending)
-                    ConsumeKeyword("ASC");
-                orderBy.Add(new OrderByTerm(expression, descending));
+                orderBy.Add(ParseOrderByTerm());
             }
             while (Consume(TokenKind.Comma));
         }
@@ -1264,6 +1299,87 @@ internal sealed class SqlParser
         }
 
         return (orderBy, limit, offset);
+    }
+
+    private OrderByTerm ParseOrderByTerm()
+    {
+        var expressionOffset = _lexer.Current.Offset;
+        var expression = ParseExpression();
+        var ordinal = TryParseOrderByOrdinal(
+            _sql.AsSpan(expressionOffset, _lexer.Current.Offset - expressionOffset));
+        var descending = ConsumeKeyword("DESC");
+        if (!descending)
+            ConsumeKeyword("ASC");
+
+        var nullPlacement = NullPlacement.Default;
+        if (ConsumeKeyword("NULLS"))
+        {
+            if (ConsumeKeyword("FIRST"))
+                nullPlacement = NullPlacement.First;
+            else if (ConsumeKeyword("LAST"))
+                nullPlacement = NullPlacement.Last;
+            else
+                throw Error("Expected FIRST or LAST after NULLS.");
+        }
+
+        return new OrderByTerm(expression, descending, nullPlacement, ordinal);
+    }
+
+    private static long? TryParseOrderByOrdinal(ReadOnlySpan<char> expression)
+    {
+        var collation = expression.IndexOf("COLLATE", StringComparison.OrdinalIgnoreCase);
+        if (collation >= 0)
+            expression = expression[..collation];
+
+        expression = expression.Trim();
+        while (TryStripOuterParentheses(ref expression))
+            expression = expression.Trim();
+
+        var sign = '\0';
+        if (!expression.IsEmpty && expression[0] is '+' or '-')
+        {
+            sign = expression[0];
+            expression = expression[1..].Trim();
+            while (TryStripOuterParentheses(ref expression))
+                expression = expression.Trim();
+        }
+
+        if (expression.IsEmpty || expression.IndexOfAnyExceptInRange('0', '9') >= 0)
+            return null;
+
+        var text = sign == '\0'
+            ? expression.ToString()
+            : sign + expression.ToString();
+        return long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ordinal)
+            ? ordinal
+            : null;
+    }
+
+    private static bool TryStripOuterParentheses(ref ReadOnlySpan<char> expression)
+    {
+        if (expression.Length < 2 || expression[0] != '(' || expression[^1] != ')')
+            return false;
+
+        var depth = 0;
+        for (var index = 0; index < expression.Length; index++)
+        {
+            depth += expression[index] switch
+            {
+                '(' => 1,
+                ')' => -1,
+                _ => 0,
+            };
+            if (depth == 0 && index != expression.Length - 1)
+                return false;
+            if (depth < 0)
+                return false;
+        }
+
+        if (depth != 0)
+            return false;
+
+        expression = expression[1..^1];
+        return true;
     }
 
     private Projection ParseProjection()
@@ -1352,11 +1468,7 @@ internal sealed class SqlParser
             ExpectKeyword("BY");
             do
             {
-                var expression = ParseExpression();
-                var descending = ConsumeKeyword("DESC");
-                if (!descending)
-                    ConsumeKeyword("ASC");
-                orderBy.Add(new OrderByTerm(expression, descending));
+                orderBy.Add(ParseOrderByTerm());
             }
             while (Consume(TokenKind.Comma));
         }
