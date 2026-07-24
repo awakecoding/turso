@@ -5,7 +5,8 @@ namespace Turso.Core.Storage;
 /// <summary>
 /// Acquires byte-range locks in SQLite's WAL shared-memory file. The component
 /// uses the file only as a lock carrier: it neither maps nor writes the
-/// WAL-index, so it is not interoperable with SQLite clients.
+/// WAL-index. Physical pagers separately exclude other client processes with a
+/// lifetime main-file ownership lock.
 /// </summary>
 /// <remarks>
 /// SQLite reserves bytes 120 through 127 of <c>database-shm</c> for the WAL

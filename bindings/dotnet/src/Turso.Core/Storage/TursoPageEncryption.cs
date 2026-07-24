@@ -2,7 +2,10 @@ using System.Security.Cryptography;
 
 namespace Turso.Core.Storage;
 
-/// <summary>The AES-GCM cipher identifiers defined by Turso's encrypted page format.</summary>
+/// <summary>
+/// Cipher identifiers 1 and 2 from version 0 of Turso's encrypted page format.
+/// Other Turso cipher identifiers are intentionally rejected by managed storage.
+/// </summary>
 public enum TursoEncryptionCipher : byte
 {
     Aes128Gcm = 1,
@@ -123,9 +126,9 @@ internal sealed class TursoPageEncryption : IDisposable
     internal const int MetadataSize = TagSize + NonceSize;
     internal const int TagSize = 16;
     internal const int NonceSize = 12;
+    internal const byte FormatVersion = 0;
     private const int SqliteHeaderSize = 100;
     private const int TursoHeaderSize = 16;
-    private const byte TursoFormatVersion = 0;
 
     private static ReadOnlySpan<byte> SqliteHeader => "SQLite format 3\0"u8;
     private static ReadOnlySpan<byte> TursoHeaderPrefix => "Turso"u8;
@@ -167,17 +170,25 @@ internal sealed class TursoPageEncryption : IDisposable
             throw new InvalidDataException("Encrypted Turso database header is truncated.");
         if (!header[..TursoHeaderPrefix.Length].SequenceEqual(TursoHeaderPrefix))
             throw new InvalidDataException("Database does not contain a Turso encrypted header.");
-        if (header[5] != TursoFormatVersion)
-            throw new InvalidDataException($"Unsupported Turso encrypted database format version {header[5]}.");
+        if (header[5] != FormatVersion)
+        {
+            throw new InvalidDataException(
+                $"Unsupported Turso encrypted database format version {header[5]}; "
+                + "managed storage supports only format version 0 and will not infer or fall back to another format.");
+        }
         if (header[6] is not (byte)TursoEncryptionCipher.Aes128Gcm and not (byte)TursoEncryptionCipher.Aes256Gcm)
         {
             throw new InvalidDataException(
-                $"Encrypted database uses Turso cipher ID {header[6]}, which managed storage cannot open because .NET does not provide a format-compatible implementation.");
+                $"Encrypted database uses Turso cipher ID {header[6]} ({GetCipherName(header[6])}); "
+                + "managed storage supports only cipher ID 1 (AES-128-GCM) and cipher ID 2 (AES-256-GCM) "
+                + "for format version 0 and will not infer or fall back to another cipher.");
         }
         if (header[6] != (byte)Cipher)
         {
             throw new InvalidDataException(
-                $"Encrypted database uses Turso cipher ID {header[6]}, but the supplied options specify cipher ID {(byte)Cipher}.");
+                $"Encrypted database uses Turso cipher ID {header[6]} ({GetCipherName(header[6])}), "
+                + $"but the supplied options specify cipher ID {(byte)Cipher} ({GetCipherName((byte)Cipher)}); "
+                + "cipher fallback is not permitted.");
         }
         if (header[7..TursoHeaderSize].IndexOfAnyExcept((byte)0) >= 0)
             throw new InvalidDataException("Turso encrypted database header has non-zero reserved bytes.");
@@ -241,7 +252,7 @@ internal sealed class TursoPageEncryption : IDisposable
 
         var encrypted = new byte[PageSize];
         TursoHeaderPrefix.CopyTo(encrypted);
-        encrypted[5] = TursoFormatVersion;
+        encrypted[5] = FormatVersion;
         encrypted[6] = (byte)Cipher;
         page[TursoHeaderSize..SqliteHeaderSize].CopyTo(encrypted.AsSpan(TursoHeaderSize));
 
@@ -313,6 +324,21 @@ internal sealed class TursoPageEncryption : IDisposable
         if (page.Length != PageSize)
             throw new ArgumentException($"Encrypted page data must be exactly {PageSize} bytes.", nameof(page));
     }
+
+    private static string GetCipherName(byte cipherId)
+        => cipherId switch
+        {
+            0 => "none",
+            1 => "AES-128-GCM",
+            2 => "AES-256-GCM",
+            3 => "AEGIS-256",
+            4 => "AEGIS-256X2",
+            5 => "AEGIS-256X4",
+            6 => "AEGIS-128L",
+            7 => "AEGIS-128X2",
+            8 => "AEGIS-128X4",
+            _ => "unknown",
+        };
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 }

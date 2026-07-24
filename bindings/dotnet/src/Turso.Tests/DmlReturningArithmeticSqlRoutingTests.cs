@@ -3,30 +3,9 @@ using Turso.Core;
 
 namespace Turso.Tests;
 
-// Proves that EmbeddedDatabase routes the byte-identical-safe RETURNING arithmetic subset of
-// INSERT/UPDATE/DELETE through the real Arithmetic opcode (DmlStatementCompiler.EmitExpression +
-// VdbeArithmetic.Evaluate) and that every other RETURNING expression stays on the tree-walking
-// evaluator. A RETURNING item lowers to the compiled path only when it is an arithmetic operation
-// (+, -, *, /, %) whose every operand recursively resolves to:
-//
-//   * a numeric-affinity (INTEGER/REAL/NUMERIC) column of the affected row,
-//   * the affected row's rowid,
-//   * an INTEGER/REAL/NULL literal,
-//   * a parameter whose currently bound value classifies as INTEGER/REAL/NULL, or
-//   * a nested arithmetic node over the same.
-//
-// That is exactly where VdbeArithmetic matches the evaluator's numeric operators for the values a
-// numeric-affinity column can feed. A TEXT/BLOB-affinity column operand, a non-numeric constant or
-// parameter, and every function / subquery / collation / cast / comparison / concatenation / complex
-// operand fall back, because there the opcode would raise a type error where the evaluator applies
-// numeric affinity. Bare projections ("*", a column, the rowid, a folded constant) are owned by the
-// existing star/column/constant routes, so only genuine arithmetic enters the new path.
-//
-// As in the sibling routing suites, EXPLAIN is the ground truth for "was this lowered to bytecode?":
-// a routed statement dumps its opcode stream (including Arithmetic), while every deliberate fallback
-// shape throws because EXPLAIN only describes lowered programs. Because compilation happens per
-// execution, a parameter operand is re-baked (and re-classified) on every Step, so a rebind to a
-// text/blob value re-declines and the whole statement falls back.
+// Routing coverage for arithmetic RETURNING expressions. The DML compiler reuses the generic SELECT
+// emitter, including its late-bound parameters, numeric affinity, nested arithmetic, and conservative
+// builtin-function gate. Unsupported semantic families remain evaluator-owned.
 public class DmlReturningArithmeticSqlRoutingTests
 {
     // ---- routed opcode proofs ------------------------------------------------------------------
@@ -39,12 +18,13 @@ public class DmlReturningArithmeticSqlRoutingTests
 
         var rows = ReadRows(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING value + 1;");
         Opcodes(rows).Should().Equal(
-            "OpenWriteCursor", "Rewind", "Insert", "Column", "LoadConstant", "Arithmetic",
-            "ResultRow", "Next", "Commit", "CloseCursor", "Halt");
+            "OpenWriteCursor", "Rewind", "Insert", "Next", "OpenReadCursor", "Rewind", "Column",
+            "LoadConstant", "NumericAffinity", "NumericAffinity", "Arithmetic", "ResultRow", "Next",
+            "CloseCursor", "Commit", "CloseCursor", "Halt");
 
         // The column reads into a scratch register, the literal bakes to another, and the real
         // Arithmetic opcode folds the operand block into the output register the ResultRow emits.
-        Comments(rows).Should().Contain("r[1]=c0.col[0]");
+        Comments(rows).Should().Contain("r[1]=c1.col[0]");
         Comments(rows).Should().Contain("r[2]=1");
         Comments(rows).Should().Contain("r[0]=r[1] + r[2]");
         Comments(rows).Should().Contain("output=r[0]");
@@ -84,12 +64,13 @@ public class DmlReturningArithmeticSqlRoutingTests
 
         var rows = ReadRows(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING rowid + 1;");
         Opcodes(rows).Should().Equal(
-            "OpenWriteCursor", "Rewind", "Insert", "RowId", "LoadConstant", "Arithmetic",
-            "ResultRow", "Next", "Commit", "CloseCursor", "Halt");
+            "OpenWriteCursor", "Rewind", "Insert", "Next", "OpenReadCursor", "Rewind", "RowId",
+            "LoadConstant", "NumericAffinity", "NumericAffinity", "Arithmetic", "ResultRow", "Next",
+            "CloseCursor", "Commit", "CloseCursor", "Halt");
 
         // The rowid pseudo-column is always an integer, so it feeds arithmetic through the dedicated
         // RowId opcode regardless of any declared column affinity.
-        Comments(rows).Should().Contain("r[1]=c0.rowid");
+        Comments(rows).Should().Contain("r[1]=c1.rowid");
 
         // The first auto-assigned rowid is 1, so the routed fold returns 2.
         RoutedValue(connection, "INSERT INTO t VALUES (10) RETURNING rowid + 1;")
@@ -173,8 +154,9 @@ public class DmlReturningArithmeticSqlRoutingTests
 
         var rows = ReadRows(connection, "EXPLAIN UPDATE t SET value = 20 RETURNING value + 1;");
         Opcodes(rows).Should().Equal(
-            "OpenWriteCursor", "Rewind", "Update", "Column", "LoadConstant", "Arithmetic",
-            "ResultRow", "Next", "Commit", "CloseCursor", "Halt");
+            "OpenWriteCursor", "Rewind", "Update", "Next", "OpenReadCursor", "Rewind", "Column",
+            "LoadConstant", "NumericAffinity", "NumericAffinity", "Arithmetic", "ResultRow", "Next",
+            "CloseCursor", "Commit", "CloseCursor", "Halt");
 
         // UPDATE RETURNING projects the post-write row, so value + 1 folds over the new 20.
         RoutedValue(connection, "UPDATE t SET value = 20 RETURNING value + 1;")
@@ -190,8 +172,9 @@ public class DmlReturningArithmeticSqlRoutingTests
 
         var rows = ReadRows(connection, "EXPLAIN DELETE FROM t RETURNING value + 1;");
         Opcodes(rows).Should().Equal(
-            "OpenWriteCursor", "Rewind", "Delete", "Column", "LoadConstant", "Arithmetic",
-            "ResultRow", "Next", "Commit", "CloseCursor", "Halt");
+            "OpenWriteCursor", "Rewind", "Delete", "Next", "OpenReadCursor", "Rewind", "Column",
+            "LoadConstant", "NumericAffinity", "NumericAffinity", "Arithmetic", "ResultRow", "Next",
+            "CloseCursor", "Commit", "CloseCursor", "Halt");
 
         // DELETE RETURNING projects the pre-delete row, so value + 1 folds over the removed 10.
         RoutedValue(connection, "DELETE FROM t RETURNING value + 1;")
@@ -209,8 +192,8 @@ public class DmlReturningArithmeticSqlRoutingTests
         // this one, so it bakes a single LoadConstant and emits no Arithmetic opcode.
         var rows = ReadRows(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING 1 + 2;");
         Opcodes(rows).Should().Equal(
-            "OpenWriteCursor", "Rewind", "Insert", "LoadConstant", "ResultRow", "Next", "Commit",
-            "CloseCursor", "Halt");
+            "OpenWriteCursor", "Rewind", "Insert", "Next", "OpenReadCursor", "Rewind",
+            "LoadConstant", "ResultRow", "Next", "CloseCursor", "Commit", "CloseCursor", "Halt");
         Opcodes(rows).Should().NotContain("Arithmetic");
         Comments(rows).Should().Contain("r[0]=3");
 
@@ -221,36 +204,38 @@ public class DmlReturningArithmeticSqlRoutingTests
     // ---- evaluator fallbacks -------------------------------------------------------------------
 
     [Test]
-    public void TextAffinityColumnOperandFallsBackToEvaluator()
+    public void TextAffinityColumnOperandRoutesThroughNumericAffinity()
     {
         using var connection = Connect();
         Execute(connection, "CREATE TABLE t(label TEXT);");
 
-        // A TEXT-affinity column can hold arbitrary text, so the Arithmetic opcode (which raises on
-        // text) cannot claim byte-identity; the statement stays on the affinity-applying evaluator.
-        ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES ('10') RETURNING label + 1;");
+        Opcodes(ReadRows(connection, "EXPLAIN INSERT INTO t VALUES ('10') RETURNING label + 1;"))
+            .Should().ContainInOrder("Column", "NumericAffinity", "Arithmetic");
 
         RoutedValue(connection, "INSERT INTO t VALUES ('10') RETURNING label + 1;")
             .Should().Be(SqlValue.Integer(11));
     }
 
     [Test]
-    public void BlobAffinityColumnOperandFallsBackToEvaluator()
+    public void BlobAffinityColumnOperandRoutesThroughNumericAffinity()
     {
         using var connection = Connect();
         Execute(connection, "CREATE TABLE t(data BLOB);");
 
-        ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES (x'0102') RETURNING data + 1;");
+        Opcodes(ReadRows(connection, "EXPLAIN INSERT INTO t VALUES (x'0102') RETURNING data + 1;"))
+            .Should().ContainInOrder("Column", "NumericAffinity", "Arithmetic");
+        RoutedValue(connection, "INSERT INTO t VALUES (x'0102') RETURNING data + 1;")
+            .Should().Be(SqlValue.Integer(1));
     }
 
     [Test]
-    public void FunctionOperandFallsBackToEvaluator()
+    public void AllowListedFunctionOperandRoutes()
     {
         using var connection = Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
 
-        // A function call is not a leaf the Arithmetic operand lowering accepts, so it declines.
-        ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES (-4) RETURNING abs(value) + 1;");
+        Opcodes(ReadRows(connection, "EXPLAIN INSERT INTO t VALUES (-4) RETURNING abs(value) + 1;"))
+            .Should().ContainInOrder("Function", "NumericAffinity", "Arithmetic");
 
         RoutedValue(connection, "INSERT INTO t VALUES (-4) RETURNING abs(value) + 1;")
             .Should().Be(SqlValue.Integer(5));
@@ -267,14 +252,15 @@ public class DmlReturningArithmeticSqlRoutingTests
     }
 
     [Test]
-    public void CollationOperandFallsBackToEvaluator()
+    public void ValueOnlyCollationOperandRoutes()
     {
         using var connection = Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
 
-        // COLLATE binds tighter than the arithmetic operator, so the left operand is a collation
-        // node, which carries collation semantics the Arithmetic opcode does not model.
-        ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING value COLLATE NOCASE + 1;");
+        Opcodes(ReadRows(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING value COLLATE NOCASE + 1;"))
+            .Should().Contain("Arithmetic");
+        RoutedValue(connection, "INSERT INTO t VALUES (10) RETURNING value COLLATE NOCASE + 1;")
+            .Should().Be(SqlValue.Integer(11));
     }
 
     [Test]
@@ -312,27 +298,29 @@ public class DmlReturningArithmeticSqlRoutingTests
     }
 
     [Test]
-    public void BareParameterProjectionFallsBackToEvaluator()
+    public void BareParameterProjectionRoutesWithLateBinding()
     {
         using var connection = Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
 
-        // A bare parameter is not an arithmetic operation, so the new route leaves it alone (and it is
-        // not a constant scalar either), keeping the evaluator authoritative.
-        ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING ?;", SqlValue.Integer(7));
+        Opcodes(ExplainBound(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING ?;", SqlValue.Integer(7)))
+            .Should().Contain("LoadParameter");
+        using var statement = connection.Prepare("INSERT INTO t VALUES (10) RETURNING ?;");
+        statement.Bind(1, SqlValue.Integer(7));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(7));
     }
 
     [Test]
-    public void ParameterOperandRebindToTextFallsBackToEvaluator()
+    public void ParameterOperandRebindToTextKeepsTheCompiledShape()
     {
         using var connection = Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
 
-        // The same statement routes with a numeric parameter but declines once the parameter is
-        // rebound to text, because each Step re-bakes and re-classifies the operand.
         Opcodes(ExplainBound(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING value + ?;", SqlValue.Integer(5)))
             .Should().Contain("Arithmetic");
-        ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING value + ?;", SqlValue.Text("x"));
+        Opcodes(ExplainBound(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING value + ?;", SqlValue.Text("x")))
+            .Should().ContainInOrder("LoadParameter", "NumericAffinity", "Arithmetic");
 
         // Executing with the text binding still succeeds through the evaluator, which applies numeric
         // affinity to the unparseable text operand (treated as 0).
@@ -344,26 +332,23 @@ public class DmlReturningArithmeticSqlRoutingTests
     }
 
     [Test]
-    public void RoutedArithmeticErrorPropagatesBeforeCommit()
+    public void RoutedFunctionErrorPropagatesBeforeCommit()
     {
         using var connection = Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
 
-        // A blob stored in a numeric-affinity column is the accepted affinity-routing limitation: the
-        // column routes by affinity, but the runtime value makes the Arithmetic opcode raise. The
-        // projection runs before Commit, so the error aborts the UPDATE and nothing is persisted.
-        Execute(connection, "INSERT INTO t VALUES (x'0102');");
+        Execute(connection, "INSERT INTO t VALUES (7);");
 
-        using (var statement = connection.Prepare("UPDATE t SET value = x'0304' RETURNING value + 1;"))
+        using (var statement = connection.Prepare(
+                   "UPDATE t SET value = -9223372036854775808 RETURNING abs(value);"))
         {
-            Assert.Catch(() => statement.Step());
+            Assert.Throws<EmbeddedSqlException>(() => statement.Step())!
+                .Message.Should().Be("integer overflow");
         }
 
-        // The buffered update was discarded, so the original blob row survives unchanged.
         var rows = ReadRows(connection, "SELECT value FROM t;");
         rows.Should().ContainSingle();
-        rows[0][0].Kind.Should().Be(SqlValueKind.Blob);
-        rows[0][0].AsBlob().ToArray().Should().Equal(new byte[] { 0x01, 0x02 });
+        rows[0][0].Should().Be(SqlValue.Integer(7));
     }
 
     // ---- helpers -------------------------------------------------------------------------------

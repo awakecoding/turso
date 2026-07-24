@@ -271,7 +271,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "aes128gcm" => TursoEncryptionOptions.FromHex(Turso.Core.Storage.TursoEncryptionCipher.Aes128Gcm, key),
             "aes256gcm" => TursoEncryptionOptions.FromHex(Turso.Core.Storage.TursoEncryptionCipher.Aes256Gcm, key),
             _ => throw new NotSupportedException(
-                "Local Provider=Managed supports only AES128GCM and AES256GCM encryption ciphers."),
+                "Local Provider=Managed supports only Turso encrypted format version 0 with "
+                + "AES128GCM (cipher ID 1) or AES256GCM (cipher ID 2); cipher fallback is not permitted."),
         };
     }
 

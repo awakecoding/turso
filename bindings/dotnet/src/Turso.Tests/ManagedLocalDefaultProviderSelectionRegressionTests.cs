@@ -67,7 +67,6 @@ public class ManagedLocalDefaultProviderSelectionRegressionTests
 
     [TestCase("Data Source=:memory:", true)]
     [TestCase("Data Source=:memory:;Local Provider=Native", false)]
-    [TestCase("Data Source=libsql://example.com", false)]
     public void UseTursoSelectsManagedMigrationsOnlyForImplicitLocalConnections(
         string connectionString,
         bool usesManagedMigrations)

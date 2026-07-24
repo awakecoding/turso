@@ -51,7 +51,20 @@ public readonly record struct DmlProjectionOp(bool IsColumn, bool IsRowId, int C
 /// </summary>
 public sealed record CompiledDml(
     VdbeProgram Program,
-    IReadOnlyList<VdbeWriteTarget> WriteTargets);
+    IReadOnlyList<VdbeWriteTarget> WriteTargets)
+{
+    internal IReadOnlyList<VdbeWriteTarget?> RuntimeWriteTargets { get; init; } = WriteTargets;
+
+    internal IReadOnlyList<VdbeCursorSource?>? CursorSources { get; init; }
+
+    internal IReadOnlyList<int>? ParameterIndices { get; init; }
+}
+
+internal sealed record DmlReturningProgram(
+    IReadOnlyList<VdbeInstruction> Instructions,
+    int OutputCount,
+    int RegisterCount,
+    IReadOnlyList<int> ParameterIndices);
 
 /// <summary>
 /// A DML scan filter over either declared row values alone or those values together with the
@@ -91,7 +104,7 @@ internal sealed class DmlRowFilter
 /// are supplied by the caller so the emitted program matches the evaluator exactly.
 /// </summary>
 /// <remarks>
-/// Every program shares one fixed layout so jump targets can be computed up front:
+/// The public descriptor path keeps the original single-loop layout:
 /// <code>
 ///   0            OpenWriteCursor
 ///   1            Rewind        -> commitAddr (nothing to mutate)
@@ -105,6 +118,10 @@ internal sealed class DmlRowFilter
 ///                CloseCursor
 ///                Halt
 /// </code>
+/// The managed SQL route uses a second read cursor for generic RETURNING expressions: the write loop
+/// buffers all affected rows, then a source-ordered read loop evaluates RETURNING before Commit. Keeping
+/// mutation callbacks ahead of every projection matches the evaluator's observable order while projection
+/// failures still discard the buffered statement.
 /// The projection block has no internal jumps, so its length is measured while it is lowered and the
 /// jump targets (<c>nextAddr</c>, <c>commitAddr</c>) are derived from it. A RETURNING item may be a bare
 /// column/rowid/constant or a composable arithmetic expression over them; the latter reads its operands
@@ -192,6 +209,33 @@ public static class DmlStatementCompiler
         return new CompiledDml(program, [writeTarget]);
     }
 
+    internal static CompiledDml CompileWithFilter(
+        DmlKind kind,
+        string tableName,
+        int columnCount,
+        DmlRowFilter? filter,
+        DmlReturningProgram returning,
+        VdbeWriteTarget writeTarget,
+        VdbeCursorSource returningSource)
+    {
+        ArgumentNullException.ThrowIfNull(tableName);
+        ArgumentNullException.ThrowIfNull(returning);
+        ArgumentNullException.ThrowIfNull(writeTarget);
+        ArgumentNullException.ThrowIfNull(returningSource);
+        if (kind == DmlKind.Insert && filter is not null)
+            throw new StatementCompilationException("INSERT programs do not filter rows.");
+        if (returning.OutputCount <= 0)
+            throw new StatementCompilationException("A compiled RETURNING program must produce at least one output.");
+
+        var program = BuildTwoPhaseProgram(kind, tableName, columnCount, filter, returning);
+        return new CompiledDml(program, [writeTarget])
+        {
+            RuntimeWriteTargets = [writeTarget, null],
+            CursorSources = [null, returningSource],
+            ParameterIndices = returning.ParameterIndices,
+        };
+    }
+
     private static VdbeProgram BuildProgram(
         DmlKind kind,
         string tableName,
@@ -268,6 +312,91 @@ public static class DmlStatementCompiler
 
         return new VdbeProgram(registerCount, cursorCount: 1, instructions);
     }
+
+    private static VdbeProgram BuildTwoPhaseProgram(
+        DmlKind kind,
+        string tableName,
+        int columnCount,
+        DmlRowFilter? filter,
+        DmlReturningProgram returning)
+    {
+        var writeCursor = new Cursor(0);
+        var returningCursor = new Cursor(1);
+        const int mutationLoopStart = 2;
+        var filterCount = filter is null ? 0 : 1;
+        var mutateAddr = mutationLoopStart + filterCount;
+        var mutationNextAddr = mutateAddr + 1;
+        var returningOpenAddr = mutationNextAddr + 1;
+        var returningLoopStart = returningOpenAddr + 2;
+        var resultRowAddr = returningLoopStart + returning.Instructions.Count;
+        var returningNextAddr = resultRowAddr + 1;
+        var returningCloseAddr = returningNextAddr + 1;
+        var commitAddr = returningCloseAddr + 1;
+
+        var instructions = new List<VdbeInstruction>(commitAddr + 3)
+        {
+            new OpenWriteCursorInstruction(writeCursor, tableName, columnCount),
+            new RewindCursorInstruction(writeCursor, new ProgramCounter(returningOpenAddr)),
+        };
+
+        AddFilter(instructions, writeCursor, filter, mutationNextAddr);
+        instructions.Add(Mutation(kind, writeCursor));
+        instructions.Add(new NextInstruction(writeCursor, new ProgramCounter(mutationLoopStart)));
+
+        instructions.Add(new OpenReadCursorInstruction(returningCursor, tableName, columnCount));
+        instructions.Add(new RewindCursorInstruction(returningCursor, new ProgramCounter(commitAddr)));
+        instructions.AddRange(returning.Instructions);
+        instructions.Add(new ResultRowInstruction(
+            new RegisterRange(new Register(0), returning.OutputCount)));
+        instructions.Add(new NextInstruction(returningCursor, new ProgramCounter(returningLoopStart)));
+        instructions.Add(new CloseCursorInstruction(returningCursor));
+        instructions.Add(new CommitInstruction(writeCursor));
+        instructions.Add(new CloseCursorInstruction(writeCursor));
+        instructions.Add(new HaltInstruction());
+
+        return new VdbeProgram(
+            returning.RegisterCount,
+            cursorCount: 2,
+            instructions,
+            parameterSlotCount: returning.ParameterIndices.Count);
+    }
+
+    private static void AddFilter(
+        List<VdbeInstruction> instructions,
+        Cursor cursor,
+        DmlRowFilter? filter,
+        int falseTarget)
+    {
+        if (filter?.RowPredicate is { } rowPredicate)
+        {
+            instructions.Add(new FilterInstruction(
+                cursor,
+                rowPredicate,
+                new ProgramCounter(falseTarget),
+                $"skip row when WHERE is false, goto {falseTarget}"));
+        }
+        else if (filter?.RowIdPredicate is { } rowIdPredicate)
+        {
+            instructions.Add(new FilterRowIdInstruction(
+                cursor,
+                rowIdPredicate,
+                new ProgramCounter(falseTarget),
+                $"skip row when WHERE is false, goto {falseTarget}"));
+        }
+        else if (filter is not null)
+        {
+            throw new StatementCompilationException("DML filter has no predicate.");
+        }
+    }
+
+    private static VdbeInstruction Mutation(DmlKind kind, Cursor cursor)
+        => kind switch
+        {
+            DmlKind.Insert => new InsertInstruction(cursor),
+            DmlKind.Update => new UpdateInstruction(cursor),
+            DmlKind.Delete => new DeleteInstruction(cursor),
+            _ => throw new StatementCompilationException($"Unsupported DML kind {kind}."),
+        };
 
     // Emits the instructions that compute <paramref name="expression"/> into <paramref name="destination"/>,
     // appending them to <paramref name="block"/>. Leaves read the affected row's column/rowid or bake a

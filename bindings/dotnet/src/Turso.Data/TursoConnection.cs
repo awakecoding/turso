@@ -6,18 +6,27 @@ using Turso.Core.Storage;
 
 namespace Turso;
 
-public class TursoConnection : DbConnection
+public class TursoConnection : DbConnection, ILocalReaderConnection
 {
     private TursoNativeDatabase? _nativeDatabase;
+    private TursoReplicaDatabase? _replicaDatabase;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private ManagedConnectionPoolLease? _managedPoolLease;
+    private ManagedConnectionPoolKey? _managedPoolKey;
     private TursoRemoteClient? _remoteClient;
     private TursoConnectionOptions _connectionOptions;
+    private TursoReplicaOptions? _replicaOptions;
+    private HttpMessageHandler? _ownedReplicaHttpHandler;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
     private bool _disposed;
     private bool _readUncommitted;
+    private bool _managedSharedMemory;
     private bool _remoteTransactionActive;
     private bool _managedReadOnly;
-    private readonly HashSet<TursoDataReader> _openReaders = [];
+    private readonly HashSet<IConnectionOwnedReader> _openReaders = [];
+    private readonly object _readerLock = new();
+    private readonly HashSet<TursoCommand> _openCommands = [];
+    private TursoTransaction? _transaction;
 
     [AllowNull]
     public override string ConnectionString
@@ -29,6 +38,8 @@ public class TursoConnection : DbConnection
                 throw new InvalidOperationException("ConnectionString cannot be set while the connection is open.");
 
             _connectionOptions = TursoConnectionOptions.Parse(value ?? string.Empty);
+            _managedPoolKey = null;
+            _replicaOptions = null;
         }
     }
 
@@ -42,7 +53,7 @@ public class TursoConnection : DbConnection
         ? ConnectionState.Open
         : ConnectionState.Closed;
 
-    public override bool CanCreateBatch => _connectionOptions.IsRemote && !_connectionOptions.IsReplica;
+    public override bool CanCreateBatch => !_connectionOptions.IsReplica;
 
     protected override DbProviderFactory DbProviderFactory => TursoFactory.Instance;
 
@@ -55,57 +66,28 @@ public class TursoConnection : DbConnection
         _connectionOptions = TursoConnectionOptions.Parse(connectionString);
     }
 
+    /// <summary>
+    /// Creates a connection configured as an embedded replica.
+    /// </summary>
+    /// <param name="replicaOptions">The embedded replica configuration.</param>
+    public static TursoConnection CreateReplica(TursoReplicaOptions replicaOptions)
+    {
+        ArgumentNullException.ThrowIfNull(replicaOptions);
+        replicaOptions.Validate();
+        var ownedHttpHandler = replicaOptions.HttpPolicy.ClaimMessageHandlerOwnership();
+        var connectionReplicaOptions = replicaOptions.CloneForConnection();
+        return new TursoConnection
+        {
+            _replicaOptions = connectionReplicaOptions,
+            _connectionOptions = TursoConnectionOptions.FromReplica(connectionReplicaOptions),
+            _ownedReplicaHttpHandler = ownedHttpHandler,
+        };
+    }
+
     public override void Open()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null)
-            throw new InvalidOperationException("The connection is already open.");
-        if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
-        {
-            if (!_connectionOptions.IsRemote && _connectionOptions.LocalProvider == TursoLocalProvider.Managed)
-            {
-                throw new NotSupportedException(
-                    "Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.");
-            }
-
-            throw new NotSupportedException(
-                "Password is not supported. Use Encryption Cipher and Encryption Key for local encrypted databases.");
-        }
-
-        if (_connectionOptions.IsRemote)
-        {
-            OpenRemote();
-            return;
-        }
-
-        ValidateLocalOnlyOptions();
-
-        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
-        {
-            using var managedOptions = _connectionOptions.GetManagedLocalOpenOptions();
-            OpenManagedDatabase(managedOptions);
-
-            return;
-        }
-
-        var filename = _connectionOptions["Data Source"] ?? ":memory:";
-        var cipher = _connectionOptions.GetEncryptionCipher();
-        var hexkey = _connectionOptions["Encryption Key"];
-
-        if (cipher.HasValue)
-        {
-            if (string.IsNullOrWhiteSpace(hexkey))
-                throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
-
-            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher, hexkey);
-        }
-        else
-        {
-            if (!string.IsNullOrWhiteSpace(hexkey))
-                throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
-
-            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher: null, encryptionKey: null);
-        }
+        ValidateCanOpen();
+        OpenCore();
     }
 
     public override Task OpenAsync(CancellationToken cancellationToken)
@@ -113,29 +95,75 @@ public class TursoConnection : DbConnection
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
 
-        Open();
-        return Task.CompletedTask;
+        if (_connectionOptions.IsRemote && _connectionOptions.IsReplica)
+        {
+            ValidateCanOpen();
+            ValidateReplicaLocalProvider();
+            return OpenRemoteReplicaAsync(GetReplicaOptions(), cancellationToken);
+        }
+
+        return Task.Run(
+            () =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Open();
+                if (!cancellationToken.IsCancellationRequested)
+                    return;
+
+                Close();
+                cancellationToken.ThrowIfCancellationRequested();
+            },
+            CancellationToken.None);
+    }
+
+    public static void ClearAllPools() => ManagedConnectionPool.ClearAll();
+
+    public static void ClearPool(TursoConnection connection)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        if (connection._managedPoolKey is { } key
+            || connection._connectionOptions.TryGetManagedPoolKey(out key))
+        {
+            ManagedConnectionPool.Clear(key);
+        }
     }
 
     public override void Close()
     {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: true);
         if (_remoteClient is not null)
         {
-            CloseRemote();
+            try
+            {
+                _transaction?.Dispose();
+            }
+            finally
+            {
+                CloseRemote();
+                _transaction = null;
+            }
             return;
         }
 
+        _replicaDatabase?.EnsureCanClose();
         var nativeDatabase = _nativeDatabase;
         var managedDatabase = _managedDatabase;
+        var managedPoolLease = _managedPoolLease;
         var managedEncryptionFileSystem = _managedEncryptionFileSystem;
+        var reusable = false;
         try
         {
             CloseOpenReaders();
+            _transaction?.Dispose();
+            ResetOpenCommands();
+            reusable = true;
         }
         finally
         {
             _nativeDatabase = null;
+            _replicaDatabase = null;
             _managedDatabase = null;
+            _managedPoolLease = null;
             _managedEncryptionFileSystem = null;
             try
             {
@@ -145,13 +173,18 @@ public class TursoConnection : DbConnection
             {
                 try
                 {
-                    managedDatabase?.Dispose();
+                    if (managedPoolLease is not null)
+                        managedPoolLease.Release(reusable);
+                    else
+                        managedDatabase?.Dispose();
                 }
                 finally
                 {
                     managedEncryptionFileSystem?.Dispose();
                     _readUncommitted = false;
+                    _managedSharedMemory = false;
                     _managedReadOnly = false;
+                    _transaction = null;
                 }
             }
         }
@@ -159,8 +192,13 @@ public class TursoConnection : DbConnection
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_disposed)
+        {
             Close();
+            _disposed = true;
+            _ownedReplicaHttpHandler?.Dispose();
+            _ownedReplicaHttpHandler = null;
+        }
 
         _disposed = true;
         base.Dispose(disposing);
@@ -168,12 +206,15 @@ public class TursoConnection : DbConnection
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
         if (_nativeDatabase is null && _managedDatabase is null && _remoteClient is null)
         {
             throw new InvalidOperationException("Turso database is closed.");
         }
+        if (_transaction is not null)
+            throw new InvalidOperationException("Parallel transactions are not supported.");
 
-        return new TursoTransaction(this, isolationLevel);
+        return _transaction = new TursoTransaction(this, isolationLevel);
     }
 
     protected override DbCommand CreateDbCommand()
@@ -184,7 +225,7 @@ public class TursoConnection : DbConnection
     protected override DbBatch CreateDbBatch()
     {
         if (!CanCreateBatch)
-            throw new NotSupportedException("Turso batch execution is currently supported only for remote connections.");
+            throw new NotSupportedException("Turso batch execution is not supported for embedded replica connections.");
 
         return new TursoBatch(this);
     }
@@ -202,8 +243,15 @@ public class TursoConnection : DbConnection
         SyncAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 
+    public TursoSyncResult Sync(TursoSyncOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return SyncAsync(options, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
     public Task SyncAsync(CancellationToken cancellationToken = default)
     {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
@@ -212,7 +260,26 @@ public class TursoConnection : DbConnection
         if (!_connectionOptions.IsReplica)
             throw new NotSupportedException("Sync requires an embedded replica connection.");
 
-        throw new NotSupportedException("Embedded replica sync is not supported yet by the .NET provider.");
+        return (_replicaDatabase ?? throw new InvalidOperationException("Turso database is closed."))
+            .SyncAsync(cancellationToken);
+    }
+
+    public Task<TursoSyncResult> SyncAsync(
+        TursoSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<TursoSyncResult>(cancellationToken);
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException("Turso database is closed.");
+        if (!_connectionOptions.IsReplica)
+            throw new NotSupportedException("Sync requires an embedded replica connection.");
+
+        return (_replicaDatabase ?? throw new InvalidOperationException("Turso database is closed."))
+            .SyncAsync(options, cancellationToken);
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -228,21 +295,63 @@ public class TursoConnection : DbConnection
 
     internal bool IsManaged => _managedDatabase is not null;
 
+    internal TursoTransaction? Transaction => _transaction;
+
     internal bool ReadUncommitted
     {
         get => _readUncommitted;
-        set => _readUncommitted = value;
+        set
+        {
+            if (value && _managedSharedMemory)
+                throw new NotSupportedException(ManagedSharedCacheContract.ReadUncommittedNotSupportedMessage);
+
+            _readUncommitted = value;
+        }
     }
 
     internal TursoNativeDatabase NativeDatabase
-        => _nativeDatabase ?? throw new InvalidOperationException("Turso database is closed.");
+    {
+        get
+        {
+            _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
+            return _nativeDatabase ?? throw new InvalidOperationException("Turso database is closed.");
+        }
+    }
 
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("Turso database is closed.");
 
-    internal void ReaderOpened(TursoDataReader reader) => _openReaders.Add(reader);
+    void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader)
+    {
+        lock (_readerLock)
+            _openReaders.Add(reader);
+    }
 
-    internal void ReaderClosed(TursoDataReader reader) => _openReaders.Remove(reader);
+    void ILocalReaderConnection.ReaderClosed(IConnectionOwnedReader reader)
+    {
+        lock (_readerLock)
+            _openReaders.Remove(reader);
+    }
+
+    internal void CommandOpened(TursoCommand command) => _openCommands.Add(command);
+
+    internal void CommandClosed(TursoCommand command) => _openCommands.Remove(command);
+
+    internal void TransactionCompleted(TursoTransaction transaction)
+    {
+        if (ReferenceEquals(_transaction, transaction))
+            _transaction = null;
+    }
+
+    internal void TransactionCompletedExternally(SqlTransactionCompletion completion)
+    {
+        if (completion == SqlTransactionCompletion.None)
+            return;
+
+        _remoteTransactionActive = false;
+        _transaction?.MarkCompletedExternally();
+        CloseRemoteSessionIfStateless();
+    }
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
         string sql,
@@ -279,7 +388,14 @@ public class TursoConnection : DbConnection
         var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
         try
         {
-            return await remoteClient.ExecuteBatchAsync(batchCommands, commandTimeout, wantRows, closeAfter, cancellationToken)
+            return await remoteClient.ExecuteBatchAsync(
+                    batchCommands,
+                    commandTimeout,
+                    wantRows,
+                    closeAfter,
+                    cancellationToken,
+                    step => TransactionCompletedExternally(
+                        SqlTransactionControl.GetCompletion(batchCommands[step].CommandText)))
                 .ConfigureAwait(false);
         }
         catch (TursoRemoteSqlException)
@@ -384,11 +500,13 @@ public class TursoConnection : DbConnection
 
     private void OpenRemote()
     {
-        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
-            throw new NotSupportedException("Local Provider=Managed is supported only for local database connections.");
+        ValidateReplicaLocalProvider();
 
         if (_connectionOptions.IsReplica)
-            throw new NotSupportedException("Embedded replica connections are not supported yet by the .NET provider. Use a remote URL without Replica Path for direct remote execution.");
+        {
+            SetReplicaDatabase(TursoReplicaProvider.OpenReplica(GetReplicaOptions()));
+            return;
+        }
 
         if (_connectionOptions.SyncInterval > 0)
             throw new NotSupportedException("Sync Interval requires embedded replica support, which is not supported yet by the .NET provider.");
@@ -397,6 +515,112 @@ public class TursoConnection : DbConnection
             throw new InvalidOperationException("Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
 
         _remoteClient = new TursoRemoteClient(_connectionOptions.GetRemoteUri(), _connectionOptions.AuthToken);
+    }
+
+    private async Task OpenRemoteReplicaAsync(
+        TursoReplicaOptions options,
+        CancellationToken cancellationToken)
+    {
+        var ValidateRemoteLocalProvider = await TursoReplicaProvider
+            .OpenReplicaAsync(options, cancellationToken)
+            .ConfigureAwait(false);
+        SetReplicaDatabase(ValidateRemoteLocalProvider);
+    }
+
+    private void ValidateReplicaLocalProvider()
+    {
+        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+            throw new NotSupportedException("Local Provider=Managed is supported only for local database connections.");
+    }
+
+    private TursoReplicaOptions GetReplicaOptions()
+    {
+        if (_connectionOptions.SyncInterval > 0)
+        {
+            throw new NotSupportedException(
+                "Sync Interval is not supported yet for embedded replica connections. Call Sync or SyncAsync explicitly.");
+        }
+
+        if (_connectionOptions.GetEncryptionCipher().HasValue
+            || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
+        {
+            throw new InvalidOperationException(
+                "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
+        }
+
+        return _replicaOptions ?? new TursoReplicaOptions(
+            _connectionOptions.ReplicaPath,
+            _connectionOptions.GetRemoteUri(),
+            _connectionOptions.AuthToken);
+    }
+
+    private void SetReplicaDatabase(TursoReplicaDatabase replicaDatabase)
+    {
+        if (_disposed)
+        {
+            replicaDatabase.Dispose();
+            throw new ObjectDisposedException(nameof(TursoConnection));
+        }
+
+        _replicaDatabase = replicaDatabase;
+        _nativeDatabase = replicaDatabase;
+    }
+
+    private void ValidateCanOpen()
+    {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null)
+            throw new InvalidOperationException("The connection is already open.");
+        if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
+        {
+            if (!_connectionOptions.IsRemote && _connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+            {
+                throw new NotSupportedException(
+                    "Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.");
+            }
+
+            throw new NotSupportedException(
+                "Password is not supported. Use Encryption Cipher and Encryption Key for local encrypted databases.");
+        }
+    }
+
+    private void OpenCore()
+    {
+        if (_connectionOptions.IsRemote)
+        {
+            OpenRemote();
+            return;
+        }
+
+        ValidateLocalOnlyOptions();
+
+        if (_connectionOptions.LocalProvider == TursoLocalProvider.Managed)
+        {
+            using var managedOptions = _connectionOptions.GetManagedLocalOpenOptions();
+            OpenManagedDatabase(managedOptions);
+
+            return;
+        }
+
+        var filename = _connectionOptions["Data Source"] ?? ":memory:";
+        var cipher = _connectionOptions.GetEncryptionCipher();
+        var hexkey = _connectionOptions["Encryption Key"];
+
+        if (cipher.HasValue)
+        {
+            if (string.IsNullOrWhiteSpace(hexkey))
+                throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
+
+            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher, hexkey);
+        }
+        else
+        {
+            if (!string.IsNullOrWhiteSpace(hexkey))
+                throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
+
+            _nativeDatabase = TursoNativeProvider.OpenDatabase(filename, cipher: null, encryptionKey: null);
+        }
     }
 
     private void ValidateLocalOnlyOptions()
@@ -413,7 +637,23 @@ public class TursoConnection : DbConnection
 
     private void OpenManagedDatabase(ManagedLocalOpenOptions options)
     {
-        if (options.Encryption is null && !options.ReadOnly)
+        if (options.SharedMemoryName is not null)
+        {
+            _managedDatabase = ManagedSharedMemoryDatabase.Open(options.SharedMemoryName);
+            _managedSharedMemory = true;
+        }
+        else if (_connectionOptions.Pooling
+            && options.Encryption is null
+            && !options.DataSource.Equals(":memory:", StringComparison.Ordinal))
+        {
+            var poolKey = ManagedConnectionPoolKey.Create(options.DataSource, options.ReadOnly);
+            _managedPoolLease = ManagedConnectionPool.Rent(
+                poolKey,
+                () => OpenUnencryptedManagedDatabase(poolKey.DataSource, options.ReadOnly));
+            _managedDatabase = _managedPoolLease.Database;
+            _managedPoolKey = poolKey;
+        }
+        else if (options.Encryption is null && !options.ReadOnly)
         {
             var managedDatabase = ManagedDatabaseAdapter.Open(options.DataSource);
             try
@@ -427,6 +667,7 @@ public class TursoConnection : DbConnection
                 throw;
             }
         }
+
         else
         {
             TursoEncryptionFileSystem? managedEncryptionFileSystem = null;
@@ -483,6 +724,23 @@ public class TursoConnection : DbConnection
         }
     }
 
+    private static IManagedDatabaseAdapter OpenUnencryptedManagedDatabase(string dataSource, bool readOnly)
+    {
+        var managedDatabase = readOnly
+            ? ManagedDatabaseAdapter.OpenFile(dataSource, PhysicalFileSystem.Instance, readOnly: true)
+            : ManagedDatabaseAdapter.Open(dataSource);
+        try
+        {
+            _ = managedDatabase.Connect();
+            return managedDatabase;
+        }
+        catch
+        {
+            managedDatabase.Dispose();
+            throw;
+        }
+    }
+
     private void CloseRemote()
     {
         var remoteClient = _remoteClient;
@@ -492,6 +750,8 @@ public class TursoConnection : DbConnection
         Exception? closeError = null;
         try
         {
+            CloseOpenReaders();
+            ResetOpenCommands();
             if (_remoteTransactionActive)
             {
                 remoteClient
@@ -515,6 +775,7 @@ public class TursoConnection : DbConnection
             _remoteTransactionActive = false;
             _readUncommitted = false;
             _managedReadOnly = false;
+            _transaction?.Dispose();
         }
 
         if (closeError is not null)
@@ -531,7 +792,16 @@ public class TursoConnection : DbConnection
 
     private void CloseOpenReaders()
     {
-        foreach (var reader in _openReaders.ToArray())
+        IConnectionOwnedReader[] readers;
+        lock (_readerLock)
+            readers = _openReaders.ToArray();
+        foreach (var reader in readers)
             reader.CloseFromConnection();
+    }
+
+    private void ResetOpenCommands()
+    {
+        foreach (var command in _openCommands.ToArray())
+            command.ResetFromConnection();
     }
 }

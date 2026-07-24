@@ -34,8 +34,8 @@ public class ArithmeticScanSqlRoutingTests
 
         var explain = ReadRows(connection, "EXPLAIN SELECT id, left_value + right_value AS total FROM t");
         explain.Select(row => row[1].AsText()).Should().Equal(
-            "OpenReadCursor", "Rewind", "Column", "Column", "Column", "Arithmetic", "ResultRow", "Next",
-            "CloseCursor", "Halt");
+            "OpenReadCursor", "Rewind", "Column", "Column", "Column", "NumericAffinity",
+            "NumericAffinity", "Arithmetic", "ResultRow", "Next", "CloseCursor", "Halt");
         explain.Select(row => row[6].AsText()).Should().Contain(
             "r[2]=c0.col[1]",
             "r[3]=c0.col[2]",
@@ -44,20 +44,23 @@ public class ArithmeticScanSqlRoutingTests
     }
 
     [Test]
-    public void TextOperandAndUnsupportedScanShapesFallBackToEvaluator()
+    public void TextColumnsConstantsAndFiltersRouteThroughGenericExpressions()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(a, b)");
         Execute(connection, "INSERT INTO t VALUES ('10', 2)");
 
         ReadRows(connection, "SELECT a + b FROM t")[0].Should().Equal(SqlValue.Integer(12));
-        ExplainRefused(connection, "EXPLAIN SELECT a + b FROM t");
+        ReadRows(connection, "EXPLAIN SELECT a + b FROM t")
+            .Select(row => row[1].AsText()).Should().Contain("NumericAffinity");
 
         ReadRows(connection, "SELECT a + 1 FROM t")[0].Should().Equal(SqlValue.Integer(11));
-        ExplainRefused(connection, "EXPLAIN SELECT a + 1 FROM t");
+        ReadRows(connection, "EXPLAIN SELECT a + 1 FROM t")
+            .Select(row => row[1].AsText()).Should().Contain("Arithmetic");
 
         ReadRows(connection, "SELECT a + b FROM t WHERE b = 2")[0].Should().Equal(SqlValue.Integer(12));
-        ExplainRefused(connection, "EXPLAIN SELECT a + b FROM t WHERE b = 2");
+        ReadRows(connection, "EXPLAIN SELECT a + b FROM t WHERE b = 2")
+            .Select(row => row[1].AsText()).Should().Contain("Filter");
     }
 
     [Test]
@@ -70,15 +73,15 @@ public class ArithmeticScanSqlRoutingTests
         using var statement = connection.Prepare("SELECT a + b FROM t");
         Drain(statement)[0].Should().Equal(SqlValue.Integer(12));
 
-        // The next execution must not reuse the prior VDBE eligibility decision: the added text value needs
-        // the evaluator's numeric affinity instead of an Arithmetic type error.
+        // The same generic bytecode shape handles the newly visible text value through numeric affinity.
         Execute(connection, "INSERT INTO t VALUES ('10', 2)");
         statement.Reset();
         var rows = Drain(statement);
         rows.Should().HaveCount(2);
         rows[0].Should().Equal(SqlValue.Integer(12));
         rows[1].Should().Equal(SqlValue.Integer(12));
-        ExplainRefused(connection, "EXPLAIN SELECT a + b FROM t");
+        ReadRows(connection, "EXPLAIN SELECT a + b FROM t")
+            .Select(row => row[1].AsText()).Should().Contain("NumericAffinity");
     }
 
     private static void AssertMatchesSqlite(IReadOnlyList<string> setup, string query)

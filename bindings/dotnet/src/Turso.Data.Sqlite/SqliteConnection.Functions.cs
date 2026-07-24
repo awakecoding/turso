@@ -10,6 +10,8 @@ public partial class SqliteConnection
     private void RegisterScalarFunction(string name, int argc, bool isDeterministic, Func<object?[], object?>? function)
     {
         ArgumentNullException.ThrowIfNull(name);
+        if (function is not null && IsManagedSharedMemory)
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheCallbacksNotSupported);
         if (function is null)
         {
             RemoveFunctionRegistrations(_scalarFunctions, name);

@@ -27,7 +27,7 @@ public sealed class ExplainQueryPlanTests
     }
 
     [Test]
-    public void RebindingParametersReportsTheRuntimeRouteWithoutRenderingValues()
+    public void RebindingParametersReportsTheLateBoundRuntimeRouteWithoutRenderingValues()
     {
         using var connection = new EmbeddedDatabase().Connect();
         using var statement = connection.Prepare("EXPLAIN QUERY PLAN SELECT ?1 + 1;");
@@ -39,7 +39,7 @@ public sealed class ExplainQueryPlanTests
 
         statement.Reset();
         statement.Bind(1, SqlValue.Text("3"));
-        ReadDetail(statement).Should().Be("MANAGED EVALUATOR FALLBACK");
+        ReadDetail(statement).Should().Be("MANAGED COMPILED VDBE");
 
         using var unbound = connection.Prepare("EXPLAIN QUERY PLAN SELECT ?1 + 1;");
         Assert.Throws<EmbeddedSqlException>(() => unbound.Step())!
@@ -54,6 +54,13 @@ public sealed class ExplainQueryPlanTests
         Execute(connection, "INSERT INTO t VALUES (1);");
 
         ReadPlan(connection, "EXPLAIN QUERY PLAN INSERT INTO t VALUES (2);")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
+        ReadScalar(connection, "SELECT count(*) FROM t;").Should().Be(SqlValue.Integer(1));
+
+        ReadPlan(
+                connection,
+                "EXPLAIN QUERY PLAN INSERT INTO t VALUES (2) RETURNING abs(value), value + ?1;",
+                SqlValue.Integer(4))
             .Rows[0][3].Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
         ReadScalar(connection, "SELECT count(*) FROM t;").Should().Be(SqlValue.Integer(1));
 
@@ -80,14 +87,63 @@ public sealed class ExplainQueryPlanTests
         ReadDetail(statement).Should().Be("MANAGED EVALUATOR FALLBACK");
         calls.Should().Be(0);
 
+        using var recursive = connection.Prepare(
+            """
+            EXPLAIN QUERY PLAN
+            WITH RECURSIVE c(value) AS (
+                SELECT observe(1)
+                UNION ALL
+                SELECT value + 1 FROM c WHERE value < 2
+            )
+            SELECT * FROM c;
+            """);
+        ReadDetail(recursive).Should().Be("MANAGED EVALUATOR FALLBACK");
+        calls.Should().Be(0);
+
         using var explain = connection.Prepare("EXPLAIN SELECT observe(7);");
         Assert.Throws<EmbeddedSqlException>(() => explain.Step())!
             .Message.Should().Be(
                 "EXPLAIN is only supported for statements lowered to the bytecode compiler.");
         calls.Should().Be(0);
 
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        using var dmlPlan = connection.Prepare(
+            "EXPLAIN QUERY PLAN INSERT INTO t VALUES (7) RETURNING observe(value);");
+        ReadDetail(dmlPlan).Should().Be("MANAGED EVALUATOR FALLBACK");
+        calls.Should().Be(0);
+        ReadScalar(connection, "SELECT count(*) FROM t;").Should().Be(SqlValue.Integer(0));
+
         ReadScalar(connection, "SELECT observe(7);").Should().Be(SqlValue.Integer(7));
         calls.Should().Be(1);
+    }
+
+    [Test]
+    public void CancellationStopsBeforePlanningAndLeavesTheStatementReusable()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1);");
+        using var statement = connection.Prepare(
+            "EXPLAIN QUERY PLAN UPDATE t SET value = value + 1 RETURNING value;");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Assert.Throws<OperationCanceledException>(() => statement.Step(cancellation.Token));
+        ReadDetail(statement).Should().Be("MANAGED COMPILED VDBE");
+        ReadScalar(connection, "SELECT value FROM t;").Should().Be(SqlValue.Integer(1));
+
+        using var cancelable = new CancellationTokenSource();
+        using var cancelablePlan = connection.Prepare(
+            "EXPLAIN QUERY PLAN UPDATE t SET value = value + 1 RETURNING value;");
+        cancelablePlan.Step(cancelable.Token).Should().Be(StatementStepResult.Row);
+        cancelablePlan.GetValue(3).Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+        cancelablePlan.Step(cancelable.Token).Should().Be(StatementStepResult.Done);
+        ReadScalar(connection, "SELECT value FROM t;").Should().Be(SqlValue.Integer(1));
+
+        using var cancelableSelect = connection.Prepare("EXPLAIN QUERY PLAN SELECT value FROM t;");
+        cancelableSelect.Step(cancelable.Token).Should().Be(StatementStepResult.Row);
+        cancelableSelect.GetValue(3).Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+        cancelableSelect.Step(cancelable.Token).Should().Be(StatementStepResult.Done);
     }
 
     [Test]
@@ -114,9 +170,13 @@ public sealed class ExplainQueryPlanTests
 
     private static (string[] Columns, List<SqlValue[]> Rows) ReadPlan(
         EmbeddedConnection connection,
-        string sql)
+        string sql,
+        params SqlValue[] parameters)
     {
         using var statement = connection.Prepare(sql);
+        for (var index = 0; index < parameters.Length; index++)
+            statement.Bind(index + 1, parameters[index]);
+
         var columns = Enumerable.Range(0, statement.GetColumnCount()).Select(statement.GetColumnName).ToArray();
         var rows = new List<SqlValue[]>();
         while (statement.Step() == StatementStepResult.Row)
@@ -160,7 +220,8 @@ public sealed class ExplainQueryPlanDifferentialTests
         sqlite.Rows.Should().ContainSingle();
         AssertPublicRowShape(managed.Rows[0]);
         AssertPublicRowShape(sqlite.Rows[0]);
-        managed.Rows[0][3].Should().Be("MANAGED COMPILED VDBE");
+        // Managed commands execute with a cancellation-capable timeout token.
+        managed.Rows[0][3].Should().Be("MANAGED EVALUATOR FALLBACK");
         ((string)sqlite.Rows[0][3]).Should().NotBeNullOrWhiteSpace();
     }
 

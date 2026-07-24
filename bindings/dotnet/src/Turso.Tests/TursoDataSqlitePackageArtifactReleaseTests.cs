@@ -8,6 +8,7 @@ using AwesomeAssertions;
 
 namespace Turso.Tests;
 
+[NonParallelizable]
 public class TursoDataSqlitePackageArtifactReleaseTests
 {
     private const string RawPackageTargetFrameworks = "net8.0;net9.0;net10.0";
@@ -20,8 +21,17 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         try
         {
             var projectPath = FindProjectPath();
-            var packageVersion = "0.0.0-package-validation";
+            var packageVersion = $"0.0.0-package-validation-{Guid.NewGuid():N}";
+            BuildForPackage(projectPath, "net9.0");
             Pack(projectPath, packageDirectory, packageVersion);
+            Pack(
+                Path.Combine(
+                    Path.GetDirectoryName(projectPath)!,
+                    "..",
+                    "Turso.EntityFrameworkCore.Sqlite",
+                    "Turso.EntityFrameworkCore.Sqlite.csproj"),
+                packageDirectory,
+                packageVersion);
 
             var packagePath = Path.Combine(packageDirectory, $"Turso.Data.Sqlite.{packageVersion}.nupkg");
             File.Exists(packagePath).Should().BeTrue();
@@ -79,6 +89,23 @@ public class TursoDataSqlitePackageArtifactReleaseTests
     }
 
     [Test]
+    public void ManagedPackageExposesReplicaOptionsWithoutSyncCompanion()
+    {
+        var packageDirectory = CreatePackageDirectory("turso-managed-replica-options-validation");
+
+        try
+        {
+            var packageVersion = $"0.0.0-managed-replica-options-{Guid.NewGuid():N}";
+            Pack(FindProjectPath(), packageDirectory, packageVersion);
+            RunManagedReplicaOptionsConsumer(packageDirectory, packageVersion);
+        }
+        finally
+        {
+            DeletePackageDirectory(packageDirectory);
+        }
+    }
+
+    [Test]
     public void NativeCompanionPackageRoutesExplicitNativeConnections()
     {
         var packageDirectory = CreatePackageDirectory("turso-native-package-validation");
@@ -98,6 +125,58 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             Pack(nativeProjectPath, packageDirectory, packageVersion);
 
             RunNativePackageConsumer(packageDirectory, packageVersion);
+        }
+        finally
+        {
+            DeletePackageDirectory(packageDirectory);
+        }
+    }
+
+    [Test]
+    public void SyncCompanionPackageDeclaresFacadeAndOpensDeferredReplica()
+    {
+        var packageDirectory = CreatePackageDirectory("turso-sync-package-validation");
+
+        try
+        {
+            var packageVersion = $"0.0.0-sync-package-validation-{Guid.NewGuid():N}";
+            var sqliteProjectPath = FindProjectPath();
+            var projectDirectory = Path.GetDirectoryName(sqliteProjectPath)!;
+            var syncProjectPath = Path.Combine(
+                projectDirectory,
+                "..",
+                "Turso.Data.Sync",
+                "Turso.Data.Sync.csproj");
+
+            Pack(sqliteProjectPath, packageDirectory, packageVersion);
+            Restore(syncProjectPath);
+            BuildForPackage(syncProjectPath, "net9.0");
+            Pack(syncProjectPath, packageDirectory, packageVersion);
+
+            var packagePath = Path.Combine(
+                packageDirectory,
+                $"Turso.Data.Sqlite.Sync.{packageVersion}.nupkg");
+            using (var archive = ZipFile.OpenRead(packagePath))
+            {
+                var nuspecEntry = archive.Entries.Single(entry =>
+                    entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase));
+                using var nuspecStream = nuspecEntry.Open();
+                var facadeDependencyVersions = XDocument.Load(nuspecStream)
+                    .Descendants()
+                    .Where(element => element.Name.LocalName == "dependency")
+                    .Where(element =>
+                        string.Equals(
+                            element.Attribute("id")!.Value,
+                            "Turso.Data.Sqlite",
+                            StringComparison.Ordinal))
+                    .Select(element => element.Attribute("version")!.Value)
+                    .ToArray();
+
+                facadeDependencyVersions.Should().NotBeEmpty()
+                    .And.OnlyContain(version => version == packageVersion);
+            }
+
+            RunSyncPackageConsumer(packageDirectory, packageVersion);
         }
         finally
         {
@@ -220,6 +299,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
     {
         var loadContext = new AssemblyLoadContext("turso-package-validation", isCollectible: true);
         var loadContextReference = new WeakReference(loadContext);
+        var databasePath = Path.Combine(libraryDirectory, $"pool-{Guid.NewGuid():N}.db");
         Func<AssemblyLoadContext, AssemblyName, Assembly?> resolver =
             (_, assemblyName) => LoadPackageAssembly(loadContext, libraryDirectory, assemblyName);
         loadContext.Resolving += resolver;
@@ -229,13 +309,23 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             var connectionType = facadeAssembly.GetType("Turso.Data.Sqlite.SqliteConnection", throwOnError: true)!;
             using var connection = (IDisposable)Activator.CreateInstance(
                 connectionType,
-                "Data Source=:memory:;Local Provider=Managed")!;
+                $"Data Source={databasePath};Pooling=True;Local Provider=Managed")!;
 
             connectionType.GetMethod("Open")!.Invoke(connection, null);
             connectionType.GetMethod("Close")!.Invoke(connection, null);
+            connectionType.GetMethod("Open")!.Invoke(connection, null);
+            connectionType.GetMethod("ClearPool")!.Invoke(null, [connection]);
+            connectionType.GetMethod("Close")!.Invoke(connection, null);
+            connectionType.GetMethod("ClearAllPools")!.Invoke(null, null);
         }
         finally
         {
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                var candidate = databasePath + suffix;
+                if (File.Exists(candidate))
+                    File.Delete(candidate);
+            }
             loadContext.Resolving -= resolver;
             loadContext.Unload();
         }
@@ -324,7 +414,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         string? packageSource = null,
         string? packageVersion = null)
     {
-        var arguments = new List<string> { "restore", projectPath };
+        var arguments = new List<string> { "restore", projectPath, "--force-evaluate" };
         if (packageSource is not null)
         {
             arguments.Add("--source");
@@ -415,6 +505,62 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         RunDotnet(consumerDirectory, "run", "--no-restore", "--project", projectPath);
     }
 
+    private static void RunSyncPackageConsumer(string packageDirectory, string packageVersion)
+    {
+        var consumerDirectory = Path.Combine(packageDirectory, "sync-consumer");
+        Directory.CreateDirectory(consumerDirectory);
+        var projectPath = Path.Combine(consumerDirectory, "SyncConsumer.csproj");
+        File.WriteAllText(
+            projectPath,
+            $$"""
+              <Project Sdk="Microsoft.NET.Sdk">
+                <PropertyGroup>
+                  <OutputType>Exe</OutputType>
+                  <TargetFramework>net9.0</TargetFramework>
+                  <ImplicitUsings>enable</ImplicitUsings>
+                </PropertyGroup>
+                <ItemGroup>
+                  <PackageReference Include="Turso.Data.Sqlite.Sync" Version="{{packageVersion}}" />
+                </ItemGroup>
+              </Project>
+              """);
+        File.WriteAllText(
+            Path.Combine(consumerDirectory, "Program.cs"),
+            """
+            using Turso;
+            using Turso.Data.Sync;
+
+            ReplicaProviderRegistration.Register();
+            var factoryType = typeof(ReplicaProviderRegistration).Assembly.GetType(
+                "Turso.Data.Sync.SyncReplicaProviderFactory",
+                throwOnError: true)!;
+            var factory = (TursoReplicaProviderFactory)Activator.CreateInstance(
+                factoryType,
+                nonPublic: true)!;
+            using var replica = factory.OpenReplica(
+                new TursoReplicaOptions(
+                    ":memory:",
+                    new Uri("http://127.0.0.1:1"),
+                    authToken: null,
+                    bootstrapIfEmpty: false));
+            using var statement = replica.PrepareStatement("SELECT 42");
+            if (!statement.Read() || statement.GetValue(0).IntValue != 42 || statement.Read())
+                throw new InvalidOperationException("The packed Sync companion did not open its local replica.");
+            """);
+
+        RunDotnet(consumerDirectory, "restore", projectPath, "--source", packageDirectory);
+        using (var assetsStream = File.OpenRead(Path.Combine(consumerDirectory, "obj", "project.assets.json")))
+        using (var assets = JsonDocument.Parse(assetsStream))
+        {
+            var libraries = assets.RootElement.GetProperty("libraries");
+            libraries.TryGetProperty($"Turso.Data.Sqlite.Sync/{packageVersion}", out _).Should().BeTrue();
+            libraries.TryGetProperty($"Turso.Data.Sqlite/{packageVersion}", out _).Should().BeTrue(
+                "the Sync package must restore its matching managed facade");
+        }
+
+        RunDotnet(consumerDirectory, "run", "--no-restore", "--project", projectPath);
+    }
+
     private static void RestoreNativeAotPackageConsumer(string packageDirectory, string packageVersion)
     {
         var consumerDirectory = Path.Combine(packageDirectory, "nativeaot-consumer");
@@ -466,17 +612,67 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 </PropertyGroup>
                 <ItemGroup>
                   <PackageReference Include="Turso.Data.Sqlite" Version="{{packageVersion}}" />
+                  <PackageReference Include="Turso.EntityFrameworkCore.Sqlite" Version="{{packageVersion}}" />
                 </ItemGroup>
               </Project>
               """);
         File.WriteAllText(
             Path.Combine(consumerDirectory, "Program.cs"),
             """
+            using Microsoft.EntityFrameworkCore;
             using Turso.Data.Sqlite;
 
-            using (var managed = new SqliteConnection("Data Source=:memory:;Local Provider=Managed"))
+            const string key = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+            var path = Path.Combine(Path.GetTempPath(), $"turso-package-artifact-{Guid.NewGuid():N}.db");
+            var connectionString =
+                $"Data Source={path};Local Provider=Managed;Encryption Cipher=AES256GCM;Encryption Key={key}";
+            try
             {
-                managed.Open();
+                using (var encrypted = new SqliteConnection(connectionString))
+                {
+                    encrypted.Open();
+                    encrypted.ExecuteNonQuery("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('encrypted');");
+                }
+
+                using (var reopened = new SqliteConnection(connectionString))
+                {
+                    reopened.Open();
+                    if (reopened.ExecuteScalar<string>("SELECT value FROM data;") != "encrypted")
+                        throw new InvalidOperationException("The packed managed provider did not reopen encrypted data.");
+                }
+
+                using var unsupported = new SqliteConnection(
+                    $"Data Source={path};Local Provider=Managed;Encryption Cipher=AEGIS256;Encryption Key={key}");
+                try
+                {
+                    unsupported.Open();
+                    throw new InvalidOperationException("The packed managed provider accepted AEGIS.");
+                }
+                catch (NotSupportedException exception) when (
+                    exception.Message.Contains("cipher ID 1", StringComparison.Ordinal)
+                    && exception.Message.Contains("cipher ID 2", StringComparison.Ordinal))
+                {
+                }
+            }
+            finally
+            {
+                foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+                    File.Delete(path + suffix);
+            }
+
+            using var managed = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+            managed.Open();
+
+            var options = new DbContextOptionsBuilder<ManagedConsumerContext>()
+                .UseTurso(managed)
+                .Options;
+            await using (var context = new ManagedConsumerContext(options))
+            {
+                await context.Database.EnsureCreatedAsync();
+                context.Records.Add(new ManagedConsumerRecord { Value = "entity-framework" });
+                await context.SaveChangesAsync();
+                if ((await context.Records.SingleAsync()).Value != "entity-framework")
+                    throw new InvalidOperationException("The managed Entity Framework package consumer returned an unexpected result.");
             }
 
             using var native = new SqliteConnection("Data Source=:memory:;Local Provider=Native");
@@ -491,9 +687,34 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             }
 
             throw new InvalidOperationException("The managed package unexpectedly activated a native provider.");
+
+            sealed class ManagedConsumerContext(DbContextOptions<ManagedConsumerContext> options) : DbContext(options)
+            {
+                public DbSet<ManagedConsumerRecord> Records => Set<ManagedConsumerRecord>();
+            }
+
+            sealed class ManagedConsumerRecord
+            {
+                public int Id { get; init; }
+
+                public required string Value { get; init; }
+            }
             """);
 
-        RunDotnet(consumerDirectory, "restore", projectPath, "--source", packageDirectory);
+        var nugetConfigPath = Path.Combine(consumerDirectory, "NuGet.config");
+        File.WriteAllText(
+            nugetConfigPath,
+            $$"""
+              <?xml version="1.0" encoding="utf-8"?>
+              <configuration>
+                <packageSources>
+                  <clear />
+                  <add key="managed-package" value="{{System.Security.SecurityElement.Escape(packageDirectory)}}" />
+                  <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+                </packageSources>
+              </configuration>
+              """);
+        RunDotnet(consumerDirectory, "restore", projectPath, "--configfile", nugetConfigPath);
         AssertManagedConsumerRestoresNoNativeCompanions(consumerDirectory);
         RunDotnet(consumerDirectory, "build", projectPath, "--no-restore");
         RunDotnet(consumerDirectory, "run", projectPath, "--no-build", "--no-restore");
@@ -510,6 +731,73 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             "--output",
             publishDirectory);
         AssertManagedConsumerPublishOutputHasNoNativeAssets(publishDirectory);
+    }
+
+    private static void RunManagedReplicaOptionsConsumer(string packageDirectory, string packageVersion)
+    {
+        var consumerDirectory = Path.Combine(packageDirectory, "managed-replica-options-consumer");
+        Directory.CreateDirectory(consumerDirectory);
+        var projectPath = Path.Combine(consumerDirectory, "ManagedReplicaOptionsConsumer.csproj");
+        File.WriteAllText(
+            projectPath,
+            $$"""
+              <Project Sdk="Microsoft.NET.Sdk">
+                <PropertyGroup>
+                  <OutputType>Exe</OutputType>
+                  <TargetFramework>net9.0</TargetFramework>
+                  <ImplicitUsings>enable</ImplicitUsings>
+                </PropertyGroup>
+                <ItemGroup>
+                  <PackageReference Include="Turso.Data.Sqlite" Version="{{packageVersion}}" />
+                </ItemGroup>
+              </Project>
+              """);
+        File.WriteAllText(
+            Path.Combine(consumerDirectory, "Program.cs"),
+            """
+            using Turso;
+
+            var options = new TursoReplicaOptions(
+                "replica.db",
+                new Uri("https://example.turso.io"),
+                authToken: null)
+            {
+                LongPollTimeout = TimeSpan.FromSeconds(15),
+                PartialBootstrap = TursoPartialBootstrapOptions.Prefix(64 * 1024),
+                PushOperationsThreshold = 1000,
+                PullBytesThreshold = 1024 * 1024,
+            };
+            using var nullConnection = new TursoConnection(null!);
+            using var defaultConnection = new TursoConnection(default!);
+            using var replica = TursoConnection.CreateReplica(options);
+            try
+            {
+                replica.Open();
+            }
+            catch (NotSupportedException exception) when (
+                exception.Message.Contains("Turso.Data.Sqlite.Sync", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            throw new InvalidOperationException("The managed package unexpectedly activated embedded replica Sync.");
+            """);
+
+        var nugetConfigPath = Path.Combine(consumerDirectory, "NuGet.config");
+        File.WriteAllText(
+            nugetConfigPath,
+            $$"""
+              <?xml version="1.0" encoding="utf-8"?>
+              <configuration>
+                <packageSources>
+                  <clear />
+                  <add key="managed-package" value="{{System.Security.SecurityElement.Escape(packageDirectory)}}" />
+                </packageSources>
+              </configuration>
+              """);
+        RunDotnet(consumerDirectory, "restore", projectPath, "--configfile", nugetConfigPath);
+        AssertManagedConsumerRestoresNoNativeCompanions(consumerDirectory);
+        RunDotnet(consumerDirectory, "run", projectPath, "--no-restore");
     }
 
     private static void AssertManagedConsumerRestoresNoNativeCompanions(string consumerDirectory)
@@ -532,8 +820,10 @@ public class TursoDataSqlitePackageArtifactReleaseTests
     private static bool IsNativeCompanionPackage(string packageIdentity)
         => packageIdentity.StartsWith("Turso.Raw/", StringComparison.OrdinalIgnoreCase) ||
            packageIdentity.StartsWith("Turso.Data.Native/", StringComparison.OrdinalIgnoreCase) ||
+           packageIdentity.StartsWith("Turso.Data.Sync/", StringComparison.OrdinalIgnoreCase) ||
            packageIdentity.StartsWith("Turso.Data.Sqlite.Native/", StringComparison.OrdinalIgnoreCase) ||
-           packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot", StringComparison.OrdinalIgnoreCase);
+           packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot", StringComparison.OrdinalIgnoreCase) ||
+           packageIdentity.StartsWith("Turso.Data.Sqlite.Sync/", StringComparison.OrdinalIgnoreCase);
 
     private static void AssertManagedConsumerPublishOutputHasNoNativeAssets(string publishDirectory)
     {
@@ -542,9 +832,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             .Where(path => Path.GetFileName(path) is
                 "Turso.Raw.dll" or
                 "Turso.Data.Native.dll" or
+                "Turso.Data.Sync.dll" or
                 "turso_sdk_kit.dll" or
+                "turso_sync_sdk_kit.dll" or
                 "libturso_sdk_kit.so" or
+                "libturso_sync_sdk_kit.so" or
                 "libturso_sdk_kit.dylib" or
+                "libturso_sync_sdk_kit.dylib" or
                 "libturso_sdk_kit.a")
             .ToArray();
 

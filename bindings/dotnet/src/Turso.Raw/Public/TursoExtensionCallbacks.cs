@@ -23,7 +23,7 @@ public delegate void TursoContextDestructorCallback(IntPtr context);
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 public delegate void TursoValueDestructorCallback(IntPtr result);
 
-public enum TursoExtensionValueType
+public enum TursoExtensionValueType : uint
 {
     Null = 0,
     Integer = 1,
