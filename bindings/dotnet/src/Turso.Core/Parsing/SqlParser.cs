@@ -135,27 +135,28 @@ internal sealed class SqlParser
     private ParsedStatement ParsePragma()
     {
         var name = ExpectIdentifier();
+        string? schema = null;
         if (Consume(TokenKind.Dot))
         {
-            var schema = name;
+            schema = name;
             name = ExpectIdentifier();
-            if (!schema.Equals("main", StringComparison.OrdinalIgnoreCase))
-                throw Error($"Unsupported PRAGMA database {schema}.");
         }
 
         if (name.Equals("table_info", StringComparison.OrdinalIgnoreCase))
-            return new PragmaTableInfoStatement(ParsePragmaObjectName());
+            return new PragmaTableInfoStatement(ParsePragmaObjectName(schema));
         if (name.Equals("table_xinfo", StringComparison.OrdinalIgnoreCase))
-            return new PragmaTableXInfoStatement(ParsePragmaObjectName());
+            return new PragmaTableXInfoStatement(ParsePragmaObjectName(schema));
         if (name.Equals("index_list", StringComparison.OrdinalIgnoreCase))
-            return new PragmaIndexListStatement(ParsePragmaObjectName());
+            return new PragmaIndexListStatement(ParsePragmaObjectName(schema));
         if (name.Equals("index_info", StringComparison.OrdinalIgnoreCase))
-            return new PragmaIndexInfoStatement(ParsePragmaObjectName());
+            return new PragmaIndexInfoStatement(ParsePragmaObjectName(schema));
         if (name.Equals("table_list", StringComparison.OrdinalIgnoreCase))
         {
             RequireReadOnlyPragma(name);
-            return new PragmaTableListStatement();
+            return new PragmaTableListStatement(schema);
         }
+        if (schema is not null && !schema.Equals("main", StringComparison.OrdinalIgnoreCase))
+            throw Error($"Unsupported PRAGMA database {schema}.");
         if (name.Equals("database_list", StringComparison.OrdinalIgnoreCase))
         {
             RequireReadOnlyPragma(name);
@@ -198,12 +199,25 @@ internal sealed class SqlParser
         throw Error($"Unsupported PRAGMA {name}.");
     }
 
-    private string ParsePragmaObjectName()
+    private string ParsePragmaObjectName(string? pragmaSchema)
     {
         Expect(TokenKind.LeftParen);
-        var objectName = ExpectIdentifier();
+        var objectName = ParseSchemaQualifiedName();
         Expect(TokenKind.RightParen);
-        return objectName;
+        if (ManagedSchemaName.TrySplit(objectName, out var objectSchema, out var localName))
+        {
+            if (pragmaSchema is not null
+                && !pragmaSchema.Equals(objectSchema, StringComparison.OrdinalIgnoreCase))
+            {
+                throw Error("PRAGMA database qualifiers do not match.");
+            }
+
+            return objectName;
+        }
+
+        return pragmaSchema is null
+            ? objectName
+            : ManagedSchemaName.Create(pragmaSchema, localName);
     }
 
     private void RequireReadOnlyPragma(string name)
@@ -346,6 +360,16 @@ internal sealed class SqlParser
 
     private ParsedStatement ParseCreate()
     {
+        var temporary = ConsumeKeyword("TEMP") || ConsumeKeyword("TEMPORARY");
+        if (temporary)
+        {
+            if (CurrentIsKeyword("VIEW") || CurrentIsKeyword("TRIGGER"))
+                throw Error("Temporary triggers and views are not supported by the managed engine.");
+            if (!CurrentIsKeyword("TABLE"))
+                throw Error("Only temporary tables are supported by the managed engine.");
+
+            return ParseCreateTable(temporary: true);
+        }
         if (ConsumeKeyword("UNIQUE"))
         {
             ExpectKeyword("INDEX");
@@ -355,15 +379,19 @@ internal sealed class SqlParser
             return ParseCreateIndex(unique: false);
         if (ConsumeKeyword("VIEW"))
             return ParseCreateView();
-        if (CurrentIsKeyword("TEMP") || CurrentIsKeyword("TEMPORARY"))
-            throw Error("Temporary triggers and views are not supported.");
         if (ConsumeKeyword("TRIGGER"))
             return ParseCreateTrigger();
+        if (ConsumeKeyword("VIRTUAL"))
+        {
+            ExpectKeyword("TABLE");
+            throw Error(
+                "Managed virtual tables are not supported: no module registration, planner, or execution contract is available.");
+        }
 
-        return ParseCreateTable();
+        return ParseCreateTable(temporary: false);
     }
 
-    private ParsedStatement ParseCreateTable()
+    private ParsedStatement ParseCreateTable(bool temporary)
     {
         ExpectKeyword("TABLE");
         var ifNotExists = false;
@@ -375,6 +403,22 @@ internal sealed class SqlParser
         }
 
         var name = ParseSchemaQualifiedName();
+        if (temporary
+            && ManagedSchemaName.TrySplit(name, out var schema, out _)
+            && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            throw Error("temporary table name must be unqualified");
+        }
+        if (temporary && !ManagedSchemaName.TrySplit(name, out _, out _))
+            name = ManagedSchemaName.Create("temp", name);
+        if (ConsumeKeyword("AS"))
+        {
+            if (!IsQueryStart())
+                throw Error("Expected a SELECT query after AS.");
+
+            return new CreateTableAsSelectStatement(name, ParseQuery(), ifNotExists, temporary);
+        }
+
         Expect(TokenKind.LeftParen);
         var columns = new List<EmbeddedColumn>();
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null;
@@ -423,15 +467,37 @@ internal sealed class SqlParser
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
 
-        // WITHOUT ROWID makes the PRIMARY KEY the physical key; the trailing clause is only
-        // valid after the closing parenthesis, matching SQLite's grammar.
         var withoutRowid = false;
-        if (ConsumeKeyword("WITHOUT"))
+        var strict = false;
+        var optionRequired = false;
+        while (true)
         {
-            if (!ConsumeKeyword("ROWID"))
-                throw Error("Expected ROWID after WITHOUT.");
+            if (ConsumeKeyword("WITHOUT"))
+            {
+                if (withoutRowid)
+                    throw Error("WITHOUT ROWID may only be specified once.");
+                if (!ConsumeKeyword("ROWID"))
+                    throw Error("Expected ROWID after WITHOUT.");
 
-            withoutRowid = true;
+                withoutRowid = true;
+            }
+            else if (ConsumeKeyword("STRICT"))
+            {
+                if (strict)
+                    throw Error("STRICT may only be specified once.");
+
+                strict = true;
+            }
+            else
+            {
+                if (optionRequired)
+                    throw Error("Expected STRICT or WITHOUT ROWID after ','.");
+                break;
+            }
+
+            optionRequired = Consume(TokenKind.Comma);
+            if (!optionRequired)
+                break;
         }
 
         return new CreateTableStatement(
@@ -443,7 +509,8 @@ internal sealed class SqlParser
             uniqueConstraints,
             checkConstraints,
             tablePrimaryKeyConflictAlgorithm,
-            tablePrimaryKeyConstraintName);
+            tablePrimaryKeyConstraintName,
+            strict);
     }
 
     private abstract record TableConstraint;

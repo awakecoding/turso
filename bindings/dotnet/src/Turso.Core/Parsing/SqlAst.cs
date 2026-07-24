@@ -15,7 +15,15 @@ internal sealed record CreateTableStatement(
     IReadOnlyList<TableUniqueConstraint>? UniqueConstraints = null,
     IReadOnlyList<CheckConstraint>? CheckConstraints = null,
     InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm = null,
-    string? PrimaryKeyConstraintName = null) : ParsedStatement;
+    string? PrimaryKeyConstraintName = null,
+    bool Strict = false,
+    IReadOnlyList<SqlValue[]>? InitialRows = null) : ParsedStatement;
+
+internal sealed record CreateTableAsSelectStatement(
+    string Name,
+    QueryStatement Query,
+    bool IfNotExists,
+    bool Temporary) : ParsedStatement;
 
 internal sealed record DropTableStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -165,7 +173,7 @@ internal sealed record PragmaIndexListStatement(string TableName) : ParsedStatem
 
 internal sealed record PragmaIndexInfoStatement(string IndexName) : ParsedStatement;
 
-internal sealed record PragmaTableListStatement : ParsedStatement;
+internal sealed record PragmaTableListStatement(string? Schema = null) : ParsedStatement;
 
 internal sealed record PragmaDatabaseListStatement : ParsedStatement;
 

@@ -160,7 +160,7 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
             .WithMessage("Cross-database statements are not supported by managed ATTACH;*");
 
         var temporary = () => ReadRows(connection, "SELECT * FROM temp.items;");
-        temporary.Should().Throw<EmbeddedSqlException>().WithMessage("*temporary database*");
+        temporary.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: items");
     }
 
     [Test]
