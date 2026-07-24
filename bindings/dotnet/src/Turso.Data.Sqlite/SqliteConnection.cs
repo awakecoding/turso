@@ -8,7 +8,7 @@ using Turso.Core.Storage;
 
 namespace Turso.Data.Sqlite;
 
-public partial class SqliteConnection : DbConnection
+public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 {
     private const int SQLITE_ERROR = 1;
     private const int SQLITE_CANTOPEN = 14;
@@ -21,7 +21,7 @@ public partial class SqliteConnection : DbConnection
     private SqliteConnectionStringBuilder _connectionOptions = new();
     private bool _disposed;
     private int? _defaultTimeout;
-    private readonly HashSet<SqliteDataReader> _openReaders = [];
+    private readonly HashSet<IConnectionOwnedReader> _openReaders = [];
     private readonly object _readerGate = new();
     private readonly ManualResetEventSlim _noOpenReaders = new(initialState: true);
     private readonly HashSet<SqliteBlob> _openManagedBlobs = [];
@@ -99,6 +99,8 @@ public partial class SqliteConnection : DbConnection
     public override ConnectionState State => _database is null && _managedDatabase is null
         ? ConnectionState.Closed
         : ConnectionState.Open;
+
+    public override bool CanCreateBatch => true;
 
     protected override DbProviderFactory DbProviderFactory => SqliteFactory.Instance;
 
@@ -496,6 +498,8 @@ public partial class SqliteConnection : DbConnection
 
     protected override DbCommand CreateDbCommand() => CreateCommand();
 
+    protected override DbBatch CreateDbBatch() => new SqliteBatch(this);
+
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
         => BeginTransaction(isolationLevel);
 
@@ -527,7 +531,7 @@ public partial class SqliteConnection : DbConnection
         get
         {
             lock (_readerGate)
-                return _openReaders.Count != 0;
+                return _openReaders.Any(static reader => reader is SqliteDataReader);
         }
     }
 
@@ -537,24 +541,29 @@ public partial class SqliteConnection : DbConnection
 
     internal bool RecursiveTriggers => _recursiveTriggers;
 
-    internal void ReaderOpened(SqliteDataReader reader)
+    void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
         lock (_readerGate)
         {
             if (!_openReaders.Add(reader))
                 throw new InvalidOperationException("The data reader is already registered with this connection.");
-            _noOpenReaders.Reset();
+            if (reader is SqliteDataReader)
+                _noOpenReaders.Reset();
         }
     }
 
-    internal void ReaderClosed(SqliteDataReader reader)
+    void ILocalReaderConnection.ReaderClosed(IConnectionOwnedReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
         lock (_readerGate)
         {
-            if (_openReaders.Remove(reader) && _openReaders.Count == 0)
+            if (_openReaders.Remove(reader)
+                && reader is SqliteDataReader
+                && !_openReaders.Any(static openReader => openReader is SqliteDataReader))
+            {
                 _noOpenReaders.Set();
+            }
         }
     }
 
@@ -862,7 +871,7 @@ public partial class SqliteConnection : DbConnection
 
     private void CloseOpenReaders()
     {
-        SqliteDataReader[] readers;
+        IConnectionOwnedReader[] readers;
         lock (_readerGate)
             readers = _openReaders.ToArray();
         foreach (var reader in readers)

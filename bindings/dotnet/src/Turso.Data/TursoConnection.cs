@@ -6,7 +6,7 @@ using Turso.Core.Storage;
 
 namespace Turso;
 
-public class TursoConnection : DbConnection
+public class TursoConnection : DbConnection, ILocalReaderConnection
 {
     private TursoNativeDatabase? _nativeDatabase;
     private TursoReplicaDatabase? _replicaDatabase;
@@ -23,7 +23,7 @@ public class TursoConnection : DbConnection
     private bool _managedSharedMemory;
     private bool _remoteTransactionActive;
     private bool _managedReadOnly;
-    private readonly HashSet<TursoDataReader> _openReaders = [];
+    private readonly HashSet<IConnectionOwnedReader> _openReaders = [];
     private readonly object _readerLock = new();
     private readonly HashSet<TursoCommand> _openCommands = [];
     private TursoTransaction? _transaction;
@@ -53,7 +53,7 @@ public class TursoConnection : DbConnection
         ? ConnectionState.Open
         : ConnectionState.Closed;
 
-    public override bool CanCreateBatch => _connectionOptions.IsRemote && !_connectionOptions.IsReplica;
+    public override bool CanCreateBatch => !_connectionOptions.IsReplica;
 
     protected override DbProviderFactory DbProviderFactory => TursoFactory.Instance;
 
@@ -133,7 +133,15 @@ public class TursoConnection : DbConnection
         _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: true);
         if (_remoteClient is not null)
         {
-            CloseRemote();
+            try
+            {
+                _transaction?.Dispose();
+            }
+            finally
+            {
+                CloseRemote();
+                _transaction = null;
+            }
             return;
         }
 
@@ -176,6 +184,7 @@ public class TursoConnection : DbConnection
                     _readUncommitted = false;
                     _managedSharedMemory = false;
                     _managedReadOnly = false;
+                    _transaction = null;
                 }
             }
         }
@@ -202,7 +211,6 @@ public class TursoConnection : DbConnection
         {
             throw new InvalidOperationException("Turso database is closed.");
         }
-
         if (_transaction is not null)
             throw new InvalidOperationException("Parallel transactions are not supported.");
 
@@ -217,7 +225,7 @@ public class TursoConnection : DbConnection
     protected override DbBatch CreateDbBatch()
     {
         if (!CanCreateBatch)
-            throw new NotSupportedException("Turso batch execution is currently supported only for remote connections.");
+            throw new NotSupportedException("Turso batch execution is not supported for embedded replica connections.");
 
         return new TursoBatch(this);
     }
@@ -287,6 +295,8 @@ public class TursoConnection : DbConnection
 
     internal bool IsManaged => _managedDatabase is not null;
 
+    internal TursoTransaction? Transaction => _transaction;
+
     internal bool ReadUncommitted
     {
         get => _readUncommitted;
@@ -311,13 +321,13 @@ public class TursoConnection : DbConnection
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("Turso database is closed.");
 
-    internal void ReaderOpened(TursoDataReader reader)
+    void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader)
     {
         lock (_readerLock)
             _openReaders.Add(reader);
     }
 
-    internal void ReaderClosed(TursoDataReader reader)
+    void ILocalReaderConnection.ReaderClosed(IConnectionOwnedReader reader)
     {
         lock (_readerLock)
             _openReaders.Remove(reader);
@@ -333,8 +343,11 @@ public class TursoConnection : DbConnection
             _transaction = null;
     }
 
-    internal void TransactionCompletedExternally()
+    internal void TransactionCompletedExternally(SqlTransactionCompletion completion)
     {
+        if (completion == SqlTransactionCompletion.None)
+            return;
+
         _remoteTransactionActive = false;
         _transaction?.MarkCompletedExternally();
         CloseRemoteSessionIfStateless();
@@ -375,7 +388,14 @@ public class TursoConnection : DbConnection
         var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
         try
         {
-            return await remoteClient.ExecuteBatchAsync(batchCommands, commandTimeout, wantRows, closeAfter, cancellationToken)
+            return await remoteClient.ExecuteBatchAsync(
+                    batchCommands,
+                    commandTimeout,
+                    wantRows,
+                    closeAfter,
+                    cancellationToken,
+                    step => TransactionCompletedExternally(
+                        SqlTransactionControl.GetCompletion(batchCommands[step].CommandText)))
                 .ConfigureAwait(false);
         }
         catch (TursoRemoteSqlException)
@@ -772,7 +792,7 @@ public class TursoConnection : DbConnection
 
     private void CloseOpenReaders()
     {
-        TursoDataReader[] readers;
+        IConnectionOwnedReader[] readers;
         lock (_readerLock)
             readers = _openReaders.ToArray();
         foreach (var reader in readers)

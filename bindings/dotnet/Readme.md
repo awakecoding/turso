@@ -248,7 +248,7 @@ var name = await command.ExecuteScalarAsync();
 
 Remote mode uses the Hrana HTTP `/v2/pipeline` protocol. `libsql://` URLs default to HTTPS; `Tls=False` maps them to HTTP for local development. `ws://` and `wss://` URLs are accepted and mapped to the equivalent HTTP pipeline endpoint. `Auth Token` requires HTTPS unless the host is `localhost` or loopback.
 
-Remote mode also supports ADO.NET `DbBatch` for latency-sensitive workloads that should be sent in one Hrana batch:
+Local and remote connections support ADO.NET `DbBatch`:
 
 ```C#
 await using var batch = connection.CreateBatch();
@@ -267,6 +267,8 @@ batch.BatchCommands.Add(select);
 
 await using var reader = await batch.ExecuteReaderAsync();
 ```
+
+Local batches execute each batch command in order on one connection and expose command boundaries through `DbDataReader.NextResult()`. Each command has its own parameters and affected-row count. Local batches do not create an implicit transaction: completed commands remain committed if a later command fails unless the batch is associated with an explicit transaction. Transaction association is refreshed between commands, so commands after an explicit `COMMIT` or full `ROLLBACK` run outside the completed transaction. Closing or disposing a reader drains the remaining commands; `Cancel()` or cancellation stops before the next command. Remote batches preserve the existing single Hrana batch request.
 
 Provider factories are available through `TursoFactory.Instance`:
 

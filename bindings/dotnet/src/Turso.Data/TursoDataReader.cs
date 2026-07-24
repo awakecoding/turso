@@ -7,16 +7,17 @@ using Turso.Core;
 
 namespace Turso;
 
-public class TursoDataReader : DbDataReader
+public class TursoDataReader : DbDataReader, IConnectionOwnedReader
 {
     private readonly TursoCommand _command;
     private readonly TursoConnection _connection;
     private readonly TursoNativeStatement? _nativeStatement;
     private readonly IManagedStatementAdapter? _managedStatement;
     private readonly CommandBehavior _behavior;
-    private readonly bool _completesTransaction;
+    private readonly Action _completionCallback;
     private bool _isClosed;
     private bool _hasCurrentRow;
+    private bool _completionNotified;
 
     private enum ReaderValueKind
     {
@@ -84,6 +85,16 @@ public class TursoDataReader : DbDataReader
         TursoNativeStatement? nativeStatement,
         IManagedStatementAdapter? managedStatement,
         CommandBehavior behavior)
+        : this(command, nativeStatement, managedStatement, behavior, static () => { })
+    {
+    }
+
+    internal TursoDataReader(
+        TursoCommand command,
+        TursoNativeStatement? nativeStatement,
+        IManagedStatementAdapter? managedStatement,
+        CommandBehavior behavior,
+        Action completionCallback)
     {
         if ((nativeStatement is null) == (managedStatement is null))
             throw new ArgumentException("A reader requires exactly one statement implementation.");
@@ -94,9 +105,8 @@ public class TursoDataReader : DbDataReader
         _nativeStatement = nativeStatement;
         _managedStatement = managedStatement;
         _behavior = behavior;
-        _completesTransaction =
-            SqlTransactionControl.GetCompletion(command.CommandText) != SqlTransactionCompletion.None;
-        _connection.ReaderOpened(this);
+        _completionCallback = completionCallback;
+        ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
     public override bool GetBoolean(int ordinal)
@@ -306,8 +316,8 @@ public class TursoDataReader : DbDataReader
         {
         }
 
-        MarkTransactionCompletedExternally();
         _hasCurrentRow = false;
+        NotifyCompletion();
         return false;
     }
 
@@ -324,7 +334,7 @@ public class TursoDataReader : DbDataReader
         base.Dispose(disposing);
     }
 
-    internal void CloseFromConnection() => CloseCore(closeConnection: false);
+    void IConnectionOwnedReader.CloseFromConnection() => CloseCore(closeConnection: false);
 
     public override bool Read()
         => _command.RunOperation(ReadCore);
@@ -334,7 +344,7 @@ public class TursoDataReader : DbDataReader
         EnsureOpen();
         _hasCurrentRow = Step(cancellationToken);
         if (!_hasCurrentRow)
-            MarkTransactionCompletedExternally();
+            NotifyCompletion();
         return _hasCurrentRow;
     }
 
@@ -519,6 +529,15 @@ public class TursoDataReader : DbDataReader
             throw new InvalidOperationException("The data reader is closed.");
     }
 
+    private void NotifyCompletion()
+    {
+        if (_completionNotified)
+            return;
+
+        _completionNotified = true;
+        _completionCallback();
+    }
+
     private void CloseCore(bool closeConnection)
     {
         if (_isClosed)
@@ -534,15 +553,10 @@ public class TursoDataReader : DbDataReader
         {
             _hasCurrentRow = false;
             _isClosed = true;
-            _connection.ReaderClosed(this);
+            ((ILocalReaderConnection)_connection).ReaderClosed(this);
             if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
                 _connection.Close();
         }
     }
 
-    private void MarkTransactionCompletedExternally()
-    {
-        if (_completesTransaction)
-            _connection.TransactionCompletedExternally();
-    }
 }

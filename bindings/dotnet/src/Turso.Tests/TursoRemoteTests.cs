@@ -232,16 +232,29 @@ public class TursoRemoteTests
     }
 
     [Test]
-    public void TestCanCreateBatchIsRemoteOnly()
+    public void TestCanCreateBatchSupportsLocalAndRemoteConnections()
     {
         using var localConnection = new TursoConnection("Data Source=:memory:");
-        localConnection.CanCreateBatch.Should().BeFalse();
-        localConnection.Invoking(x => x.CreateBatch())
-            .Should().Throw<NotSupportedException>()
-            .WithMessage("Turso batch execution is currently supported only for remote connections.");
+        localConnection.CanCreateBatch.Should().BeTrue();
+        localConnection.CreateBatch().Should().BeOfType<TursoBatch>();
 
         using var remoteConnection = new TursoConnection("Data Source=https://example.com");
         remoteConnection.CanCreateBatch.Should().BeTrue();
+    }
+
+    [Test]
+    public async Task TestRemoteBatchHonorsPreCanceledTokenBeforeValidation()
+    {
+        using var connection = new TursoConnection("Data Source=http://localhost:1");
+        connection.Open();
+        using var batch = (TursoBatch)connection.CreateBatch();
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+
+        var execution = batch.ExecuteNonQueryAsync(cancellation.Token);
+
+        execution.IsCanceled.Should().BeTrue();
+        Assert.ThrowsAsync<OperationCanceledException>(async () => await execution);
     }
 
     [Test]
@@ -1380,6 +1393,137 @@ public class TursoRemoteTests
     }
 
     [Test]
+    public void TestRemoteBatchScalarSkipsNonQueryResults()
+    {
+        const string responseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "batch",
+                    "result": {
+                      "step_results": [
+                        {
+                          "cols": [],
+                          "rows": [],
+                          "affected_row_count": 1,
+                          "last_insert_rowid": "1"
+                        },
+                        {
+                          "cols": [
+                            { "name": "n", "decltype": "INTEGER" }
+                          ],
+                          "rows": [
+                            [
+                              { "type": "integer", "value": "42" }
+                            ]
+                          ],
+                          "affected_row_count": 0,
+                          "last_insert_rowid": null
+                        }
+                      ],
+                      "step_errors": [null, null]
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        using var batch = (TursoBatch)connection.CreateBatch();
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO t VALUES (1)"));
+        batch.BatchCommands.Add(new TursoBatchCommand("SELECT 42"));
+
+        batch.ExecuteScalar().Should().Be(42L);
+    }
+
+    [Test]
+    public void TestRemoteBatchTracksSuccessfulCommitBeforeLaterStepFailure()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+        const string batchResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "batch",
+                    "result": {
+                      "step_results": [
+                        {
+                          "cols": [],
+                          "rows": [],
+                          "affected_row_count": 0,
+                          "last_insert_rowid": null
+                        },
+                        null
+                      ],
+                      "step_errors": [
+                        null,
+                        {
+                          "message": "no such table: missing",
+                          "code": "SQLITE_ERROR"
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+        const string closeResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, batchResponseJson, closeResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        using var batch = (TursoBatch)connection.CreateBatch();
+        batch.BatchCommands.Add(new TursoBatchCommand("COMMIT"));
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO missing VALUES (1)"));
+
+        batch.Invoking(static value => value.ExecuteNonQuery())
+            .Should().Throw<TursoException>()
+            .WithMessage("Remote SQL execution failed: no such table: missing (SQLITE_ERROR)");
+
+        transaction.Invoking(static value => value.Commit())
+            .Should().Throw<InvalidOperationException>();
+        GetPrivateField<bool>(connection, "_remoteTransactionActive").Should().BeFalse();
+        GetPrivateField<object?>(connection, "_transaction").Should().BeNull();
+    }
+
+    [Test]
     public void TestRemoteBatchNonQueryUsesNoRowsAndIgnoresTrailingCloseError()
     {
         const string responseJson = """
@@ -1603,6 +1747,15 @@ public class TursoRemoteTests
 
             server.Completion.IsCompletedSuccessfully.Should().BeTrue();
         }
+    }
+
+    private static T GetPrivateField<T>(object instance, string name)
+    {
+        var field = instance.GetType().GetField(
+            name,
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        field.Should().NotBeNull();
+        return (T)field!.GetValue(instance)!;
     }
 
     private sealed class TestRemoteServer : IDisposable

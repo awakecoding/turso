@@ -409,7 +409,13 @@ public class TursoCommand : DbCommand
             throw new InvalidOperationException("Command was not prepared.");
         _nativeStatement = null;
         _managedStatement = null;
-        var reader = new TursoDataReader(this, nativeStatement, managedStatement, behavior);
+        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
+        var reader = new TursoDataReader(
+            this,
+            nativeStatement,
+            managedStatement,
+            behavior,
+            () => MarkTransactionCompletedExternally(transactionCompletion));
         return reader;
     }
 
@@ -507,8 +513,7 @@ public class TursoCommand : DbCommand
 
     private void MarkTransactionCompletedExternally(SqlTransactionCompletion completion)
     {
-        if (completion != SqlTransactionCompletion.None)
-            _connection?.TransactionCompletedExternally();
+        _connection?.TransactionCompletedExternally(completion);
     }
 
     private void ValidateTransaction()

@@ -40,7 +40,11 @@ public class TursoTransaction : DbTransaction
 
     internal bool IsCompleted => _completed;
 
-    internal void MarkCompletedExternally() => CompleteTransaction();
+    internal void MarkCompletedExternally()
+    {
+        if (!_completed)
+            CompleteTransaction();
+    }
 
     protected override DbConnection? DbConnection => _connection;
 

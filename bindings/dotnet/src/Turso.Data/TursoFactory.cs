@@ -10,6 +10,12 @@ public sealed class TursoFactory : DbProviderFactory
     {
     }
 
+    public override bool CanCreateBatch => true;
+
+    public override DbBatch CreateBatch() => new TursoBatch();
+
+    public override DbBatchCommand CreateBatchCommand() => new TursoBatchCommand();
+
     public override DbCommand CreateCommand() => new TursoCommand();
 
     public override DbConnection CreateConnection() => new TursoConnection();
