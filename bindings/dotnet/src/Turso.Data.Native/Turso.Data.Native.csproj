@@ -7,7 +7,7 @@
 
     <PackageId>Turso.Data.Sqlite.Native</PackageId>
     <Title>Turso native local-provider companion</Title>
-    <Description>Optional native Turso SDK provider for applications that explicitly select Local Provider=Native.</Description>
+    <Description>Optional dynamic native local-provider companion for Turso.Data.Sqlite. Select Local Provider=Native; Turso.Raw supplies the desktop and mobile runtime assets.</Description>
     <Authors>Turso authors</Authors>
     <PackageTags>turso;sqlite;database;native;interop</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

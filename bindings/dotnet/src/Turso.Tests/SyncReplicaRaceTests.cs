@@ -51,6 +51,113 @@ public sealed class SyncReplicaRaceTests
     }
 
     [Test]
+    public async Task ClosingConnectionCancelsExplicitSyncAndAllowsReopen()
+    {
+        using var handler = new ControlledHandler(
+            static (_, _, cancellationToken) => HoldRequestAsync(cancellationToken));
+        using var connection = TursoConnection.CreateReplica(
+            new TursoReplicaOptions(
+                ":memory:",
+                new Uri("http://127.0.0.1"),
+                authToken: null,
+                bootstrapIfEmpty: false)
+            {
+                HttpPolicy = new TursoSyncHttpPolicy(handler),
+            });
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 42;";
+        using var reader = command.ExecuteReader();
+        reader.Read().Should().BeTrue();
+        var sync = connection.SyncAsync(CancellationToken.None);
+        await handler.WaitForRequestAsync(1);
+
+        var close = Task.Run(connection.Close);
+
+        await AssertCanceledAsync(sync);
+        await close.WaitAsync(TimeSpan.FromSeconds(5));
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        reader.IsClosed.Should().BeTrue();
+
+        connection.Open();
+        connection.ExecuteNonQuery("SELECT 42;").Should().Be(0);
+        connection.Close();
+    }
+
+    [Test]
+    public async Task CloseSurfacesCancellationCallbackFailureAfterCleanup()
+    {
+        using var handler = new ControlledHandler(
+            static async (_, _, cancellationToken) =>
+            {
+                using var registration = cancellationToken.Register(
+                    static () => throw new InvalidOperationException("synthetic cancellation callback failure"));
+                return await HoldRequestAsync(cancellationToken);
+            });
+        using var connection = TursoConnection.CreateReplica(
+            new TursoReplicaOptions(
+                ":memory:",
+                new Uri("http://127.0.0.1"),
+                authToken: null,
+                bootstrapIfEmpty: false)
+            {
+                HttpPolicy = new TursoSyncHttpPolicy(handler),
+            });
+        connection.Open();
+        var sync = connection.SyncAsync(CancellationToken.None);
+        await handler.WaitForRequestAsync(1);
+
+        var close = async () => await Task.Run(connection.Close).WaitAsync(TimeSpan.FromSeconds(5));
+
+        var exception = await close.Should().ThrowAsync<AggregateException>();
+        exception.Which.Flatten().InnerExceptions.Should().ContainSingle(
+            error => error is InvalidOperationException
+                && error.Message == "synthetic cancellation callback failure");
+        await AssertCanceledAsync(sync);
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+
+        connection.Open();
+        connection.ExecuteNonQuery("SELECT 42;").Should().Be(0);
+        connection.Close();
+    }
+
+    [Test]
+    public async Task DisposeSurfacesCancellationCallbackFailureAfterReleasingOwnedResources()
+    {
+        using var handler = new ControlledHandler(
+            static async (_, _, cancellationToken) =>
+            {
+                using var registration = cancellationToken.Register(
+                    static () => throw new InvalidOperationException("synthetic cancellation callback failure"));
+                return await HoldRequestAsync(cancellationToken);
+            });
+        var connection = TursoConnection.CreateReplica(
+            new TursoReplicaOptions(
+                ":memory:",
+                new Uri("http://127.0.0.1"),
+                authToken: null,
+                bootstrapIfEmpty: false)
+            {
+                HttpPolicy = new TursoSyncHttpPolicy(handler, disposeMessageHandler: true),
+            });
+        connection.Open();
+        var sync = connection.SyncAsync(CancellationToken.None);
+        await handler.WaitForRequestAsync(1);
+
+        var dispose = async () => await Task.Run(connection.Dispose).WaitAsync(TimeSpan.FromSeconds(5));
+
+        var exception = await dispose.Should().ThrowAsync<AggregateException>();
+        exception.Which.Flatten().InnerExceptions.Should().ContainSingle(
+            error => error is InvalidOperationException
+                && error.Message == "synthetic cancellation callback failure");
+        await AssertCanceledAsync(sync);
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        handler.IsDisposed.Should().BeTrue();
+        connection.Invoking(x => x.Open()).Should().Throw<ObjectDisposedException>();
+        connection.Dispose();
+    }
+
+    [Test]
     public async Task StreamingFailureCompletesNativeIoAndAllowsAnotherSyncAttempt()
     {
         using var handler = new ControlledHandler((request, _, cancellationToken) =>
@@ -259,6 +366,8 @@ public sealed class SyncReplicaRaceTests
 
         public IReadOnlyList<string> RequestPaths => _requestPaths.ToArray();
 
+        public bool IsDisposed { get; private set; }
+
         public Task WaitForRequestAsync(int request)
             => GetRequest(request).Task.WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -296,6 +405,12 @@ public sealed class SyncReplicaRaceTests
                 if (Interlocked.CompareExchange(ref _maximumActiveRequests, activeRequests, maximum) == maximum)
                     return;
             }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            IsDisposed = true;
+            base.Dispose(disposing);
         }
     }
 

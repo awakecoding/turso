@@ -10,7 +10,7 @@
 
     <PackageId>Turso.Data.Sqlite</PackageId>
     <Title>Turso SQLite-compatible ADO.NET Provider</Title>
-    <Description>SQLite-compatible ADO.NET facade for Turso, intended to ease migration from Microsoft.Data.Sqlite.</Description>
+    <Description>Managed ADO.NET package for Turso: TursoConnection supports managed local and remote Hrana databases, while Turso.Data.Sqlite is a local-only Microsoft.Data.Sqlite-compatible facade. Native local and embedded replica modes use optional companion packages.</Description>
     <Authors>Turso authors</Authors>
     <PackageTags>turso;sqlite;database;ado.net;system.data</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

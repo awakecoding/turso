@@ -348,6 +348,81 @@ public sealed class DurableIndexSemanticsTests
         }
     }
 
+    [Test]
+    public void LimitedDmlNullPlacementPreservesRichIndexOrdering()
+    {
+        var path = CreateDatabasePath("limited-dml-null-order");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE ranked(id INTEGER PRIMARY KEY, label TEXT, marker TEXT);
+                    INSERT INTO ranked VALUES
+                        (1, 'b', NULL),
+                        (2, 'A', NULL),
+                        (3, NULL, NULL),
+                        (4, 'a', NULL),
+                        (5, NULL, NULL);
+                    CREATE INDEX ranked_label
+                        ON ranked(label COLLATE NOCASE DESC);
+                    """);
+
+                Query(
+                        connection,
+                        """
+                        UPDATE ranked SET marker = 'updated'
+                        RETURNING id
+                        ORDER BY label COLLATE NOCASE DESC NULLS FIRST, id ASC
+                        LIMIT 2;
+                        """)
+                    .Select(row => row[0].AsInteger())
+                    .Order()
+                    .Should().Equal(3, 5);
+                Query(
+                        connection,
+                        """
+                        DELETE FROM ranked
+                        RETURNING id
+                        ORDER BY label COLLATE NOCASE ASC NULLS LAST, id DESC
+                        LIMIT 1;
+                        """)
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(4);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Query(connection, "SELECT id FROM ranked WHERE marker = 'updated' ORDER BY id;")
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(3, 5);
+                Query(connection, "SELECT id FROM ranked ORDER BY id;")
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(1, 2, 3, 5);
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            QueryIntegers(
+                    sqlite,
+                    """
+                    SELECT id FROM ranked INDEXED BY ranked_label
+                    ORDER BY label COLLATE NOCASE DESC, id ASC;
+                    """)
+                .Should().Equal(1, 2, 3, 5);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void FailedRichIndexRewriteRecoversAtomicallyInWalAndDeleteModes(bool deleteMode)

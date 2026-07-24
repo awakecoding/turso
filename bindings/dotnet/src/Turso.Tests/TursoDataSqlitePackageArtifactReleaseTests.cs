@@ -12,6 +12,18 @@ namespace Turso.Tests;
 public class TursoDataSqlitePackageArtifactReleaseTests
 {
     private const string RawPackageTargetFrameworks = "net8.0;net9.0;net10.0";
+    private const string ManagedPackageDescription =
+        "Managed ADO.NET package for Turso: TursoConnection supports managed local and remote Hrana databases, while Turso.Data.Sqlite is a local-only Microsoft.Data.Sqlite-compatible facade. Native local and embedded replica modes use optional companion packages.";
+    private const string NativePackageDescription =
+        "Optional dynamic native local-provider companion for Turso.Data.Sqlite. Select Local Provider=Native; Turso.Raw supplies the desktop and mobile runtime assets.";
+    private const string SyncPackageDescription =
+        "Optional native embedded-replica and explicit Sync companion for TursoConnection, with desktop and mobile runtime assets.";
+    private const string RawPackageDescription =
+        "Dynamic native interop and runtime assets for the optional Turso.Data.Sqlite.Native local provider on Windows, Linux, macOS, Android, and iOS.";
+    private const string EfPackageDescription =
+        "Local-only Entity Framework Core 9.x provider for Turso.Data.Sqlite, using EF Core SQLite translation with managed or native local execution.";
+    private const string NativeAotPackageDescription =
+        "RID-specific static native library assets for net8.0, net9.0, and net10.0 NativeAOT desktop publishing with Turso.Data.Sqlite.";
 
     [Test]
     public void PackageContainsManagedDependenciesWithoutRawAndLoadsManagedConnection()
@@ -22,19 +34,24 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         {
             var projectPath = FindProjectPath();
             var packageVersion = $"0.0.0-package-validation-{Guid.NewGuid():N}";
+            var efProjectPath = Path.Combine(
+                Path.GetDirectoryName(projectPath)!,
+                "..",
+                "Turso.EntityFrameworkCore.Sqlite",
+                "Turso.EntityFrameworkCore.Sqlite.csproj");
             BuildForPackage(projectPath, "net9.0");
+            BuildForPackage(efProjectPath, "net9.0");
             Pack(projectPath, packageDirectory, packageVersion);
-            Pack(
-                Path.Combine(
-                    Path.GetDirectoryName(projectPath)!,
-                    "..",
-                    "Turso.EntityFrameworkCore.Sqlite",
-                    "Turso.EntityFrameworkCore.Sqlite.csproj"),
-                packageDirectory,
-                packageVersion);
+            Pack(efProjectPath, packageDirectory, packageVersion);
 
             var packagePath = Path.Combine(packageDirectory, $"Turso.Data.Sqlite.{packageVersion}.nupkg");
             File.Exists(packagePath).Should().BeTrue();
+            AssertPackageMetadata(packagePath, ManagedPackageDescription);
+            AssertPackageMetadata(
+                Path.Combine(
+                    packageDirectory,
+                    $"Turso.EntityFrameworkCore.Sqlite.{packageVersion}.nupkg"),
+                EfPackageDescription);
 
             var extractionDirectory = Path.Combine(packageDirectory, "extracted");
             ZipFile.ExtractToDirectory(packagePath, extractionDirectory);
@@ -96,7 +113,9 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         try
         {
             var packageVersion = $"0.0.0-managed-replica-options-{Guid.NewGuid():N}";
-            Pack(FindProjectPath(), packageDirectory, packageVersion);
+            var projectPath = FindProjectPath();
+            BuildForPackage(projectPath, "net9.0");
+            Pack(projectPath, packageDirectory, packageVersion);
             RunManagedReplicaOptionsConsumer(packageDirectory, packageVersion);
         }
         finally
@@ -114,7 +133,9 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         {
             var packageVersion = $"0.0.0-native-package-validation-{Guid.NewGuid():N}";
             var projectDirectory = Path.GetDirectoryName(FindProjectPath())!;
-            Pack(Path.Combine(projectDirectory, "Turso.Data.Sqlite.csproj"), packageDirectory, packageVersion);
+            var sqliteProjectPath = Path.Combine(projectDirectory, "Turso.Data.Sqlite.csproj");
+            BuildForPackage(sqliteProjectPath, "net9.0");
+            Pack(sqliteProjectPath, packageDirectory, packageVersion);
             PackRawPackage(
                 Path.Combine(projectDirectory, "..", "Turso.Raw", "Turso.Raw.csproj"),
                 packageDirectory,
@@ -124,6 +145,9 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             BuildNativeCompanion(nativeProjectPath);
             Pack(nativeProjectPath, packageDirectory, packageVersion);
 
+            AssertPackageMetadata(
+                Path.Combine(packageDirectory, $"Turso.Data.Sqlite.Native.{packageVersion}.nupkg"),
+                NativePackageDescription);
             RunNativePackageConsumer(packageDirectory, packageVersion);
         }
         finally
@@ -148,6 +172,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 "Turso.Data.Sync",
                 "Turso.Data.Sync.csproj");
 
+            BuildForPackage(sqliteProjectPath, "net9.0");
             Pack(sqliteProjectPath, packageDirectory, packageVersion);
             Restore(syncProjectPath);
             BuildForPackage(syncProjectPath, "net9.0");
@@ -156,6 +181,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             var packagePath = Path.Combine(
                 packageDirectory,
                 $"Turso.Data.Sqlite.Sync.{packageVersion}.nupkg");
+            AssertPackageMetadata(packagePath, SyncPackageDescription);
             using (var archive = ZipFile.OpenRead(packagePath))
             {
                 var nuspecEntry = archive.Entries.Single(entry =>
@@ -198,6 +224,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
             var packagePath = Path.Combine(packageDirectory, $"Turso.Raw.{packageVersion}.nupkg");
             File.Exists(packagePath).Should().BeTrue();
+            AssertPackageMetadata(packagePath, RawPackageDescription);
 
             using var archive = ZipFile.OpenRead(packagePath);
             foreach (var targetFramework in RawPackageTargetFrameworks.Split(';'))
@@ -263,6 +290,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 packageDirectory,
                 $"Turso.Data.Sqlite.NativeAot.win-x64.{packageVersion}.nupkg");
             File.Exists(packagePath).Should().BeTrue();
+            AssertPackageMetadata(packagePath, NativeAotPackageDescription);
 
             using (var archive = ZipFile.OpenRead(packagePath))
             {
@@ -331,6 +359,30 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         }
 
         return loadContextReference;
+    }
+
+    private static void AssertPackageMetadata(string packagePath, string expectedDescription)
+    {
+        using var archive = ZipFile.OpenRead(packagePath);
+        archive.Entries.Should().Contain(entry =>
+            string.Equals(entry.FullName, "README.md", StringComparison.OrdinalIgnoreCase));
+
+        var nuspecEntry = archive.Entries.Single(entry =>
+            entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase));
+        using var nuspecStream = nuspecEntry.Open();
+        var metadata = XDocument.Load(nuspecStream)
+            .Descendants()
+            .Single(element => element.Name.LocalName == "metadata");
+        metadata.Elements()
+            .Single(element => element.Name.LocalName == "description")
+            .Value
+            .Should()
+            .Be(expectedDescription);
+        metadata.Elements()
+            .Single(element => element.Name.LocalName == "readme")
+            .Value
+            .Should()
+            .Be("README.md");
     }
 
     private static void EnsureUnloaded(WeakReference loadContextReference)
