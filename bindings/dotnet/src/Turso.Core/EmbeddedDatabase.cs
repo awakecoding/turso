@@ -5274,6 +5274,8 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow,
         out CompiledSelect compiled)
     {
+        select = ResolveNamedWindows(select);
+
         // A SELECT carrying LIMIT/OFFSET lowers only when its LIMIT/OFFSET-free base is a
         // gate-able route. Direct scans, constant projections, source-less scalar Function programs,
         // aggregates, the deliberately narrow bounded sorted-scan subset, and a strictly-gated
@@ -7163,11 +7165,9 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!IsRunningWindowFrame(window.Frame))
             return false;
 
-        // Only aggregate window functions the evaluator itself accepts. Percentile and ranking
-        // (row_number/rank/lag/...) calls decline so the evaluator raises its own
-        // "not a supported window function" diagnostic instead of the route silently diverging.
-        // Percentile is excluded because the evaluator's ValidateWindowFunction rejects it as a
-        // window function even though it is a managed aggregate.
+        // The bytecode shape only models aggregate accumulation. Dedicated ranking,
+        // navigation, and value functions decline to the evaluator; managed percentile
+        // aggregates also decline because they are not available as window functions.
         if (!IsBuiltInAggregate(function)
             && !TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
         {
@@ -7210,8 +7210,10 @@ public sealed class EmbeddedDatabase : IDisposable
     // default RANGE frame) and every bounded/forward-looking ROWS frame decline.
     private static bool IsRunningWindowFrame(WindowFrame? frame)
         => frame is not null
+            && frame.Mode == Turso.Core.Parsing.WindowFrameMode.Rows
             && frame.Start.Kind == FrameBoundKind.UnboundedPreceding
-            && frame.End.Kind == FrameBoundKind.CurrentRow;
+            && frame.End.Kind == FrameBoundKind.CurrentRow
+            && frame.Exclusion == FrameExclusion.NoOthers;
 
     // Structural equality of two window specs: PARTITION BY expressions and ORDER BY terms compared
     // element-wise (record equality on the IReadOnlyList fields is reference equality, so the lists
@@ -8576,11 +8578,17 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        statement = ResolveNamedWindows(statement);
         var resolvedOrderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
         ValidateOrderByCollations(resolvedOrderBy);
         var windowFunctions = CollectSelectWindowFunctions(statement);
         foreach (var function in windowFunctions)
+        {
+            foreach (var partition in function.Window!.PartitionBy)
+                ValidateCollation(GetCollation(partition));
             ValidateOrderByCollations(function.Window!.OrderBy);
+            ValidateWindowFunction(function);
+        }
         var limit = statement.Limit is null
             ? (long?)null
             : RequireLimitInteger(Evaluate(statement.Limit, parameters, outerRow, context));
@@ -14863,6 +14871,229 @@ public sealed class EmbeddedDatabase : IDisposable
 
     // ----- Aggregate window functions (func(...) OVER (...)) -----
 
+    private SelectStatement ResolveNamedWindows(SelectStatement statement)
+    {
+        if (statement.NamedWindows.Count == 0
+            && !SelectExpressions(statement).Any(ContainsNamedWindowReference))
+        {
+            return statement;
+        }
+
+        var resolved = new Dictionary<string, WindowSpecification>(StringComparer.OrdinalIgnoreCase);
+
+        WindowSpecification ResolveSpecification(
+            WindowSpecification specification,
+            bool ignoreUnknownBase = false)
+        {
+            if (specification.BaseWindowName is null)
+            {
+                return RewriteWindowExpressions(specification with { IsNamedReference = false });
+            }
+
+            if (!resolved.TryGetValue(specification.BaseWindowName, out var baseSpecification))
+            {
+                if (!ignoreUnknownBase || specification.IsNamedReference)
+                    throw new EmbeddedSqlException($"no such window: {specification.BaseWindowName}");
+
+                return RewriteWindowExpressions(specification with
+                {
+                    BaseWindowName = null,
+                    IsNamedReference = false,
+                });
+            }
+
+            if (specification.IsNamedReference)
+                return baseSpecification;
+
+            if (specification.PartitionBy.Count != 0)
+            {
+                throw new EmbeddedSqlException(
+                    $"cannot override PARTITION clause of window: {specification.BaseWindowName}");
+            }
+            if (baseSpecification.OrderBy.Count != 0 && specification.OrderBy.Count != 0)
+            {
+                throw new EmbeddedSqlException(
+                    $"cannot override ORDER BY clause of window: {specification.BaseWindowName}");
+            }
+            if (baseSpecification.Frame is not null)
+            {
+                throw new EmbeddedSqlException(
+                    $"cannot override frame specification of window: {specification.BaseWindowName}");
+            }
+
+            return RewriteWindowExpressions(new WindowSpecification(
+                null,
+                baseSpecification.PartitionBy,
+                specification.OrderBy.Count == 0 ? baseSpecification.OrderBy : specification.OrderBy,
+                specification.Frame));
+        }
+
+        WindowSpecification RewriteWindowExpressions(WindowSpecification specification)
+        {
+            return specification with
+            {
+                BaseWindowName = null,
+                IsNamedReference = false,
+                PartitionBy = specification.PartitionBy.Select(ResolveExpression).ToArray(),
+                OrderBy = specification.OrderBy.Select(term => term with
+                {
+                    Expression = ResolveExpression(term.Expression),
+                }).ToArray(),
+                Frame = specification.Frame is null
+                    ? null
+                    : specification.Frame with
+                    {
+                        Start = specification.Frame.Start with
+                        {
+                            Offset = specification.Frame.Start.Offset is null
+                                ? null
+                                : ResolveExpression(specification.Frame.Start.Offset),
+                        },
+                        End = specification.Frame.End with
+                        {
+                            Offset = specification.Frame.End.Offset is null
+                                ? null
+                                : ResolveExpression(specification.Frame.End.Offset),
+                        },
+                    },
+            };
+        }
+
+        Expression ResolveExpression(Expression expression)
+        {
+            return expression switch
+            {
+                FunctionExpression function => function with
+                {
+                    Arguments = function.Arguments.Select(ResolveExpression).ToArray(),
+                    Filter = function.Filter is null ? null : ResolveExpression(function.Filter),
+                    Window = function.Window is null ? null : ResolveSpecification(function.Window),
+                },
+                UnaryExpression unary => unary with { Operand = ResolveExpression(unary.Operand) },
+                BinaryExpression binary => binary with
+                {
+                    Left = ResolveExpression(binary.Left),
+                    Right = ResolveExpression(binary.Right),
+                },
+                CollationExpression collation => collation with
+                {
+                    Expression = ResolveExpression(collation.Expression),
+                },
+                CastExpression cast => cast with { Expression = ResolveExpression(cast.Expression) },
+                CaseExpression @case => @case with
+                {
+                    Operand = @case.Operand is null ? null : ResolveExpression(@case.Operand),
+                    Clauses = @case.Clauses.Select(clause => clause with
+                    {
+                        When = ResolveExpression(clause.When),
+                        Then = ResolveExpression(clause.Then),
+                    }).ToArray(),
+                    Else = @case.Else is null ? null : ResolveExpression(@case.Else),
+                },
+                LikeExpression like => like with
+                {
+                    Value = ResolveExpression(like.Value),
+                    Pattern = ResolveExpression(like.Pattern),
+                    Escape = like.Escape is null ? null : ResolveExpression(like.Escape),
+                },
+                GlobExpression glob => glob with
+                {
+                    Value = ResolveExpression(glob.Value),
+                    Pattern = ResolveExpression(glob.Pattern),
+                },
+                InExpression @in => @in with
+                {
+                    Value = ResolveExpression(@in.Value),
+                    Values = @in.Values.Select(ResolveExpression).ToArray(),
+                },
+                InSubqueryExpression inSubquery => inSubquery with
+                {
+                    Value = ResolveExpression(inSubquery.Value),
+                },
+                BetweenExpression between => between with
+                {
+                    Value = ResolveExpression(between.Value),
+                    Lower = ResolveExpression(between.Lower),
+                    Upper = ResolveExpression(between.Upper),
+                },
+                _ => expression,
+            };
+        }
+
+        // SQLite resolves bases against definitions already seen and lets the last duplicate
+        // name win. A forward base is therefore an empty base, while OVER name is resolved
+        // after the complete WINDOW clause.
+        foreach (var definition in statement.NamedWindows)
+            resolved[definition.Name] = ResolveSpecification(definition.Specification, ignoreUnknownBase: true);
+
+        return statement with
+        {
+            Projections = statement.Projections.Select(projection => projection with
+            {
+                Expression = ResolveExpression(projection.Expression),
+            }).ToArray(),
+            Where = statement.Where is null ? null : ResolveExpression(statement.Where),
+            GroupBy = statement.GroupBy.Select(ResolveExpression).ToArray(),
+            Having = statement.Having is null ? null : ResolveExpression(statement.Having),
+            NamedWindows = [],
+            OrderBy = statement.OrderBy.Select(term => term with
+            {
+                Expression = ResolveExpression(term.Expression),
+            }).ToArray(),
+            Limit = statement.Limit is null ? null : ResolveExpression(statement.Limit),
+            Offset = statement.Offset is null ? null : ResolveExpression(statement.Offset),
+        };
+    }
+
+    private static IEnumerable<Expression> SelectExpressions(SelectStatement statement)
+    {
+        foreach (var projection in statement.Projections)
+            yield return projection.Expression;
+        if (statement.Where is not null)
+            yield return statement.Where;
+        foreach (var expression in statement.GroupBy)
+            yield return expression;
+        if (statement.Having is not null)
+            yield return statement.Having;
+        foreach (var term in statement.OrderBy)
+            yield return term.Expression;
+        if (statement.Limit is not null)
+            yield return statement.Limit;
+        if (statement.Offset is not null)
+            yield return statement.Offset;
+    }
+
+    private static bool ContainsNamedWindowReference(Expression expression)
+    {
+        return expression switch
+        {
+            FunctionExpression function => function.Window?.BaseWindowName is not null
+                || function.Arguments.Any(ContainsNamedWindowReference)
+                || (function.Filter is not null && ContainsNamedWindowReference(function.Filter)),
+            UnaryExpression unary => ContainsNamedWindowReference(unary.Operand),
+            BinaryExpression binary => ContainsNamedWindowReference(binary.Left)
+                || ContainsNamedWindowReference(binary.Right),
+            CollationExpression collation => ContainsNamedWindowReference(collation.Expression),
+            CastExpression cast => ContainsNamedWindowReference(cast.Expression),
+            CaseExpression @case => (@case.Operand is not null && ContainsNamedWindowReference(@case.Operand))
+                || @case.Clauses.Any(clause => ContainsNamedWindowReference(clause.When)
+                    || ContainsNamedWindowReference(clause.Then))
+                || (@case.Else is not null && ContainsNamedWindowReference(@case.Else)),
+            LikeExpression like => ContainsNamedWindowReference(like.Value)
+                || ContainsNamedWindowReference(like.Pattern)
+                || (like.Escape is not null && ContainsNamedWindowReference(like.Escape)),
+            GlobExpression glob => ContainsNamedWindowReference(glob.Value)
+                || ContainsNamedWindowReference(glob.Pattern),
+            InExpression @in => ContainsNamedWindowReference(@in.Value)
+                || @in.Values.Any(ContainsNamedWindowReference),
+            InSubqueryExpression inSubquery => ContainsNamedWindowReference(inSubquery.Value),
+            BetweenExpression between => ContainsNamedWindowReference(between.Value)
+                || ContainsNamedWindowReference(between.Lower)
+                || ContainsNamedWindowReference(between.Upper),
+            _ => false,
+        };
+    }
+
     private List<FunctionExpression> CollectSelectWindowFunctions(SelectStatement statement)
     {
         var result = new List<FunctionExpression>();
@@ -15061,27 +15292,129 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    // Rejects everything outside the supported subset: only aggregate functions may be
-    // windowed, DISTINCT is disallowed, and window arguments cannot nest aggregates or
-    // other window functions.
     private void ValidateWindowFunction(FunctionExpression function)
     {
         if (function.Distinct)
             throw new EmbeddedSqlException("DISTINCT is not supported for window functions");
 
-        var isAggregate = string.Equals(function.Name, "COUNT", StringComparison.Ordinal)
-            || IsBuiltInAggregate(function)
-            || TryGetAggregateFunction(function.Name, function.Arguments.Count, out _);
-        if (!isAggregate)
+        var name = function.Name.ToUpperInvariant();
+        var isBuiltInWindow = name is "ROW_NUMBER"
+            or "RANK"
+            or "DENSE_RANK"
+            or "PERCENT_RANK"
+            or "CUME_DIST"
+            or "NTILE"
+            or "LAG"
+            or "LEAD"
+            or "FIRST_VALUE"
+            or "LAST_VALUE"
+            or "NTH_VALUE";
+        var isAggregate = IsAggregateWindowFunction(function);
+        if (!isBuiltInWindow && !isAggregate)
         {
             throw new EmbeddedSqlException(
-                $"{function.Name} is not a supported window function; only aggregate window functions are available");
+                $"{function.Name} is not a supported window function");
+        }
+
+        if (function.Filter is not null && !isAggregate)
+            throw new EmbeddedSqlException("FILTER clause may only be used with aggregate window functions");
+
+        switch (name)
+        {
+            case "ROW_NUMBER":
+            case "RANK":
+            case "DENSE_RANK":
+            case "PERCENT_RANK":
+            case "CUME_DIST":
+                RequireWindowArgumentCount(function, 0);
+                break;
+            case "NTILE":
+            case "FIRST_VALUE":
+            case "LAST_VALUE":
+                RequireWindowArgumentCount(function, 1);
+                break;
+            case "NTH_VALUE":
+                RequireWindowArgumentCount(function, 2);
+                break;
+            case "LAG":
+            case "LEAD":
+                if (function.Arguments.Count is < 1 or > 3 || function.CountStar)
+                    ThrowWrongWindowArgumentCount(function);
+                break;
+            case "COUNT":
+                if ((!function.CountStar && function.Arguments.Count > 1)
+                    || (function.CountStar && function.Arguments.Count != 0))
+                {
+                    ThrowWrongWindowArgumentCount(function);
+                }
+                break;
+            case "SUM":
+            case "TOTAL":
+            case "AVG":
+            case "MIN":
+            case "MAX":
+                RequireWindowArgumentCount(function, 1);
+                break;
+            case "GROUP_CONCAT":
+                if (function.Arguments.Count is < 1 or > 2 || function.CountStar)
+                    ThrowWrongWindowArgumentCount(function);
+                break;
         }
 
         foreach (var argument in function.Arguments)
         {
             if (ContainsWindowFunction(argument) || ContainsAggregate(argument))
                 throw new EmbeddedSqlException("window function arguments cannot contain aggregate or window functions");
+        }
+
+        if (function.Filter is not null
+            && (ContainsWindowFunction(function.Filter) || ContainsAggregate(function.Filter)))
+        {
+            throw new EmbeddedSqlException("FILTER clause cannot contain aggregate or window functions");
+        }
+
+        var window = function.Window!;
+        ValidateWindowFrameStructure(window);
+        if (window.PartitionBy.Any(expression => ContainsWindowFunction(expression) || ContainsAggregate(expression))
+            || window.OrderBy.Any(term =>
+                ContainsWindowFunction(term.Expression) || ContainsAggregate(term.Expression))
+            || window.Frame?.Start.Offset is { } startOffset
+                && (ContainsWindowFunction(startOffset) || ContainsAggregate(startOffset))
+            || window.Frame?.End.Offset is { } endOffset
+                && (ContainsWindowFunction(endOffset) || ContainsAggregate(endOffset)))
+        {
+            throw new EmbeddedSqlException("misuse of window function");
+        }
+    }
+
+    private bool IsAggregateWindowFunction(FunctionExpression function)
+    {
+        var name = function.Name.ToUpperInvariant();
+        return name is "COUNT" or "SUM" or "TOTAL" or "AVG" or "MIN" or "MAX" or "GROUP_CONCAT"
+            || TryGetAggregateFunction(function.Name, function.Arguments.Count, out _);
+    }
+
+    private static void RequireWindowArgumentCount(FunctionExpression function, int expected)
+    {
+        if (function.CountStar || function.Arguments.Count != expected)
+            ThrowWrongWindowArgumentCount(function);
+    }
+
+    private static void ThrowWrongWindowArgumentCount(FunctionExpression function)
+        => throw new EmbeddedSqlException(
+            $"wrong number of arguments to function {function.Name.ToLowerInvariant()}()");
+
+    private static void ValidateWindowFrameStructure(WindowSpecification specification)
+    {
+        if (specification.Frame is not { Mode: Turso.Core.Parsing.WindowFrameMode.Range } frame)
+            return;
+
+        var hasOffset = frame.Start.Kind is FrameBoundKind.Preceding or FrameBoundKind.Following
+            || frame.End.Kind is FrameBoundKind.Preceding or FrameBoundKind.Following;
+        if (hasOffset && specification.OrderBy.Count != 1)
+        {
+            throw new EmbeddedSqlException(
+                "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression");
         }
     }
 
@@ -15096,19 +15429,43 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        foreach (var function in windowFunctions)
-            ValidateWindowFunction(function);
-
         var rowCount = selectedRows.Count;
         var windowValues = new Dictionary<FunctionExpression, SqlValue>[rowCount];
         for (var index = 0; index < rowCount; index++)
             windowValues[index] = new Dictionary<FunctionExpression, SqlValue>();
+        var inputs = PrepareWindowFunctionInputs(
+            windowFunctions,
+            selectedRows,
+            parameters,
+            context);
 
+        var groups = new List<List<FunctionExpression>>();
         foreach (var function in windowFunctions)
         {
-            var values = ComputeWindowFunction(function, selectedRows, parameters, context);
-            for (var index = 0; index < rowCount; index++)
-                windowValues[index][function] = values[index];
+            var group = groups.FirstOrDefault(candidate =>
+                WindowSpecsEqual(candidate[0].Window!, function.Window!));
+            if (group is null)
+            {
+                group = [];
+                groups.Add(group);
+            }
+
+            group.Add(function);
+        }
+
+        foreach (var group in groups)
+        {
+            var values = ComputeWindowFunctions(
+                group,
+                selectedRows,
+                inputs,
+                parameters,
+                context);
+            foreach (var function in group)
+            {
+                for (var index = 0; index < rowCount; index++)
+                    windowValues[index][function] = values[function][index];
+            }
         }
 
         var orderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
@@ -15193,6 +15550,37 @@ public sealed class EmbeddedDatabase : IDisposable
             0);
     }
 
+    private Dictionary<FunctionExpression, WindowFunctionInput[]> PrepareWindowFunctionInputs(
+        IReadOnlyList<FunctionExpression> functions,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var inputs = new Dictionary<FunctionExpression, WindowFunctionInput[]>();
+        foreach (var function in functions)
+            inputs.Add(function, new WindowFunctionInput[rows.Count]);
+
+        for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var row = rows[rowIndex];
+            foreach (var function in functions)
+            {
+                var included = !IsAggregateWindowFunction(function)
+                    || function.Filter is null
+                    || IsTrue(Evaluate(function.Filter, parameters, row, context));
+                var arguments = included
+                    ? function.Arguments
+                        .Select(argument => Evaluate(argument, parameters, row, context))
+                        .ToArray()
+                    : [];
+                inputs[function][rowIndex] = new WindowFunctionInput(included, arguments);
+            }
+        }
+
+        return inputs;
+    }
+
     // Produces a collation entry per output column (not per projection) so that DISTINCT
     // comparison never indexes past the end when a projection expands to several columns
     // via * or table.*.
@@ -15242,136 +15630,743 @@ public sealed class EmbeddedDatabase : IDisposable
         return decorated.Select(entry => entry.value).ToList();
     }
 
-    // Computes the window aggregate for every row, returned in the same order as the input
-    // rows. Rows are grouped by PARTITION BY, ordered within the partition, and each row's
-    // frame is aggregated independently.
-    private SqlValue[] ComputeWindowFunction(
-        FunctionExpression function,
+    private sealed class WindowPartition
+    {
+        public WindowPartition(SqlValue[] keys)
+        {
+            Keys = keys;
+        }
+
+        public SqlValue[] Keys { get; }
+
+        public List<int> Members { get; } = [];
+    }
+
+    private sealed record WindowOrderEntry(
+        int SourceIndex,
+        int StableOrdinal,
+        SqlValue[] OrderKeys);
+
+    private readonly record struct WindowFunctionInput(bool Included, SqlValue[] Arguments);
+
+    private sealed record WindowPeerInfo(
+        int[] Starts,
+        int[] Ends,
+        int[] GroupIndexes,
+        IReadOnlyList<(int Start, int End)> Groups);
+
+    private readonly record struct WindowFrameRuntime(SqlValue? StartOffset, SqlValue? EndOffset);
+
+    private Dictionary<FunctionExpression, SqlValue[]> ComputeWindowFunctions(
+        IReadOnlyList<FunctionExpression> functions,
         IReadOnlyList<SourceRow> rows,
+        IReadOnlyDictionary<FunctionExpression, WindowFunctionInput[]> inputs,
         SqlValue[] parameters,
         QueryContext context)
     {
-        var spec = function.Window!;
-        var results = new SqlValue[rows.Count];
-        var baseFunction = function with { Window = null };
+        var spec = functions[0].Window!;
+        var results = new Dictionary<FunctionExpression, SqlValue[]>();
+        foreach (var function in functions)
+            results.Add(function, new SqlValue[rows.Count]);
 
-        var partitions = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-        var partitionOrder = new List<string>();
+        var partitionCollations = spec.PartitionBy.Select(GetCollation).ToArray();
+        var partitions = new List<WindowPartition>();
+        var orderKeysBySource = new SqlValue[rows.Count][];
         for (var index = 0; index < rows.Count; index++)
         {
-            var key = spec.PartitionBy.Count == 0
-                ? string.Empty
-                : GetGroupKey(spec.PartitionBy, parameters, rows[index], context);
-            if (!partitions.TryGetValue(key, out var members))
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var keys = spec.PartitionBy
+                .Select(expression => Evaluate(expression, parameters, rows[index], context))
+                .ToArray();
+            var partition = partitions.FirstOrDefault(candidate =>
+                WindowPartitionKeysEqual(candidate.Keys, keys, partitionCollations));
+            if (partition is null)
             {
-                members = [];
-                partitions.Add(key, members);
-                partitionOrder.Add(key);
+                partition = new WindowPartition(keys);
+                partitions.Add(partition);
             }
 
-            members.Add(index);
+            partition.Members.Add(index);
+            orderKeysBySource[index] = spec.OrderBy
+                .Select(term => Evaluate(term.Expression, parameters, rows[index], context))
+                .ToArray();
         }
 
-        foreach (var key in partitionOrder)
+        if (partitions.Count == 0)
+            return results;
+
+        var needsFrame = functions.Any(WindowFunctionUsesFrame);
+        var frameRuntime = needsFrame
+            ? PrepareWindowFrame(spec, parameters, context)
+            : default;
+        foreach (var partition in partitions)
         {
-            var members = partitions[key];
-            if (spec.OrderBy.Count > 0)
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var entries = new List<WindowOrderEntry>(partition.Members.Count);
+            for (var ordinal = 0; ordinal < partition.Members.Count; ordinal++)
             {
-                members = StableSortIndices(
-                    members,
-                    (left, right) => CompareRows(rows[left], rows[right], spec.OrderBy, parameters, context));
+                var sourceIndex = partition.Members[ordinal];
+                entries.Add(new WindowOrderEntry(
+                    sourceIndex,
+                    ordinal,
+                    orderKeysBySource[sourceIndex]));
             }
 
-            var orderedRows = members.Select(index => rows[index]).ToList();
-            for (var position = 0; position < orderedRows.Count; position++)
+            if (spec.OrderBy.Count > 0)
             {
-                var (start, end) = ResolveFrame(spec, orderedRows, position, parameters, context);
-                IReadOnlyList<SourceRow> frameRows = start > end
-                    ? []
-                    : orderedRows.GetRange(start, end - start + 1);
-                results[members[position]] = EvaluateAggregate(baseFunction, frameRows, parameters, context);
+                entries.Sort((left, right) =>
+                {
+                    var comparison = CompareWindowOrderKeys(left.OrderKeys, right.OrderKeys, spec.OrderBy);
+                    return comparison != 0
+                        ? comparison
+                        : left.StableOrdinal.CompareTo(right.StableOrdinal);
+                });
+            }
+
+            var peers = BuildWindowPeerInfo(entries, spec.OrderBy);
+            var ntileBuckets = new Dictionary<FunctionExpression, long>();
+            foreach (var function in functions.Where(function =>
+                         function.Name.Equals("NTILE", StringComparison.OrdinalIgnoreCase)))
+            {
+                var buckets = ToSqliteInteger(
+                    inputs[function][entries[0].SourceIndex].Arguments[0]);
+                if (buckets <= 0)
+                    throw new EmbeddedSqlException("argument of ntile must be a positive integer");
+                ntileBuckets.Add(function, buckets);
+            }
+
+            for (var position = 0; position < entries.Count; position++)
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                var framePositions = needsFrame
+                    ? ResolveWindowFramePositions(
+                        spec,
+                        entries,
+                        peers,
+                        position,
+                        frameRuntime)
+                    : [];
+                foreach (var function in functions)
+                {
+                    results[function][entries[position].SourceIndex] = EvaluateWindowFunctionAtPosition(
+                        function,
+                        entries,
+                        peers,
+                        position,
+                        framePositions,
+                        ntileBuckets.GetValueOrDefault(function),
+                        inputs[function],
+                        parameters,
+                        context);
+                }
             }
         }
 
         return results;
     }
 
-    private (int Start, int End) ResolveFrame(
-        WindowSpecification spec,
-        IReadOnlyList<SourceRow> orderedRows,
-        int position,
-        SqlValue[] parameters,
-        QueryContext context)
+    private static bool WindowFunctionUsesFrame(FunctionExpression function)
     {
-        var count = orderedRows.Count;
-        if (spec.Frame is null)
+        return function.Name.ToUpperInvariant() switch
         {
-            if (spec.OrderBy.Count == 0)
-                return (0, count - 1);
+            "ROW_NUMBER" or "RANK" or "DENSE_RANK" or "PERCENT_RANK" or "CUME_DIST"
+                or "NTILE" or "LAG" or "LEAD" => false,
+            _ => true,
+        };
+    }
 
-            // Default frame is RANGE UNBOUNDED PRECEDING AND CURRENT ROW: the current row
-            // plus every earlier row, and all following rows that are ORDER BY peers.
-            var end = position;
-            while (end + 1 < count
-                && CompareRows(orderedRows[end + 1], orderedRows[position], spec.OrderBy, parameters, context) == 0)
+    private bool WindowPartitionKeysEqual(
+        IReadOnlyList<SqlValue> left,
+        IReadOnlyList<SqlValue> right,
+        IReadOnlyList<string?> collations)
+    {
+        if (left.Count != right.Count)
+            return false;
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (!DistinctValuesEqual(left[index], right[index], collations[index]))
+                return false;
+        }
+
+        return true;
+    }
+
+    private int CompareWindowOrderKeys(
+        IReadOnlyList<SqlValue> left,
+        IReadOnlyList<SqlValue> right,
+        IReadOnlyList<OrderByTerm> orderBy)
+    {
+        for (var index = 0; index < orderBy.Count; index++)
+        {
+            var comparison = CompareForOrdering(
+                left[index],
+                right[index],
+                orderBy[index],
+                GetCollation(orderBy[index].Expression));
+            if (comparison != 0)
+                return comparison;
+        }
+
+        return 0;
+    }
+
+    private WindowPeerInfo BuildWindowPeerInfo(
+        IReadOnlyList<WindowOrderEntry> entries,
+        IReadOnlyList<OrderByTerm> orderBy)
+    {
+        var starts = new int[entries.Count];
+        var ends = new int[entries.Count];
+        var groupIndexes = new int[entries.Count];
+        var groups = new List<(int Start, int End)>();
+        var start = 0;
+        while (start < entries.Count)
+        {
+            var end = start;
+            while (end + 1 < entries.Count
+                && CompareWindowOrderKeys(entries[start].OrderKeys, entries[end + 1].OrderKeys, orderBy) == 0)
             {
                 end++;
             }
 
-            return (0, end);
+            var groupIndex = groups.Count;
+            groups.Add((start, end));
+            for (var position = start; position <= end; position++)
+            {
+                starts[position] = start;
+                ends[position] = end;
+                groupIndexes[position] = groupIndex;
+            }
+
+            start = end + 1;
         }
 
-        var startRaw = ResolveBoundIndex(spec.Frame.Start, position, count, parameters, context);
-        var endRaw = ResolveBoundIndex(spec.Frame.End, position, count, parameters, context);
-        var effectiveStart = Math.Max(0L, startRaw);
-        var effectiveEnd = Math.Min(count - 1L, endRaw);
-        if (effectiveStart > effectiveEnd)
-            return (0, -1);
-
-        return ((int)effectiveStart, (int)effectiveEnd);
+        return new WindowPeerInfo(starts, ends, groupIndexes, groups);
     }
 
-    private long ResolveBoundIndex(
+    private WindowFrameRuntime PrepareWindowFrame(
+        WindowSpecification spec,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (spec.Frame is not { } frame)
+            return default;
+
+        return new WindowFrameRuntime(
+            EvaluateWindowFrameOffset(frame.Mode, frame.Start, "starting", parameters, context),
+            EvaluateWindowFrameOffset(frame.Mode, frame.End, "ending", parameters, context));
+    }
+
+    private SqlValue? EvaluateWindowFrameOffset(
+        Turso.Core.Parsing.WindowFrameMode mode,
+        FrameBound bound,
+        string boundary,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (bound.Offset is null)
+            return null;
+
+        if (!IsWindowFrameConstant(bound.Offset))
+        {
+            throw new EmbeddedSqlException(
+                mode == Turso.Core.Parsing.WindowFrameMode.Range
+                    ? $"frame {boundary} offset must be a non-negative number"
+                    : $"frame {boundary} offset must be a non-negative integer");
+        }
+
+        var value = Evaluate(bound.Offset, parameters, null, context);
+        if (mode == Turso.Core.Parsing.WindowFrameMode.Range)
+        {
+            if (!TryGetWindowNumber(value, out var number) || number < 0 || double.IsNaN(number))
+            {
+                throw new EmbeddedSqlException(
+                    $"frame {boundary} offset must be a non-negative number");
+            }
+
+            return SqlValue.Real(number);
+        }
+
+        if (!TryGetExactWindowInteger(value, out var integer) || integer < 0)
+        {
+            throw new EmbeddedSqlException(
+                $"frame {boundary} offset must be a non-negative integer");
+        }
+
+        return SqlValue.Integer(integer);
+    }
+
+    private static bool IsWindowFrameConstant(Expression expression)
+    {
+        return expression switch
+        {
+            LiteralExpression or ParameterExpression => true,
+            UnaryExpression unary => IsWindowFrameConstant(unary.Operand),
+            BinaryExpression binary => IsWindowFrameConstant(binary.Left)
+                && IsWindowFrameConstant(binary.Right),
+            CollationExpression collation => IsWindowFrameConstant(collation.Expression),
+            CastExpression cast => IsWindowFrameConstant(cast.Expression),
+            CaseExpression @case => (@case.Operand is null || IsWindowFrameConstant(@case.Operand))
+                && @case.Clauses.All(clause => IsWindowFrameConstant(clause.When)
+                    && IsWindowFrameConstant(clause.Then))
+                && (@case.Else is null || IsWindowFrameConstant(@case.Else)),
+            LikeExpression like => IsWindowFrameConstant(like.Value)
+                && IsWindowFrameConstant(like.Pattern)
+                && (like.Escape is null || IsWindowFrameConstant(like.Escape)),
+            GlobExpression glob => IsWindowFrameConstant(glob.Value)
+                && IsWindowFrameConstant(glob.Pattern),
+            InExpression @in => IsWindowFrameConstant(@in.Value)
+                && @in.Values.All(IsWindowFrameConstant),
+            BetweenExpression between => IsWindowFrameConstant(between.Value)
+                && IsWindowFrameConstant(between.Lower)
+                && IsWindowFrameConstant(between.Upper),
+            _ => false,
+        };
+    }
+
+    private IReadOnlyList<int> ResolveWindowFramePositions(
+        WindowSpecification spec,
+        IReadOnlyList<WindowOrderEntry> entries,
+        WindowPeerInfo peers,
+        int position,
+        WindowFrameRuntime runtime)
+    {
+        var frame = spec.Frame ?? new WindowFrame(
+            Turso.Core.Parsing.WindowFrameMode.Range,
+            new FrameBound(FrameBoundKind.UnboundedPreceding, null),
+            new FrameBound(FrameBoundKind.CurrentRow, null));
+        var startRaw = ResolveWindowFrameBound(
+            frame,
+            frame.Start,
+            isStart: true,
+            entries,
+            peers,
+            position,
+            runtime.StartOffset,
+            spec.OrderBy);
+        var endRaw = ResolveWindowFrameBound(
+            frame,
+            frame.End,
+            isStart: false,
+            entries,
+            peers,
+            position,
+            runtime.EndOffset,
+            spec.OrderBy);
+        var start = (int)Math.Clamp(startRaw, 0L, entries.Count);
+        var end = (int)Math.Clamp(endRaw, -1L, entries.Count - 1L);
+        if (start > end)
+            return [];
+
+        var result = new List<int>(end - start + 1);
+        for (var candidate = start; candidate <= end; candidate++)
+        {
+            var peer = candidate >= peers.Starts[position] && candidate <= peers.Ends[position];
+            var include = frame.Exclusion switch
+            {
+                FrameExclusion.NoOthers => true,
+                FrameExclusion.CurrentRow => candidate != position,
+                FrameExclusion.Group => !peer,
+                FrameExclusion.Ties => candidate == position || !peer,
+                _ => throw new InvalidOperationException(
+                    $"Unsupported window frame exclusion {frame.Exclusion}."),
+            };
+            if (include)
+                result.Add(candidate);
+        }
+
+        return result;
+    }
+
+    private long ResolveWindowFrameBound(
+        WindowFrame frame,
+        FrameBound bound,
+        bool isStart,
+        IReadOnlyList<WindowOrderEntry> entries,
+        WindowPeerInfo peers,
+        int position,
+        SqlValue? offset,
+        IReadOnlyList<OrderByTerm> orderBy)
+    {
+        return frame.Mode switch
+        {
+            Turso.Core.Parsing.WindowFrameMode.Rows
+                => ResolveRowsFrameBound(bound, position, entries.Count, offset),
+            Turso.Core.Parsing.WindowFrameMode.Groups
+                => ResolveGroupsFrameBound(bound, isStart, entries.Count, peers, position, offset),
+            Turso.Core.Parsing.WindowFrameMode.Range
+                => ResolveRangeFrameBound(bound, isStart, entries, peers, position, offset, orderBy),
+            _ => throw new InvalidOperationException($"Unsupported window frame mode {frame.Mode}."),
+        };
+    }
+
+    private static long ResolveRowsFrameBound(
         FrameBound bound,
         int position,
         int count,
+        SqlValue? offset)
+    {
+        return bound.Kind switch
+        {
+            FrameBoundKind.UnboundedPreceding => 0,
+            FrameBoundKind.UnboundedFollowing => count - 1L,
+            FrameBoundKind.CurrentRow => position,
+            FrameBoundKind.Preceding => position - Math.Min(offset!.Value.AsInteger(), count),
+            FrameBoundKind.Following => position + Math.Min(offset!.Value.AsInteger(), count),
+            _ => throw new InvalidOperationException($"Unsupported ROWS frame bound {bound.Kind}."),
+        };
+    }
+
+    private static long ResolveGroupsFrameBound(
+        FrameBound bound,
+        bool isStart,
+        int count,
+        WindowPeerInfo peers,
+        int position,
+        SqlValue? offset)
+    {
+        if (bound.Kind == FrameBoundKind.UnboundedPreceding)
+            return 0;
+        if (bound.Kind == FrameBoundKind.UnboundedFollowing)
+            return count - 1L;
+
+        var currentGroup = peers.GroupIndexes[position];
+        var targetGroup = bound.Kind switch
+        {
+            FrameBoundKind.CurrentRow => currentGroup,
+            FrameBoundKind.Preceding => currentGroup - Math.Min(offset!.Value.AsInteger(), peers.Groups.Count),
+            FrameBoundKind.Following => currentGroup + Math.Min(offset!.Value.AsInteger(), peers.Groups.Count),
+            _ => throw new InvalidOperationException($"Unsupported GROUPS frame bound {bound.Kind}."),
+        };
+        if (targetGroup < 0)
+            return isStart ? 0 : -1;
+        if (targetGroup >= peers.Groups.Count)
+            return isStart ? count : count - 1L;
+
+        var group = peers.Groups[(int)targetGroup];
+        return isStart ? group.Start : group.End;
+    }
+
+    private long ResolveRangeFrameBound(
+        FrameBound bound,
+        bool isStart,
+        IReadOnlyList<WindowOrderEntry> entries,
+        WindowPeerInfo peers,
+        int position,
+        SqlValue? offset,
+        IReadOnlyList<OrderByTerm> orderBy)
+    {
+        if (bound.Kind == FrameBoundKind.UnboundedPreceding)
+            return 0;
+        if (bound.Kind == FrameBoundKind.UnboundedFollowing)
+            return entries.Count - 1L;
+        if (bound.Kind == FrameBoundKind.CurrentRow)
+            return isStart ? peers.Starts[position] : peers.Ends[position];
+
+        var current = entries[position].OrderKeys[0];
+        if (!TryGetStoredWindowNumber(current, out var currentNumber))
+            return isStart ? peers.Starts[position] : peers.Ends[position];
+
+        var direction = orderBy[0].Descending ? -1d : 1d;
+        // Negating descending keys maps both directions onto one ascending coordinate space.
+        var currentCoordinate = direction * currentNumber;
+        var distance = offset!.Value.AsReal();
+        var target = bound.Kind == FrameBoundKind.Preceding
+            ? currentCoordinate - distance
+            : currentCoordinate + distance;
+
+        if (isStart)
+        {
+            for (var candidate = 0; candidate < entries.Count; candidate++)
+            {
+                if (TryGetStoredWindowNumber(entries[candidate].OrderKeys[0], out var value)
+                    && direction * value >= target)
+                {
+                    return candidate;
+                }
+            }
+
+            return entries.Count;
+        }
+
+        for (var candidate = entries.Count - 1; candidate >= 0; candidate--)
+        {
+            if (TryGetStoredWindowNumber(entries[candidate].OrderKeys[0], out var value)
+                && direction * value <= target)
+            {
+                return candidate;
+            }
+        }
+
+        return -1;
+    }
+
+    private SqlValue EvaluateWindowFunctionAtPosition(
+        FunctionExpression function,
+        IReadOnlyList<WindowOrderEntry> entries,
+        WindowPeerInfo peers,
+        int position,
+        IReadOnlyList<int> framePositions,
+        long ntileBuckets,
+        IReadOnlyList<WindowFunctionInput> inputs,
         SqlValue[] parameters,
         QueryContext context)
     {
-        switch (bound.Kind)
+        var name = function.Name.ToUpperInvariant();
+        switch (name)
         {
-            case FrameBoundKind.UnboundedPreceding:
-                return 0;
-            case FrameBoundKind.UnboundedFollowing:
-                return count - 1L;
-            case FrameBoundKind.CurrentRow:
-                return position;
-            case FrameBoundKind.Preceding:
-                return position - GetClampedFrameOffset(bound.Offset!, count, parameters, context);
-            case FrameBoundKind.Following:
-                return position + GetClampedFrameOffset(bound.Offset!, count, parameters, context);
+            case "ROW_NUMBER":
+                return SqlValue.Integer(position + 1L);
+            case "RANK":
+                return SqlValue.Integer(peers.Starts[position] + 1L);
+            case "DENSE_RANK":
+                return SqlValue.Integer(peers.GroupIndexes[position] + 1L);
+            case "PERCENT_RANK":
+                return SqlValue.Real(entries.Count == 1
+                    ? 0
+                    : (double)peers.Starts[position] / (entries.Count - 1));
+            case "CUME_DIST":
+                return SqlValue.Real((double)(peers.Ends[position] + 1) / entries.Count);
+            case "NTILE":
+                return SqlValue.Integer(ComputeNtile(position, entries.Count, ntileBuckets));
+            case "LAG":
+            case "LEAD":
+                return EvaluateLagLead(function, entries, position, inputs);
+            case "FIRST_VALUE":
+                return framePositions.Count == 0
+                    ? SqlValue.Null
+                    : inputs[entries[framePositions[0]].SourceIndex].Arguments[0];
+            case "LAST_VALUE":
+                return framePositions.Count == 0
+                    ? SqlValue.Null
+                    : inputs[entries[framePositions[^1]].SourceIndex].Arguments[0];
+            case "NTH_VALUE":
+                {
+                    var value = inputs[entries[position].SourceIndex].Arguments[1];
+                    if (!TryGetExactWindowInteger(value, out var nth) || nth <= 0)
+                    {
+                        throw new EmbeddedSqlException(
+                            "second argument to nth_value must be a positive integer");
+                    }
+
+                    return nth > framePositions.Count
+                        ? SqlValue.Null
+                        : inputs[entries[framePositions[(int)nth - 1]].SourceIndex].Arguments[0];
+                }
             default:
-                throw new EmbeddedSqlException("Unsupported window frame bound.");
+                return EvaluateWindowAggregate(
+                    function,
+                    entries,
+                    framePositions,
+                    inputs,
+                    parameters,
+                    context);
         }
     }
 
-    private long GetClampedFrameOffset(
-        Expression expression,
-        int count,
+    private SqlValue EvaluateWindowAggregate(
+        FunctionExpression function,
+        IReadOnlyList<WindowOrderEntry> entries,
+        IReadOnlyList<int> framePositions,
+        IReadOnlyList<WindowFunctionInput> inputs,
         SqlValue[] parameters,
         QueryContext context)
     {
-        var value = Evaluate(expression, parameters, null, context);
-        if (value.Kind != SqlValueKind.Integer)
-            throw new EmbeddedSqlException("frame boundary offset must be a non-negative integer");
+        var isBuiltIn = function.Name.Equals("COUNT", StringComparison.OrdinalIgnoreCase)
+            || IsBuiltInAggregate(function);
+        if (!isBuiltIn
+            && TryGetAggregateFunction(function.Name, function.Arguments.Count, out var aggregate))
+        {
+            var accumulator = aggregate.Seed;
+            foreach (var position in framePositions)
+            {
+                var input = inputs[entries[position].SourceIndex];
+                if (!input.Included)
+                    continue;
 
-        var offset = value.AsInteger();
-        if (offset < 0)
-            throw new EmbeddedSqlException("frame boundary offset must be a non-negative integer");
+                accumulator = aggregate.Step(accumulator, [.. input.Arguments]);
+            }
 
-        // Clamp before it is combined with the row position so the bound arithmetic can
-        // never overflow the 64-bit index space.
-        return Math.Min(offset, count);
+            return aggregate.Finalize(accumulator);
+        }
+
+        var argumentNames = Enumerable.Range(0, function.Arguments.Count)
+            .Select(index => $"window_arg_{index}")
+            .ToArray();
+        var preparedRows = new List<SourceRow>(framePositions.Count);
+        foreach (var position in framePositions)
+        {
+            var input = inputs[entries[position].SourceIndex];
+            if (!input.Included)
+                continue;
+
+            preparedRows.Add(new SourceRow(argumentNames, input.Arguments));
+        }
+
+        var preparedArguments = function.Arguments
+            .Select((argument, index) => RewritePreparedWindowArgument(
+                argument,
+                new ColumnExpression(argumentNames[index])))
+            .ToArray();
+        return EvaluateAggregateFunction(
+            function with
+            {
+                Arguments = preparedArguments,
+                Filter = null,
+                Window = null,
+            },
+            preparedRows,
+            parameters,
+            context);
+    }
+
+    private static Expression RewritePreparedWindowArgument(
+        Expression original,
+        ColumnExpression prepared)
+        => original is CollationExpression collation
+            ? collation with { Expression = prepared }
+            : prepared;
+
+    private static long ComputeNtile(int position, int count, long buckets)
+    {
+        var smallerSize = count / buckets;
+        if (smallerSize == 0)
+            return position + 1L;
+
+        var largerBucketCount = count % buckets;
+        var largerRows = (smallerSize + 1) * largerBucketCount;
+        return position < largerRows
+            ? position / (smallerSize + 1) + 1
+            : largerBucketCount + (position - largerRows) / smallerSize + 1;
+    }
+
+    private SqlValue EvaluateLagLead(
+        FunctionExpression function,
+        IReadOnlyList<WindowOrderEntry> entries,
+        int position,
+        IReadOnlyList<WindowFunctionInput> inputs)
+    {
+        var current = inputs[entries[position].SourceIndex].Arguments;
+        var offsetValue = function.Arguments.Count >= 2
+            ? current[1]
+            : SqlValue.Integer(1);
+        decimal? target = null;
+        if (offsetValue.Kind != SqlValueKind.Null
+            && TryGetExactWindowInteger(offsetValue, out var offset))
+        {
+            target = function.Name.Equals("LAG", StringComparison.OrdinalIgnoreCase)
+                ? (decimal)position - offset
+                : (decimal)position + offset;
+        }
+
+        if (target is >= 0 && target < entries.Count)
+            return inputs[entries[(int)target.Value].SourceIndex].Arguments[0];
+
+        return function.Arguments.Count == 3
+            ? current[2]
+            : SqlValue.Null;
+    }
+
+    private static bool TryGetExactWindowInteger(SqlValue value, out long integer)
+    {
+        switch (value.Kind)
+        {
+            case SqlValueKind.Integer:
+                integer = value.AsInteger();
+                return true;
+            case SqlValueKind.Real:
+                {
+                    var real = value.AsReal();
+                    if (double.IsFinite(real)
+                        && real == Math.Truncate(real)
+                        && real >= long.MinValue
+                        && real < -(double)long.MinValue)
+                    {
+                        integer = (long)real;
+                        return true;
+                    }
+
+                    break;
+                }
+            case SqlValueKind.Text:
+                {
+                    var text = value.AsText().Trim();
+                    if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out integer))
+                        return true;
+                    if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var real)
+                        && double.IsFinite(real)
+                        && real == Math.Truncate(real)
+                        && real >= long.MinValue
+                        && real < -(double)long.MinValue)
+                    {
+                        integer = (long)real;
+                        return true;
+                    }
+
+                    break;
+                }
+        }
+
+        integer = 0;
+        return false;
+    }
+
+    private static bool TryGetWindowNumber(SqlValue value, out double number)
+    {
+        switch (value.Kind)
+        {
+            case SqlValueKind.Integer:
+                number = value.AsInteger();
+                return true;
+            case SqlValueKind.Real:
+                number = value.AsReal();
+                return true;
+            case SqlValueKind.Text:
+                return double.TryParse(
+                    value.AsText().Trim(),
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out number);
+            default:
+                number = 0;
+                return false;
+        }
+    }
+
+    private static bool TryGetStoredWindowNumber(SqlValue value, out double number)
+    {
+        if (value.Kind == SqlValueKind.Integer)
+        {
+            number = value.AsInteger();
+            return true;
+        }
+        if (value.Kind == SqlValueKind.Real)
+        {
+            number = value.AsReal();
+            return true;
+        }
+
+        number = 0;
+        return false;
+    }
+
+    private static long ToSqliteInteger(SqlValue value)
+    {
+        if (TryGetExactWindowInteger(value, out var integer))
+            return integer;
+        if (value.Kind == SqlValueKind.Real)
+            return (long)value.AsReal();
+        if (value.Kind == SqlValueKind.Text
+            && double.TryParse(
+                value.AsText().Trim(),
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var real))
+        {
+            return (long)real;
+        }
+
+        return 0;
     }
 
     private int CompareRows(
@@ -19207,6 +20202,8 @@ public sealed class EmbeddedConnection : IDisposable
                 foreach (var expression in select.GroupBy)
                     CollectExpressionSchemas(expression, schemas, commonTableExpressions);
                 CollectExpressionSchemas(select.Having, schemas, commonTableExpressions);
+                foreach (var window in select.NamedWindows)
+                    CollectWindowSchemas(window.Specification, schemas, commonTableExpressions);
                 foreach (var orderBy in select.OrderBy)
                     CollectExpressionSchemas(orderBy.Expression, schemas, commonTableExpressions);
                 CollectExpressionSchemas(select.Limit, schemas, commonTableExpressions);
@@ -19505,6 +20502,13 @@ public sealed class EmbeddedConnection : IDisposable
                 GroupBy = select.GroupBy.Select(expression =>
                     RewriteExpressionSchema(expression, schema, commonTableExpressions)).ToArray(),
                 Having = RewriteNullableExpression(select.Having, schema, commonTableExpressions),
+                NamedWindows = select.NamedWindows.Select(window => window with
+                {
+                    Specification = RewriteWindowSchema(
+                        window.Specification,
+                        schema,
+                        commonTableExpressions)!,
+                }).ToArray(),
                 OrderBy = RewriteOrderBy(select.OrderBy, schema, commonTableExpressions),
                 Limit = RewriteNullableExpression(select.Limit, schema, commonTableExpressions),
                 Offset = RewriteNullableExpression(select.Offset, schema, commonTableExpressions),
@@ -19815,6 +20819,7 @@ public sealed class EmbeddedConnection : IDisposable
                 || ExpressionContainsSchemaQualification(select.Where)
                 || select.GroupBy.Any(ExpressionContainsSchemaQualification)
                 || ExpressionContainsSchemaQualification(select.Having)
+                || select.NamedWindows.Any(window => WindowContainsSchemaQualification(window.Specification))
                 || select.OrderBy.Any(orderBy => ExpressionContainsSchemaQualification(orderBy.Expression))
                 || ExpressionContainsSchemaQualification(select.Limit)
                 || ExpressionContainsSchemaQualification(select.Offset),

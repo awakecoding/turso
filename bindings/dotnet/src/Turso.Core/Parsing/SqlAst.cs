@@ -220,6 +220,7 @@ internal sealed record SelectStatement(
     Expression? Where,
     IReadOnlyList<Expression> GroupBy,
     Expression? Having,
+    IReadOnlyList<NamedWindowDefinition> NamedWindows,
     IReadOnlyList<OrderByTerm> OrderBy,
     Expression? Limit,
     Expression? Offset) : QueryStatement;
@@ -310,13 +311,21 @@ internal sealed record OrderByTerm(
     NullPlacement NullPlacement = NullPlacement.Default,
     long? Ordinal = null);
 
-// Aggregate window functions (func(...) OVER (...)). Only the ROWS frame type is
-// materialized; RANGE/GROUPS/EXCLUDE and dedicated ranking functions are rejected
-// at parse time so the engine never silently produces divergent results.
 internal sealed record WindowSpecification(
+    string? BaseWindowName,
     IReadOnlyList<Expression> PartitionBy,
     IReadOnlyList<OrderByTerm> OrderBy,
-    WindowFrame? Frame);
+    WindowFrame? Frame,
+    bool IsNamedReference = false);
+
+internal sealed record NamedWindowDefinition(string Name, WindowSpecification Specification);
+
+internal enum WindowFrameMode
+{
+    Rows,
+    Range,
+    Groups,
+}
 
 internal enum FrameBoundKind
 {
@@ -329,7 +338,19 @@ internal enum FrameBoundKind
 
 internal sealed record FrameBound(FrameBoundKind Kind, Expression? Offset);
 
-internal sealed record WindowFrame(FrameBound Start, FrameBound End);
+internal enum FrameExclusion
+{
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+internal sealed record WindowFrame(
+    WindowFrameMode Mode,
+    FrameBound Start,
+    FrameBound End,
+    FrameExclusion Exclusion = FrameExclusion.NoOthers);
 
 internal sealed record ColumnAssignment(
     string Column,

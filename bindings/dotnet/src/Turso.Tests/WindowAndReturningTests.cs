@@ -337,25 +337,40 @@ public class WindowAndReturningTests
     }
 
     [Test]
-    public void WindowRejectsRangeFrame()
+    public void RangeFrameMatchesSqlite()
     {
-        AssertRejected("SELECT sum(value) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;");
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(id INTEGER, value INTEGER);",
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+            ],
+            "SELECT sum(value) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;");
     }
 
     [Test]
-    public void WindowRejectsGroupsFrame()
+    public void GroupsFrameMatchesSqlite()
     {
-        AssertRejected("SELECT sum(value) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;");
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(id INTEGER, value INTEGER);",
+                "INSERT INTO t VALUES (1, 10), (1, 20), (2, 30);",
+            ],
+            "SELECT sum(value) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;");
     }
 
     [Test]
-    public void WindowRejectsExcludeClause()
+    public void ExcludeClauseMatchesSqlite()
     {
-        AssertRejected("SELECT sum(value) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t;");
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(id INTEGER, value INTEGER);",
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+            ],
+            "SELECT sum(value) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t;");
     }
 
     [Test]
-    public void WindowRejectsNamedWindowReference()
+    public void MissingNamedWindowReferenceIsRejected()
     {
         AssertRejected("SELECT sum(value) OVER w FROM t;");
     }
@@ -367,15 +382,25 @@ public class WindowAndReturningTests
     }
 
     [Test]
-    public void WindowRejectsRankingFunctions()
+    public void RankingFunctionsMatchSqlite()
     {
-        AssertRejected("SELECT row_number() OVER (ORDER BY id) FROM t;");
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(id INTEGER, value INTEGER);",
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+            ],
+            "SELECT row_number() OVER (ORDER BY id), rank() OVER (ORDER BY value) FROM t;");
     }
 
     [Test]
-    public void WindowRejectsLagFunction()
+    public void LagFunctionMatchesSqlite()
     {
-        AssertRejected("SELECT lag(value) OVER (ORDER BY id) FROM t;");
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(id INTEGER, value INTEGER);",
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+            ],
+            "SELECT lag(value) OVER (ORDER BY id), lead(value, 1, -1) OVER (ORDER BY id) FROM t;");
     }
 
     [Test]
