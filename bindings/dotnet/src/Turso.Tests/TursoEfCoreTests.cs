@@ -379,21 +379,23 @@ public class TursoEfCoreTests
     [TestCase(ReferentialAction.Cascade, ReferentialAction.NoAction)]
     [TestCase(ReferentialAction.SetNull, ReferentialAction.NoAction)]
     [TestCase(ReferentialAction.NoAction, ReferentialAction.Cascade)]
-    public void ManagedMigrationsRejectUnsupportedReferentialActions(
+    public void ManagedMigrationsKeepReferentialActions(
         ReferentialAction onDelete,
         ReferentialAction onUpdate)
     {
         using var context = CreateManagedContext("Data Source=:memory:;Local Provider=Managed");
         var operation = CreateTableWithForeignKey(onDelete, onUpdate);
 
-        var generate = () => context.GetService<IMigrationsSqlGenerator>().Generate([operation]);
-
-        generate.Should().Throw<NotSupportedException>()
-            .WithMessage($"*ON DELETE {onDelete}*ON UPDATE {onUpdate}*");
+        var commands = context.GetService<IMigrationsSqlGenerator>().Generate([operation]);
+        var sql = string.Concat(commands.Select(command => command.CommandText));
+        if (onDelete != ReferentialAction.NoAction)
+            sql.Should().Contain("ON DELETE " + FormatReferentialAction(onDelete));
+        if (onUpdate != ReferentialAction.NoAction)
+            sql.Should().Contain("ON UPDATE " + FormatReferentialAction(onUpdate));
     }
 
     [Test]
-    public void ManagedMigrationsRejectUnsupportedReferentialActionsDuringTableRebuild()
+    public void ManagedMigrationsKeepReferentialActionsDuringTableRebuild()
     {
         var options = new DbContextOptionsBuilder<CascadeContext>()
             .UseTurso("Data Source=:memory:;Local Provider=Managed")
@@ -417,10 +419,9 @@ public class TursoEfCoreTests
         };
 
         var model = context.GetService<IDesignTimeModel>().Model;
-        var generate = () => context.GetService<IMigrationsSqlGenerator>().Generate([operation], model);
-
-        generate.Should().Throw<NotSupportedException>()
-            .WithMessage("*ON DELETE Cascade*ON UPDATE NoAction*");
+        var commands = context.GetService<IMigrationsSqlGenerator>().Generate([operation], model);
+        string.Concat(commands.Select(command => command.CommandText))
+            .Should().Contain("ON DELETE CASCADE");
     }
 
     [Test]
@@ -436,7 +437,7 @@ public class TursoEfCoreTests
     }
 
     [Test]
-    public async Task ManagedEnsureCreatedRejectsCompositeForeignKeysBeforeSchemaMutation()
+    public async Task ManagedEnsureCreatedSupportsCompositeForeignKeys()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         await connection.OpenAsync();
@@ -446,15 +447,12 @@ public class TursoEfCoreTests
             .Options;
         await using var context = new CompositeForeignKeyContext(options);
 
-        var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
-
-        await ensureCreated.Should().ThrowAsync<NotSupportedException>()
-            .WithMessage("*exactly one child column and one explicitly named parent column*");
+        (await context.Database.EnsureCreatedAsync()).Should().BeTrue();
 
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table';";
 
-        (await command.ExecuteScalarAsync()).Should().Be(0L);
+        (await command.ExecuteScalarAsync()).Should().Be(2L);
     }
 
     [Test]
@@ -469,8 +467,19 @@ public class TursoEfCoreTests
         sql.Should().Contain("FOREIGN KEY (\"ParentId1\", \"ParentId2\") REFERENCES \"Parents\" (\"Id1\", \"Id2\")");
     }
 
+    private static string FormatReferentialAction(ReferentialAction action)
+        => action switch
+        {
+            ReferentialAction.Cascade => "CASCADE",
+            ReferentialAction.Restrict => "RESTRICT",
+            ReferentialAction.SetNull => "SET NULL",
+            ReferentialAction.SetDefault => "SET DEFAULT",
+            ReferentialAction.NoAction => "NO ACTION",
+            _ => throw new InvalidOperationException($"Unknown referential action {action}."),
+        };
+
     [Test]
-    public async Task ManagedEnsureCreatedRejectsCascadeBeforeSchemaMutation()
+    public async Task ManagedEnsureCreatedPersistsCascadeForeignKeys()
     {
         using var database = TemporaryDatabase.Create();
         var options = new DbContextOptionsBuilder<CascadeContext>()
@@ -478,17 +487,15 @@ public class TursoEfCoreTests
             .Options;
         await using var context = new CascadeContext(options);
 
-        var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
-
-        await ensureCreated.Should().ThrowAsync<NotSupportedException>()
-            .WithMessage("*ON DELETE Cascade*");
+        (await context.Database.EnsureCreatedAsync()).Should().BeTrue();
 
         await using var connection = new SqliteConnection(database.ConnectionString + ";Local Provider=Managed");
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table';";
+        command.CommandText = "SELECT \"sql\" FROM \"sqlite_master\" WHERE \"name\" = 'Children';";
 
-        (await command.ExecuteScalarAsync()).Should().Be(0L);
+        (await command.ExecuteScalarAsync()).Should().BeOfType<string>()
+            .Which.Should().Contain("ON DELETE CASCADE");
     }
 
     [Test]

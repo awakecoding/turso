@@ -270,10 +270,26 @@ public sealed class EmbeddedDatabase : IDisposable
         bool InsideTrigger = false,
         long LastInsertRowId = 0,
         bool ForeignKeysEnabled = false,
+        bool DeferForeignKeys = false,
+        bool InTransaction = false,
         bool RecursiveTriggersEnabled = false,
         IReadOnlySet<string>? ActiveTriggers = null,
         int TriggerDepth = 0,
+        int ForeignKeyActionDepth = 0,
+        ForeignKeyStatementState? ForeignKeyStatement = null,
         CancellationToken CancellationToken = default);
+
+    internal sealed class ForeignKeyStatementState
+    {
+        public int Depth { get; set; }
+    }
+
+    internal sealed record ForeignKeyViolation(
+        string ChildTable,
+        int ForeignKeyIndex,
+        string RowIdentity,
+        string ChildKey,
+        bool DeclaredDeferred);
 
     // Bundles the mutable schema (tables, views, triggers) so a transaction can
     // snapshot and atomically publish all managed catalog state together.
@@ -430,6 +446,8 @@ public sealed class EmbeddedDatabase : IDisposable
         long lastInsertRowId = 0,
         bool foreignKeysEnabled = false,
         bool recursiveTriggersEnabled = false,
+        bool deferForeignKeys = false,
+        bool inTransaction = false,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -448,6 +466,8 @@ public sealed class EmbeddedDatabase : IDisposable
                         lastInsertRowId,
                         foreignKeysEnabled,
                         recursiveTriggersEnabled,
+                        deferForeignKeys,
+                        inTransaction,
                         cancellationToken);
                 }
                 catch (EmbeddedConflictFailException)
@@ -495,6 +515,8 @@ public sealed class EmbeddedDatabase : IDisposable
                         lastInsertRowId,
                         foreignKeysEnabled,
                         recursiveTriggersEnabled,
+                        deferForeignKeys,
+                        inTransaction,
                         cancellationToken);
                 }
                 catch (EmbeddedConflictFailException)
@@ -527,6 +549,8 @@ public sealed class EmbeddedDatabase : IDisposable
                     lastInsertRowId,
                     foreignKeysEnabled,
                     recursiveTriggersEnabled,
+                    deferForeignKeys,
+                    inTransaction,
                     cancellationToken);
 
             var working = new SchemaCatalog(_tables, _views, _triggers).Clone();
@@ -540,6 +564,8 @@ public sealed class EmbeddedDatabase : IDisposable
                     lastInsertRowId,
                     foreignKeysEnabled,
                     recursiveTriggersEnabled,
+                    deferForeignKeys,
+                    inTransaction,
                     cancellationToken);
             }
             catch (EmbeddedConflictFailException)
@@ -1104,6 +1130,8 @@ public sealed class EmbeddedDatabase : IDisposable
         long lastInsertRowId = 0,
         bool foreignKeysEnabled = false,
         bool recursiveTriggersEnabled = false,
+        bool deferForeignKeys = false,
+        bool inTransaction = false,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -1118,12 +1146,17 @@ public sealed class EmbeddedDatabase : IDisposable
             catalog.Triggers,
             LastInsertRowId: lastInsertRowId,
             ForeignKeysEnabled: foreignKeysEnabled,
+            DeferForeignKeys: deferForeignKeys,
+            InTransaction: inTransaction,
             RecursiveTriggersEnabled: recursiveTriggersEnabled,
+            ForeignKeyStatement: foreignKeysEnabled ? new ForeignKeyStatementState() : null,
             CancellationToken: cancellationToken);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog),
-            DropTableStatement drop => ExecuteDropTable(drop, catalog),
+            DropTableStatement drop => context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(context, () => ExecuteDropTable(drop, catalog, context))
+                : ExecuteDropTable(drop, catalog, context),
             CreateIndexStatement createIndex => ExecuteCreateIndex(createIndex, catalog),
             DropIndexStatement dropIndex => ExecuteDropIndex(dropIndex, tables),
             CreateViewStatement createView => ExecuteCreateView(createView, catalog),
@@ -1143,6 +1176,8 @@ public sealed class EmbeddedDatabase : IDisposable
             PragmaTableXInfoStatement tableXInfo => ExecutePragmaTableXInfo(tableXInfo, tables),
             PragmaIndexListStatement indexList => ExecutePragmaIndexList(indexList, tables),
             PragmaIndexInfoStatement indexInfo => ExecutePragmaIndexInfo(indexInfo, tables),
+            PragmaForeignKeyListStatement foreignKeyList => ExecutePragmaForeignKeyList(foreignKeyList, tables),
+            PragmaForeignKeyCheckStatement foreignKeyCheck => ExecutePragmaForeignKeyCheck(foreignKeyCheck, tables),
             PragmaTableListStatement => ExecutePragmaTableList(catalog),
             PragmaDatabaseListStatement => ExecutePragmaDatabaseList(),
             PragmaEncodingStatement => ExecutePragmaEncoding(),
@@ -1346,6 +1381,95 @@ public sealed class EmbeddedDatabase : IDisposable
         return new ExecutionResult(columns, rows, 0);
     }
 
+    private static ExecutionResult ExecutePragmaForeignKeyList(
+        PragmaForeignKeyListStatement statement,
+        IReadOnlyDictionary<string, EmbeddedTable> tables)
+    {
+        var columns = new[] { "id", "seq", "table", "from", "to", "on_update", "on_delete", "match" };
+        if (!tables.TryGetValue(statement.TableName, out var table))
+            return new ExecutionResult(columns, [], 0);
+
+        var rows = new List<SqlValue[]>();
+        var foreignKeys = table.ForeignKeys.Reverse().ToArray();
+        for (var id = 0; id < foreignKeys.Length; id++)
+        {
+            var foreignKey = foreignKeys[id];
+            for (var sequence = 0; sequence < foreignKey.ChildColumns.Count; sequence++)
+            {
+                rows.Add(
+                [
+                    SqlValue.Integer(id),
+                    SqlValue.Integer(sequence),
+                    SqlValue.Text(foreignKey.ParentTable),
+                    SqlValue.Text(foreignKey.ChildColumns[sequence]),
+                    sequence < foreignKey.ParentColumns.Count
+                        ? SqlValue.Text(foreignKey.ParentColumns[sequence])
+                        : SqlValue.Null,
+                    SqlValue.Text(FormatForeignKeyAction(foreignKey.OnUpdate)),
+                    SqlValue.Text(FormatForeignKeyAction(foreignKey.OnDelete)),
+                    SqlValue.Text("NONE"),
+                ]);
+            }
+        }
+
+        return new ExecutionResult(columns, rows, 0);
+    }
+
+    private ExecutionResult ExecutePragmaForeignKeyCheck(
+        PragmaForeignKeyCheckStatement statement,
+        IReadOnlyDictionary<string, EmbeddedTable> tables)
+    {
+        var columns = new[] { "table", "rowid", "parent", "fkid" };
+        var selectedTables = statement.TableName is null
+            ? tables
+            : tables.TryGetValue(statement.TableName, out var selected)
+                ? new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [statement.TableName] = selected,
+                }
+                : new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase);
+        var rows = new List<SqlValue[]>();
+        foreach (var (childTableName, childTable) in selectedTables.Reverse())
+        {
+            var foreignKeys = childTable.ForeignKeys.Reverse().ToArray();
+            for (var foreignKeyId = 0; foreignKeyId < foreignKeys.Length; foreignKeyId++)
+            {
+                var foreignKey = foreignKeys[foreignKeyId];
+                var childColumns = ResolveForeignKeyChildColumns(childTable, childTableName, foreignKey);
+                ForeignKeyParent? parent = null;
+                if (tables.ContainsKey(foreignKey.ParentTable))
+                    parent = ResolveForeignKeyParent(tables, childTableName, foreignKey);
+
+                for (var rowIndex = 0; rowIndex < childTable.Rows.Count; rowIndex++)
+                {
+                    var childValues = GetForeignKeyValues(childTable.Rows[rowIndex], childColumns);
+                    if (childValues.Any(value => value.Kind == SqlValueKind.Null)
+                        || (parent is not null && ParentContains(
+                            parent,
+                            parent.Table.Rows,
+                            childValues,
+                            childTable.Rows[rowIndex],
+                            ReferenceEquals(childTable, parent.Table))))
+                    {
+                        continue;
+                    }
+
+                    rows.Add(
+                    [
+                        SqlValue.Text(childTableName),
+                        childTable.HasRowid && rowIndex < childTable.RowIds.Count
+                            ? SqlValue.Integer(childTable.RowIds[rowIndex])
+                            : SqlValue.Null,
+                        SqlValue.Text(foreignKey.ParentTable),
+                        SqlValue.Integer(foreignKeyId),
+                    ]);
+                }
+            }
+        }
+
+        return new ExecutionResult(columns, rows, 0);
+    }
+
     private ExecutionResult ExecuteCreateTable(CreateTableStatement statement, SchemaCatalog catalog)
     {
         var tables = catalog.Tables;
@@ -1383,18 +1507,46 @@ public sealed class EmbeddedDatabase : IDisposable
                 statement.CheckConstraints,
                 statement.PrimaryKeyConflictAlgorithm,
                 statement.PrimaryKeyConstraintName,
-                statement.PrimaryKeyDeclarationOrder));
+                statement.PrimaryKeyDeclarationOrder,
+                statement.TableForeignKeys));
         return new ExecutionResult([], [], 0, true);
     }
 
-    private static ExecutionResult ExecuteDropTable(DropTableStatement statement, SchemaCatalog catalog)
+    private ExecutionResult ExecuteDropTable(
+        DropTableStatement statement,
+        SchemaCatalog catalog,
+        QueryContext context)
     {
         var tables = catalog.Tables;
         if (catalog.Views.ContainsKey(statement.Name))
             throw new EmbeddedSqlException($"use DROP VIEW to delete view {statement.Name}");
 
-        if (tables.Remove(statement.Name))
+        if (tables.TryGetValue(statement.Name, out var table))
         {
+            if (context.ForeignKeysEnabled && table.Rows.Count > 0)
+            {
+                var backup = CloneTables(tables);
+                var originalRows = table.Rows.ToArray();
+                try
+                {
+                    table.Rows.Clear();
+                    table.RowIds.Clear();
+                    ValidateForeignKeysAfterDelete(
+                        context,
+                        statement.Name,
+                        table,
+                        originalRows,
+                        table.Rows,
+                        originalRows);
+                }
+                catch
+                {
+                    RestoreTables(tables, backup);
+                    throw;
+                }
+            }
+
+            tables.Remove(statement.Name);
             RemoveTriggersForTable(catalog, statement.Name);
             return new ExecutionResult([], [], 0, true);
         }
@@ -1664,9 +1816,19 @@ public sealed class EmbeddedDatabase : IDisposable
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
         if (statement.ConflictAlgorithm is { } algorithm)
-            return ExecuteConflictResolvedInsert(statement, algorithm, parameters, context);
+        {
+            return context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(
+                    context,
+                    () => ExecuteConflictResolvedInsert(statement, algorithm, parameters, context))
+                : ExecuteConflictResolvedInsert(statement, algorithm, parameters, context);
+        }
         if (statement.Upsert is not null)
-            return ExecuteUpsert(statement, parameters, context);
+        {
+            return context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(context, () => ExecuteUpsert(statement, parameters, context))
+                : ExecuteUpsert(statement, parameters, context);
+        }
         if (context.Tables.TryGetValue(statement.TableName, out var table)
             && table.HasNonDefaultConflictAlgorithms)
         {
@@ -1798,12 +1960,6 @@ public sealed class EmbeddedDatabase : IDisposable
                     case InsertConflictAlgorithm.Replace
                         when row is not null
                             && exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal):
-                        if (HasForeignKeyParticipation(context, statement.TableName, table))
-                        {
-                            throw new EmbeddedSqlException(
-                                "Managed constraint-level ON CONFLICT REPLACE does not support tables participating in FOREIGN KEY constraints when foreign_keys is enabled.");
-                        }
-
                         CommitReplacement(
                             context,
                             statement.TableName,
@@ -1916,12 +2072,6 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException(
                 $"Managed INSERT OR {algorithm.ToString().ToUpperInvariant()} does not support CTE sources.");
         }
-        if (context.ForeignKeysEnabled && table.ForeignKeys.Count > 0)
-        {
-            throw new EmbeddedSqlException(
-                $"Managed INSERT OR {algorithm.ToString().ToUpperInvariant()} does not support tables with FOREIGN KEY constraints when foreign_keys is enabled.");
-        }
-
         var sourceRows = statement.Source is null
             ? null
             : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
@@ -2012,12 +2162,6 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (context.CommonTableExpressions.Count != 0)
             throw new EmbeddedSqlException("Managed INSERT OR REPLACE does not support CTE sources.");
-        if (HasForeignKeyParticipation(context, statement.TableName, table))
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSERT OR REPLACE does not support tables participating in FOREIGN KEY constraints when foreign_keys is enabled.");
-        }
-
         var sourceRows = statement.Source is null
             ? null
             : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
@@ -2178,10 +2322,13 @@ public sealed class EmbeddedDatabase : IDisposable
             if (conflictIndex < 0)
                 continue;
 
+            var originalRows = table.Rows.ToArray();
+            var deletedRow = table.Rows[conflictIndex];
             table.Rows.RemoveAt(conflictIndex);
             table.RowIds.RemoveAt(conflictIndex);
             if (table.HasRowid)
                 RecordBlobMutation(tableName, conflictedRowId);
+            ValidateForeignKeysAfterDelete(context, tableName, table, originalRows, rows, [deletedRow]);
             if (deleteTriggers.Count > 0)
                 FireTriggers(deleteTriggers, context);
         }
@@ -2257,21 +2404,6 @@ public sealed class EmbeddedDatabase : IDisposable
         => exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal)
             || exception.Message.StartsWith("NOT NULL constraint failed:", StringComparison.Ordinal)
             || exception.Message.StartsWith("CHECK constraint failed:", StringComparison.Ordinal);
-
-    private static bool HasForeignKeyParticipation(
-        QueryContext context,
-        string tableName,
-        EmbeddedTable table)
-    {
-        if (!context.ForeignKeysEnabled)
-            return false;
-        if (table.ForeignKeys.Count > 0)
-            return true;
-
-        return context.Tables.Values.Any(candidate =>
-            candidate.ForeignKeys.Any(foreignKey =>
-                string.Equals(foreignKey.ParentTable, tableName, StringComparison.OrdinalIgnoreCase)));
-    }
 
     // Trigger bodies can fail after their row mutations are published. Keep the complete
     // statement under one backup so every VALUES row and statement-level trigger is atomic.
@@ -2418,15 +2550,16 @@ public sealed class EmbeddedDatabase : IDisposable
             ValidateColumnUniqueConstraints(table, updatedRows);
             ValidatePrimaryKey(statement.TableName, table, updatedRows);
             ValidateUniqueIndexes(statement.TableName, table, updatedRows);
+            var originalRows = table.Rows.Select(row => row.ToArray()).ToArray();
+            ApplyUpsertRows(table, updatedRows, updatedRowIds);
             ValidateForeignKeysAfterUpdate(
                 context,
                 statement.TableName,
                 table,
-                table.Rows,
+                originalRows,
                 updatedRows,
                 updatePlan!,
                 [conflictPosition]);
-            ApplyUpsertRows(table, updatedRows, updatedRowIds);
 
             affectedRows.Add(updated);
             affectedRowIds.Add(originalRowId);
@@ -2882,8 +3015,8 @@ public sealed class EmbeddedDatabase : IDisposable
     }
 
     // Re-sorts a WITHOUT ROWID table's rows into primary-key order (honoring per-column
-    // ASC/DESC) so scans observe the physical key order SQLite exposes. The parallel rowid
-    // list is reordered in lock-step to stay index-aligned with the rows.
+    // ASC/DESC) so scans observe the physical key order SQLite exposes. The parallel internal
+    // row-identity list is reordered in lock-step even though SQL cannot access those values.
     private void SortWithoutRowid(EmbeddedTable table)
     {
         if (!table.WithoutRowid)
@@ -3625,14 +3758,8 @@ public sealed class EmbeddedDatabase : IDisposable
         ValidateColumnUniqueConstraints(table, rows);
         ValidatePrimaryKey(tableName, table, rows);
         ValidateUniqueIndexes(tableName, table, rows);
-        ValidateForeignKeysAfterUpdate(
-            context,
-            tableName,
-            table,
-            originalRows,
-            rows,
-            plan,
-            updatedPositions);
+        var originalRowSnapshot = originalRows.Select(row => row.ToArray()).ToArray();
+        var postUpdateRowSnapshot = rows.ToArray();
         beforeMutation?.Invoke();
         var originalRowIds = table.HasRowid
             ? updatedPositions.Select(position => table.RowIds[position]).ToArray()
@@ -3642,6 +3769,14 @@ public sealed class EmbeddedDatabase : IDisposable
         table.RowIds.Clear();
         table.RowIds.AddRange(rowIds);
         SortWithoutRowid(table);
+        ValidateForeignKeysAfterUpdate(
+            context,
+            tableName,
+            table,
+            originalRowSnapshot,
+            postUpdateRowSnapshot,
+            plan,
+            updatedPositions);
         if (table.HasRowid)
         {
             for (var index = 0; index < updatedPositions.Count; index++)
@@ -3685,10 +3820,10 @@ public sealed class EmbeddedDatabase : IDisposable
             .Select(assignment => assignment.Index)
             .ToHashSet();
         var changedRows = updatedPositions.Select(position => postUpdateRows[position]).ToArray();
-        foreach (var foreignKey in table.ForeignKeys)
+        foreach (var foreignKey in table.ForeignKeys.Reverse())
         {
-            if (table.TryGetColumnIndex(foreignKey.ChildColumn, out var childColumn)
-                && assignedColumns.Contains(childColumn))
+            var childColumns = ResolveForeignKeyChildColumns(table, tableName, foreignKey);
+            if (childColumns.Any(assignedColumns.Contains))
             {
                 ValidateChildForeignKeys(context, tableName, table, changedRows, tableName, postUpdateRows, foreignKey);
             }
@@ -3716,7 +3851,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         foreach (var (childTableName, childTable) in context.Tables)
         {
-            foreach (var foreignKey in childTable.ForeignKeys)
+            foreach (var foreignKey in childTable.ForeignKeys.Reverse())
             {
                 if (!string.Equals(foreignKey.ParentTable, tableName, StringComparison.OrdinalIgnoreCase))
                     continue;
@@ -3724,13 +3859,15 @@ public sealed class EmbeddedDatabase : IDisposable
                 var parent = ResolveForeignKeyParent(context.Tables, childTableName, foreignKey);
                 foreach (var deletedRow in deletedRows)
                 {
-                    ValidateChildrenReferencingParentValue(
+                    ApplyForeignKeyParentAction(
                         context,
                         childTableName,
                         childTable,
                         foreignKey,
                         parent,
-                        deletedRow[parent.ColumnIndex],
+                        GetForeignKeyValues(deletedRow, parent.ColumnIndices),
+                        newParentValues: null,
+                        foreignKey.OnDelete,
                         tableName,
                         postDeleteRows);
                 }
@@ -3748,29 +3885,31 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         foreach (var (childTableName, childTable) in context.Tables)
         {
-            foreach (var foreignKey in childTable.ForeignKeys)
+            foreach (var foreignKey in childTable.ForeignKeys.Reverse())
             {
                 if (!string.Equals(foreignKey.ParentTable, tableName, StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 var parent = ResolveForeignKeyParent(context.Tables, childTableName, foreignKey);
-                if (!assignedColumns.Contains(parent.ColumnIndex))
+                if (!parent.ColumnIndices.Any(assignedColumns.Contains))
                     continue;
 
                 foreach (var position in updatedPositions)
                 {
-                    var oldValue = originalRows[position][parent.ColumnIndex];
-                    var newValue = postUpdateRows[position][parent.ColumnIndex];
-                    if (Compare(oldValue, newValue, parent.Collation) == 0)
+                    var oldValues = GetForeignKeyValues(originalRows[position], parent.ColumnIndices);
+                    var newValues = GetForeignKeyValues(postUpdateRows[position], parent.ColumnIndices);
+                    if (ForeignKeyValuesEqual(parent, oldValues, newValues))
                         continue;
 
-                    ValidateChildrenReferencingParentValue(
+                    ApplyForeignKeyParentAction(
                         context,
                         childTableName,
                         childTable,
                         foreignKey,
                         parent,
-                        oldValue,
+                        oldValues,
+                        newValues,
+                        foreignKey.OnUpdate,
                         tableName,
                         postUpdateRows);
                 }
@@ -3787,27 +3926,103 @@ public sealed class EmbeddedDatabase : IDisposable
         IReadOnlyList<SqlValue[]> targetRows,
         ForeignKeyDefinition? onlyForeignKey = null)
     {
-        foreach (var foreignKey in childTable.ForeignKeys)
+        foreach (var foreignKey in childTable.ForeignKeys.Reverse())
         {
             if (onlyForeignKey is not null && !ReferenceEquals(foreignKey, onlyForeignKey))
                 continue;
 
-            if (!childTable.TryGetColumnIndex(foreignKey.ChildColumn, out var childColumn))
-                throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
-
+            var childColumns = ResolveForeignKeyChildColumns(childTable, childTableName, foreignKey);
             var parent = ResolveForeignKeyParent(context.Tables, childTableName, foreignKey);
             var parentRows = string.Equals(parent.TableName, targetTableName, StringComparison.OrdinalIgnoreCase)
                 ? targetRows
                 : parent.Table.Rows;
             foreach (var childRow in childRows)
             {
-                var childValue = childRow[childColumn];
-                if (childValue.Kind == SqlValueKind.Null)
+                var childValues = GetForeignKeyValues(childRow, childColumns);
+                if (childValues.Any(value => value.Kind == SqlValueKind.Null))
                     continue;
 
-                if (!ParentContains(parent, parentRows, childValue))
-                    throw new EmbeddedSqlException("FOREIGN KEY constraint failed");
+                if (!ParentContains(
+                        parent,
+                        parentRows,
+                        childValues,
+                        childRow,
+                        ReferenceEquals(childTable, parent.Table)))
+                    ThrowForeignKeyConstraint(context, foreignKey);
             }
+        }
+    }
+
+    private void ApplyForeignKeyParentAction(
+        QueryContext context,
+        string childTableName,
+        EmbeddedTable childTable,
+        ForeignKeyDefinition foreignKey,
+        ForeignKeyParent parent,
+        IReadOnlyList<SqlValue> oldParentValues,
+        IReadOnlyList<SqlValue>? newParentValues,
+        ForeignKeyAction action,
+        string targetTableName,
+        IReadOnlyList<SqlValue[]> targetRows)
+    {
+        var matchingRows = FindForeignKeyChildPositions(
+            childTable,
+            childTableName,
+            foreignKey,
+            parent,
+            oldParentValues);
+        if (matchingRows.Count == 0)
+            return;
+
+        switch (action)
+        {
+            case ForeignKeyAction.Cascade when newParentValues is null:
+                ExecuteForeignKeyDelete(
+                    context,
+                    childTableName,
+                    childTable,
+                    foreignKey,
+                    parent,
+                    oldParentValues);
+                return;
+            case ForeignKeyAction.Cascade:
+                ExecuteForeignKeyUpdate(
+                    context,
+                    childTableName,
+                    childTable,
+                    foreignKey,
+                    parent,
+                    oldParentValues,
+                    ForeignKeyAction.Cascade,
+                    newParentValues);
+                return;
+            case ForeignKeyAction.SetNull:
+            case ForeignKeyAction.SetDefault:
+                ExecuteForeignKeyUpdate(
+                    context,
+                    childTableName,
+                    childTable,
+                    foreignKey,
+                    parent,
+                    oldParentValues,
+                    action,
+                    newParentValues: null);
+                return;
+            case ForeignKeyAction.Restrict:
+                throw new EmbeddedSqlException("FOREIGN KEY constraint failed");
+            case ForeignKeyAction.NoAction:
+                ValidateChildrenReferencingParentValue(
+                    context,
+                    childTableName,
+                    childTable,
+                    foreignKey,
+                    parent,
+                    oldParentValues,
+                    targetTableName,
+                    targetRows);
+                return;
+            default:
+                throw new InvalidOperationException($"Unknown foreign key action {action}.");
         }
     }
 
@@ -3817,13 +4032,11 @@ public sealed class EmbeddedDatabase : IDisposable
         EmbeddedTable childTable,
         ForeignKeyDefinition foreignKey,
         ForeignKeyParent parent,
-        SqlValue oldParentValue,
+        IReadOnlyList<SqlValue> oldParentValues,
         string targetTableName,
         IReadOnlyList<SqlValue[]> targetRows)
     {
-        if (!childTable.TryGetColumnIndex(foreignKey.ChildColumn, out var childColumn))
-            throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
-
+        var childColumns = ResolveForeignKeyChildColumns(childTable, childTableName, foreignKey);
         var childRows = string.Equals(childTableName, targetTableName, StringComparison.OrdinalIgnoreCase)
             ? targetRows
             : childTable.Rows;
@@ -3832,16 +4045,244 @@ public sealed class EmbeddedDatabase : IDisposable
             : parent.Table.Rows;
         foreach (var childRow in childRows)
         {
-            var childValue = childRow[childColumn];
-            if (childValue.Kind == SqlValueKind.Null
-                || !ValuesMatchParent(parent, oldParentValue, childValue))
+            var childValues = GetForeignKeyValues(childRow, childColumns);
+            if (childValues.Any(value => value.Kind == SqlValueKind.Null)
+                || !ValuesMatchParent(parent, oldParentValues, childValues))
             {
                 continue;
             }
 
-            if (!ParentContains(parent, parentRows, childValue))
-                throw new EmbeddedSqlException("FOREIGN KEY constraint failed");
+            if (!ParentContains(
+                    parent,
+                    parentRows,
+                    childValues,
+                    childRow,
+                    ReferenceEquals(childTable, parent.Table)))
+                ThrowForeignKeyConstraint(context, foreignKey);
         }
+    }
+
+    private IReadOnlyList<int> FindForeignKeyChildPositions(
+        EmbeddedTable childTable,
+        string childTableName,
+        ForeignKeyDefinition foreignKey,
+        ForeignKeyParent parent,
+        IReadOnlyList<SqlValue> oldParentValues)
+    {
+        var childColumns = ResolveForeignKeyChildColumns(childTable, childTableName, foreignKey);
+        var positions = new List<int>();
+        for (var position = 0; position < childTable.Rows.Count; position++)
+        {
+            var childValues = GetForeignKeyValues(childTable.Rows[position], childColumns);
+            if (childValues.Any(value => value.Kind == SqlValueKind.Null))
+                continue;
+            if (ValuesMatchParent(parent, oldParentValues, childValues))
+                positions.Add(position);
+        }
+
+        return positions;
+    }
+
+    private void ExecuteForeignKeyDelete(
+        QueryContext context,
+        string childTableName,
+        EmbeddedTable childTable,
+        ForeignKeyDefinition foreignKey,
+        ForeignKeyParent parent,
+        IReadOnlyList<SqlValue> oldParentValues)
+    {
+        var actionContext = EnterForeignKeyAction(context);
+        _ = ExecuteWithTriggers(
+            childTableName,
+            TriggerEvent.Delete,
+            actionContext,
+            () => PerformForeignKeyDelete(
+                actionContext,
+                childTableName,
+                childTable,
+                foreignKey,
+                parent,
+                oldParentValues));
+    }
+
+    private ExecutionResult PerformForeignKeyDelete(
+        QueryContext context,
+        string childTableName,
+        EmbeddedTable childTable,
+        ForeignKeyDefinition foreignKey,
+        ForeignKeyParent parent,
+        IReadOnlyList<SqlValue> oldParentValues)
+    {
+        var deletedPositions = FindForeignKeyChildPositions(
+            childTable,
+            childTableName,
+            foreignKey,
+            parent,
+            oldParentValues).ToHashSet();
+        if (deletedPositions.Count == 0)
+            return ExecutionResult.Empty;
+
+        var originalRows = childTable.Rows.ToArray();
+        var rows = new List<SqlValue[]>(childTable.Rows.Count - deletedPositions.Count);
+        var rowIds = new List<long>(Math.Max(0, childTable.RowIds.Count - deletedPositions.Count));
+        var deletedRows = new List<SqlValue[]>(deletedPositions.Count);
+        var deletedRowIds = new List<long>(deletedPositions.Count);
+        for (var position = 0; position < childTable.Rows.Count; position++)
+        {
+            var rowId = position < childTable.RowIds.Count ? childTable.RowIds[position] : position + 1;
+            if (deletedPositions.Contains(position))
+            {
+                deletedRows.Add(childTable.Rows[position]);
+                deletedRowIds.Add(rowId);
+            }
+            else
+            {
+                rows.Add(childTable.Rows[position]);
+                rowIds.Add(rowId);
+            }
+        }
+
+        childTable.Rows.Clear();
+        childTable.Rows.AddRange(rows);
+        childTable.RowIds.Clear();
+        childTable.RowIds.AddRange(rowIds);
+        ValidateForeignKeysAfterDelete(
+            context,
+            childTableName,
+            childTable,
+            originalRows,
+            childTable.Rows,
+            deletedRows);
+        if (childTable.HasRowid)
+        {
+            foreach (var rowId in deletedRowIds)
+                RecordBlobMutation(childTableName, rowId);
+        }
+
+        return new ExecutionResult([], [], deletedRows.Count, true);
+    }
+
+    private void ExecuteForeignKeyUpdate(
+        QueryContext context,
+        string childTableName,
+        EmbeddedTable childTable,
+        ForeignKeyDefinition foreignKey,
+        ForeignKeyParent parent,
+        IReadOnlyList<SqlValue> oldParentValues,
+        ForeignKeyAction action,
+        IReadOnlyList<SqlValue>? newParentValues)
+    {
+        var actionContext = EnterForeignKeyAction(context);
+        _ = ExecuteWithTriggers(
+            childTableName,
+            TriggerEvent.Update,
+            actionContext,
+            () => PerformForeignKeyUpdate(
+                actionContext,
+                childTableName,
+                childTable,
+                foreignKey,
+                parent,
+                oldParentValues,
+                action,
+                newParentValues));
+    }
+
+    private ExecutionResult PerformForeignKeyUpdate(
+        QueryContext context,
+        string childTableName,
+        EmbeddedTable childTable,
+        ForeignKeyDefinition foreignKey,
+        ForeignKeyParent parent,
+        IReadOnlyList<SqlValue> oldParentValues,
+        ForeignKeyAction action,
+        IReadOnlyList<SqlValue>? newParentValues)
+    {
+        var updatedPositions = FindForeignKeyChildPositions(
+            childTable,
+            childTableName,
+            foreignKey,
+            parent,
+            oldParentValues);
+        if (updatedPositions.Count == 0)
+            return ExecutionResult.Empty;
+
+        var assignments = new List<ColumnAssignment>(foreignKey.ChildColumns.Count);
+        for (var position = 0; position < foreignKey.ChildColumns.Count; position++)
+        {
+            var columnIndex = childTable.GetColumnIndex(foreignKey.ChildColumns[position]);
+            var value = action switch
+            {
+                ForeignKeyAction.Cascade => newParentValues?[position]
+                    ?? throw new InvalidOperationException("ON UPDATE CASCADE lost the new parent key."),
+                ForeignKeyAction.SetNull => SqlValue.Null,
+                ForeignKeyAction.SetDefault => EvaluateForeignKeyDefault(
+                    childTable.ColumnDefinitions[columnIndex],
+                    context),
+                _ => throw new InvalidOperationException($"Foreign key action {action} cannot update child rows."),
+            };
+            assignments.Add(new ColumnAssignment(
+                foreignKey.ChildColumns[position],
+                new LiteralExpression(value)));
+        }
+
+        var statement = new UpdateStatement(childTableName, assignments, Where: null);
+        var plan = PrepareUpdate(statement, childTable);
+        var originalRows = childTable.Rows.ToArray();
+        var rows = childTable.Rows.Select(row => row.ToArray()).ToList();
+        var rowIds = childTable.RowIds.Count == childTable.Rows.Count
+            ? childTable.RowIds.ToList()
+            : Enumerable.Range(1, childTable.Rows.Count).Select(position => (long)position).ToList();
+        foreach (var position in updatedPositions)
+        {
+            var rowId = position < childTable.RowIds.Count ? childTable.RowIds[position] : position + 1;
+            var (updated, newRowId) = BuildUpdatedRow(
+                statement,
+                childTable,
+                plan,
+                childTable.Rows[position],
+                rowId,
+                EmptyParameters,
+                context);
+            rows[position] = updated;
+            rowIds[position] = newRowId;
+        }
+
+        CommitUpdates(
+            context,
+            childTableName,
+            childTable,
+            originalRows,
+            rows,
+            rowIds,
+            plan,
+            updatedPositions);
+        return new ExecutionResult([], [], updatedPositions.Count, true);
+    }
+
+    private SqlValue EvaluateForeignKeyDefault(EmbeddedColumn column, QueryContext context)
+        => column.DefaultExpression is { } expression
+            ? Evaluate(expression, EmptyParameters, row: null, context)
+            : column.DefaultValue ?? SqlValue.Null;
+
+    private static QueryContext EnterForeignKeyAction(QueryContext context)
+    {
+        if (context.ForeignKeyActionDepth >= MaximumTriggerDepth)
+            throw new EmbeddedSqlException("too many levels of trigger recursion");
+        return context with { ForeignKeyActionDepth = context.ForeignKeyActionDepth + 1 };
+    }
+
+    private static void ThrowForeignKeyConstraint(QueryContext context, ForeignKeyDefinition foreignKey)
+    {
+        if (context.InTransaction
+            && (context.DeferForeignKeys || foreignKey.Deferral == ForeignKeyDeferral.InitiallyDeferred))
+        {
+            return;
+        }
+        if (context.ForeignKeyStatement is { Depth: > 0 })
+            return;
+
+        throw new EmbeddedSqlException("FOREIGN KEY constraint failed");
     }
 
     private ForeignKeyParent ResolveForeignKeyParent(
@@ -3851,53 +4292,219 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (!tables.TryGetValue(foreignKey.ParentTable, out var parent))
             throw new EmbeddedSqlException($"no such table: main.{foreignKey.ParentTable}");
-        if (!parent.TryGetColumnIndex(foreignKey.ParentColumn, out var parentColumn))
-            throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
-
-        var column = parent.ColumnDefinitions[parentColumn];
-        if (column.IsGenerated)
-            throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
-
-        if (parent.PrimaryKeyColumns.Count == 1 && parent.PrimaryKeyColumns[0].Index == parentColumn)
+        if (foreignKey.ParentColumns.Count != 0
+            && foreignKey.ParentColumns.Count != foreignKey.ChildColumns.Count)
         {
-            var collation = parent.TableLevelPrimaryKey?[0].Collation ?? column.Collation;
-            if (IsBinaryCollation(collation))
-                return new ForeignKeyParent(parent, foreignKey.ParentTable, parentColumn, collation);
+            throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
         }
 
-        if (column.Unique && IsBinaryCollation(column.Collation))
-            return new ForeignKeyParent(parent, foreignKey.ParentTable, parentColumn, column.Collation);
+        int[] parentColumns;
+        if (foreignKey.ParentColumns.Count == 0)
+        {
+            if (parent.PrimaryKeyColumns.Count != foreignKey.ChildColumns.Count)
+                throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
+            parentColumns = parent.PrimaryKeyColumns.Select(column => column.Index).ToArray();
+        }
+        else
+        {
+            parentColumns = new int[foreignKey.ParentColumns.Count];
+            for (var position = 0; position < parentColumns.Length; position++)
+            {
+                if (!parent.TryGetColumnIndex(foreignKey.ParentColumns[position], out parentColumns[position]))
+                    throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
+            }
+        }
+
+        if (PrimaryKeyMatches(parent, parentColumns))
+        {
+            return new ForeignKeyParent(
+                parent,
+                foreignKey.ParentTable,
+                parentColumns,
+                parentColumns
+                    .Select((column, position) =>
+                        parent.TableLevelPrimaryKey?[position].Collation
+                        ?? parent.ColumnDefinitions[column].Collation)
+                    .ToArray());
+        }
 
         var uniqueIndex = parent.Indexes.FirstOrDefault(index =>
             index.Unique
-            && index.Columns.Count == 1
-            && index.Columns[0].ColumnIndex == parentColumn
-            && IsBinaryCollation(index.Columns[0].Collation));
+            && index.Columns.Count == parentColumns.Length
+            && index.Columns.Select(column => column.ColumnIndex).SequenceEqual(parentColumns)
+            && index.Columns.Select(column => NormalizeCollation(column.Collation)).SequenceEqual(
+                parentColumns.Select(column => NormalizeCollation(parent.ColumnDefinitions[column].Collation)),
+                StringComparer.OrdinalIgnoreCase));
         if (uniqueIndex is not null)
         {
             return new ForeignKeyParent(
                 parent,
                 foreignKey.ParentTable,
-                parentColumn,
-                uniqueIndex.Columns[0].Collation);
+                parentColumns,
+                uniqueIndex.Columns.Select(column => column.Collation).ToArray());
         }
 
         throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
     }
 
+    private static bool PrimaryKeyMatches(EmbeddedTable parent, IReadOnlyList<int> columns)
+        => parent.PrimaryKeyColumns.Count == columns.Count
+            && parent.PrimaryKeyColumns.Select(column => column.Index).SequenceEqual(columns);
+
+    private static string NormalizeCollation(string? collation)
+        => collation ?? "BINARY";
+
+    private static int[] ResolveForeignKeyChildColumns(
+        EmbeddedTable childTable,
+        string childTableName,
+        ForeignKeyDefinition foreignKey)
+    {
+        var childColumns = new int[foreignKey.ChildColumns.Count];
+        for (var position = 0; position < childColumns.Length; position++)
+        {
+            if (!childTable.TryGetColumnIndex(foreignKey.ChildColumns[position], out childColumns[position]))
+                throw ForeignKeyMismatch(childTableName, foreignKey.ParentTable);
+        }
+
+        return childColumns;
+    }
+
+    private static SqlValue[] GetForeignKeyValues(SqlValue[] row, IReadOnlyList<int> columns)
+        => columns.Select(column => row[column]).ToArray();
+
     private bool ParentContains(
         ForeignKeyParent parent,
         IReadOnlyList<SqlValue[]> parentRows,
-        SqlValue childValue)
-        => parentRows.Any(row => ValuesMatchParent(parent, row[parent.ColumnIndex], childValue));
-
-    private bool ValuesMatchParent(ForeignKeyParent parent, SqlValue parentValue, SqlValue childValue)
+        IReadOnlyList<SqlValue> childValues,
+        SqlValue[]? childRow = null,
+        bool selfReferential = false)
     {
-        var comparableChildValue = EmbeddedTable.ApplyColumnAffinity(
-            parent.Table.ColumnDefinitions[parent.ColumnIndex],
-            childValue);
-        return Compare(parentValue, comparableChildValue, parent.Collation) == 0;
+        foreach (var parentRow in parentRows)
+        {
+            var parentValues = GetForeignKeyValues(parentRow, parent.ColumnIndices);
+            if (selfReferential && ReferenceEquals(parentRow, childRow))
+            {
+                if (parentValues.SequenceEqual(childValues))
+                    return true;
+                continue;
+            }
+            if (ValuesMatchParent(parent, parentValues, childValues))
+                return true;
+        }
+
+        return false;
     }
+
+    private bool ValuesMatchParent(
+        ForeignKeyParent parent,
+        IReadOnlyList<SqlValue> parentValues,
+        IReadOnlyList<SqlValue> childValues)
+    {
+        for (var position = 0; position < parent.ColumnIndices.Count; position++)
+        {
+            var parentColumn = parent.ColumnIndices[position];
+            var comparableChildValue = EmbeddedTable.ApplyColumnAffinity(
+                parent.Table.ColumnDefinitions[parentColumn],
+                childValues[position]);
+            if (Compare(parentValues[position], comparableChildValue, parent.Collations[position]) != 0)
+                return false;
+        }
+
+        return true;
+    }
+
+    private bool ForeignKeyValuesEqual(
+        ForeignKeyParent parent,
+        IReadOnlyList<SqlValue> left,
+        IReadOnlyList<SqlValue> right)
+    {
+        for (var position = 0; position < parent.ColumnIndices.Count; position++)
+        {
+            if (Compare(left[position], right[position], parent.Collations[position]) != 0)
+                return false;
+        }
+
+        return true;
+    }
+
+    internal HashSet<ForeignKeyViolation> CollectForeignKeyViolations(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        bool includeImmediate)
+    {
+        var violations = new HashSet<ForeignKeyViolation>();
+        foreach (var (childTableName, childTable) in tables)
+        {
+            for (var foreignKeyIndex = 0; foreignKeyIndex < childTable.ForeignKeys.Count; foreignKeyIndex++)
+            {
+                var foreignKey = childTable.ForeignKeys[foreignKeyIndex];
+                var declaredDeferred = foreignKey.Deferral == ForeignKeyDeferral.InitiallyDeferred;
+                if (!includeImmediate && !declaredDeferred)
+                    continue;
+
+                ForeignKeyParent? parent = null;
+                int[] childColumns;
+                try
+                {
+                    childColumns = ResolveForeignKeyChildColumns(childTable, childTableName, foreignKey);
+                    if (tables.ContainsKey(foreignKey.ParentTable))
+                        parent = ResolveForeignKeyParent(tables, childTableName, foreignKey);
+                }
+                catch (EmbeddedSqlException exception) when (
+                    exception.Message.StartsWith("foreign key mismatch", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                for (var rowIndex = 0; rowIndex < childTable.Rows.Count; rowIndex++)
+                {
+                    var childValues = GetForeignKeyValues(childTable.Rows[rowIndex], childColumns);
+                    if (childValues.Any(value => value.Kind == SqlValueKind.Null)
+                        || (parent is not null && ParentContains(
+                            parent,
+                            parent.Table.Rows,
+                            childValues,
+                            childTable.Rows[rowIndex],
+                            ReferenceEquals(childTable, parent.Table))))
+                    {
+                        continue;
+                    }
+
+                    violations.Add(new ForeignKeyViolation(
+                        childTableName,
+                        foreignKeyIndex,
+                        BuildForeignKeyRowIdentity(childTable, rowIndex),
+                        string.Join("|", childValues.Select(EncodeForeignKeyValue)),
+                        declaredDeferred));
+                }
+            }
+        }
+
+        return violations;
+    }
+
+    private static string BuildForeignKeyRowIdentity(EmbeddedTable table, int rowIndex)
+    {
+        if (table.HasRowid && rowIndex < table.RowIds.Count)
+            return "R:" + table.RowIds[rowIndex].ToString(CultureInfo.InvariantCulture);
+
+        if (table.PrimaryKeyColumns.Count == 0)
+            throw new InvalidOperationException($"WITHOUT ROWID table {table.Name} lost its primary key.");
+
+        return "K:" + string.Join(
+            "|",
+            table.PrimaryKeyColumns.Select(column => EncodeForeignKeyValue(table.Rows[rowIndex][column.Index])));
+    }
+
+    private static string EncodeForeignKeyValue(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Null => "N",
+            SqlValueKind.Integer => "I" + value.AsInteger().ToString(CultureInfo.InvariantCulture),
+            SqlValueKind.Real => "R" + BitConverter.DoubleToInt64Bits(value.AsReal()).ToString("X16", CultureInfo.InvariantCulture),
+            SqlValueKind.Text => "T" + Convert.ToHexString(Encoding.UTF8.GetBytes(value.AsText())),
+            SqlValueKind.Blob => "B" + Convert.ToHexString(value.AsBlob().Span),
+            _ => throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}."),
+        };
 
     private static bool IsBinaryCollation(string? collation)
         => collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase);
@@ -3913,8 +4520,8 @@ public sealed class EmbeddedDatabase : IDisposable
     private sealed record ForeignKeyParent(
         EmbeddedTable Table,
         string TableName,
-        int ColumnIndex,
-        string? Collation);
+        IReadOnlyList<int> ColumnIndices,
+        IReadOnlyList<string?> Collations);
 
     // Mutable per-statement UPDATE plan: the resolved column assignments and any rowid
     // (or rowid-alias) reassignment.
@@ -4137,9 +4744,7 @@ public sealed class EmbeddedDatabase : IDisposable
             rowIds.Add(rowid);
         }
 
-        if (rowsAffected > 0)
-            ValidateForeignKeysAfterDelete(context, statement.TableName, table, table.Rows, rows, deletedRows);
-
+        var originalRows = table.Rows.ToArray();
         var returningResult = statement.Returning is null
             ? null
             : BuildReturningResult(
@@ -4156,6 +4761,16 @@ public sealed class EmbeddedDatabase : IDisposable
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
         table.RowIds.AddRange(rowIds);
+        if (rowsAffected > 0)
+        {
+            ValidateForeignKeysAfterDelete(
+                context,
+                statement.TableName,
+                table,
+                originalRows,
+                table.Rows,
+                deletedRows);
+        }
         if (table.HasRowid)
         {
             foreach (var rowId in deletedRowIds)
@@ -4255,25 +4870,85 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             throw new EmbeddedSqlException("too many levels of trigger recursion");
         }
-        if (triggers.Count == 0)
+        if (triggers.Count == 0 && !context.ForeignKeysEnabled)
             return performBase();
 
-        if (context.TriggerDepth >= MaximumTriggerDepth)
+        if (triggers.Count > 0 && context.TriggerDepth >= MaximumTriggerDepth)
             throw new EmbeddedSqlException("too many levels of trigger recursion");
+
+        ExecutionResult PerformAndFire()
+        {
+            var result = performBase();
+            if (result.RowsAffected > 0 && triggers.Count > 0)
+                FireTriggers(triggers, context);
+            return result;
+        }
+
+        if (context.ForeignKeysEnabled)
+            return ExecuteWithForeignKeyStatement(context, PerformAndFire);
 
         var backup = CloneTables(context.Tables);
         try
         {
-            var result = performBase();
-            if (result.RowsAffected > 0)
-                FireTriggers(triggers, context);
-
-            return result;
+            return PerformAndFire();
         }
         catch
         {
             RestoreTables(context.Tables, backup);
             throw;
+        }
+    }
+
+    private ExecutionResult ExecuteWithForeignKeyStatement(
+        QueryContext context,
+        Func<ExecutionResult> operation)
+    {
+        var foreignKeyState = context.ForeignKeyStatement
+            ?? throw new InvalidOperationException("Foreign-key enforcement lost its statement state.");
+        if (foreignKeyState.Depth > 0)
+            return operation();
+
+        var baseline = CollectForeignKeyViolations(context.Tables, includeImmediate: true);
+        var backup = CloneTables(context.Tables);
+        foreignKeyState.Depth++;
+        void ValidateRetainedState()
+        {
+            var remaining = CollectForeignKeyViolations(context.Tables, includeImmediate: true);
+            var introducedImmediate = remaining
+                .Except(baseline)
+                .Any(violation => !context.InTransaction
+                    || (!context.DeferForeignKeys && !violation.DeclaredDeferred));
+            if (introducedImmediate)
+                throw new EmbeddedSqlException("FOREIGN KEY constraint failed");
+        }
+
+        try
+        {
+            var result = operation();
+            ValidateRetainedState();
+            return result;
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            try
+            {
+                ValidateRetainedState();
+            }
+            catch
+            {
+                RestoreTables(context.Tables, backup);
+                throw;
+            }
+            throw;
+        }
+        catch
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+        finally
+        {
+            foreignKeyState.Depth--;
         }
     }
 
@@ -10072,11 +10747,10 @@ public sealed class EmbeddedDatabase : IDisposable
                         ?? FormatSqlLiteral(column.DefaultValue
                             ?? throw new InvalidOperationException("Default metadata is incomplete.")));
             }
-            if (column.ForeignKey is { } foreignKey)
+            foreach (var foreignKey in column.ForeignKeyConstraints)
             {
-                definition += FormatConstraintName(column.ForeignKeyConstraintName)
-                    + $" REFERENCES {QuoteIdentifier(foreignKey.ParentTable)}"
-                    + $" ({QuoteIdentifier(foreignKey.ParentColumn)})";
+                definition += FormatConstraintName(foreignKey.ConstraintName)
+                    + FormatForeignKeyReference(foreignKey);
             }
             foreach (var check in column.CheckConstraints)
                 definition += FormatCheckConstraint(check);
@@ -10123,9 +10797,51 @@ public sealed class EmbeddedDatabase : IDisposable
         foreach (var check in table.CheckConstraints)
             columns.Add(FormatCheckConstraint(check).TrimStart());
 
+        foreach (var foreignKey in table.TableForeignKeys)
+        {
+            columns.Add(
+                FormatConstraintName(foreignKey.ConstraintName).TrimStart()
+                + (foreignKey.ConstraintName is null ? string.Empty : " ")
+                + $"FOREIGN KEY ({string.Join(", ", foreignKey.ChildColumns.Select(QuoteIdentifier))})"
+                + FormatForeignKeyReference(foreignKey));
+        }
+
         var withoutRowid = table.WithoutRowid ? " WITHOUT ROWID" : string.Empty;
         return $"CREATE TABLE {QuoteIdentifier(name)} ({string.Join(", ", columns)}){withoutRowid}";
     }
+
+    private static string FormatForeignKeyReference(ForeignKeyDefinition foreignKey)
+    {
+        var parentColumns = foreignKey.ParentColumns.Count == 0
+            ? string.Empty
+            : $" ({string.Join(", ", foreignKey.ParentColumns.Select(QuoteIdentifier))})";
+        var clause = $" REFERENCES {QuoteIdentifier(foreignKey.ParentTable)}{parentColumns}";
+        if (foreignKey.OnDelete != ForeignKeyAction.NoAction)
+            clause += " ON DELETE " + FormatForeignKeyAction(foreignKey.OnDelete);
+        if (foreignKey.OnUpdate != ForeignKeyAction.NoAction)
+            clause += " ON UPDATE " + FormatForeignKeyAction(foreignKey.OnUpdate);
+        if (foreignKey.Match is { } match)
+            clause += " MATCH " + QuoteIdentifier(match);
+        clause += foreignKey.Deferral switch
+        {
+            ForeignKeyDeferral.NotDeferrable => string.Empty,
+            ForeignKeyDeferral.InitiallyImmediate => " DEFERRABLE INITIALLY IMMEDIATE",
+            ForeignKeyDeferral.InitiallyDeferred => " DEFERRABLE INITIALLY DEFERRED",
+            _ => throw new InvalidOperationException($"Unknown foreign key deferral {foreignKey.Deferral}."),
+        };
+        return clause;
+    }
+
+    private static string FormatForeignKeyAction(ForeignKeyAction action)
+        => action switch
+        {
+            ForeignKeyAction.NoAction => "NO ACTION",
+            ForeignKeyAction.Restrict => "RESTRICT",
+            ForeignKeyAction.SetNull => "SET NULL",
+            ForeignKeyAction.SetDefault => "SET DEFAULT",
+            ForeignKeyAction.Cascade => "CASCADE",
+            _ => throw new InvalidOperationException($"Unknown foreign key action {action}."),
+        };
 
     private static string FormatConstraintName(string? name)
         => name is null ? string.Empty : " CONSTRAINT " + QuoteIdentifier(name);
@@ -16499,6 +17215,7 @@ public sealed class EmbeddedConnection : IDisposable
     private long _lastInsertRowId;
     private bool _queryOnly;
     private bool _foreignKeys;
+    private bool _deferForeignKeys;
     private bool _recursiveTriggers;
     private int? _pendingPageSize;
     private bool _disposed;
@@ -16548,6 +17265,7 @@ public sealed class EmbeddedConnection : IDisposable
         public PragmaHeaderMetadata PragmaHeader { get; set; } = pragmaHeader;
         public bool HasChanges { get; set; }
         public bool HasSnapshotPragmaHeader { get; set; }
+        public HashSet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations { get; } = [];
     }
 
     private readonly record struct RoutedStatement(
@@ -16649,6 +17367,7 @@ public sealed class EmbeddedConnection : IDisposable
         _lastInsertRowId = 0;
         _queryOnly = false;
         _foreignKeys = false;
+        _deferForeignKeys = false;
         _recursiveTriggers = false;
         _pendingPageSize = null;
         foreach (var attachment in _attachedDatabases.Values)
@@ -16822,6 +17541,8 @@ public sealed class EmbeddedConnection : IDisposable
                 return ExecutePragmaQueryOnly(queryOnly);
             case PragmaForeignKeysStatement foreignKeys:
                 return ExecutePragmaForeignKeys(foreignKeys);
+            case PragmaDeferForeignKeysStatement deferForeignKeys:
+                return ExecutePragmaDeferForeignKeys(deferForeignKeys);
             case PragmaRecursiveTriggersStatement recursiveTriggers:
                 return ExecutePragmaRecursiveTriggers(recursiveTriggers);
             case PragmaHeaderIntegerStatement headerInteger:
@@ -16839,10 +17560,19 @@ public sealed class EmbeddedConnection : IDisposable
                 var routed = RouteStatement(statement);
                 TransactionDatabaseState? transactionState = null;
                 EmbeddedDatabase.SchemaCatalog? statementCatalog = null;
+                HashSet<EmbeddedDatabase.ForeignKeyViolation>? deferredBefore = null;
                 try
                 {
                     ExecutionResult result;
                     transactionState = GetTransactionState(routed.Database);
+                    if (transactionState is not null
+                        && _foreignKeys
+                        && EmbeddedDatabase.MayMutate(routed.Statement))
+                    {
+                        deferredBefore = routed.Database.CollectForeignKeyViolations(
+                            transactionState.Catalog.Tables,
+                            includeImmediate: _deferForeignKeys);
+                    }
                     var mutationReserved = ReserveTransactionMutation(routed.Database, routed.Statement);
                     try
                     {
@@ -16854,6 +17584,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 _lastInsertRowId,
                                 _foreignKeys,
                                 _recursiveTriggers,
+                                _deferForeignKeys,
+                                inTransaction: false,
                                 cancellationToken);
                         }
                         else
@@ -16868,6 +17600,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 _lastInsertRowId,
                                 _foreignKeys,
                                 _recursiveTriggers,
+                                _deferForeignKeys,
+                                inTransaction: true,
                                 cancellationToken);
                             if (EmbeddedDatabase.MayMutate(routed.Statement))
                                 cancellationToken.ThrowIfCancellationRequested();
@@ -16882,8 +17616,16 @@ public sealed class EmbeddedConnection : IDisposable
                     {
                         if (result.Changed)
                         {
+                            UpdatePendingDeferredForeignKeys(
+                                routed.Database,
+                                transactionState,
+                                statementCatalog
+                                    ?? throw new InvalidOperationException(
+                                        "A transactional mutation lost its statement catalog."),
+                                deferredBefore);
                             transactionState.Catalog = statementCatalog
-                                ?? throw new InvalidOperationException("A transactional mutation lost its statement catalog.");
+                                ?? throw new InvalidOperationException(
+                                    "A transactional mutation lost its statement catalog.");
                             transactionState.HasChanges = true;
                             _transactionWriteDatabase = routed.Database;
                             if (EmbeddedDatabase.MayChangeSchema(routed.Statement))
@@ -16915,6 +17657,13 @@ public sealed class EmbeddedConnection : IDisposable
                     _lastInsertRowId = exception.LastInsertRowId;
                     if (transactionState is not null)
                     {
+                        UpdatePendingDeferredForeignKeys(
+                            routed.Database,
+                            transactionState,
+                            statementCatalog
+                                ?? throw new InvalidOperationException(
+                                    "A partial transactional mutation lost its statement catalog."),
+                            deferredBefore);
                         transactionState.Catalog = statementCatalog
                             ?? throw new InvalidOperationException("A partial transactional mutation lost its statement catalog.");
                         transactionState.HasChanges = true;
@@ -16924,6 +17673,24 @@ public sealed class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
         }
+    }
+
+    private void UpdatePendingDeferredForeignKeys(
+        EmbeddedDatabase database,
+        TransactionDatabaseState state,
+        EmbeddedDatabase.SchemaCatalog updatedCatalog,
+        HashSet<EmbeddedDatabase.ForeignKeyViolation>? before)
+    {
+        if (!_foreignKeys || before is null)
+            return;
+
+        var after = database.CollectForeignKeyViolations(
+            updatedCatalog.Tables,
+            includeImmediate: _deferForeignKeys);
+        foreach (var resolved in before.Except(after))
+            state.PendingDeferredViolations.Remove(resolved);
+        foreach (var introduced in after.Except(before))
+            state.PendingDeferredViolations.Add(introduced);
     }
 
     private ExecutionResult ExecuteAttach(AttachDatabaseStatement statement, SqlValue[] parameters)
@@ -18224,6 +18991,7 @@ public sealed class EmbeddedConnection : IDisposable
         if (_transactionDatabases is null)
             throw new InvalidOperationException("No managed transaction is active.");
 
+        ValidateDeferredForeignKeys();
         var changed = _transactionDatabases
             .Where(pair => pair.Value.HasChanges)
             .ToArray();
@@ -18286,6 +19054,43 @@ public sealed class EmbeddedConnection : IDisposable
         return statement.Enabled is null
             ? new ExecutionResult(["foreign_keys"], [[SqlValue.Integer(_foreignKeys ? 1 : 0)]], 0)
             : ExecutionResult.Empty;
+    }
+
+    private ExecutionResult ExecutePragmaDeferForeignKeys(PragmaDeferForeignKeysStatement statement)
+    {
+        if (statement.Enabled is { } enabled)
+        {
+            _deferForeignKeys = enabled;
+            if (!enabled && _transactionDatabases is not null)
+            {
+                foreach (var state in _transactionDatabases.Values)
+                    state.PendingDeferredViolations.Clear();
+            }
+            return ExecutionResult.Empty;
+        }
+
+        return new ExecutionResult(
+            ["defer_foreign_keys"],
+            [[SqlValue.Integer(_deferForeignKeys ? 1 : 0)]],
+            0);
+    }
+
+    private void ValidateDeferredForeignKeys()
+    {
+        if (!_foreignKeys || _transactionDatabases is null)
+            return;
+
+        foreach (var (database, state) in _transactionDatabases)
+        {
+            if (state.PendingDeferredViolations.Count == 0)
+                continue;
+
+            var current = database.CollectForeignKeyViolations(
+                state.Catalog.Tables,
+                includeImmediate: _deferForeignKeys);
+            if (state.PendingDeferredViolations.Any(current.Contains))
+                throw new EmbeddedSqlException("FOREIGN KEY constraint failed");
+        }
     }
 
     private ExecutionResult ExecutePragmaRecursiveTriggers(PragmaRecursiveTriggersStatement statement)
@@ -18450,6 +19255,10 @@ public sealed class EmbeddedConnection : IDisposable
             return ["seq", "name", "unique", "origin", "partial"];
         if (statement is PragmaIndexInfoStatement)
             return ["seqno", "cid", "name"];
+        if (statement is PragmaForeignKeyListStatement)
+            return ["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"];
+        if (statement is PragmaForeignKeyCheckStatement)
+            return ["table", "rowid", "parent", "fkid"];
         if (statement is PragmaTableListStatement)
             return ["schema", "name", "type", "ncol", "wr", "strict"];
         if (statement is PragmaDatabaseListStatement)
@@ -18460,6 +19269,8 @@ public sealed class EmbeddedConnection : IDisposable
             return ["query_only"];
         if (statement is PragmaForeignKeysStatement { Enabled: null })
             return ["foreign_keys"];
+        if (statement is PragmaDeferForeignKeysStatement { Enabled: null })
+            return ["defer_foreign_keys"];
         if (statement is PragmaRecursiveTriggersStatement { Enabled: null })
             return ["recursive_triggers"];
         if (statement is PragmaHeaderIntegerStatement { Value: null } headerInteger)
@@ -18521,7 +19332,9 @@ public sealed class EmbeddedConnection : IDisposable
                     pair.Value.Catalog.Clone(),
                     pair.Value.HasChanges,
                     pair.Value.PragmaHeader,
-                    pair.Value.HasSnapshotPragmaHeader)),
+                    pair.Value.HasSnapshotPragmaHeader,
+                    new HashSet<EmbeddedDatabase.ForeignKeyViolation>(
+                        pair.Value.PendingDeferredViolations))),
             _transactionWriteDatabase));
     }
 
@@ -18557,6 +19370,8 @@ public sealed class EmbeddedConnection : IDisposable
             state.HasChanges = savedState.HasChanges;
             state.PragmaHeader = savedState.PragmaHeader;
             state.HasSnapshotPragmaHeader = savedState.HasSnapshotPragmaHeader;
+            state.PendingDeferredViolations.Clear();
+            state.PendingDeferredViolations.UnionWith(savedState.PendingDeferredViolations);
         }
         _transactionWriteDatabase = savepoint.WriteDatabase;
 
@@ -18584,6 +19399,7 @@ public sealed class EmbeddedConnection : IDisposable
         _transactionMutationDatabase = null;
         _transactionOpenedBySavepoint = false;
         _savepoints.Clear();
+        _deferForeignKeys = false;
         if (transactionDatabases is not null)
         {
             foreach (var database in transactionDatabases.Keys)
@@ -18600,7 +19416,8 @@ public sealed class EmbeddedConnection : IDisposable
         EmbeddedDatabase.SchemaCatalog Catalog,
         bool HasChanges,
         PragmaHeaderMetadata PragmaHeader,
-        bool HasSnapshotPragmaHeader);
+        bool HasSnapshotPragmaHeader,
+        IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations);
 
     private void ThrowIfDisposed()
     {
@@ -18661,11 +19478,13 @@ public sealed class EmbeddedStatement : IDisposable
     {
         ThrowIfDisposed();
         if (_statement is (QueryStatement or PragmaTableInfoStatement or PragmaTableXInfoStatement
-            or PragmaIndexListStatement or PragmaIndexInfoStatement or PragmaTableListStatement
+            or PragmaIndexListStatement or PragmaIndexInfoStatement or PragmaForeignKeyListStatement
+            or PragmaForeignKeyCheckStatement or PragmaTableListStatement
             or PragmaDatabaseListStatement or PragmaEncodingStatement or ExplainStatement)
             || _statement is ExplainQueryPlanStatement
             || _statement is PragmaQueryOnlyStatement { Enabled: null }
             || _statement is PragmaForeignKeysStatement { Enabled: null }
+            || _statement is PragmaDeferForeignKeysStatement { Enabled: null }
             || _statement is PragmaRecursiveTriggersStatement { Enabled: null }
             || _statement is PragmaHeaderIntegerStatement { Value: null }
             || _statement is PragmaJournalModeStatement
@@ -18871,7 +19690,8 @@ internal sealed class EmbeddedTable
         IReadOnlyList<CheckConstraint>? checkConstraints = null,
         InsertConflictAlgorithm? primaryKeyConflictAlgorithm = null,
         string? primaryKeyConstraintName = null,
-        int? primaryKeyDeclarationOrder = null)
+        int? primaryKeyDeclarationOrder = null,
+        IReadOnlyList<ForeignKeyDefinition>? tableForeignKeys = null)
     {
         Name = name;
         ColumnDefinitions = columns.ToArray();
@@ -18889,6 +19709,7 @@ internal sealed class EmbeddedTable
             : Array.AsReadOnly(tablePrimaryKey.ToArray());
         TableUniqueConstraints = Array.AsReadOnly((uniqueConstraints ?? []).ToArray());
         CheckConstraints = Array.AsReadOnly((checkConstraints ?? []).ToArray());
+        TableForeignKeys = Array.AsReadOnly((tableForeignKeys ?? []).ToArray());
         TablePrimaryKeyConflictAlgorithm = primaryKeyConflictAlgorithm;
         TablePrimaryKeyConstraintName = primaryKeyConstraintName;
         TablePrimaryKeyDeclarationOrder = primaryKeyDeclarationOrder;
@@ -18908,9 +19729,10 @@ internal sealed class EmbeddedTable
         GeneratedColumnOrder = ValidateAndOrderGeneratedColumns(ColumnDefinitions, PrimaryKeyColumns, _columnIndices);
         ForeignKeys = Array.AsReadOnly(
             ColumnDefinitions
-                .Where(column => column.ForeignKey is not null)
-                .Select(column => column.ForeignKey!)
+                .SelectMany(column => column.ForeignKeyConstraints)
+                .Concat(TableForeignKeys)
                 .ToArray());
+        ValidateForeignKeyChildColumns();
 
         CreateConstraintIndexes();
         ValidateSchemaExpressions();
@@ -19101,6 +19923,24 @@ internal sealed class EmbeddedTable
             .ToArray();
     }
 
+    private void ValidateForeignKeyChildColumns()
+    {
+        foreach (var foreignKey in ForeignKeys)
+        {
+            if (foreignKey.ChildColumns.Count == 0)
+                throw new EmbeddedSqlException("foreign key constraint must contain at least one child column");
+
+            foreach (var childColumn in foreignKey.ChildColumns)
+            {
+                if (!_columnIndices.ContainsKey(childColumn))
+                {
+                    throw new EmbeddedSqlException(
+                        $"unknown column \"{childColumn}\" in foreign key definition");
+                }
+            }
+        }
+    }
+
     private EmbeddedIndexColumn[] ResolveConstraintIndexColumns(
         IReadOnlyList<TablePrimaryKeyColumn> terms,
         string constraint)
@@ -19282,6 +20122,8 @@ internal sealed class EmbeddedTable
     public IReadOnlyList<TableUniqueConstraint> TableUniqueConstraints { get; }
 
     public IReadOnlyList<CheckConstraint> CheckConstraints { get; }
+
+    public IReadOnlyList<ForeignKeyDefinition> TableForeignKeys { get; }
 
     public InsertConflictAlgorithm? TablePrimaryKeyConflictAlgorithm { get; }
 
@@ -19768,7 +20610,7 @@ internal sealed class EmbeddedTable
     {
         if (_columnIndices.ContainsKey(column.Name))
             throw new EmbeddedSqlException($"duplicate column name: {column.Name}");
-        if (column.ForeignKey is not null)
+        if (column.ForeignKeyConstraints.Count > 0)
             throw new EmbeddedSqlException("ALTER TABLE ADD COLUMN with REFERENCES is not supported.");
         if (column.PrimaryKey || column.Unique)
             throw new EmbeddedSqlException("Cannot add a PRIMARY KEY or UNIQUE column.");
@@ -19782,7 +20624,8 @@ internal sealed class EmbeddedTable
             CheckConstraints,
             TablePrimaryKeyConflictAlgorithm,
             TablePrimaryKeyConstraintName,
-            TablePrimaryKeyDeclarationOrder);
+            TablePrimaryKeyDeclarationOrder,
+            TableForeignKeys);
 
         if (column.DefaultExpression is not null && Rows.Count > 0)
             throw new EmbeddedSqlException("Cannot add a column with non-constant default.");
@@ -19857,7 +20700,8 @@ internal sealed class EmbeddedTable
             || HasGeneratedColumns
             || TableLevelPrimaryKey is not null
             || TableUniqueConstraints.Count > 0
-            || ColumnDefinitions[index].ForeignKey is not null)
+            || ForeignKeys.Any(foreignKey =>
+                foreignKey.ChildColumns.Contains(name, StringComparer.OrdinalIgnoreCase)))
         {
             throw new EmbeddedSqlException(
                 "ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, "
@@ -19893,7 +20737,8 @@ internal sealed class EmbeddedTable
             CheckConstraints,
             TablePrimaryKeyConflictAlgorithm,
             TablePrimaryKeyConstraintName,
-            TablePrimaryKeyDeclarationOrder);
+            TablePrimaryKeyDeclarationOrder,
+            TableForeignKeys);
         foreach (var row in Rows)
             clone.Rows.Add(row.ToArray());
 

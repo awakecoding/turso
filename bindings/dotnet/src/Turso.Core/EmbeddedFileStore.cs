@@ -176,7 +176,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 create.CheckConstraints,
                 create.PrimaryKeyConflictAlgorithm,
                 create.PrimaryKeyConstraintName,
-                create.PrimaryKeyDeclarationOrder);
+                create.PrimaryKeyDeclarationOrder,
+                create.TableForeignKeys);
             LoadTableRows(entry.Name, table, entry.RootPage, occupiedBtreePages);
             tables[entry.Name] = table;
             rootPages[entry.Name] = entry.RootPage;
