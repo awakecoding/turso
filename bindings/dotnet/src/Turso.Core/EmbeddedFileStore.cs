@@ -7413,6 +7413,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 FindRuntimeDependency(select.Where),
                 FindRuntimeDependency(select.GroupBy),
                 FindRuntimeDependency(select.Having),
+                FindRuntimeDependency(select.NamedWindows),
                 FindRuntimeDependency(select.OrderBy),
                 FindRuntimeDependency(select.Limit),
                 FindRuntimeDependency(select.Offset)),
@@ -7531,6 +7532,27 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         return null;
+    }
+
+    private static string? FindRuntimeDependency(IEnumerable<NamedWindowDefinition> windows)
+    {
+        foreach (var window in windows)
+        {
+            var dependency = FindRuntimeDependency(window.Specification);
+            if (dependency is not null)
+                return dependency;
+        }
+
+        return null;
+    }
+
+    private static string? FindRuntimeDependency(WindowSpecification window)
+    {
+        return FirstRuntimeDependency(
+            FindRuntimeDependency(window.PartitionBy),
+            FindRuntimeDependency(window.OrderBy),
+            FindRuntimeDependency(window.Frame?.Start.Offset),
+            FindRuntimeDependency(window.Frame?.End.Offset));
     }
 
     private static string? FindRuntimeDependency(IEnumerable<Expression> expressions)

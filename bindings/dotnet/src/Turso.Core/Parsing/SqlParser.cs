@@ -1179,7 +1179,28 @@ internal sealed class SqlParser
         if (ConsumeKeyword("HAVING"))
             having = ParseExpression();
 
-        return new SelectStatement(distinct, projections, source, where, groupBy, having, [], null, null);
+        var namedWindows = ParseNamedWindows();
+        return new SelectStatement(distinct, projections, source, where, groupBy, having, namedWindows, [], null, null);
+    }
+
+    private IReadOnlyList<NamedWindowDefinition> ParseNamedWindows()
+    {
+        if (!ConsumeKeyword("WINDOW"))
+            return [];
+
+        var windows = new List<NamedWindowDefinition>();
+        do
+        {
+            var name = ExpectIdentifier();
+            ExpectKeyword("AS");
+            Expect(TokenKind.LeftParen);
+            var specification = ParseWindowSpecification();
+            Expect(TokenKind.RightParen);
+            windows.Add(new NamedWindowDefinition(name, specification));
+        }
+        while (Consume(TokenKind.Comma));
+
+        return windows;
     }
 
     private (IReadOnlyList<OrderByTerm> OrderBy, Expression? Limit, Expression? Offset) ParseOrderByAndLimit()
@@ -1360,9 +1381,34 @@ internal sealed class SqlParser
             return null;
 
         if (_lexer.Current.Kind != TokenKind.LeftParen)
-            throw Error("Named windows are not supported; OVER must be followed by an inline window definition.");
+        {
+            return new WindowSpecification(
+                ExpectIdentifier(),
+                [],
+                [],
+                null,
+                IsNamedReference: true);
+        }
 
         Expect(TokenKind.LeftParen);
+        var specification = ParseWindowSpecification();
+        Expect(TokenKind.RightParen);
+        return specification;
+    }
+
+    private WindowSpecification ParseWindowSpecification()
+    {
+        string? baseWindowName = null;
+        if (_lexer.Current.Kind == TokenKind.Identifier
+            && !CurrentIsKeyword("PARTITION")
+            && !CurrentIsKeyword("ORDER")
+            && !CurrentIsKeyword("ROWS")
+            && !CurrentIsKeyword("RANGE")
+            && !CurrentIsKeyword("GROUPS")
+            && !CurrentIsKeyword("EXCLUDE"))
+        {
+            baseWindowName = ExpectIdentifier();
+        }
 
         var partitionBy = new List<Expression>();
         if (ConsumeKeyword("PARTITION"))
@@ -1387,15 +1433,19 @@ internal sealed class SqlParser
         }
 
         var frame = ParseWindowFrame();
-        Expect(TokenKind.RightParen);
-        return new WindowSpecification(partitionBy, orderBy, frame);
+        return new WindowSpecification(baseWindowName, partitionBy, orderBy, frame);
     }
 
     private WindowFrame? ParseWindowFrame()
     {
-        if (CurrentIsKeyword("RANGE") || CurrentIsKeyword("GROUPS"))
-            throw Error("Only ROWS window frames are supported.");
-        if (!ConsumeKeyword("ROWS"))
+        WindowFrameMode mode;
+        if (ConsumeKeyword("ROWS"))
+            mode = WindowFrameMode.Rows;
+        else if (ConsumeKeyword("RANGE"))
+            mode = WindowFrameMode.Range;
+        else if (ConsumeKeyword("GROUPS"))
+            mode = WindowFrameMode.Groups;
+        else
             return null;
 
         FrameBound start;
@@ -1412,11 +1462,30 @@ internal sealed class SqlParser
             end = new FrameBound(FrameBoundKind.CurrentRow, null);
         }
 
-        if (CurrentIsKeyword("EXCLUDE"))
-            throw Error("EXCLUDE clauses in window frames are not supported.");
-
         ValidateFrameBounds(start, end);
-        return new WindowFrame(start, end);
+        return new WindowFrame(mode, start, end, ParseFrameExclusion());
+    }
+
+    private FrameExclusion ParseFrameExclusion()
+    {
+        if (!ConsumeKeyword("EXCLUDE"))
+            return FrameExclusion.NoOthers;
+        if (ConsumeKeyword("NO"))
+        {
+            ExpectKeyword("OTHERS");
+            return FrameExclusion.NoOthers;
+        }
+        if (ConsumeKeyword("CURRENT"))
+        {
+            ExpectKeyword("ROW");
+            return FrameExclusion.CurrentRow;
+        }
+        if (ConsumeKeyword("GROUP"))
+            return FrameExclusion.Group;
+        if (ConsumeKeyword("TIES"))
+            return FrameExclusion.Ties;
+
+        throw Error("Expected NO OTHERS, CURRENT ROW, GROUP, or TIES after EXCLUDE.");
     }
 
     private FrameBound ParseFrameBound()
@@ -1584,7 +1653,8 @@ internal sealed class SqlParser
             || keyword.Equals("INTERSECT", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("UNION", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("USING", StringComparison.OrdinalIgnoreCase)
-            || keyword.Equals("WHERE", StringComparison.OrdinalIgnoreCase);
+            || keyword.Equals("WHERE", StringComparison.OrdinalIgnoreCase)
+            || keyword.Equals("WINDOW", StringComparison.OrdinalIgnoreCase);
     }
 
     private bool IsQueryStart()

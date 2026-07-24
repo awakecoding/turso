@@ -319,14 +319,16 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void RankingFunctionWindowFallsBackAndEvaluatorRejects()
+    public void RankingFunctionWindowFallsBackAndEvaluatorProducesValues()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
 
         var query = $"SELECT row_number() OVER (ORDER BY id {RunningFrame}) FROM t;";
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query));
+        ReadRows(connection, query).Select(row => row[0]).Should().Equal(
+            SqlValue.Integer(1),
+            SqlValue.Integer(2));
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
     }
 
