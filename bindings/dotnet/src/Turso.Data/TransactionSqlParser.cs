@@ -9,6 +9,15 @@ internal enum TransactionCompletionKind
 
 internal static class TransactionSqlParser
 {
+    internal static string? GetFirstKeyword(string sql)
+    {
+        var span = sql.AsSpan();
+        var index = 0;
+        return TryReadKeyword(span, ref index, out var keyword)
+            ? keyword.ToString()
+            : null;
+    }
+
     internal static TransactionCompletionKind GetCompletionKind(string sql)
     {
         var span = sql.AsSpan();

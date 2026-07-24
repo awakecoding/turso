@@ -455,7 +455,7 @@ public class LocalBatchTests
         connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
         using var batch = (SqliteBatch)connection.CreateBatch();
         var command = new SqliteBatchCommand(
-            "SELECT 1; UPDATE data SET value = 2 WHERE 0;");
+            "SELECT 1; /* comment */ UPDATE data SET value = 2 WHERE 0;");
         batch.BatchCommands.Add(command);
 
         using var reader = batch.ExecuteReader();
@@ -463,6 +463,85 @@ public class LocalBatchTests
         reader.NextResult().Should().BeFalse();
         reader.RecordsAffected.Should().Be(0);
         command.RecordsAffected.Should().Be(0);
+    }
+
+    [TestCase("Managed")]
+    [TestCase("Native")]
+    public async Task CommentedZeroRowDmlIsCountedByAsyncSqliteBatchReader(string provider)
+    {
+        using var connection = OpenSqliteConnection(provider);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        await using var batch = (SqliteBatch)connection.CreateBatch();
+        var command = new SqliteBatchCommand(
+            "SELECT 1; -- comment\nUPDATE data SET value = 2 WHERE 0;");
+        batch.BatchCommands.Add(command);
+
+        await using var reader = await batch.ExecuteReaderAsync();
+        reader.RecordsAffected.Should().Be(-1);
+        (await reader.NextResultAsync()).Should().BeFalse();
+        reader.RecordsAffected.Should().Be(0);
+        command.RecordsAffected.Should().Be(0);
+    }
+
+    [TestCase("Managed")]
+    [TestCase("Native")]
+    public async Task CommentedZeroRowDmlIsCountedBySqliteCommandReaders(string provider)
+    {
+        using var connection = OpenSqliteConnection(provider);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText =
+                "SELECT 1; /* comment */ UPDATE data SET value = 2 WHERE 0;";
+            using var reader = command.ExecuteReader();
+            reader.RecordsAffected.Should().Be(-1);
+            reader.NextResult().Should().BeFalse();
+            reader.RecordsAffected.Should().Be(0);
+        }
+
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText =
+                "SELECT 1; -- comment\nUPDATE data SET value = 2 WHERE 0;";
+            await using var reader = await command.ExecuteReaderAsync();
+            reader.RecordsAffected.Should().Be(-1);
+            (await reader.NextResultAsync()).Should().BeFalse();
+            reader.RecordsAffected.Should().Be(0);
+        }
+    }
+
+    [TestCase("Managed")]
+    [TestCase("Native")]
+    public void CommentedWithDmlIsCountedWithoutMatchingLiteralText(string provider)
+    {
+        using var connection = OpenSqliteConnection(provider);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        using var batch = (SqliteBatch)connection.CreateBatch();
+        var dml = new SqliteBatchCommand(
+            """
+            SELECT 1;
+            /* lead */ WITH candidate(value) AS (SELECT 1)
+            /* operation */ UPDATE data SET value = 2
+            WHERE value IN (SELECT value FROM candidate) AND 0;
+            """);
+        var select = new SqliteBatchCommand(
+            """
+            WITH candidate(value) AS (SELECT ') UPDATE'),
+                 replace AS (SELECT value FROM candidate)
+            SELECT value FROM replace;
+            """);
+        batch.BatchCommands.Add(dml);
+        batch.BatchCommands.Add(select);
+
+        using var reader = batch.ExecuteReader();
+        reader.NextResult().Should().BeTrue();
+        reader.Read().Should().BeTrue();
+        reader.GetString(0).Should().Be(") UPDATE");
+        reader.NextResult().Should().BeFalse();
+        reader.RecordsAffected.Should().Be(0);
+        dml.RecordsAffected.Should().Be(0);
+        select.RecordsAffected.Should().Be(-1);
     }
 
     [TestCase("Managed")]

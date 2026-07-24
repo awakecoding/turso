@@ -597,17 +597,66 @@ public class SqliteCommand : DbCommand
         if (string.IsNullOrWhiteSpace(firstStatement))
             return false;
 
-        var trimmed = firstStatement.TrimStart();
-        return trimmed.StartsWith("INSERT", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)
-               || trimmed.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase)
-               || IsWithDmlStatement(trimmed);
+        var firstKeyword = TransactionSqlParser.GetFirstKeyword(firstStatement);
+        return firstKeyword is not null
+               && (firstKeyword.Equals("INSERT", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("UPDATE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("DELETE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("REPLACE", StringComparison.OrdinalIgnoreCase)
+                   || firstKeyword.Equals("WITH", StringComparison.OrdinalIgnoreCase)
+                   && IsWithDmlStatement(firstStatement));
     }
 
-    private static bool IsWithDmlStatement(string trimmedStatement)
-        => trimmedStatement.StartsWith("WITH", StringComparison.OrdinalIgnoreCase)
-           && Regex.IsMatch(trimmedStatement, @"\)\s*(INSERT|UPDATE|DELETE|REPLACE)\b", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    private static bool IsWithDmlStatement(string statement)
+    {
+        var offset = 0;
+        if (!TryReadScriptToken(statement, ref offset, out var token)
+            || !IsKeyword(statement, token, "WITH"))
+        {
+            return false;
+        }
+
+        var parenthesisDepth = 0;
+        var completedCte = false;
+        while (TryReadScriptToken(statement, ref offset, out token))
+        {
+            if (token.Kind == ScriptTokenKind.Semicolon)
+                return false;
+            if (token.Kind == ScriptTokenKind.Other && token.Length == 1)
+            {
+                switch (statement[token.Offset])
+                {
+                    case '(':
+                        parenthesisDepth++;
+                        continue;
+                    case ')' when parenthesisDepth > 0:
+                        parenthesisDepth--;
+                        completedCte |= parenthesisDepth == 0;
+                        continue;
+                    case ',' when parenthesisDepth == 0:
+                        completedCte = false;
+                        continue;
+                }
+            }
+
+            if (parenthesisDepth != 0 || !completedCte)
+                continue;
+            if (IsKeyword(statement, token, "INSERT")
+                || IsKeyword(statement, token, "UPDATE")
+                || IsKeyword(statement, token, "DELETE")
+                || IsKeyword(statement, token, "REPLACE"))
+            {
+                return true;
+            }
+            if (IsKeyword(statement, token, "SELECT")
+                || IsKeyword(statement, token, "VALUES"))
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
 
     private static List<string> SplitStatements(string commandText)
     {
