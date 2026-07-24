@@ -82,6 +82,41 @@ public sealed class ManagedJournalPageMigrationTests
     }
 
     [Test]
+    public void PageSizeMigrationPreservesCompositeForeignKeyActionsAndCatalogText()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "page-size-foreign-keys.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA foreign_keys = ON;");
+            Execute(connection, "CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));");
+            Execute(
+                connection,
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, "
+                    + "FOREIGN KEY(a, b) REFERENCES parent "
+                    + "ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);");
+            Execute(connection, "INSERT INTO parent VALUES (1, 2);");
+            for (var index = 0; index < 80; index++)
+                Execute(connection, $"INSERT INTO child VALUES ({index}, 1, 2);");
+
+            ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
+            Execute(connection, "PRAGMA page_size=1024; VACUUM;");
+            ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(1024));
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Execute(reopenedConnection, "PRAGMA foreign_keys = ON;");
+        ReadValue(reopenedConnection, "SELECT sql FROM sqlite_schema WHERE name = 'child';")
+            .AsText().Should().Contain("ON UPDATE CASCADE")
+            .And.Contain("DEFERRABLE INITIALLY DEFERRED");
+        Execute(reopenedConnection, "UPDATE parent SET a = 3, b = 4;");
+        ReadValue(reopenedConnection, "SELECT COUNT(*) FROM child WHERE a = 3 AND b = 4;")
+            .Should().Be(SqlValue.Integer(80));
+    }
+
+    [Test]
     public void WalModeAndInvalidPageSizeAssignmentsDoNotChangeTheFormat()
     {
         var fileSystem = new InMemoryFileSystem();

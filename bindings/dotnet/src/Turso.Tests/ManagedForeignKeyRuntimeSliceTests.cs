@@ -143,29 +143,28 @@ public sealed class ManagedForeignKeyRuntimeSliceTests
     }
 
     [Test]
-    public void UnsupportedForeignKeyDefinitionsAreRejectedBeforeCatalogMutation()
+    public void FullForeignKeyDefinitionsAreAcceptedWhileUnsafeQualificationIsRejectedBeforeCatalogMutation()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
 
-        Action missingParentColumn = () => connection.Prepare(
-            "CREATE TABLE missing_parent_column(child INTEGER REFERENCES parent);");
-        missingParentColumn.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Foreign key references must name exactly one parent column. At SQL offset *");
-        Action composite = () => connection.Prepare(
-            "CREATE TABLE composite(a INTEGER, b INTEGER, FOREIGN KEY(a, b) REFERENCES parent(id, code));");
-        composite.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Composite foreign key constraints are not supported. At SQL offset *");
-        Action actions = () => connection.Prepare(
-            "CREATE TABLE actions(child INTEGER REFERENCES parent(id) ON DELETE CASCADE);");
-        actions.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Foreign key actions, MATCH, and deferral are not supported. At SQL offset *");
+        Execute(connection, "CREATE TABLE parent(id INTEGER, code INTEGER, PRIMARY KEY(id, code));");
+        Execute(
+            connection,
+            "CREATE TABLE full_shape(id INTEGER, code INTEGER, "
+                + "FOREIGN KEY(id, code) REFERENCES parent "
+                + "ON UPDATE CASCADE ON DELETE SET NULL MATCH FULL DEFERRABLE INITIALLY DEFERRED);");
         Action qualified = () => connection.Prepare(
             "CREATE TABLE qualified(child INTEGER REFERENCES main.parent(id));");
         qualified.Should().Throw<EmbeddedSqlException>()
             .WithMessage("Schema-qualified foreign keys are not supported. At SQL offset *");
+        Action unknownChild = () => Execute(
+            connection,
+            "CREATE TABLE unknown_child(value INTEGER, FOREIGN KEY(missing) REFERENCES parent(id));");
+        unknownChild.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("unknown column \"missing\" in foreign key definition");
 
-        Count(connection, "sqlite_schema WHERE name = 'missing_parent_column'").Should().Be(0);
+        Count(connection, "sqlite_schema WHERE name = 'qualified' OR name = 'unknown_child'").Should().Be(0);
 
         Execute(connection, "PRAGMA foreign_keys = ON;");
         Execute(connection, "CREATE TABLE non_unique_parent(value INTEGER);");

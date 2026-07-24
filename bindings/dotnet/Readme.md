@@ -340,7 +340,7 @@ Supported common connection string keywords include:
 | `Data Source` | Database path or `:memory:`. Aliases include `DataSource` and `Filename`. |
 | `Mode` | Parsed and preserved for compatibility. |
 | `Cache` | Managed `Cache=Shared` is supported only with a named `Data Source` and `Mode=Memory`; see the shared-cache contract below. |
-| `Foreign Keys` | Parsed and preserved for compatibility. |
+| `Foreign Keys` | Initializes the connection-local `foreign_keys` setting. The managed engine supports composite keys, referential actions, and deferred constraints. |
 | `Local Provider` | `Managed` is the default for local databases. Set `Native` when `Turso.Data.Sqlite.Native` or a RID-specific `Turso.Data.Sqlite.NativeAot.*` companion is referenced. |
 | `Recursive Triggers` | Parsed and preserved for compatibility. |
 | `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
@@ -353,6 +353,31 @@ Supported common connection string keywords include:
 | `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |
 | `Sync Interval` | Automatic replica synchronization is not supported. Call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly. |
 | `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
+
+### Managed foreign-key semantics
+
+The managed local engine supports composite child and parent keys, explicit or omitted
+parent primary-key columns, UNIQUE parent keys, parent affinity and collation, generated
+columns, and `WITHOUT ROWID` tables within the storage shapes supported by the managed
+pager. `ON DELETE` and `ON UPDATE` implement `CASCADE`, `SET NULL`, `SET DEFAULT`,
+`RESTRICT`, and `NO ACTION`, including bounded self-referential and multi-table cascades.
+Foreign-key actions run before the engine's existing AFTER-trigger subset, and the whole
+statement (actions and trigger effects included) rolls back on failure.
+
+`DEFERRABLE INITIALLY DEFERRED` and `PRAGMA defer_foreign_keys` participate in managed
+transactions and savepoints. A failed deferred `COMMIT` or outermost `RELEASE` leaves the
+transaction open so the violation can be repaired. `PRAGMA foreign_keys` remains
+connection-local and cannot change while a transaction is active.
+`PRAGMA foreign_key_list` and `PRAGMA foreign_key_check` expose the retained schema and
+violations. As in SQLite, named `MATCH` clauses are accepted and use MATCH SIMPLE
+behavior.
+
+Foreign keys are always resolved within the database that owns the child table. A
+schema-qualified `REFERENCES` target is rejected, and an ATTACH transaction still may
+mutate only one database because independent files cannot be committed atomically.
+Managed schema rewriting still rejects `ALTER TABLE ADD COLUMN ... REFERENCES` and
+foreign-key-dependent column renames. Trigger forms outside the managed trigger subset
+(for example `UPDATE OF` with `OLD`/`NEW` row references) remain unsupported.
 
 ### Managed local encryption format
 

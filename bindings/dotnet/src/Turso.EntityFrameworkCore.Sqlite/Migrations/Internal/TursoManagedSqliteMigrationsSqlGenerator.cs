@@ -64,33 +64,7 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
         IModel? model,
         MigrationCommandListBuilder builder)
     {
-        ValidateForeignKeyShape(operation);
-        ValidateReferentialActions(operation);
         base.ForeignKeyConstraint(operation, model, builder);
-    }
-
-    private static void ValidateForeignKeyShape(AddForeignKeyOperation operation)
-    {
-        if (operation.Columns.Count() == 1 && operation.PrincipalColumns is { Length: 1 })
-            return;
-
-        throw new NotSupportedException(
-            $"The managed local provider requires exactly one child column and one explicitly named parent column for '{operation.Name}' " +
-            $"on '{operation.Table}'.");
-    }
-
-    private static void ValidateReferentialActions(AddForeignKeyOperation operation)
-    {
-        if (operation.OnDelete == ReferentialAction.NoAction
-            && operation.OnUpdate == ReferentialAction.NoAction)
-        {
-            return;
-        }
-
-        throw new NotSupportedException(
-            $"The managed local provider does not support foreign key referential actions for '{operation.Name}' " +
-            $"on '{operation.Table}' (ON DELETE {operation.OnDelete}, ON UPDATE {operation.OnUpdate}). " +
-            "Configure both actions as NoAction.");
     }
 
     private static void ValidateOperations(IReadOnlyList<MigrationOperation> operations, IModel? model)
@@ -102,11 +76,6 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                 foreach (var column in createTableWithDefaultSql.Columns)
                     ValidateComputedColumn(column);
 
-                foreach (var foreignKey in createTableWithDefaultSql.ForeignKeys)
-                {
-                    ValidateForeignKeyShape(foreignKey);
-                    ValidateReferentialActions(foreignKey);
-                }
             }
 
             if (operation is AddColumnOperation or AlterColumnOperation)
