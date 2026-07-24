@@ -290,11 +290,12 @@ public class CompoundSelectSqlRoutingTests
         var rows = ReadRows(connection, "EXPLAIN SELECT a FROM t INTERSECT SELECT a FROM u;");
         var opcodes = Opcodes(rows).ToList();
 
-        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(1);
+        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(2);
         opcodes.Count(opcode => opcode == "CompoundResultRow").Should().Be(1);
+        opcodes.Should().Contain("RowSetRewind").And.Contain("RowSetNext");
         opcodes.Should().NotContain("ResultRow").And.NotContain("DistinctResultRow");
         Comments(rows).Should().Contain(
-            "output=r[1] if new to distinct set 1 and present in all of sets {0}");
+            "output=r[2] if new to distinct set 2 and present in all of sets {1}");
     }
 
     [Test]
@@ -309,11 +310,12 @@ public class CompoundSelectSqlRoutingTests
         var rows = ReadRows(connection, "EXPLAIN SELECT a FROM t EXCEPT SELECT a FROM u;");
         var opcodes = Opcodes(rows).ToList();
 
-        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(1);
+        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(2);
         opcodes.Count(opcode => opcode == "CompoundResultRow").Should().Be(1);
+        opcodes.Should().Contain("RowSetRewind").And.Contain("RowSetNext");
         opcodes.Should().NotContain("ResultRow").And.NotContain("DistinctResultRow");
         Comments(rows).Should().Contain(
-            "output=r[1] if new to distinct set 1 and absent from all of sets {0}");
+            "output=r[2] if new to distinct set 2 and absent from all of sets {1}");
     }
 
     [Test]
@@ -351,14 +353,14 @@ public class CompoundSelectSqlRoutingTests
     }
 
     [Test]
-    public void StarUnionDistinctFallsBackToEvaluator()
+    public void StarUnionDistinctRoutesWithExpandedMetadata()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedTwoColumn(connection);
 
-        // A star-expanded first term cannot supply a per-output-column collation vector, so UNION
-        // distinct declines and stays on the evaluator rather than routing an incorrect dedup.
-        Assert.Throws<EmbeddedSqlException>(
+        var rows = ReadRows(connection, "SELECT * FROM t UNION SELECT * FROM u;");
+        rows.Should().HaveCount(4);
+        Assert.DoesNotThrow(
             () => ReadRows(connection, "EXPLAIN SELECT * FROM t UNION SELECT * FROM u;"));
     }
 

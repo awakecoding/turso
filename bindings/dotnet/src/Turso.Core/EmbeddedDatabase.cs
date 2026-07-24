@@ -4389,6 +4389,11 @@ public sealed class EmbeddedDatabase : IDisposable
         if (select.Limit is not null || select.Offset is not null)
             return TryCompileLimitedSelect(select, parameters, context, outerRow, out compiled);
 
+        // A bare star over a lowerable derived query is the same result stream with only a metadata
+        // boundary. Reuse the child's program so nested compounds remain fully compiled.
+        if (TryCompileDerivedPassThroughSelect(select, parameters, context, outerRow, out compiled))
+            return true;
+
         // The direct scan / source-less constant projection subset.
         if (TryCompileScanOrConstant(select, parameters, context, outerRow, out compiled))
             return true;
@@ -4427,6 +4432,39 @@ public sealed class EmbeddedDatabase : IDisposable
             outerRow,
             allowPostJoinWhere: false,
             compiled: out compiled);
+    }
+
+    private bool TryCompileDerivedPassThroughSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+        if (select.Distinct
+            || select.Where is not null
+            || select.GroupBy.Count != 0
+            || select.Having is not null
+            || select.OrderBy.Count != 0
+            || select.Limit is not null
+            || select.Offset is not null
+            || select.Source is not DerivedTableSource derived
+            || select.Projections.Count != 1)
+        {
+            return false;
+        }
+
+        var expression = select.Projections[0].Expression;
+        if (expression is not StarExpression
+            && (expression is not QualifiedStarExpression qualified
+                || derived.Alias is null
+                || !string.Equals(qualified.Qualifier, derived.Alias, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        return TryCompileCompoundTerm(derived.Query, parameters, context, outerRow, out compiled);
     }
 
     // Generic source-less and direct-scan projections, delegated to the shared
@@ -4998,7 +5036,7 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    // Lowers a compound SELECT whose terms are all lowerable SELECTs sequenced by a single uniform
+    // Lowers a compound SELECT whose terms are lowerable queries sequenced by a single uniform
     // UNION ALL, UNION/DISTINCT, INTERSECT, or EXCEPT operator into one VdbeProgram via
     // CompoundProgramBuilder, or returns false so the tree-walking evaluator keeps ownership of every
     // shape below.
@@ -5019,10 +5057,8 @@ public sealed class EmbeddedDatabase : IDisposable
     //        fold exactly.
     //    These are precisely what BuildUnionAll/BuildUnionDistinct/BuildIntersect/BuildExcept emit,
     //    so flattening is order-, duplicate-, and membership-identical.
-    //  - every term is a SELECT that TryCompileSelect already lowers (constant projection, table
-    //    scan, aggregate, sorted scan, or join), and every term projects the same number of result
-    //    columns. Because every lowering route declines DISTINCT, no term carries its own row sets,
-    //    which is what the set-operation builders require.
+    //  - every term is a lowerable SELECT, VALUES row set, or nested compound, and every term projects
+    //    the same number of result columns. Nested row-set state is retained by the builder.
     //  - for UNION/DISTINCT, INTERSECT, and EXCEPT (every operator that de-duplicates or probes rows),
     //    the first term's projection list maps one-to-one onto the output columns so the evaluator's
     //    per-output-column collation vector aligns with the row width; a star-expanded first term
@@ -5036,8 +5072,8 @@ public sealed class EmbeddedDatabase : IDisposable
     //  - mixed operators (e.g. UNION ALL ... UNION ..., or INTERSECT ... EXCEPT ...); the builder
     //    sequences one uniform operator per call and the evaluator's left-associative mixed fold is
     //    not reproduced here.
-    //  - any term that is not a SELECT (VALUES, a nested compound) or that TryCompileSelect declines
-    //    (CTE/view/derived sources it cannot scan, DISTINCT terms, subquery WHEREs, ...).
+    //  - any term whose expressions can invoke user callbacks, use unsupported subqueries, or otherwise
+    //    cannot be represented by a child VDBE program.
     //  - terms whose result-column counts differ, so the evaluator raises its exact "SELECTs to the
     //    left and right of a compound operator do not have the same number of result columns" error.
     private bool TryCompileCompoundSelect(
@@ -5049,7 +5085,8 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         compiled = null!;
 
-        if (statement.Operators.Count == 0
+        if (context.CancellationToken.CanBeCanceled
+            || statement.Operators.Count == 0
             || statement.OrderBy.Count != 0
             || statement.Limit is not null
             || statement.Offset is not null)
@@ -5072,18 +5109,15 @@ public sealed class EmbeddedDatabase : IDisposable
                 return false;
         }
 
-        // Every term must be a SELECT that lowers on its own and projects the same number of result
+        // Every term must lower on its own and project the same number of result
         // columns; otherwise fall back so the evaluator produces the value or its exact error.
         var terms = new List<CompoundTerm>(statement.Terms.Count);
+        var parameterIndices = new List<int>();
         var columnCount = -1;
         foreach (var term in statement.Terms)
         {
-            if (term is not SelectStatement { Distinct: false } select
-                || !TryCompileSelect(select, parameters, context, outerRow, out var compiledTerm)
-                || compiledTerm.ParameterIndices is { Count: > 0 })
-            {
+            if (!TryCompileCompoundTerm(term, parameters, context, outerRow, out var compiledTerm))
                 return false;
-            }
 
             var width = ResultRowWidth(compiledTerm.Program);
             if (columnCount < 0)
@@ -5092,13 +5126,12 @@ public sealed class EmbeddedDatabase : IDisposable
                 return false;
 
             terms.Add(new CompoundTerm(compiledTerm.Program, compiledTerm.CursorSources));
+            if (compiledTerm.ParameterIndices is { } termParameterIndices)
+                parameterIndices.AddRange(termParameterIndices);
         }
 
-        if (compoundOperator is CompoundOperator.Intersect or CompoundOperator.Except
-            && terms.Any(term => !IsReorderSafeSetOperationTerm(term.Program)))
-        {
+        if (terms.Any(term => !IsConservativeCompoundTerm(term.Program)))
             return false;
-        }
 
         CompoundTerm compound;
         if (compoundOperator == CompoundOperator.UnionAll)
@@ -5115,7 +5148,7 @@ public sealed class EmbeddedDatabase : IDisposable
             // The collation vector only aligns with the row width when the first term projects one
             // column per output, so a star-expanded first term declines rather than index a too-short
             // vector (the same range the evaluator's own RowsEqual would fault on).
-            var collations = GetCompoundCollations(statement.Terms[0], columnCount);
+            var collations = GetQueryOutputCollations(statement.Terms[0], context);
             if (collations.Count != columnCount
                 || collations.Any(collation => !IsStreamingSafeDistinctCollation(collation)))
                 return false;
@@ -5131,29 +5164,109 @@ public sealed class EmbeddedDatabase : IDisposable
             };
         }
 
-        compiled = new CompiledSelect(compound.Program, compound.CursorSources);
+        compiled = new CompiledSelect(compound.Program, compound.CursorSources, parameterIndices);
         return true;
     }
 
-    // INTERSECT/EXCEPT currently build probe terms before the primary term. Only programs whose
-    // execution cannot raise or invoke user code may be reordered this way; computed arithmetic,
-    // functions, aggregates, joins, and sorters remain on the evaluator, which evaluates terms
-    // left-to-right.
-    private static bool IsReorderSafeSetOperationTerm(VdbeProgram program)
-        => program.Instructions.All(instruction => instruction is
-            LoadConstantInstruction
-            or LoadParameterInstruction
-            or CopyInstruction
-            or OpenReadCursorInstruction
-            or CloseCursorInstruction
-            or RewindCursorInstruction
-            or ColumnInstruction
-            or RowIdInstruction
-            or FilterInstruction
-            or FilterRowIdInstruction
-            or NextInstruction
-            or ResultRowInstruction
-            or HaltInstruction);
+    private static bool IsConservativeCompoundTerm(VdbeProgram program)
+        => program.Instructions.All(instruction => instruction is not (
+            FunctionInstruction
+            or AggResetInstruction
+            or AggStepInstruction
+            or AggFinalizeInstruction
+            or OpenSorterInstruction
+            or FilterRegistersInstruction));
+
+    private bool TryCompileCompoundTerm(
+        QueryStatement term,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
+        switch (term)
+        {
+            case SelectStatement { Source: null } select
+                when TryCompileUnfoldedSourceLessSelect(select, parameters, context, out compiled):
+                return true;
+            case SelectStatement select:
+                return TryCompileSelect(select, parameters, context, outerRow, out compiled);
+            case ValuesClause values:
+                return TryCompileCompoundValues(values, parameters, context, out compiled);
+            case CompoundSelectStatement compound:
+                return TryCompileCompoundSelect(compound, parameters, context, outerRow, out compiled);
+            default:
+                compiled = null!;
+                return false;
+        }
+    }
+
+    // Compiles source-less terms without eager arithmetic folding. Runtime evaluation preserves the
+    // source-order timing of errors in later INTERSECT/EXCEPT terms.
+    private bool TryCompileUnfoldedSourceLessSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        out CompiledSelect compiled)
+    {
+        var compiler = new SelectStatementCompiler(
+            _ => false,
+            _ => throw new InvalidOperationException("Unfolded compound terms do not fold expressions."),
+            _ => null,
+            (_, _) => null,
+            (_, _) => null,
+            (_, _) => null,
+            function => TryGetRoutableBuiltinScalarCall(function, out var routable)
+                ? BuildBuiltinScalarFunction(routable, parameters, context)
+                : null,
+            ArithmeticNumericAffinity,
+            ModuloNumericAffinity);
+        return compiler.TryCompile(select, out compiled);
+    }
+
+    private bool TryCompileCompoundValues(
+        ValuesClause values,
+        SqlValue[] parameters,
+        QueryContext context,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+        var width = values.Rows[0].Count;
+        if (values.Rows.Any(row => row.Count != width))
+            return false;
+
+        var rows = new List<CompiledSelect>(values.Rows.Count);
+        foreach (var row in values.Rows)
+        {
+            var select = new SelectStatement(
+                Distinct: false,
+                row.Select(expression => new Projection(expression, Alias: null)).ToArray(),
+                Source: null,
+                Where: null,
+                GroupBy: [],
+                Having: null,
+                OrderBy: [],
+                Limit: null,
+                Offset: null);
+            if (!TryCompileUnfoldedSourceLessSelect(select, parameters, context, out var compiledRow))
+                return false;
+            rows.Add(compiledRow);
+        }
+
+        if (rows.Count == 1)
+        {
+            compiled = rows[0];
+            return true;
+        }
+
+        var compound = CompoundProgramBuilder.BuildUnionAll(
+            rows.Select(row => new CompoundTerm(row.Program, row.CursorSources)).ToArray());
+        compiled = new CompiledSelect(
+            compound.Program,
+            compound.CursorSources,
+            rows.SelectMany(row => row.ParameterIndices ?? []).ToArray());
+        return true;
+    }
 
     // The number of result columns a compiled term projects, read from its first result-row emission.
     // Every lowered SELECT emits one, and CompoundProgramBuilder validates the widths agree, so this
@@ -5168,6 +5281,10 @@ public sealed class EmbeddedDatabase : IDisposable
                     return result.Values.Count;
                 case DistinctResultRowInstruction distinct:
                     return distinct.Values.Count;
+                case CompoundResultRowInstruction compound:
+                    return compound.Values.Count;
+                case GuardedRowInstruction { Destination: ResultRowDestination } guarded:
+                    return guarded.Values.Count;
             }
         }
 
@@ -7204,9 +7321,12 @@ public sealed class EmbeddedDatabase : IDisposable
                     outerRow: null,
                     out _),
             ValuesClause values => TryPrepareValuesLowering(values, out _),
-            // WITH execution starts by materializing CTE inputs. Report the evaluator boundary
-            // rather than evaluating those inputs merely to discover a later compiled phase.
-            WithSelectStatement => false,
+            WithSelectStatement with => !context.CancellationToken.CanBeCanceled
+                && TryBuildRecursiveCteExplainProgram(
+                    with,
+                    parameters,
+                    context,
+                    out _),
             InsertStatement insert => CanRouteInsertThroughCompiler(insert, context)
                 && TryCompileInsert(insert, parameters, context, out _, out _, out _),
             UpdateStatement update => CanRouteUpdateThroughCompiler(update, context)
@@ -7485,7 +7605,11 @@ public sealed class EmbeddedDatabase : IDisposable
             SeedWorkTableInstruction => VdbeExplain.Describe(instruction),
             WorkTableStepInstruction => VdbeExplain.Describe(instruction),
             WorkTableExpandInstruction => VdbeExplain.Describe(instruction),
+            WorkTableExpandGenerationInstruction => VdbeExplain.Describe(instruction),
             CloseWorkTableInstruction => VdbeExplain.Describe(instruction),
+            RowSetRewindInstruction => VdbeExplain.Describe(instruction),
+            RowSetNextInstruction => VdbeExplain.Describe(instruction),
+            GuardedRowInstruction => VdbeExplain.Describe(instruction),
             _ => throw new EmbeddedSqlException($"Cannot describe unsupported opcode {instruction.Opcode}."),
         };
     }
@@ -8064,20 +8188,17 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         ValidateCompoundOrderByCollations(statement, context);
 
-        // Route the supported same-operator UNION / UNION ALL subset entirely through the bytecode
-        // compiler, running the sequenced program as a real execution path. Its result columns are
-        // the first term's, exactly as the tree-walking fold below reports first.Columns. Everything
-        // else (ORDER BY/LIMIT/OFFSET, INTERSECT/EXCEPT, mixed operators, non-lowerable terms) keeps
-        // the evaluator.
+        // Route safe uniform UNION/INTERSECT/EXCEPT chains through the bytecode compiler. Metadata comes
+        // structurally from the first term, matching the evaluator's fold. Ordered, limited, mixed,
+        // callback-capable, cancellable, and otherwise non-lowerable shapes keep the evaluator.
         if (!context.CancellationToken.CanBeCanceled
             && TryCompileCompoundSelect(statement, parameters, context, outerRow, out var compiledCompound))
         {
-            var firstTerm = (SelectStatement)statement.Terms[0];
-            var compoundColumns = GetColumnNames(
-                firstTerm.Projections,
-                GetOutputColumns(firstTerm.Source, context),
-                GetRawOutputColumns(firstTerm.Source, context));
-            return RunCompiledProgram(compiledCompound, compoundColumns);
+            var compoundColumns = DescribeQuery(statement.Terms[0], context);
+            return RunCompiledProgram(
+                compiledCompound,
+                compoundColumns,
+                BuildValuesBinding(compiledCompound.ParameterIndices ?? [], parameters));
         }
 
         var first = ExecuteCompoundTerm(statement.Terms[0], parameters, context, outerRow);
@@ -8144,10 +8265,9 @@ public sealed class EmbeddedDatabase : IDisposable
     // array, so the same compiled program re-executes with fresh parameters without being rebuilt.
     // Its columns are named column1..columnN exactly as the tree-walking evaluator names them.
     // Everything the builder cannot reproduce byte-for-byte keeps the evaluator (see
-    // TryCompileValues). Only the top-level statement reaches this wrapper; a VALUES used as a
-    // derived table, a scalar/IN/EXISTS subquery, a CTE body, or a compound term still runs on the
-    // evaluator via ExecuteQuery/ExecuteCompoundTerm, mirroring how compound SELECT terms stay on
-    // ExecuteSelect rather than the routed ExecuteSelectStatement.
+    // TryCompileValues). Only the top-level statement reaches this cached wrapper; compound terms and
+    // bare-star derived tables use the compound lowering, while other derived/subquery/CTE uses remain
+    // evaluator-owned.
     private ExecutionResult ExecuteValuesStatement(
         ValuesClause values,
         SqlValue[] parameters,
@@ -8522,22 +8642,27 @@ public sealed class EmbeddedDatabase : IDisposable
         var columns = ResolveCommonTableExpressionColumns(commonTableExpression, anchor.Columns);
         var collations = GetQueryOutputCollations(commonTableExpression.Query, cteContext);
         var deduplicate = recursiveOperator == CompoundOperator.Union;
+        var anchorsRoutable = AreRecursiveAnchorsRoutable(
+            compound,
+            firstRecursiveIndex,
+            parameters,
+            cteContext,
+            outerRow);
 
-        // Route the linear single-term subset -- one already-validated recursive SELECT that scans the
-        // CTE exactly once as its sole source, with no DISTINCT and no ORDER BY, over a non-empty anchor
-        // that fits the row guard -- entirely through the recursive-worktable bytecode. The anchor rows
-        // seed the FIFO frontier and the recursive term becomes the per-frontier-row transform, so the
-        // Step/Expand loop reproduces the tree-walking loop's breadth-first working-set iteration exactly
-        // (same rows, same order, same UNION de-duplication). Every other shape -- multiple recursive
-        // terms, a joined/derived recursive source, a DISTINCT or ORDER BY recursive term, a compound with
-        // its own ORDER BY/LIMIT/OFFSET, or an empty/oversized anchor -- stays on the loop below.
+        // Route one safe recursive SELECT through generation expansion. Evaluating the term once over each
+        // complete working set preserves joined-source order and recursive-term DISTINCT, while callback,
+        // custom-collation, cancellable, multi-term, ordered-compound, and unbounded-shape boundaries stay
+        // on the evaluator below.
         if (recursiveTerms.Count == 1
+            && !cteContext.CancellationToken.CanBeCanceled
             && anchor.Rows.Count >= 1
             && anchor.Rows.Count <= RecursiveCteRowLimit
             && compound.OrderBy.Count == 0
             && compound.Limit is null
             && compound.Offset is null
-            && IsLinearRecursiveTerm(recursiveTerms[0], name))
+            && anchorsRoutable
+            && collations.All(IsStreamingSafeDistinctCollation)
+            && IsRoutableRecursiveTerm(recursiveTerms[0], name, cteContext))
         {
             return RunRecursiveCteViaVdbe(
                 name,
@@ -8606,22 +8731,92 @@ public sealed class EmbeddedDatabase : IDisposable
         return new SourceData(columns, result, collations);
     }
 
-    // Whether a recursive term is the linear shape the recursive-worktable bytecode lowers exactly: its
-    // sole FROM source is the recursive CTE itself (so every generation scans the CTE once, row by row),
-    // and it carries neither DISTINCT nor ORDER BY -- both of which would let whole-working-set evaluation
-    // diverge from the per-frontier-row expansion the worktable performs. The caller has already run
-    // ValidateRecursiveTerm, so aggregates, GROUP BY/HAVING, window functions, LIMIT/OFFSET, and any second
-    // reference to the CTE are already excluded; this only adds the single-source / no-DISTINCT / no-ORDER
-    // BY conditions that make per-row expansion order- and multiset-identical to the tree-walking loop.
-    private static bool IsLinearRecursiveTerm(SelectStatement term, string name)
-        => term.Source is NamedTableSource named
-            && string.Equals(named.Name, name, StringComparison.OrdinalIgnoreCase)
-            && !term.Distinct
-            && term.OrderBy.Count == 0;
+    private static bool IsRoutableRecursiveTerm(
+        SelectStatement term,
+        string name,
+        QueryContext context)
+    {
+        if (term.OrderBy.Count != 0
+            || !IsRoutableRecursiveSource(term.Source, name, context)
+            || !AreRoutableRecursiveJoinConditions(term.Source)
+            || term.Projections.Any(projection => !IsRoutableRecursiveExpression(projection.Expression))
+            || (term.Where is not null && !IsRoutableRecursiveExpression(term.Where)))
+        {
+            return false;
+        }
 
-    // Runs a routed linear recursive CTE on the resumable state machine and materializes its result as a
+        return true;
+    }
+
+    private static bool IsRoutableRecursiveSource(
+        TableSource? source,
+        string name,
+        QueryContext context)
+    {
+        return source switch
+        {
+            NamedTableSource named when string.Equals(
+                named.Name,
+                name,
+                StringComparison.OrdinalIgnoreCase) => true,
+            NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table)
+                => table.ColumnDefinitions.All(definition =>
+                    IsStreamingSafeDistinctCollation(definition.Collation)),
+            JoinTableSource
+            {
+                Kind: JoinKind.Inner,
+                Natural: false,
+                UsingColumns: null,
+            } join => IsRoutableRecursiveSource(join.Left, name, context)
+                && IsRoutableRecursiveSource(join.Right, name, context),
+            _ => false,
+        };
+    }
+
+    private static bool AreRoutableRecursiveJoinConditions(TableSource? source)
+    {
+        return source switch
+        {
+            JoinTableSource join => (join.Condition is null
+                    || IsRoutableRecursiveExpression(join.Condition))
+                && AreRoutableRecursiveJoinConditions(join.Left)
+                && AreRoutableRecursiveJoinConditions(join.Right),
+            _ => true,
+        };
+    }
+
+    // Functions, subqueries, pattern operators, and custom collations remain evaluator-owned because
+    // they can invoke callbacks or raise errors from code the recursive worktable cannot introspect.
+    private static bool IsRoutableRecursiveExpression(Expression expression)
+    {
+        return expression switch
+        {
+            LiteralExpression or ParameterExpression or ColumnExpression
+                or StarExpression or QualifiedStarExpression => true,
+            CollationExpression collation => IsStreamingSafeDistinctCollation(collation.Name)
+                && IsRoutableRecursiveExpression(collation.Expression),
+            CastExpression cast => IsRoutableRecursiveExpression(cast.Expression),
+            CaseExpression @case => (@case.Operand is null
+                    || IsRoutableRecursiveExpression(@case.Operand))
+                && @case.Clauses.All(clause =>
+                    IsRoutableRecursiveExpression(clause.When)
+                    && IsRoutableRecursiveExpression(clause.Then))
+                && (@case.Else is null || IsRoutableRecursiveExpression(@case.Else)),
+            BetweenExpression between => IsRoutableRecursiveExpression(between.Value)
+                && IsRoutableRecursiveExpression(between.Lower)
+                && IsRoutableRecursiveExpression(between.Upper),
+            InExpression @in => IsRoutableRecursiveExpression(@in.Value)
+                && @in.Values.All(IsRoutableRecursiveExpression),
+            UnaryExpression unary => IsRoutableRecursiveExpression(unary.Operand),
+            BinaryExpression binary => IsRoutableRecursiveExpression(binary.Left)
+                && IsRoutableRecursiveExpression(binary.Right),
+            _ => false,
+        };
+    }
+
+    // Runs a routed recursive CTE on the resumable state machine and materializes its result as a
     // SourceData whose columns are the CTE's resolved columns -- byte-identical to what the tree-walking
-    // loop produces, but with the FIFO Step/Expand recursion executing as real, observably looping
+    // loop produces, but with the FIFO Step/generation-expand recursion executing as real, observably looping
     // bytecode. The row guard surfaces as the evaluator's own "exceeded the maximum" diagnostic so a
     // runaway UNION ALL fails with the identical message whether it routed or not.
     private SourceData RunRecursiveCteViaVdbe(
@@ -8663,14 +8858,10 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    // Lowers a linear recursive CTE onto a RecursiveCteProgramBuilder program: the anchor rows become the
-    // constant seed generation and the recursive term becomes the VdbeRecursiveTransform. The transform is
-    // the tree-walking evaluator's own recursive-term evaluation restricted to a single frontier row -- the
-    // CTE is bound to a one-row working set and ExecuteSelect projects/filters exactly as it would over the
-    // whole set -- so value, NULL, collation, and correlation semantics are reused rather than re-derived,
-    // matching how every other direct builder delegates its leaf semantics. Because a linear term scans the
-    // CTE exactly once (guaranteed by IsLinearRecursiveTerm plus ValidateRecursiveTerm), expanding one row
-    // at a time and draining FIFO yields the identical multiset and order as whole-working-set evaluation.
+    // Lowers a recursive CTE onto a RecursiveCteProgramBuilder program: anchor rows become the constant seed
+    // generation and the recursive SELECT becomes a generation transform. Binding the CTE to the complete
+    // frontier and invoking ExecuteSelect once preserves evaluator projection, join, DISTINCT, NULL,
+    // collation, correlation, and source-order semantics rather than re-deriving them in the executor.
     // Both guards are pinned to the evaluator's row cap: the row guard reproduces its "exceeded the maximum"
     // bound (seeds count as admitted rows exactly as anchors count toward the loop's result), and the depth
     // guard is set to the same cap so it can never fire before the row guard (a chain of depth d needs more
@@ -8689,18 +8880,20 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         var width = columns.Length;
 
-        // One dictionary/context reused across expansions: each call rebinds only the CTE's single-row
-        // working set, which ExecuteSelect consumes synchronously before the next dequeue, so nothing
-        // mutable leaks between frontier rows.
+        // One dictionary/context is reused across expansions; each synchronous call replaces only the
+        // CTE's current generation before ExecuteSelect consumes it.
         var iterationTables = new Dictionary<string, SourceData>(
             cteContext.CommonTableExpressions, StringComparer.OrdinalIgnoreCase);
         var iterationContext = cteContext with { CommonTableExpressions = iterationTables };
 
-        IReadOnlyList<SqlValue[]> Transform(SqlValue[] frontierRow)
+        IReadOnlyList<SqlValue[]> Transform(IReadOnlyList<SqlValue[]> frontierRows)
         {
+            var workingSet = new SourceRow[frontierRows.Count];
+            for (var index = 0; index < frontierRows.Count; index++)
+                workingSet[index] = new SourceRow(columns, frontierRows[index]);
             iterationTables[name] = new SourceData(
                 columns,
-                [new SourceRow(columns, frontierRow)],
+                workingSet,
                 collations);
             var termResult = MaterializeQueryResult(
                 ExecuteSelect(recursiveTerm, parameters, iterationContext, outerRow));
@@ -8719,11 +8912,11 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (deduplicate)
         {
-            return RecursiveCteProgramBuilder.BuildUnionDistinct(
+            return RecursiveCteProgramBuilder.BuildUnionDistinctGenerations(
                 anchorRows, Transform, RecursiveRowsEqual, RecursiveCteRowLimit, RecursiveCteRowLimit);
         }
 
-        return RecursiveCteProgramBuilder.BuildUnionAll(
+        return RecursiveCteProgramBuilder.BuildUnionAllGenerations(
             anchorRows, Transform, RecursiveCteRowLimit, RecursiveCteRowLimit);
     }
 
@@ -8741,6 +8934,7 @@ public sealed class EmbeddedDatabase : IDisposable
     private bool TryAnalyzeLinearRecursiveCte(
         CompoundSelectStatement compound,
         string name,
+        QueryContext context,
         out SelectStatement recursiveTerm,
         out int firstRecursiveIndex,
         out bool deduplicate)
@@ -8779,7 +8973,7 @@ public sealed class EmbeddedDatabase : IDisposable
         }
 
         if (compound.Terms[firstRecursiveIndex] is not SelectStatement select
-            || !IsLinearRecursiveTerm(select, name)
+            || !IsRoutableRecursiveTerm(select, name, context)
             || CountDirectFromReferences(select.Source, name) != 1
             || CountAllReferences(select, name) != 1
             || select.GroupBy.Count > 0
@@ -8826,14 +9020,21 @@ public sealed class EmbeddedDatabase : IDisposable
         out VdbeProgram program)
     {
         program = null!;
-        if (with.CommonTableExpressions.Count != 1)
+        if (context.CancellationToken.CanBeCanceled
+            || with.CommonTableExpressions.Count != 1)
             return false;
 
         var cte = with.CommonTableExpressions[0];
         if (!IsBareSelectStarFrom(with.Query, cte.Name)
             || CountAllReferences(cte.Query, cte.Name) == 0
             || cte.Query is not CompoundSelectStatement compound
-            || !TryAnalyzeLinearRecursiveCte(compound, cte.Name, out var recursiveTerm, out var firstRecursiveIndex, out var deduplicate))
+            || !TryAnalyzeLinearRecursiveCte(
+                compound,
+                cte.Name,
+                context,
+                out var recursiveTerm,
+                out var firstRecursiveIndex,
+                out var deduplicate))
         {
             return false;
         }
@@ -8843,6 +9044,16 @@ public sealed class EmbeddedDatabase : IDisposable
             CommonTableExpressions = new Dictionary<string, SourceData>(
                 context.CommonTableExpressions, StringComparer.OrdinalIgnoreCase),
         };
+
+        if (!AreRecursiveAnchorsRoutable(
+                compound,
+                firstRecursiveIndex,
+                parameters,
+                cteContext,
+                outerRow: null))
+        {
+            return false;
+        }
 
         var anchor = EvaluateRecursiveAnchor(compound, firstRecursiveIndex, parameters, cteContext, outerRow: null);
 
@@ -8857,6 +9068,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var columns = ResolveCommonTableExpressionColumns(cte, anchor.Columns);
         var collations = GetQueryOutputCollations(cte.Query, cteContext);
+        if (collations.Any(collation => !IsStreamingSafeDistinctCollation(collation)))
+            return false;
         program = BuildRecursiveCteProgram(
             cte.Name,
             anchor.Rows,
@@ -8867,6 +9080,30 @@ public sealed class EmbeddedDatabase : IDisposable
             parameters,
             cteContext,
             outerRow: null);
+        return true;
+    }
+
+    private bool AreRecursiveAnchorsRoutable(
+        CompoundSelectStatement compound,
+        int firstRecursiveIndex,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        for (var index = 0; index < firstRecursiveIndex; index++)
+        {
+            if (!TryCompileCompoundTerm(
+                    compound.Terms[index],
+                    parameters,
+                    context,
+                    outerRow,
+                    out var compiledAnchor)
+                || !IsConservativeCompoundTerm(compiledAnchor.Program))
+            {
+                return false;
+            }
+        }
+
         return true;
     }
 

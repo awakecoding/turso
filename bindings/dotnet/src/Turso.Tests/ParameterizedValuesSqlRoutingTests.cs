@@ -259,12 +259,10 @@ public class ParameterizedValuesSqlRoutingTests
     }
 
     [Test]
-    public void ParameterInCompoundTermStaysOnEvaluator()
+    public void ParameterInCompoundTermRoutes()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
-        // The compound compiler only lowers SELECT terms, so a parameterized VALUES term keeps the whole
-        // compound on the evaluator: the values are right, the program is not lowered.
         using (var statement = connection.Prepare("SELECT 1 AS x UNION ALL VALUES (?)"))
         {
             statement.Bind(1, SqlValue.Integer(2));
@@ -277,8 +275,7 @@ public class ParameterizedValuesSqlRoutingTests
 
         using var explain = connection.Prepare("EXPLAIN SELECT 1 AS x UNION ALL VALUES (?)");
         explain.Bind(1, SqlValue.Null);
-        Assert.Throws<EmbeddedSqlException>(() => explain.Step())!
-            .Message.Should().Contain("EXPLAIN is only supported");
+        explain.Step().Should().Be(StatementStepResult.Row);
     }
 
     [Test]
