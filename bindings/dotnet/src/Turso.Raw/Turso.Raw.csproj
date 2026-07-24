@@ -7,7 +7,7 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
         <Title>Turso Native Interop</Title>
-        <Description>Native interop and runtime assets used by the Turso ADO.NET provider.</Description>
+        <Description>Dynamic native interop and runtime assets for the optional Turso.Data.Sqlite.Native local provider on Windows, Linux, macOS, Android, and iOS.</Description>
         <Authors>Turso authors</Authors>
         <PackageTags>turso;sqlite;database;native;interop</PackageTags>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>

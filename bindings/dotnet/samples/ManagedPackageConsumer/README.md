@@ -1,0 +1,13 @@
+# Managed package consumer
+
+This source-free consumer restores only packed `Turso.Data.Sqlite` and
+`Turso.EntityFrameworkCore.Sqlite` artifacts. It runs on `net8.0`, `net9.0`, and
+`net10.0` and verifies the public capability matrix, managed file pooling,
+managed encryption, the EF Core 9.x local-only contract, and the absence of
+native or Sync companion packages.
+
+Run it through the package gate:
+
+```bash
+make validate-managed-package
+```
