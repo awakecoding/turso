@@ -1028,8 +1028,9 @@ internal sealed class EmbeddedFileStore : IDisposable
     public void Persist(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
-        => PersistCore(tables, views, triggers, reclaimTrailingPages: false);
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        PragmaHeaderMetadata? pragmaHeader = null)
+        => PersistCore(tables, views, triggers, reclaimTrailingPages: false, pragmaHeader);
 
     /// <summary>
     /// Rebuilds the current managed catalog into the smallest complete page image
@@ -1042,14 +1043,15 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         ThrowIfDisposed();
         var catalog = Load();
-        PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true);
+        PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true, pragmaHeader: null);
     }
 
     private void PersistCore(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
-        bool reclaimTrailingPages)
+        bool reclaimTrailingPages,
+        PragmaHeaderMetadata? pragmaHeader)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1059,7 +1061,9 @@ internal sealed class EmbeddedFileStore : IDisposable
             EmbeddedFileStore.ValidateTableRepresentable(name, table);
         ValidateSchemaDefinitions(tables, views, triggers);
 
-        if (!reclaimTrailingPages && TryPersistBoundedTableLeafMutation(tables, views, triggers))
+        if (!reclaimTrailingPages
+            && pragmaHeader is null
+            && TryPersistBoundedTableLeafMutation(tables, views, triggers))
             return;
 
         var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
@@ -1131,7 +1135,11 @@ internal sealed class EmbeddedFileStore : IDisposable
             DatabaseSizeInPages = target,
             FirstFreelistTrunkPage = freelist.FirstTrunkPage,
             FreelistPageCount = freelist.PageCount,
-            SchemaCookie = schemaChanged ? currentHeader.SchemaCookie + 1 : currentHeader.SchemaCookie,
+            SchemaCookie = pragmaHeader is { } metadata
+                ? unchecked((uint)metadata.SchemaVersion)
+                : schemaChanged ? currentHeader.SchemaCookie + 1 : currentHeader.SchemaCookie,
+            UserVersion = pragmaHeader?.UserVersion ?? currentHeader.UserVersion,
+            ApplicationId = pragmaHeader?.ApplicationId ?? currentHeader.ApplicationId,
         };
         newHeader.WriteTo(schemaTree.RootPage);
         ValidateRewritePlan(

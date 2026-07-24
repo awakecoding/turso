@@ -88,6 +88,7 @@ public readonly struct ManagedParameterMetadata
 public enum ManagedSnapshotFailure
 {
     DestinationNotEmpty,
+    DestinationBusy,
     UnsupportedSchemaObject,
     RowidNotAccessible,
     ColumnCountMismatch,
@@ -145,6 +146,15 @@ public interface IManagedConnectionAdapter : IDisposable
 
     void CopySnapshotTo(IManagedConnectionAdapter destination)
         => throw new NotSupportedException("Managed snapshot copying is not supported by this connection adapter.");
+
+    void CopySnapshotTo(
+        IManagedConnectionAdapter destination,
+        string destinationName,
+        string sourceName)
+        => throw new NotSupportedException("Named managed snapshot copying is not supported by this connection adapter.");
+
+    void ApplySnapshotPragmaHeader(int schemaVersion, int userVersion, int applicationId)
+        => throw new NotSupportedException("Managed snapshot PRAGMA metadata is not supported by this connection adapter.");
 }
 
 public interface IManagedStatementAdapter : IDisposable
@@ -369,12 +379,48 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
     }
 
     public void CopySnapshotTo(IManagedConnectionAdapter destination)
+        => CopySnapshotTo(destination, "main", "main");
+
+    public void CopySnapshotTo(
+        IManagedConnectionAdapter destination,
+        string destinationName,
+        string sourceName)
     {
         ArgumentNullException.ThrowIfNull(destination);
-        if (ReferenceEquals(this, destination))
-            throw new ArgumentException("Managed snapshots require distinct source and destination adapters.", nameof(destination));
+        ArgumentNullException.ThrowIfNull(destinationName);
+        ArgumentNullException.ThrowIfNull(sourceName);
+        if (destination is not ManagedConnectionAdapter managedDestination)
+            throw new ArgumentException("Managed snapshots require a managed destination adapter.", nameof(destination));
 
-        ManagedSnapshot.Copy(this, destination);
+        var sourceConnection = GetConnection();
+        var destinationConnection = managedDestination.GetConnection();
+        if (sourceConnection.ReferencesSameDatabase(sourceName, destinationConnection, destinationName))
+            throw new EmbeddedSqlException("source and destination must be distinct");
+        if (destinationConnection.HasActiveTransaction)
+            throw new ManagedSnapshotException(ManagedSnapshotFailure.DestinationBusy);
+
+        ManagedConnectionAdapter? sourceSnapshot = null;
+        ManagedConnectionAdapter? destinationSnapshot = null;
+        try
+        {
+            var sourceTransactionActive = sourceConnection.HasActiveTransaction
+                                          && sourceName.Equals("main", StringComparison.OrdinalIgnoreCase);
+            var snapshotSource = sourceTransactionActive
+                ? this
+                : sourceSnapshot = Wrap(sourceConnection.OpenDatabaseConnection(sourceName));
+            destinationSnapshot = Wrap(destinationConnection.OpenDatabaseConnection(destinationName));
+            ManagedSnapshot.Copy(snapshotSource, destinationSnapshot, sourceTransactionActive);
+        }
+        finally
+        {
+            destinationSnapshot?.Dispose();
+            sourceSnapshot?.Dispose();
+        }
+    }
+
+    public void ApplySnapshotPragmaHeader(int schemaVersion, int userVersion, int applicationId)
+    {
+        GetConnection().ApplySnapshotPragmaHeader(schemaVersion, userVersion, applicationId);
     }
 
     public void Dispose()
@@ -609,17 +655,24 @@ internal static class ManagedSnapshot
 {
     private static readonly string[] RowidNames = ["rowid", "_rowid_", "oid"];
 
-    public static void Copy(IManagedConnectionAdapter source, IManagedConnectionAdapter destination)
+    public static void Copy(
+        IManagedConnectionAdapter source,
+        IManagedConnectionAdapter destination,
+        bool sourceTransactionActive = false)
     {
-        EnsureEmpty(destination);
         var sourceTransactionStarted = false;
         var destinationTransactionStarted = false;
         var destinationForeignKeysDisabled = false;
         try
         {
-            Execute(source, "BEGIN;");
-            sourceTransactionStarted = true;
+            if (!sourceTransactionActive)
+            {
+                Execute(source, "BEGIN;");
+                sourceTransactionStarted = true;
+            }
+
             var schema = ReadSchema(source);
+            var pragmaHeader = ReadPragmaHeader(source);
             if (ForeignKeysEnabled(destination))
             {
                 Execute(destination, "PRAGMA foreign_keys = OFF;");
@@ -630,6 +683,7 @@ internal static class ManagedSnapshot
             {
                 Execute(destination, "BEGIN;");
                 destinationTransactionStarted = true;
+                ClearSchema(destination);
                 foreach (var entry in schema.Where(entry => entry.Type == "table"))
                     Execute(destination, entry.Sql);
 
@@ -639,6 +693,10 @@ internal static class ManagedSnapshot
                 foreach (var entry in schema.Where(entry => entry.Type is "index" or "view" or "trigger"))
                     Execute(destination, entry.Sql);
 
+                destination.ApplySnapshotPragmaHeader(
+                    pragmaHeader.SchemaVersion,
+                    pragmaHeader.UserVersion,
+                    pragmaHeader.ApplicationId);
                 Execute(destination, "COMMIT;");
                 destinationTransactionStarted = false;
             }
@@ -666,21 +724,27 @@ internal static class ManagedSnapshot
         }
     }
 
-    private static void EnsureEmpty(IManagedConnectionAdapter destination)
+    private static void ClearSchema(IManagedConnectionAdapter destination)
     {
-        using var statement = destination.Prepare(
-            "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%';");
-        if (statement.Step() == StatementStepResult.Row)
-            throw new ManagedSnapshotException(ManagedSnapshotFailure.DestinationNotEmpty);
+        var schema = ReadSchema(destination);
+        foreach (var type in new[] { "trigger", "view", "index", "table" })
+        {
+            foreach (var entry in schema.Where(entry => entry.Type == type))
+                Execute(destination, "DROP " + type.ToUpperInvariant() + " " + QuoteIdentifier(entry.Name) + ";");
+        }
     }
 
     private static List<SchemaEntry> ReadSchema(IManagedConnectionAdapter source)
     {
-        using var statement = source.Prepare("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL;");
+        using var statement = source.Prepare(
+            "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL;");
         var schema = new List<SchemaEntry>();
         while (statement.Step() == StatementStepResult.Row)
         {
             var type = statement.GetValue(0).AsText();
+            var name = statement.GetValue(1).AsText();
+            if (name.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+                continue;
             if (type is not ("table" or "index" or "view" or "trigger"))
             {
                 throw new ManagedSnapshotException(
@@ -688,12 +752,26 @@ internal static class ManagedSnapshot
                     type);
             }
 
-            var name = statement.GetValue(1).AsText();
             var sql = statement.GetValue(2).AsText();
             schema.Add(new SchemaEntry(type, name, sql, HasWithoutRowidClause(sql)));
         }
 
         return schema;
+    }
+
+    private static SnapshotPragmaHeader ReadPragmaHeader(IManagedConnectionAdapter source)
+        => new(
+            ReadPragmaInteger(source, "schema_version"),
+            ReadPragmaInteger(source, "user_version"),
+            ReadPragmaInteger(source, "application_id"));
+
+    private static int ReadPragmaInteger(IManagedConnectionAdapter source, string name)
+    {
+        using var statement = source.Prepare("PRAGMA " + name + ";");
+        if (statement.Step() != StatementStepResult.Row)
+            throw new InvalidOperationException($"PRAGMA {name} did not return a value.");
+
+        return checked((int)statement.GetValue(0).AsInteger());
     }
 
     private static void CopyRows(
@@ -874,4 +952,9 @@ internal static class ManagedSnapshot
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 
     private sealed record SchemaEntry(string Type, string Name, string Sql, bool IsWithoutRowid);
+
+    private readonly record struct SnapshotPragmaHeader(
+        int SchemaVersion,
+        int UserVersion,
+        int ApplicationId);
 }

@@ -186,6 +186,31 @@ public sealed class EmbeddedDatabase : IDisposable
     internal IFileSystem FileSystem
         => _fileSystem ?? throw new InvalidOperationException("The managed database is not file-backed.");
 
+    internal bool ReferencesSameDatabase(EmbeddedDatabase other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        if (ReferenceEquals(this, other))
+            return true;
+        if (!IsFileBacked || !other.IsFileBacked || _fileSystem is null || other._fileSystem is null)
+            return false;
+
+        var fileSystem = TursoEncryptionFileSystem.Unwrap(_fileSystem);
+        var otherFileSystem = TursoEncryptionFileSystem.Unwrap(other._fileSystem);
+        if (fileSystem is PhysicalFileSystem && otherFileSystem is PhysicalFileSystem)
+        {
+            var comparison = OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            return string.Equals(
+                Path.GetFullPath(_databasePath),
+                Path.GetFullPath(other._databasePath),
+                comparison);
+        }
+
+        return ReferenceEquals(fileSystem, otherFileSystem)
+               && string.Equals(_databasePath, other._databasePath, StringComparison.Ordinal);
+    }
+
     private sealed record ManagedAggregateFunction(
         SqlValue Seed,
         Func<SqlValue, IReadOnlyList<SqlValue>, SqlValue> Step,
@@ -516,7 +541,7 @@ public sealed class EmbeddedDatabase : IDisposable
     internal void CommitTransaction(
         SchemaCatalog catalog,
         long version,
-        PragmaHeaderMetadata? inMemoryPragmaHeader = null)
+        PragmaHeaderMetadata? pragmaHeader = null)
     {
         lock (_gate)
         {
@@ -528,16 +553,13 @@ public sealed class EmbeddedDatabase : IDisposable
 
             if (_fileStore is null)
             {
-                if (inMemoryPragmaHeader is { } metadata)
+                if (pragmaHeader is { } metadata)
                     _inMemoryPragmaHeader = metadata;
                 PublishCatalog(catalog);
                 return;
             }
 
-            if (inMemoryPragmaHeader is not null)
-                throw new InvalidOperationException("File-backed managed databases cannot commit in-memory PRAGMA metadata.");
-
-            PersistFileCatalog(catalog);
+            PersistFileCatalog(catalog, pragmaHeader);
         }
     }
 
@@ -644,7 +666,9 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    private void PersistFileCatalog(SchemaCatalog catalog)
+    private void PersistFileCatalog(
+        SchemaCatalog catalog,
+        PragmaHeaderMetadata? pragmaHeader = null)
     {
         if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
             throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
@@ -655,7 +679,7 @@ public sealed class EmbeddedDatabase : IDisposable
             EnsureFileCatalogVersionCurrent();
             try
             {
-                _fileStore.Persist(catalog.Tables, catalog.Views, catalog.Triggers);
+                _fileStore.Persist(catalog.Tables, catalog.Views, catalog.Triggers, pragmaHeader);
             }
             catch (EmbeddedPostCommitMaintenanceException)
             {
@@ -15468,6 +15492,7 @@ public sealed class EmbeddedConnection : IDisposable
     private long _transactionVersion;
     private PragmaHeaderMetadata? _transactionPragmaHeader;
     private bool _transactionHasChanges;
+    private bool _transactionHasSnapshotPragmaHeader;
     private bool _transactionOpenedBySavepoint;
     private readonly List<SavepointEntry> _savepoints = [];
     private long _lastInsertRowId;
@@ -15491,6 +15516,20 @@ public sealed class EmbeddedConnection : IDisposable
     internal EmbeddedConnection(EmbeddedDatabase database)
     {
         _database = database;
+    }
+
+    internal bool HasActiveTransaction => _transactionCatalog is not null;
+
+    internal EmbeddedConnection OpenDatabaseConnection(string databaseName)
+        => ResolveDatabase(databaseName).Connect();
+
+    internal bool ReferencesSameDatabase(
+        string databaseName,
+        EmbeddedConnection other,
+        string otherDatabaseName)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        return ResolveDatabase(databaseName).ReferencesSameDatabase(other.ResolveDatabase(otherDatabaseName));
     }
 
     public EmbeddedStatement Prepare(string sql)
@@ -15603,6 +15642,7 @@ public sealed class EmbeddedConnection : IDisposable
         _transactionCatalog = null;
         _transactionPragmaHeader = null;
         _transactionHasChanges = false;
+        _transactionHasSnapshotPragmaHeader = false;
         _transactionOpenedBySavepoint = false;
         _savepoints.Clear();
         foreach (var attachment in _attachedDatabases.Values)
@@ -15625,6 +15665,7 @@ public sealed class EmbeddedConnection : IDisposable
                 (_transactionCatalog, _transactionVersion) = _database.CreateTransactionSnapshot();
                 _transactionPragmaHeader = _database.GetPragmaHeaderMetadata();
                 _transactionHasChanges = false;
+                _transactionHasSnapshotPragmaHeader = false;
                 _transactionOpenedBySavepoint = false;
                 _savepoints.Clear();
                 return ExecutionResult.Empty;
@@ -15636,7 +15677,7 @@ public sealed class EmbeddedConnection : IDisposable
                     _database.CommitTransaction(
                         _transactionCatalog,
                         _transactionVersion,
-                        _database.IsFileBacked ? null : _transactionPragmaHeader);
+                        GetCommitPragmaHeader());
 
                 ResetTransactionState();
                 return ExecutionResult.Empty;
@@ -15797,6 +15838,27 @@ public sealed class EmbeddedConnection : IDisposable
         }
 
         return ExecutionResult.Empty;
+    }
+
+    internal void ApplySnapshotPragmaHeader(int schemaVersion, int userVersion, int applicationId)
+    {
+        if (_transactionCatalog is null)
+            throw new InvalidOperationException("Snapshot PRAGMA metadata requires an active transaction.");
+
+        _transactionPragmaHeader = new PragmaHeaderMetadata(schemaVersion, userVersion, applicationId);
+        _transactionHasChanges = true;
+        _transactionHasSnapshotPragmaHeader = true;
+    }
+
+    private EmbeddedDatabase ResolveDatabase(string databaseName)
+    {
+        ArgumentNullException.ThrowIfNull(databaseName);
+        if (databaseName.Equals("main", StringComparison.OrdinalIgnoreCase))
+            return _database;
+        if (_attachedDatabases.TryGetValue(databaseName, out var attachment))
+            return attachment.Database;
+
+        throw new EmbeddedSqlException($"no such database: {databaseName}");
     }
 
     private ExecutionResult ExecuteDetach(DetachDatabaseStatement statement)
@@ -16403,6 +16465,7 @@ public sealed class EmbeddedConnection : IDisposable
             (_transactionCatalog, _transactionVersion) = _database.CreateTransactionSnapshot();
             _transactionPragmaHeader = _database.GetPragmaHeaderMetadata();
             _transactionHasChanges = false;
+            _transactionHasSnapshotPragmaHeader = false;
             _transactionOpenedBySavepoint = true;
         }
 
@@ -16425,7 +16488,7 @@ public sealed class EmbeddedConnection : IDisposable
                 _database.CommitTransaction(
                     _transactionCatalog,
                     _transactionVersion,
-                    _database.IsFileBacked ? null : _transactionPragmaHeader);
+                    GetCommitPragmaHeader());
             }
 
             ResetTransactionState();
@@ -16469,9 +16532,15 @@ public sealed class EmbeddedConnection : IDisposable
         _transactionCatalog = null;
         _transactionPragmaHeader = null;
         _transactionHasChanges = false;
+        _transactionHasSnapshotPragmaHeader = false;
         _transactionOpenedBySavepoint = false;
         _savepoints.Clear();
     }
+
+    private PragmaHeaderMetadata? GetCommitPragmaHeader()
+        => _database.IsFileBacked && !_transactionHasSnapshotPragmaHeader
+            ? null
+            : _transactionPragmaHeader;
 
     private sealed record SavepointEntry(
         string Name,
