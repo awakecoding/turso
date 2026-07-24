@@ -70,6 +70,24 @@ public sealed class ExplainQueryPlanTests
     }
 
     [Test]
+    public void ConstraintOwnedDmlReportsTheRuntimeEvaluatorRoute()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE constrained(value INTEGER UNIQUE ON CONFLICT IGNORE);");
+
+        ReadPlan(connection, "EXPLAIN QUERY PLAN INSERT INTO constrained VALUES (1);")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+        ReadPlan(connection, "EXPLAIN QUERY PLAN UPDATE constrained SET value = 2;")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+
+        using var insertExplain = connection.Prepare("EXPLAIN INSERT INTO constrained VALUES (1);");
+        Assert.Throws<EmbeddedSqlException>(() => insertExplain.Step());
+        using var updateExplain = connection.Prepare("EXPLAIN UPDATE constrained SET value = 2;");
+        Assert.Throws<EmbeddedSqlException>(() => updateExplain.Step());
+        ReadScalar(connection, "SELECT count(*) FROM constrained;").Should().Be(SqlValue.Integer(0));
+    }
+
+    [Test]
     public void FallbackPlanningDoesNotInvokeUserFunctions()
     {
         using var connection = new EmbeddedDatabase().Connect();
