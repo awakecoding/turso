@@ -188,6 +188,179 @@ public sealed class ManagedAutoIncrementDurabilityTests
     }
 
     [Test]
+    public void ForeignKeyActionsPreserveIndependentSequenceHighWaterMarks()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "sequence-foreign-key-actions.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA foreign_keys=ON");
+            Execute(
+                connection,
+                "CREATE TABLE parent("
+                + "id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE)");
+            Execute(
+                connection,
+                "CREATE TABLE child("
+                + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                + "parent_id INTEGER REFERENCES parent(id) "
+                + "ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)");
+            Execute(connection, "BEGIN");
+            Execute(connection, "INSERT INTO parent(code) VALUES ('first')");
+            Execute(connection, "INSERT INTO child(parent_id) VALUES (1)");
+            Execute(connection, "COMMIT");
+            Execute(connection, "UPDATE parent SET id = 10 WHERE id = 1");
+            Execute(connection, "INSERT INTO parent(code) VALUES ('second')");
+            Execute(connection, "DELETE FROM parent WHERE id = 10");
+            Execute(connection, "INSERT INTO child(parent_id) VALUES (11)");
+
+            ReadInteger(connection, "SELECT seq FROM sqlite_sequence WHERE name = 'parent'")
+                .Should().Be(11);
+            ReadInteger(connection, "SELECT seq FROM sqlite_sequence WHERE name = 'child'")
+                .Should().Be(2);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadInteger(reopenedConnection, "SELECT id FROM parent").Should().Be(11);
+        ReadInteger(reopenedConnection, "SELECT id FROM child").Should().Be(2);
+        ReadInteger(reopenedConnection, "SELECT parent_id FROM child").Should().Be(11);
+        ReadInteger(reopenedConnection, "SELECT seq FROM sqlite_sequence WHERE name = 'parent'")
+            .Should().Be(11);
+        ReadInteger(reopenedConnection, "SELECT seq FROM sqlite_sequence WHERE name = 'child'")
+            .Should().Be(2);
+    }
+
+    [Test]
+    public void DropCascadeTriggerAdvancesSequenceAtomicallyAcrossReopen()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "sequence-drop-cascade-trigger.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA foreign_keys=ON");
+            Execute(connection, "CREATE TABLE parent(id INTEGER PRIMARY KEY)");
+            Execute(
+                connection,
+                "CREATE TABLE child("
+                + "id INTEGER PRIMARY KEY, "
+                + "parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE)");
+            Execute(
+                connection,
+                "CREATE TABLE audit("
+                + "id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT)");
+            Execute(
+                connection,
+                "CREATE TRIGGER child_deleted AFTER DELETE ON child BEGIN "
+                + "INSERT INTO audit(note) VALUES ('cascade'); END");
+            Execute(connection, "INSERT INTO parent VALUES (1)");
+            Execute(connection, "INSERT INTO child VALUES (1, 1)");
+            Execute(connection, "DROP TABLE parent");
+
+            ReadInteger(connection, "SELECT count(*) FROM child").Should().Be(0);
+            ReadInteger(connection, "SELECT id FROM audit").Should().Be(1);
+            ReadInteger(connection, "SELECT seq FROM sqlite_sequence WHERE name = 'audit'")
+                .Should().Be(1);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadInteger(reopenedConnection, "SELECT count(*) FROM child").Should().Be(0);
+        ReadInteger(reopenedConnection, "SELECT id FROM audit").Should().Be(1);
+        ReadInteger(reopenedConnection, "SELECT seq FROM sqlite_sequence WHERE name = 'audit'")
+            .Should().Be(1);
+    }
+
+    [Test]
+    public void OverflowingAutoincrementSchemaSurvivesPageMigrationAndSqliteHandoff()
+    {
+        var path = CreatePhysicalDatabasePath();
+        var defaultValue = new string('s', 6_000);
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    "CREATE TABLE data("
+                    + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    + $"payload TEXT DEFAULT '{defaultValue}')");
+                Execute(connection, "INSERT INTO data(id) VALUES (50)");
+                Execute(connection, "DELETE FROM data");
+                Execute(connection, "PRAGMA journal_mode=DELETE");
+                Execute(connection, "PRAGMA page_size=512");
+                Execute(connection, "VACUUM");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False"))
+            {
+                sqlite.Open();
+                ReadScalar(sqlite, "PRAGMA integrity_check").Should().Be("ok");
+                Convert.ToInt64(ReadScalar(sqlite, "PRAGMA page_size")).Should().Be(512);
+                Convert.ToInt64(ReadScalar(sqlite, "SELECT seq FROM sqlite_sequence WHERE name = 'data'"))
+                    .Should().Be(50);
+                Convert.ToString(ReadScalar(
+                        sqlite,
+                        "SELECT sql FROM sqlite_schema WHERE name = 'data'"))!
+                    .Should().Contain("AUTOINCREMENT")
+                    .And.Contain(defaultValue);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Execute(connection, "INSERT INTO data DEFAULT VALUES");
+                ReadInteger(connection, "SELECT id FROM data").Should().Be(51);
+                ReadInteger(connection, "SELECT length(payload) FROM data").Should().Be(defaultValue.Length);
+                Execute(connection, "PRAGMA journal_mode=DELETE");
+            }
+
+            using var final = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            final.Open();
+            ReadScalar(final, "PRAGMA integrity_check").Should().Be("ok");
+            Convert.ToInt64(ReadScalar(final, "SELECT seq FROM sqlite_sequence WHERE name = 'data'"))
+                .Should().Be(51);
+        }
+        finally
+        {
+            DeletePhysicalDatabase(path);
+        }
+    }
+
+    [Test]
+    public void FileBackedWithoutRowidRejectionLeavesNoSequenceCatalogMutation()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "sequence-without-rowid-rejection.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Assert.Throws<EmbeddedSqlException>(
+                    () => Execute(
+                        connection,
+                        "CREATE TABLE rejected("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID"))!
+                .Message.Should().Be("AUTOINCREMENT not allowed on WITHOUT ROWID tables");
+            ReadInteger(
+                    connection,
+                    "SELECT count(*) FROM sqlite_schema "
+                    + "WHERE name IN ('rejected', 'sqlite_sequence')")
+                .Should().Be(0);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadInteger(
+                reopenedConnection,
+                "SELECT count(*) FROM sqlite_schema "
+                + "WHERE name IN ('rejected', 'sqlite_sequence')")
+            .Should().Be(0);
+    }
+
+    [Test]
     public void ManagedAndMicrosoftDataSqliteRoundTripTheSameSequenceFile()
     {
         var path = CreatePhysicalDatabasePath();

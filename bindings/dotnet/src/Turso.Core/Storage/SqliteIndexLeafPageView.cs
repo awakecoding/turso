@@ -45,8 +45,8 @@ public sealed class SqliteIndexLeafPageView
     public IReadOnlyList<SqliteIndexLeafPageCell> Cells { get; }
 
     /// <summary>
-    /// Whether all index record payloads were available and verified in strict
-    /// SQLite BINARY order.
+    /// Whether all index record payloads were available and verified in the
+    /// configured strict SQLite index order.
     /// </summary>
     /// <remarks>
     /// When a page has overflowing cells, pass an overflow reader to
@@ -178,7 +178,8 @@ public sealed class SqliteIndexLeafPageView
                 : overflowReader!.ReadPayload(pageCell.Cell);
             comparer.Validate(record);
             if (previousRecord is not null && comparer.Compare(previousRecord, record) >= 0)
-                throw new InvalidDataException("SQLite index-leaf records are not in strictly increasing BINARY order.");
+                throw new InvalidDataException(
+                    $"SQLite index-leaf records are not in strictly increasing declared order at cell {index}.");
 
             previousRecord = record;
             records[index] = record;

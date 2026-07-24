@@ -10,7 +10,7 @@ namespace Turso.Tests;
 public sealed class ManagedEfForeignKeyActionMigrationTests
 {
     [Test]
-    public async Task ManagedMigrationsRejectCompositeTableForeignKeysBeforeGeneratingCommands()
+    public async Task ManagedMigrationsGenerateCompositeTableForeignKeys()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         await connection.OpenAsync();
@@ -31,14 +31,21 @@ public sealed class ManagedEfForeignKeyActionMigrationTests
             PrincipalColumns = ["FirstId", "SecondId"],
         });
 
-        var generate = () => context.GetService<IMigrationsSqlGenerator>().Generate([parent, child]);
-
-        generate.Should().Throw<NotSupportedException>()
-            .WithMessage("*exactly one child column*");
+        var commands = context.GetService<IMigrationsSqlGenerator>().Generate([parent, child]);
+        var sql = string.Concat(commands.Select(command => command.CommandText));
+        sql.Should().Contain(
+            "FOREIGN KEY (\"ParentFirstId\", \"ParentSecondId\") "
+                + "REFERENCES \"Parents\" (\"FirstId\", \"SecondId\")");
+        foreach (var migrationCommand in commands)
+        {
+            await using var execute = connection.CreateCommand();
+            execute.CommandText = migrationCommand.CommandText;
+            await execute.ExecuteNonQueryAsync();
+        }
 
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';";
-        (await command.ExecuteScalarAsync()).Should().Be(0L);
+        (await command.ExecuteScalarAsync()).Should().Be(2L);
     }
 
     private static CreateTableOperation CreateTable(string name, params string[] columns)

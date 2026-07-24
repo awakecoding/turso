@@ -19,9 +19,22 @@ public sealed class ManagedJournalPageMigrationTests
         using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
         using (var connection = database.Connect())
         {
-            Execute(connection, "CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('before');");
+            Execute(connection, """
+                CREATE TABLE data(value TEXT);
+                INSERT INTO data VALUES ('before');
+                CREATE TABLE keyed(
+                    tenant TEXT,
+                    sequence INTEGER,
+                    value TEXT,
+                    PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                    UNIQUE(value)
+                ) WITHOUT ROWID;
+                CREATE INDEX keyed_value ON keyed(value DESC);
+                INSERT INTO keyed VALUES ('alpha', 1, 'before');
+                """);
             ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
             Execute(connection, "INSERT INTO data VALUES ('delete');");
+            Execute(connection, "INSERT INTO keyed VALUES ('Alpha', 2, 'delete');");
         }
 
         fileSystem.FileExists(path + "-wal").Should().BeFalse();
@@ -38,12 +51,15 @@ public sealed class ManagedJournalPageMigrationTests
             ReadValue(connection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("delete"));
             ReadValue(connection, "PRAGMA journal_mode=WAL;").Should().Be(SqlValue.Text("wal"));
             Execute(connection, "INSERT INTO data VALUES ('wal');");
+            Execute(connection, "INSERT INTO keyed VALUES ('beta', 3, 'wal');");
         }
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
         using var reopenedConnection = reopened.Connect();
         ReadValue(reopenedConnection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("wal"));
         ReadValue(reopenedConnection, "SELECT COUNT(*) FROM data;").Should().Be(SqlValue.Integer(3));
+        ReadValue(reopenedConnection, "SELECT COUNT(*) FROM keyed;").Should().Be(SqlValue.Integer(3));
+        ReadValue(reopenedConnection, "SELECT value FROM keyed LIMIT 1;").Should().Be(SqlValue.Text("delete"));
     }
 
     [TestCase(512)]
@@ -62,8 +78,24 @@ public sealed class ManagedJournalPageMigrationTests
         using (var connection = database.Connect())
         {
             Execute(connection, "CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT);");
+            Execute(connection, """
+                CREATE TABLE keyed(
+                    tenant TEXT,
+                    sequence INTEGER,
+                    value TEXT,
+                    doubled INTEGER GENERATED ALWAYS AS (sequence * 2) VIRTUAL,
+                    PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                    UNIQUE(value)
+                ) WITHOUT ROWID;
+                """);
+            Execute(connection, "CREATE INDEX keyed_doubled ON keyed(doubled DESC);");
             for (var index = 0; index < 40; index++)
+            {
                 Execute(connection, $"INSERT INTO data VALUES ({index}, 'value-{index:D2}');");
+                Execute(
+                    connection,
+                    $"INSERT INTO keyed(tenant, sequence, value) VALUES ('tenant-{index % 4}', {index}, 'keyed-{index:D2}');");
+            }
 
             ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
             Execute(connection, $"PRAGMA page_size={pageSize};");
@@ -71,6 +103,9 @@ public sealed class ManagedJournalPageMigrationTests
             Execute(connection, "VACUUM;");
             ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(pageSize));
             ReadValue(connection, "SELECT COUNT(*) FROM data;").Should().Be(SqlValue.Integer(40));
+            ReadValue(connection, "SELECT COUNT(*) FROM keyed;").Should().Be(SqlValue.Integer(40));
+            ReadValue(connection, "SELECT doubled FROM keyed WHERE tenant = 'tenant-3' AND sequence = 39;")
+                .Should().Be(SqlValue.Integer(78));
         }
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
@@ -79,6 +114,43 @@ public sealed class ManagedJournalPageMigrationTests
         ReadValue(reopenedConnection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("delete"));
         ReadValue(reopenedConnection, "SELECT value FROM data WHERE id=39;")
             .Should().Be(SqlValue.Text("value-39"));
+        ReadValue(reopenedConnection, "SELECT value FROM keyed WHERE tenant = 'tenant-3' AND sequence = 39;")
+            .Should().Be(SqlValue.Text("keyed-39"));
+    }
+
+    [Test]
+    public void PageSizeMigrationPreservesCompositeForeignKeyActionsAndCatalogText()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "page-size-foreign-keys.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA foreign_keys = ON;");
+            Execute(connection, "CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));");
+            Execute(
+                connection,
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, "
+                    + "FOREIGN KEY(a, b) REFERENCES parent "
+                    + "ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);");
+            Execute(connection, "INSERT INTO parent VALUES (1, 2);");
+            for (var index = 0; index < 80; index++)
+                Execute(connection, $"INSERT INTO child VALUES ({index}, 1, 2);");
+
+            ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
+            Execute(connection, "PRAGMA page_size=1024; VACUUM;");
+            ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(1024));
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Execute(reopenedConnection, "PRAGMA foreign_keys = ON;");
+        ReadValue(reopenedConnection, "SELECT sql FROM sqlite_schema WHERE name = 'child';")
+            .AsText().Should().Contain("ON UPDATE CASCADE")
+            .And.Contain("DEFERRABLE INITIALLY DEFERRED");
+        Execute(reopenedConnection, "UPDATE parent SET a = 3, b = 4;");
+        ReadValue(reopenedConnection, "SELECT COUNT(*) FROM child WHERE a = 3 AND b = 4;")
+            .Should().Be(SqlValue.Integer(80));
     }
 
     [Test]

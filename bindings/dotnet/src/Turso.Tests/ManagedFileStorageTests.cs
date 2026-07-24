@@ -88,7 +88,7 @@ public class ManagedFileStorageTests
     }
 
     [Test]
-    public void PersistsSecondaryIndexAndRollsBackUnsupportedDescendingIndex()
+    public void PersistsAscendingAndDescendingSecondaryIndexesAcrossReopen()
     {
         var fileSystem = new InMemoryFileSystem();
         using (var database = EmbeddedDatabase.OpenFile("secondary-index.db", fileSystem))
@@ -103,20 +103,22 @@ public class ManagedFileStorageTests
                 .Select(row => row[0].AsText())
                 .Should().Equal("a", "z");
 
-            var act = () => Execute(connection, "CREATE INDEX idx_name_desc ON t(name DESC);");
-            act.Should().Throw<EmbeddedSqlException>().WithMessage("*descending index terms*");
-
-            // The rejected statement must not corrupt the live catalog, table, or supported index.
+            Execute(connection, "CREATE INDEX idx_name_desc ON t(name DESC);");
+            Query(connection, "PRAGMA index_list(t);")
+                .Select(row => row[1].AsText())
+                .Should().BeEquivalentTo(["idx_name", "idx_name_desc"]);
             Query(connection, "SELECT COUNT(*) FROM t;")[0][0].AsInteger().Should().Be(2);
         }
 
         using (var reopened = EmbeddedDatabase.OpenFile("secondary-index.db", fileSystem))
         using (var connection = reopened.Connect())
         {
-            // Reopen validates the persisted index records against the table rows.
             Query(connection, "SELECT name FROM t ORDER BY name;")
                 .Select(row => row[0].AsText())
                 .Should().Equal("a", "z");
+            Query(connection, "PRAGMA index_list(t);")
+                .Select(row => row[1].AsText())
+                .Should().BeEquivalentTo(["idx_name", "idx_name_desc"]);
             Execute(connection, "INSERT INTO t VALUES (3, 'm');");
         }
 

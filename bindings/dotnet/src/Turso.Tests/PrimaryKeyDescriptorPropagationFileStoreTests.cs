@@ -53,10 +53,8 @@ public class PrimaryKeyDescriptorPropagationFileStoreTests
             .Contain("PRIMARY KEY (\"k\" COLLATE BINARY)");
     }
 
-    [TestCase("NOCASE")]
-    [TestCase("RTRIM")]
     [TestCase("custom_collation")]
-    public void UnsupportedWithoutRowidPrimaryKeyCollationRejectsBeforeWalWriteAndPreservesCatalog(string collation)
+    public void ApplicationDefinedWithoutRowidPrimaryKeyCollationRejectsBeforeWalWriteAndPreservesCatalog(string collation)
     {
         const string path = "primary-key-unsupported-collation.db";
         var faults = new DeterministicFaultInjector();
@@ -75,7 +73,7 @@ public class PrimaryKeyDescriptorPropagationFileStoreTests
                 $"CREATE TABLE rejected(k TEXT, PRIMARY KEY(k COLLATE {collation} ASC)) WITHOUT ROWID;");
 
             var exception = act.Should().Throw<EmbeddedSqlException>().Which;
-            exception.Message.Should().Contain($"uses {collation.ToUpperInvariant()} collation");
+            exception.Message.Should().Contain($"application-defined collation {collation.ToUpperInvariant()}");
             exception.Message.Should().NotContain("primary-key index b-tree that is not yet supported");
             faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeReject);
             Scalar(connection, "SELECT value FROM retained WHERE id = 1;").AsText().Should().Be("durable");
@@ -89,9 +87,8 @@ public class PrimaryKeyDescriptorPropagationFileStoreTests
         Assert.Throws<EmbeddedSqlException>(() => Scalar(reopenedConnection, "SELECT COUNT(*) FROM rejected;"));
     }
 
-    [TestCase("CREATE TABLE rejected(k TEXT, PRIMARY KEY(k DESC)) WITHOUT ROWID;", "is descending")]
     [TestCase("CREATE TABLE rejected(k TEXT, PRIMARY KEY(lower(k)));", "Expected RightParen")]
-    public void UnsupportedWithoutRowidPrimaryKeyDirectionOrExpressionRejectsBeforeWalWrite(string sql, string message)
+    public void UnsupportedPrimaryKeyExpressionRejectsBeforeWalWrite(string sql, string message)
     {
         var faults = new DeterministicFaultInjector();
         var fileSystem = new InMemoryFileSystem(faults);
