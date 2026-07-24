@@ -22,7 +22,12 @@ public sealed class ManagedIncrementalBlobDatabaseBoundaryTests
                 "CREATE TABLE aux.data(value BLOB, revision INTEGER);"
                 + "INSERT INTO aux.data(rowid, value, revision) VALUES (1, X'010203', 0);");
 
-            using var blob = new SqliteBlob(connection, "AuX", "data", "value", 1);
+            using var blob = new SqliteBlob(
+                connection,
+                databaseName: "AuX",
+                tableName: "data",
+                columnName: "value",
+                rowid: 1);
             var value = new byte[3];
             blob.Read(value, 0, value.Length).Should().Be(value.Length);
             value.Should().Equal(1, 2, 3);

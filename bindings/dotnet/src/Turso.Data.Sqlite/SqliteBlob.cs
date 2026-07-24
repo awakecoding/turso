@@ -27,7 +27,7 @@ public class SqliteBlob : Stream
         string databaseName,
         string tableName,
         string columnName,
-        long rowId,
+        long rowid,
         bool readOnly = false)
     {
         ArgumentNullException.ThrowIfNull(connection);
@@ -41,13 +41,13 @@ public class SqliteBlob : Stream
         _databaseName = databaseName;
         _tableName = tableName;
         _columnName = columnName;
-        _rowId = rowId;
+        _rowId = rowid;
         _readOnly = readOnly;
         if (connection.IsManagedConnection)
         {
             try
             {
-                _managedBlob = connection.ManagedConnection.OpenBlob(databaseName, tableName, columnName, rowId, readOnly);
+                _managedBlob = connection.ManagedConnection.OpenBlob(databaseName, tableName, columnName, rowid, readOnly);
             }
             catch (ManagedBlobException exception)
             {
@@ -62,7 +62,7 @@ public class SqliteBlob : Stream
             return;
         }
 
-        _stream = new MemoryStream(GetBlobValue(connection, databaseName, tableName, columnName, rowId), writable: true);
+        _stream = new MemoryStream(GetBlobValue(connection, databaseName, tableName, columnName, rowid), writable: true);
     }
 
     internal SqliteBlob(byte[] value)
