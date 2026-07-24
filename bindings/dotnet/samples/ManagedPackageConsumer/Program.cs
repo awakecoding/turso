@@ -8,6 +8,7 @@ using var connection = new SqliteConnection(
     $"Data Source={databasePath};Pooling=True;Local Provider=Managed");
 try
 {
+    VerifyPublicCapabilityContract();
     connection.Open();
 
     using var command = connection.CreateCommand();
@@ -176,6 +177,91 @@ static void VerifySourceFreeReplicaOptions()
     }
 
     throw new InvalidOperationException("The managed package unexpectedly activated embedded replica Sync.");
+}
+
+static void VerifyPublicCapabilityContract()
+{
+    using var tursoManaged = new TursoConnection("Data Source=:memory:;Local Provider=Managed");
+    AssertCapabilities(
+        tursoManaged.Capabilities,
+        tursoManaged.CanCreateBatch,
+        TursoConnectionFacade.TursoData,
+        TursoConnectionMode.ManagedLocal,
+        [true, true, true, true, false, false, false, false, false, false, true, true, false]);
+
+    using var tursoNative = new TursoConnection("Data Source=:memory:;Local Provider=Native");
+    AssertCapabilities(
+        tursoNative.Capabilities,
+        tursoNative.CanCreateBatch,
+        TursoConnectionFacade.TursoData,
+        TursoConnectionMode.NativeLocal,
+        [true, true, true, true, false, false, false, false, false, false, true, false, false]);
+
+    using var tursoRemote = new TursoConnection("Data Source=https://example.turso.io");
+    AssertCapabilities(
+        tursoRemote.Capabilities,
+        tursoRemote.CanCreateBatch,
+        TursoConnectionFacade.TursoData,
+        TursoConnectionMode.RemoteHrana,
+        [true, true, true, true, false, false, false, false, false, false, false, false, false]);
+
+    using var tursoReplica = new TursoConnection(
+        "Data Source=https://example.turso.io;Replica Path=replica.db");
+    AssertCapabilities(
+        tursoReplica.Capabilities,
+        tursoReplica.CanCreateBatch,
+        TursoConnectionFacade.TursoData,
+        TursoConnectionMode.EmbeddedReplica,
+        [false, true, true, true, false, false, false, false, false, false, false, false, true]);
+
+    using var sqliteManaged = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+    AssertCapabilities(
+        sqliteManaged.Capabilities,
+        sqliteManaged.CanCreateBatch,
+        TursoConnectionFacade.Sqlite,
+        TursoConnectionMode.ManagedLocal,
+        [true, true, true, true, true, true, true, true, true, false, true, true, false]);
+
+    using var sqliteNative = new SqliteConnection("Data Source=:memory:;Local Provider=Native");
+    AssertCapabilities(
+        sqliteNative.Capabilities,
+        sqliteNative.CanCreateBatch,
+        TursoConnectionFacade.Sqlite,
+        TursoConnectionMode.NativeLocal,
+        [true, true, true, true, true, true, true, true, true, true, true, false, false]);
+}
+
+static void AssertCapabilities(
+    TursoConnectionCapabilities capabilities,
+    bool canCreateBatch,
+    TursoConnectionFacade facade,
+    TursoConnectionMode mode,
+    bool[] expected)
+{
+    var actual = new[]
+    {
+        capabilities.CanCreateBatch,
+        capabilities.SupportsAsyncOperations,
+        capabilities.SupportsTransactions,
+        capabilities.SupportsSavepoints,
+        capabilities.SupportsBackup,
+        capabilities.SupportsIncrementalBlob,
+        capabilities.SupportsUserDefinedFunctions,
+        capabilities.SupportsUserDefinedAggregates,
+        capabilities.SupportsCustomCollations,
+        capabilities.SupportsExtensions,
+        capabilities.SupportsAttach,
+        capabilities.SupportsPooling,
+        capabilities.SupportsSync,
+    };
+    if (capabilities.Facade != facade
+        || capabilities.Mode != mode
+        || canCreateBatch != capabilities.CanCreateBatch
+        || !actual.SequenceEqual(expected))
+    {
+        throw new InvalidOperationException(
+            $"Unexpected packaged capability contract for {facade}/{mode}.");
+    }
 }
 
 static bool IsNativeCompanionPackage(string packageIdentity)
