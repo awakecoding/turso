@@ -307,6 +307,132 @@ public sealed class ExpressionOperatorParityTests
     }
 
     [Test]
+    public void CompositeForeignKeyCascadePreservesOperatorSchemaSemantics()
+    {
+        const string setup = """
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE parent(
+                code TEXT COLLATE NOCASE,
+                version INTEGER DEFAULT (8 >> 1),
+                parity INTEGER GENERATED ALWAYS AS (version & 1) STORED,
+                CHECK (version > 0
+                    AND (version, parity) IS NOT DISTINCT FROM (version, version & 1)),
+                PRIMARY KEY(code COLLATE NOCASE, version)
+            ) WITHOUT ROWID;
+            CREATE INDEX parent_lookup
+                ON parent(code COLLATE NOCASE DESC, version ASC);
+            CREATE TABLE child(
+                id INTEGER PRIMARY KEY,
+                parent_code TEXT COLLATE NOCASE,
+                parent_version INTEGER DEFAULT (8 >> 1),
+                inverted INTEGER GENERATED ALWAYS AS (~parent_version) STORED,
+                CHECK (parent_version > 0 AND (parent_version & 3) = 0),
+                FOREIGN KEY(parent_code, parent_version)
+                    REFERENCES parent(code, version)
+                    ON UPDATE CASCADE
+                    ON DELETE CASCADE
+            );
+            INSERT INTO parent(code) VALUES ('Alpha');
+            INSERT INTO child(id, parent_code) VALUES (1, 'alpha');
+            UPDATE parent
+            SET (code, version) = ('Beta', version << 1)
+            WHERE (code, version) IS NOT DISTINCT FROM ('alpha', 4);
+            """;
+
+        AssertQueryMatchesSqlite(
+            """
+            SELECT parent.code,
+                   parent.version,
+                   parent.parity,
+                   child.parent_code,
+                   child.parent_version,
+                   child.inverted
+            FROM parent
+            JOIN child
+              ON (parent.code, parent.version)
+                 IS NOT DISTINCT FROM (child.parent_code, child.parent_version);
+            """,
+            setup);
+    }
+
+    [Test]
+    public void LimitedDmlRecomputesOperatorGeneratedColumnsAfterTupleAssignments()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        ExecuteManagedBatch(
+            connection,
+            """
+            CREATE TABLE limited_values(
+                id INTEGER PRIMARY KEY,
+                value INTEGER DEFAULT (8 >> 1),
+                mask INTEGER GENERATED ALWAYS AS (value & 7) STORED,
+                label TEXT COLLATE NOCASE,
+                CHECK (value >= 0
+                    AND (value, mask) IS NOT DISTINCT FROM (value, value & 7))
+            );
+            CREATE INDEX limited_label
+                ON limited_values(label COLLATE NOCASE DESC, mask ASC);
+            INSERT INTO limited_values(id, label) VALUES (1, 'alpha');
+            INSERT INTO limited_values(id, value, label) VALUES (2, 3, 'Bravo');
+            INSERT INTO limited_values(id, value, label) VALUES (3, 5, 'charlie');
+            INSERT INTO limited_values(id, value, label) VALUES (4, 7, 'Delta');
+            """);
+
+        ReadManaged(
+                connection,
+                """
+                UPDATE limited_values
+                SET (value, label) = (value << 1, +label)
+                WHERE (value & 1) = 1
+                RETURNING id, value, mask, typeof(label)
+                ORDER BY label COLLATE NOCASE DESC, id DESC
+                LIMIT 2;
+                """)
+            .OrderBy(row => row[0].AsInteger())
+            .Should().BeEquivalentTo(
+            [
+                new[]
+                {
+                    SqlValue.Integer(3),
+                    SqlValue.Integer(10),
+                    SqlValue.Integer(2),
+                    SqlValue.Text("text"),
+                },
+                new[]
+                {
+                    SqlValue.Integer(4),
+                    SqlValue.Integer(14),
+                    SqlValue.Integer(6),
+                    SqlValue.Text("text"),
+                },
+            ], options => options.WithStrictOrdering());
+
+        Assert.Throws<EmbeddedSqlException>(
+                () => ExecuteManaged(connection, "UPDATE limited_values SET value = -1 WHERE id = 1;"))
+            !.Message.Should().Contain("CHECK constraint failed");
+
+        ReadManaged(
+            connection,
+            """
+            DELETE FROM limited_values
+            WHERE (value, mask) IN ((10, 2), (14, 6))
+            RETURNING id
+            ORDER BY id DESC
+            LIMIT 1;
+            """)
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(4));
+
+        ReadManaged(connection, "SELECT id, value, mask FROM limited_values ORDER BY id;")
+            .Should().BeEquivalentTo(
+            [
+                new[] { SqlValue.Integer(1), SqlValue.Integer(4), SqlValue.Integer(4) },
+                new[] { SqlValue.Integer(2), SqlValue.Integer(3), SqlValue.Integer(3) },
+                new[] { SqlValue.Integer(3), SqlValue.Integer(10), SqlValue.Integer(2) },
+            ], options => options.WithStrictOrdering());
+    }
+
+    [Test]
     public void RegexpAndMatchUseOnlyRegisteredScalarSemanticsWithSqliteArgumentOrder()
     {
         var managedEvents = new List<string>();
