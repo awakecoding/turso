@@ -68,6 +68,62 @@ OS-qualified TFMs. Android and iOS use the dynamic mobile package assets and
 their workload-specific app build; they are not covered by the desktop static
 NativeAOT package gates.
 
+Advanced Sync configuration uses managed-only option types from `Turso.Data`; the
+native companion is loaded only when the connection opens:
+
+```C#
+var replicaOptions = new TursoReplicaOptions(
+    "replica.db",
+    new Uri("https://example.turso.io"),
+    Environment.GetEnvironmentVariable("TURSO_AUTH_TOKEN"))
+{
+    LongPollTimeout = TimeSpan.FromSeconds(15),
+    PartialBootstrap = TursoPartialBootstrapOptions.Prefix(
+        length: 64 * 1024,
+        segmentSize: 256 * 1024,
+        prefetch: true),
+    RemoteEncryption = new TursoRemoteEncryptionOptions(
+        Environment.GetEnvironmentVariable("TURSO_ENCRYPTION_KEY")!,
+        TursoRemoteEncryptionCipher.Aes256Gcm),
+    PushOperationsThreshold = 1000,
+    PullBytesThreshold = 1024 * 1024,
+    HttpPolicy = new TursoSyncHttpPolicy(requestTimeout: TimeSpan.FromMinutes(2)),
+};
+
+using var replica = new TursoConnection(replicaOptions);
+await replica.OpenAsync(CancellationToken.None);
+var progress = new Progress<TursoSyncProgress>(value =>
+    Console.WriteLine(value.Stage));
+var result = await replica.SyncAsync(
+    new TursoSyncOptions(progress),
+    CancellationToken.None);
+Console.WriteLine($"{result.Outcome}: revision {result.Statistics.Revision}");
+```
+
+`LongPollTimeout` is sent to the server in millisecond precision. Prefix and query
+partial-bootstrap strategies are mutually exclusive by construction; segment size
+and prefetch apply only when a strategy is configured. Remote encryption requires
+the base64 key and server cipher together so the provider can set the native
+reserved-byte requirement. Push thresholds never split a transaction. Pull
+thresholds chunk full or prefix bootstrap downloads, but are rejected with query
+bootstrap because the server selects that page set. A custom `HttpMessageHandler`
+is application-owned unless `disposeMessageHandler: true` is specified, and HTTP
+timeouts are separate from long-poll duration.
+
+The options-bearing synchronization overload returns `TursoSyncResult`, including
+whether remote changes were applied and a native statistics snapshot. The
+parameterless `Sync` and cancellation-token-only `SyncAsync` methods retain their
+existing return types for binary compatibility. Progress reports the
+`Pushing`, `Pulling`, optional `Applying`, and `Completed` phases. Progress callbacks
+must not reenter or close the same replica; reentry fails explicitly. Cancellation stops
+in-flight HTTP or file I/O and does not report `Completed`.
+
+Current boundaries are intentional: automatic `Sync Interval` remains unsupported;
+local at-rest encryption options cannot be used for replicas (remote encryption is
+configured separately); logical MVCC pull is not enabled by the .NET provider; and
+partial bootstrap requires initial bootstrap to be enabled. These settings fail
+before native or network access rather than being silently ignored.
+
 ## NativeAOT static linking
 
 NativeAOT apps can opt into statically linking the Turso native library so publish output does not include a sidecar `turso_sdk_kit` DLL, `.so`, or `.dylib`. Reference the RID-specific static package alongside `Turso.Data.Sqlite`:

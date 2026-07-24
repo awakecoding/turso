@@ -127,6 +127,85 @@ public sealed class TursoReplicaOptions
     /// Gets whether a missing local replica is bootstrapped from the remote database.
     /// </summary>
     public bool BootstrapIfEmpty { get; }
+
+    /// <summary>
+    /// Gets or initializes the server long-poll timeout. A null value disables long polling.
+    /// </summary>
+    public TimeSpan? LongPollTimeout { get; init; }
+
+    /// <summary>
+    /// Gets or initializes partial bootstrap and lazy page loading.
+    /// </summary>
+    public TursoPartialBootstrapOptions? PartialBootstrap { get; init; }
+
+    /// <summary>
+    /// Gets or initializes remote database encryption.
+    /// </summary>
+    public TursoRemoteEncryptionOptions? RemoteEncryption { get; init; }
+
+    /// <summary>
+    /// Gets or initializes the maximum CDC operation target for one push batch.
+    /// </summary>
+    public long? PushOperationsThreshold { get; init; }
+
+    /// <summary>
+    /// Gets or initializes the bootstrap pull chunk target in bytes.
+    /// </summary>
+    public long? PullBytesThreshold { get; init; }
+
+    /// <summary>
+    /// Gets or initializes the HTTP transport policy.
+    /// </summary>
+    public TursoSyncHttpPolicy HttpPolicy { get; init; } = new();
+
+    internal void Validate()
+    {
+        if (!RemoteUri.IsAbsoluteUri
+            || (!RemoteUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                && !RemoteUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new ArgumentException("Embedded replica remote URLs must use HTTP or HTTPS.", nameof(RemoteUri));
+        }
+
+        if (LongPollTimeout is { } longPollTimeout
+            && (longPollTimeout < TimeSpan.FromMilliseconds(1)
+                || longPollTimeout.TotalMilliseconds > int.MaxValue))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(LongPollTimeout),
+                longPollTimeout,
+                $"Long-poll timeout must be between 1 and {int.MaxValue} milliseconds.");
+        }
+
+        ValidateNativeSize(PushOperationsThreshold, nameof(PushOperationsThreshold));
+        ValidateNativeSize(PullBytesThreshold, nameof(PullBytesThreshold));
+        if (PartialBootstrap?.SegmentSize is { } segmentSize)
+            ValidateNativeSize(segmentSize, nameof(TursoPartialBootstrapOptions.SegmentSize));
+
+        if (PartialBootstrap is not null && !BootstrapIfEmpty)
+        {
+            throw new InvalidOperationException(
+                "Partial bootstrap requires BootstrapIfEmpty=True because it configures the initial remote bootstrap.");
+        }
+
+        if (PartialBootstrap?.Kind == TursoPartialBootstrapKind.Query && PullBytesThreshold is not null)
+        {
+            throw new InvalidOperationException(
+                "PullBytesThreshold cannot be combined with query partial bootstrap because the server selects the query page set.");
+        }
+
+        ArgumentNullException.ThrowIfNull(HttpPolicy);
+    }
+
+    private static void ValidateNativeSize(long? value, string parameterName)
+    {
+        if (value is null)
+            return;
+        if (value <= 0)
+            throw new ArgumentOutOfRangeException(parameterName, value, "The value must be positive.");
+        if ((ulong)value > nuint.MaxValue)
+            throw new ArgumentOutOfRangeException(parameterName, value, "The value exceeds the native platform size.");
+    }
 }
 
 /// <summary>
@@ -160,4 +239,19 @@ public abstract class TursoReplicaDatabase : TursoNativeDatabase
     /// Pushes local changes and pulls and applies remote changes.
     /// </summary>
     public abstract Task SyncAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Pushes local changes and pulls and applies remote changes.
+    /// </summary>
+    public virtual Task<TursoSyncResult> SyncAsync(
+        TursoSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        throw new NotSupportedException(
+            "This embedded replica provider does not support result-bearing synchronization.");
+    }
+
+    internal virtual void EnsureCanClose()
+    {
+    }
 }

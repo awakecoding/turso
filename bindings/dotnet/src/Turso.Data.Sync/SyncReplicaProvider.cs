@@ -31,7 +31,7 @@ internal sealed class SyncReplicaProviderFactory : TursoReplicaProviderFactory
 
 internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
 {
-    private const string ClientName = "turso-dotnet";
+    internal const string ClientName = "turso-dotnet";
     private readonly object _lifecycleLock = new();
     private readonly SemaphoreSlim _operationGate = new(1, 1);
     private readonly CancellationTokenSource _disposeCancellation = new();
@@ -41,23 +41,26 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
     private readonly HttpClient _httpClient;
     private readonly Uri _remoteUri;
     private readonly string? _authToken;
+    private readonly AsyncLocal<bool> _insideProgressCallback = new();
     private bool _disposeRequested;
     private bool _disposed;
     private int _operationThreadId;
 
     private SyncReplicaDatabase(
         SyncDatabaseHandle database,
-        Uri remoteUri,
-        string? authToken,
+        TursoReplicaOptions options,
         HttpMessageHandler? httpMessageHandler = null)
     {
         _database = database;
-        _remoteUri = remoteUri;
-        _authToken = authToken;
-        _httpClient = httpMessageHandler is null
+        _remoteUri = options.RemoteUri;
+        _authToken = options.AuthToken;
+        var handler = httpMessageHandler ?? options.HttpPolicy.MessageHandler;
+        _httpClient = handler is null
             ? new HttpClient()
-            : new HttpClient(httpMessageHandler);
-        _httpClient.Timeout = Timeout.InfiniteTimeSpan;
+            : new HttpClient(
+                handler,
+                disposeHandler: httpMessageHandler is null && options.HttpPolicy.DisposeMessageHandler);
+        _httpClient.Timeout = options.HttpPolicy.RequestTimeout;
     }
 
     internal static SyncReplicaDatabase Open(
@@ -69,7 +72,7 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         SyncReplicaDatabase? replica = null;
         try
         {
-            replica = new SyncReplicaDatabase(database, options.RemoteUri, options.AuthToken, httpMessageHandler);
+            replica = new SyncReplicaDatabase(database, options, httpMessageHandler);
             replica.InitializeAsync(CancellationToken.None).GetAwaiter().GetResult();
             return replica;
         }
@@ -90,7 +93,7 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         SyncReplicaDatabase? replica = null;
         try
         {
-            replica = new SyncReplicaDatabase(database, options.RemoteUri, options.AuthToken);
+            replica = new SyncReplicaDatabase(database, options);
             replica.InitializeAsync(CancellationToken.None).GetAwaiter().GetResult();
             return replica;
         }
@@ -112,7 +115,7 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         SyncReplicaDatabase? replica = null;
         try
         {
-            replica = new SyncReplicaDatabase(database, options.RemoteUri, options.AuthToken);
+            replica = new SyncReplicaDatabase(database, options);
             await replica.InitializeAsync(cancellationToken).ConfigureAwait(false);
             return replica;
         }
@@ -168,6 +171,16 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
 
     public override async Task SyncAsync(CancellationToken cancellationToken)
     {
+        _ = await SyncAsync(new TursoSyncOptions(), cancellationToken).ConfigureAwait(false);
+    }
+
+    public override async Task<TursoSyncResult> SyncAsync(
+        TursoSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (_insideProgressCallback.Value)
+            throw new InvalidOperationException("Embedded replica operations cannot be reentered from a sync progress callback.");
         ThrowIfUnavailable();
         using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
@@ -176,8 +189,14 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         try
         {
             ThrowIfUnavailable();
+            ReportProgress(options.Progress, TursoSyncProgressStage.Pushing);
             await PushChangesAsync(operationCancellation.Token).ConfigureAwait(false);
-            await PullChangesAsync(operationCancellation.Token).ConfigureAwait(false);
+            ReportProgress(options.Progress, TursoSyncProgressStage.Pulling);
+            var changesApplied = await PullChangesAsync(options.Progress, operationCancellation.Token).ConfigureAwait(false);
+            var statistics = await GetStatisticsAsync(operationCancellation.Token).ConfigureAwait(false);
+            var result = SyncNative.CreateResult(changesApplied, statistics);
+            ReportProgress(options.Progress, TursoSyncProgressStage.Completed);
+            return result;
         }
         finally
         {
@@ -187,6 +206,7 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
 
     public override void Dispose()
     {
+        EnsureCanClose();
         lock (_lifecycleLock)
         {
             if (_disposed || _disposeRequested)
@@ -215,6 +235,15 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         finally
         {
             _operationGate.Release();
+        }
+    }
+
+    internal override void EnsureCanClose()
+    {
+        if (_insideProgressCallback.Value)
+        {
+            throw new InvalidOperationException(
+                "An embedded replica cannot be closed from a sync progress callback.");
         }
     }
 
@@ -266,22 +295,9 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
 
     private static SyncDatabaseHandle CreateDatabase(TursoReplicaOptions options)
     {
-        using var path = NativeUtf8String.From(options.Path);
-        using var remoteUrl = NativeUtf8String.From(options.RemoteUri.AbsoluteUri);
-        using var clientName = NativeUtf8String.From(ClientName);
-        var databaseConfig = new SyncDatabaseConfig
-        {
-            AsyncIo = 1,
-            Path = path.Pointer,
-        };
-        var replicaConfig = new SyncReplicaConfig
-        {
-            Path = path.Pointer,
-            RemoteUrl = remoteUrl.Pointer,
-            ClientName = clientName.Pointer,
-            BootstrapIfEmpty = options.BootstrapIfEmpty,
-        };
-
+        using var configuration = SyncReplicaConfiguration.Create(options);
+        var databaseConfig = configuration.DatabaseConfig;
+        var replicaConfig = configuration.ReplicaConfig;
         var status = SyncInterop.DatabaseNew(ref databaseConfig, ref replicaConfig, out var database, out var error);
         SyncNative.ThrowIfFailure(status, error);
         return SyncDatabaseHandle.FromRaw(database);
@@ -314,7 +330,9 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             throw new TursoException($"Unexpected result type {result} while pushing embedded replica changes.");
     }
 
-    private async Task PullChangesAsync(CancellationToken cancellationToken)
+    private async Task<bool> PullChangesAsync(
+        IProgress<TursoSyncProgress>? progress,
+        CancellationToken cancellationToken)
     {
         using var waitOperation = StartOperation(SyncInterop.DatabaseWaitChanges);
         var result = await DriveOperationAsync(waitOperation, cancellationToken).ConfigureAwait(false);
@@ -324,15 +342,29 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         var extractStatus = SyncInterop.OperationExtractChanges(waitOperation, out var changes);
         SyncNative.ThrowIfFailure(extractStatus, IntPtr.Zero);
         if (changes == IntPtr.Zero)
-            return;
+            return false;
 
         using var changesHandle = SyncChangesHandle.FromRaw(changes);
+        ReportProgress(progress, TursoSyncProgressStage.Applying);
         var consumedChanges = changesHandle.Consume();
         using var applyOperation = StartOperation((SyncDatabaseHandle database, out IntPtr operation, out IntPtr error) =>
             SyncInterop.DatabaseApplyChanges(database, consumedChanges, out operation, out error));
         result = await DriveOperationAsync(applyOperation, cancellationToken).ConfigureAwait(false);
         if (result != SyncOperationResultType.None)
             throw new TursoException($"Unexpected result type {result} while applying embedded replica changes.");
+        return true;
+    }
+
+    private async Task<TursoSyncStatistics> GetStatisticsAsync(CancellationToken cancellationToken)
+    {
+        using var operation = StartOperation(SyncInterop.DatabaseStats);
+        var result = await DriveOperationAsync(operation, cancellationToken).ConfigureAwait(false);
+        if (result != SyncOperationResultType.Stats)
+            throw new TursoException($"Unexpected result type {result} while reading embedded replica statistics.");
+
+        var extractStatus = SyncInterop.OperationExtractStats(operation, out var statistics);
+        SyncNative.ThrowIfFailure(extractStatus, IntPtr.Zero);
+        return SyncNative.CopyStatistics(statistics);
     }
 
     private SyncOperationHandle StartOperation(SyncOperationStarter starter)
@@ -699,6 +731,8 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
 
     private void EnterOperation()
     {
+        if (_insideProgressCallback.Value)
+            throw new InvalidOperationException("Embedded replica operations cannot be reentered from a sync progress callback.");
         if (Volatile.Read(ref _operationThreadId) == Environment.CurrentManagedThreadId)
         {
             throw new InvalidOperationException(
@@ -730,6 +764,24 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         lock (_lifecycleLock)
         {
             ObjectDisposedException.ThrowIf(_disposed || _disposeRequested, this);
+        }
+    }
+
+    private void ReportProgress(
+        IProgress<TursoSyncProgress>? progress,
+        TursoSyncProgressStage stage)
+    {
+        if (progress is null)
+            return;
+
+        _insideProgressCallback.Value = true;
+        try
+        {
+            progress.Report(new TursoSyncProgress(stage));
+        }
+        finally
+        {
+            _insideProgressCallback.Value = false;
         }
     }
 
@@ -974,6 +1026,30 @@ internal static class SyncNative
         return new ReadOnlySpan<byte>((void*)slice.Pointer, (int)slice.Length).ToArray();
     }
 
+    public static TursoSyncStatistics CopyStatistics(SyncStats statistics)
+    {
+        return new TursoSyncStatistics(
+            statistics.CdcOperations,
+            statistics.MainWalSize,
+            statistics.RevertWalSize,
+            UnixTimeOrNull(statistics.LastPullUnixTime),
+            UnixTimeOrNull(statistics.LastPushUnixTime),
+            statistics.NetworkSentBytes,
+            statistics.NetworkReceivedBytes,
+            statistics.Revision.Pointer == IntPtr.Zero ? null : CopyString(statistics.Revision));
+    }
+
+    public static TursoSyncResult CreateResult(bool changesApplied, TursoSyncStatistics statistics)
+    {
+        ArgumentNullException.ThrowIfNull(statistics);
+        return new TursoSyncResult(
+            changesApplied ? TursoSyncOutcome.RemoteChangesApplied : TursoSyncOutcome.UpToDate,
+            statistics);
+    }
+
+    private static DateTimeOffset? UnixTimeOrNull(long value)
+        => value == 0 ? null : DateTimeOffset.FromUnixTimeSeconds(value);
+
     private static string? ConsumeError(IntPtr error)
     {
         if (error == IntPtr.Zero)
@@ -1010,4 +1086,74 @@ internal sealed class NativeUtf8String : IDisposable
         Marshal.FreeCoTaskMem(Pointer);
         Pointer = IntPtr.Zero;
     }
+}
+
+internal sealed class SyncReplicaConfiguration : IDisposable
+{
+    private readonly NativeUtf8String _path;
+    private readonly NativeUtf8String _remoteUrl;
+    private readonly NativeUtf8String _clientName;
+    private readonly NativeUtf8String _partialBootstrapQuery;
+    private readonly NativeUtf8String _remoteEncryptionKey;
+    private readonly NativeUtf8String _remoteEncryptionCipher;
+
+    private SyncReplicaConfiguration(TursoReplicaOptions options)
+    {
+        options.Validate();
+        _path = NativeUtf8String.From(options.Path);
+        _remoteUrl = NativeUtf8String.From(options.RemoteUri.AbsoluteUri);
+        _clientName = NativeUtf8String.From(SyncReplicaDatabase.ClientName);
+        _partialBootstrapQuery = NativeUtf8String.From(options.PartialBootstrap?.Query);
+        _remoteEncryptionKey = NativeUtf8String.From(options.RemoteEncryption?.Base64Key);
+        _remoteEncryptionCipher = NativeUtf8String.From(options.RemoteEncryption?.NativeName);
+
+        DatabaseConfig = new SyncDatabaseConfig
+        {
+            AsyncIo = 1,
+            Path = _path.Pointer,
+        };
+        ReplicaConfig = new SyncReplicaConfig
+        {
+            Path = _path.Pointer,
+            RemoteUrl = _remoteUrl.Pointer,
+            ClientName = _clientName.Pointer,
+            LongPollTimeoutMilliseconds = options.LongPollTimeout is { } longPollTimeout
+                ? checked((int)longPollTimeout.TotalMilliseconds)
+                : 0,
+            BootstrapIfEmpty = options.BootstrapIfEmpty,
+            ReservedBytes = options.RemoteEncryption?.ReservedBytes ?? 0,
+            PartialBootstrapStrategyPrefix = options.PartialBootstrap?.PrefixLength ?? 0,
+            PartialBootstrapStrategyQuery = _partialBootstrapQuery.Pointer,
+            PartialBootstrapSegmentSize = ToNativeSize(options.PartialBootstrap?.SegmentSize),
+            PartialBootstrapPrefetch = options.PartialBootstrap?.Prefetch ?? false,
+            RemoteEncryptionKey = _remoteEncryptionKey.Pointer,
+            RemoteEncryptionCipher = _remoteEncryptionCipher.Pointer,
+            PushOperationsThreshold = ToNativeSize(options.PushOperationsThreshold),
+            PullBytesThreshold = ToNativeSize(options.PullBytesThreshold),
+            LogicalMvccPull = false,
+        };
+    }
+
+    public SyncDatabaseConfig DatabaseConfig { get; }
+
+    public SyncReplicaConfig ReplicaConfig { get; }
+
+    public static SyncReplicaConfiguration Create(TursoReplicaOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return new SyncReplicaConfiguration(options);
+    }
+
+    public void Dispose()
+    {
+        _remoteEncryptionCipher.Dispose();
+        _remoteEncryptionKey.Dispose();
+        _partialBootstrapQuery.Dispose();
+        _clientName.Dispose();
+        _remoteUrl.Dispose();
+        _path.Dispose();
+    }
+
+    private static nuint ToNativeSize(long? value)
+        => value is null ? 0 : checked((nuint)value.Value);
 }

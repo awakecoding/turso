@@ -15,6 +15,7 @@ public class TursoConnection : DbConnection
     private ManagedConnectionPoolKey? _managedPoolKey;
     private TursoRemoteClient? _remoteClient;
     private TursoConnectionOptions _connectionOptions;
+    private TursoReplicaOptions? _replicaOptions;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
     private bool _disposed;
     private bool _readUncommitted;
@@ -37,6 +38,7 @@ public class TursoConnection : DbConnection
 
             _connectionOptions = TursoConnectionOptions.Parse(value ?? string.Empty);
             _managedPoolKey = null;
+            _replicaOptions = null;
         }
     }
 
@@ -61,6 +63,14 @@ public class TursoConnection : DbConnection
     public TursoConnection(string connectionString)
     {
         _connectionOptions = TursoConnectionOptions.Parse(connectionString);
+    }
+
+    public TursoConnection(TursoReplicaOptions replicaOptions)
+    {
+        ArgumentNullException.ThrowIfNull(replicaOptions);
+        replicaOptions.Validate();
+        _replicaOptions = replicaOptions;
+        _connectionOptions = TursoConnectionOptions.FromReplica(replicaOptions);
     }
 
     public override void Open()
@@ -115,6 +125,7 @@ public class TursoConnection : DbConnection
             return;
         }
 
+        _replicaDatabase?.EnsureCanClose();
         var nativeDatabase = _nativeDatabase;
         var managedDatabase = _managedDatabase;
         var managedPoolLease = _managedPoolLease;
@@ -206,6 +217,12 @@ public class TursoConnection : DbConnection
         SyncAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 
+    public TursoSyncResult Sync(TursoSyncOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return SyncAsync(options, CancellationToken.None).GetAwaiter().GetResult();
+    }
+
     public Task SyncAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -218,6 +235,23 @@ public class TursoConnection : DbConnection
 
         return (_replicaDatabase ?? throw new InvalidOperationException("Turso database is closed."))
             .SyncAsync(cancellationToken);
+    }
+
+    public Task<TursoSyncResult> SyncAsync(
+        TursoSyncOptions options,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<TursoSyncResult>(cancellationToken);
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException("Turso database is closed.");
+        if (!_connectionOptions.IsReplica)
+            throw new NotSupportedException("Sync requires an embedded replica connection.");
+
+        return (_replicaDatabase ?? throw new InvalidOperationException("Turso database is closed."))
+            .SyncAsync(options, cancellationToken);
     }
 
     public override void ChangeDatabase(string databaseName)
@@ -468,7 +502,7 @@ public class TursoConnection : DbConnection
                 "Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
         }
 
-        return new TursoReplicaOptions(
+        return _replicaOptions ?? new TursoReplicaOptions(
             _connectionOptions.ReplicaPath,
             _connectionOptions.GetRemoteUri(),
             _connectionOptions.AuthToken);

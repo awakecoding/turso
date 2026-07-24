@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Turso;
 using Turso.Data.Sqlite;
 
 var databasePath = Path.Combine(AppContext.BaseDirectory, $"managed-package-{Guid.NewGuid():N}.db");
@@ -97,6 +98,7 @@ try
 
     EnsureNoNativeCompanionWasRestored();
     await VerifyEntityFrameworkIntegrationAsync(connection);
+    VerifySourceFreeReplicaOptions();
 
     Console.WriteLine(
         $"Managed package consumer succeeded on {AppContext.TargetFrameworkName} with EF Core {typeof(DbContext).Assembly.GetName().Version}.");
@@ -107,7 +109,6 @@ finally
     SqliteConnection.ClearAllPools();
     DeleteDatabase(databasePath);
 }
-
 static async Task VerifyEntityFrameworkIntegrationAsync(SqliteConnection connection)
 {
     var options = new DbContextOptionsBuilder<ManagedPackageContext>()
@@ -149,6 +150,32 @@ static void EnsureNoNativeCompanionWasRestored()
     }
 
     throw new FileNotFoundException("Could not locate the managed consumer restore graph.");
+}
+
+static void VerifySourceFreeReplicaOptions()
+{
+    var options = new TursoReplicaOptions(
+        "replica.db",
+        new Uri("https://example.turso.io"),
+        authToken: null)
+    {
+        LongPollTimeout = TimeSpan.FromSeconds(15),
+        PartialBootstrap = TursoPartialBootstrapOptions.Prefix(64 * 1024),
+        PushOperationsThreshold = 1000,
+        PullBytesThreshold = 1024 * 1024,
+    };
+    using var replica = new TursoConnection(options);
+    try
+    {
+        replica.Open();
+    }
+    catch (NotSupportedException exception) when (
+        exception.Message.Contains("Turso.Data.Sqlite.Sync", StringComparison.Ordinal))
+    {
+        return;
+    }
+
+    throw new InvalidOperationException("The managed package unexpectedly activated embedded replica Sync.");
 }
 
 static bool IsNativeCompanionPackage(string packageIdentity)

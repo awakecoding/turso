@@ -172,6 +172,20 @@ public class TursoConnectionOptions
         return true;
     }
 
+    internal static TursoConnectionOptions FromReplica(TursoReplicaOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var builder = new TursoConnectionStringBuilder
+        {
+            DataSource = options.RemoteUri.AbsoluteUri,
+            ReplicaPath = options.Path,
+            LocalProvider = TursoLocalProvider.Native,
+        };
+        if (!string.IsNullOrWhiteSpace(options.AuthToken))
+            builder.AuthToken = options.AuthToken;
+        return new TursoConnectionOptions(builder);
+    }
+
     private static bool IsRemoteDataSource(string dataSource)
     {
         return Uri.TryCreate(dataSource, UriKind.Absolute, out var uri)
