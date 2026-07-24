@@ -191,6 +191,8 @@ internal sealed record DetachDatabaseStatement(string Alias) : ParsedStatement;
 
 internal sealed record ExplainStatement(ParsedStatement Inner) : ParsedStatement;
 
+internal sealed record ExplainQueryPlanStatement(ParsedStatement Inner) : ParsedStatement;
+
 internal sealed record SelectStatement(
     bool Distinct,
     IReadOnlyList<Projection> Projections,

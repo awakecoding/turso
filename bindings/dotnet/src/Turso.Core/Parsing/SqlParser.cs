@@ -39,7 +39,7 @@ internal sealed class SqlParser
             if (ConsumeKeyword("QUERY"))
             {
                 ExpectKeyword("PLAN");
-                throw Error("EXPLAIN QUERY PLAN is not supported.");
+                return new ExplainQueryPlanStatement(ParseStatement());
             }
 
             return new ExplainStatement(ParseStatement());

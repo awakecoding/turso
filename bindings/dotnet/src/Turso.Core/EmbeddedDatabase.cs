@@ -1144,6 +1144,7 @@ public sealed class EmbeddedDatabase : IDisposable
             PragmaDatabaseListStatement => ExecutePragmaDatabaseList(),
             PragmaEncodingStatement => ExecutePragmaEncoding(),
             ExplainStatement explain => ExecuteExplain(explain, parameters, context),
+            ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(explainQueryPlan, parameters, context),
             BeginStatement => ExecutionResult.Empty,
             CommitStatement => ExecutionResult.Empty,
             RollbackStatement => ExecutionResult.Empty,
@@ -2901,7 +2902,7 @@ public sealed class EmbeddedDatabase : IDisposable
     // to both paths identically.
     private ExecutionResult PerformInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
-        if (CanCompileDml(context)
+        if (CanRouteInsertThroughCompiler(statement, context)
             && TryCompileInsert(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning, parameters);
 
@@ -3224,13 +3225,7 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        var requiresRowwiseConstraintValidation =
-            context.Tables.TryGetValue(statement.TableName, out var table)
-            && (table.PrimaryKeyColumns.Count > 0
-                || table.Indexes.Any(index => index.Unique)
-                || table.HasNonDefaultConflictAlgorithms);
-        if (!requiresRowwiseConstraintValidation
-            && CanCompileDml(context)
+        if (CanRouteUpdateThroughCompiler(statement, context)
             && TryCompileUpdate(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning, parameters);
 
@@ -3909,6 +3904,20 @@ public sealed class EmbeddedDatabase : IDisposable
         => !context.CancellationToken.CanBeCanceled
             && !context.ForeignKeysEnabled
             && !HasOpenBlobHandles;
+
+    private bool CanRouteInsertThroughCompiler(InsertStatement statement, QueryContext context)
+        => CanCompileDml(context)
+            && statement.ConflictAlgorithm is null
+            && statement.Upsert is null
+            && (!context.Tables.TryGetValue(statement.TableName, out var table)
+                || !table.HasNonDefaultConflictAlgorithms);
+
+    private bool CanRouteUpdateThroughCompiler(UpdateStatement statement, QueryContext context)
+        => CanCompileDml(context)
+            && (!context.Tables.TryGetValue(statement.TableName, out var table)
+                || (table.PrimaryKeyColumns.Count == 0
+                    && !table.Indexes.Any(index => index.Unique)
+                    && !table.HasNonDefaultConflictAlgorithms));
 
     private ExecutionResult PerformDeleteEvaluated(
         DeleteStatement statement,
@@ -6993,13 +7002,16 @@ public sealed class EmbeddedDatabase : IDisposable
                 when TryCompileCompoundSelect(compound, parameters, context, outerRow: null, out var compiledCompound):
                 return DescribeProgram(compiledCompound.Program);
             case InsertStatement insert
-                when TryCompileInsert(insert, parameters, context, out var compiledInsert, out _, out _):
+                when CanRouteInsertThroughCompiler(insert, context)
+                    && TryCompileInsert(insert, parameters, context, out var compiledInsert, out _, out _):
                 return DescribeProgram(compiledInsert.Program);
             case UpdateStatement update
-                when TryCompileUpdate(update, parameters, context, out var compiledUpdate, out _, out _):
+                when CanRouteUpdateThroughCompiler(update, context)
+                    && TryCompileUpdate(update, parameters, context, out var compiledUpdate, out _, out _):
                 return DescribeProgram(compiledUpdate.Program);
             case DeleteStatement delete
-                when TryCompileDelete(delete, parameters, context, out var compiledDelete, out _, out _):
+                when CanCompileDml(context)
+                    && TryCompileDelete(delete, parameters, context, out var compiledDelete, out _, out _):
                 return DescribeProgram(compiledDelete.Program);
             case ValuesClause values
                 when TryCompileValues(values, out var compiledValues, out _):
@@ -7015,6 +7027,54 @@ public sealed class EmbeddedDatabase : IDisposable
     }
 
     internal static string[] ExplainColumns() => ["addr", "opcode", "p1", "p2", "p3", "p4", "comment"];
+
+    private ExecutionResult ExecuteExplainQueryPlan(
+        ExplainQueryPlanStatement statement,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var usesCompiledProgram = statement.Inner switch
+        {
+            SelectStatement select => !context.CancellationToken.CanBeCanceled
+                && TryCompileSelect(select, parameters, context, outerRow: null, out _),
+            CompoundSelectStatement compound => TryCompileCompoundSelect(
+                compound,
+                parameters,
+                context,
+                outerRow: null,
+                out _),
+            ValuesClause values => TryPrepareValuesLowering(values, out _),
+            // WITH execution starts by materializing CTE inputs. Report the evaluator boundary
+            // rather than evaluating those inputs merely to discover a later compiled phase.
+            WithSelectStatement => false,
+            InsertStatement insert => CanRouteInsertThroughCompiler(insert, context)
+                && TryCompileInsert(insert, parameters, context, out _, out _, out _),
+            UpdateStatement update => CanRouteUpdateThroughCompiler(update, context)
+                && TryCompileUpdate(update, parameters, context, out _, out _, out _),
+            DeleteStatement delete => CanCompileDml(context)
+                && TryCompileDelete(delete, parameters, context, out _, out _, out _),
+            QueryStatement or WithDmlStatement => false,
+            _ => throw new EmbeddedSqlException(
+                "EXPLAIN QUERY PLAN is only supported for queries and INSERT, UPDATE, or DELETE statements."),
+        };
+
+        var detail = usesCompiledProgram
+            ? "MANAGED COMPILED VDBE"
+            : "MANAGED EVALUATOR FALLBACK";
+        return new ExecutionResult(
+            ExplainQueryPlanColumns(),
+            [
+                [
+                    SqlValue.Integer(0),
+                    SqlValue.Integer(0),
+                    SqlValue.Integer(0),
+                    SqlValue.Text(detail),
+                ],
+            ],
+            0);
+    }
+
+    internal static string[] ExplainQueryPlanColumns() => ["id", "parent", "notused", "detail"];
 
     private static ExecutionResult DescribeProgram(VdbeProgram program)
     {
@@ -16810,6 +16870,9 @@ public sealed class EmbeddedConnection : IDisposable
             QueryStatement query => RouteQuery(query),
             ExplainStatement { Inner: var inner } when ContainsSchemaQualification(inner)
                 => throw new EmbeddedSqlException("EXPLAIN for schema-qualified managed ATTACH statements is not supported."),
+            ExplainQueryPlanStatement { Inner: var inner } when ContainsSchemaQualification(inner)
+                => throw new EmbeddedSqlException(
+                    "EXPLAIN QUERY PLAN for schema-qualified managed ATTACH statements is not supported."),
             _ when ContainsSchemaQualification(statement)
                 => throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH."),
             _ => new RoutedStatement(_database, statement, IsAttached: false),
@@ -17594,6 +17657,7 @@ public sealed class EmbeddedConnection : IDisposable
                 || ContainsSchemaQualification(with.Dml),
             QueryStatement query => QueryContainsSchemaQualification(query),
             ExplainStatement explain => ContainsSchemaQualification(explain.Inner),
+            ExplainQueryPlanStatement explainQueryPlan => ContainsSchemaQualification(explainQueryPlan.Inner),
             _ => false,
         };
     }
@@ -18090,6 +18154,8 @@ public sealed class EmbeddedConnection : IDisposable
     {
         if (statement is ExplainStatement)
             return EmbeddedDatabase.ExplainColumns();
+        if (statement is ExplainQueryPlanStatement)
+            return EmbeddedDatabase.ExplainQueryPlanColumns();
         if (statement is PragmaTableInfoStatement)
             return ["cid", "name", "type", "notnull", "dflt_value", "pk"];
         if (statement is PragmaTableXInfoStatement)
@@ -18311,6 +18377,7 @@ public sealed class EmbeddedStatement : IDisposable
         if (_statement is (QueryStatement or PragmaTableInfoStatement or PragmaTableXInfoStatement
             or PragmaIndexListStatement or PragmaIndexInfoStatement or PragmaTableListStatement
             or PragmaDatabaseListStatement or PragmaEncodingStatement or ExplainStatement)
+            || _statement is ExplainQueryPlanStatement
             || _statement is PragmaQueryOnlyStatement { Enabled: null }
             || _statement is PragmaForeignKeysStatement { Enabled: null }
             || _statement is PragmaRecursiveTriggersStatement { Enabled: null }

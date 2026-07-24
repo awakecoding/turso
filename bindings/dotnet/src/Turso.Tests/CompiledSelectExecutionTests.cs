@@ -157,12 +157,13 @@ public class CompiledSelectExecutionTests
     }
 
     [Test]
-    public void ExplainQueryPlanIsRejected()
+    public void ExplainQueryPlanUsesTheSqliteColumnShape()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
 
-        Assert.Throws<EmbeddedSqlException>(() => connection.Prepare("EXPLAIN QUERY PLAN SELECT 1;"));
+        ColumnNames(connection, "EXPLAIN QUERY PLAN SELECT 1;")
+            .Should().Equal("id", "parent", "notused", "detail");
     }
 
     [Test]

@@ -401,6 +401,31 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
   `DbCommand.Cancel()` during execution. `CommandTimeout` applies to busy reader
   waits; it is not a general query-execution deadline.
 
+### Managed query-plan diagnostics
+
+The managed provider supports both SQLite diagnostic statement forms. `EXPLAIN` returns
+`addr`, `opcode`, `p1`, `p2`, `p3`, `p4`, and `comment` for a statement that is fully
+lowered to the managed VDBE. It returns an error for evaluator-owned statements rather
+than fabricating bytecode. Supported parameter expressions emit `LoadParameter` and stay
+late-bound, so their values are not embedded in the VDBE dump and rebinding does not
+change an otherwise identical compiled shape.
+
+`EXPLAIN QUERY PLAN` keeps SQLite's public `id`, `parent`, `notused`, and `detail`
+columns but reports the managed execution boundary, not SQLite optimizer internals. It
+returns one deterministic row: the first three columns are `0`, and `detail` is either
+`MANAGED COMPILED VDBE` or `MANAGED EVALUATOR FALLBACK`. All parameters must be bound
+before stepping; their values are used to choose the same route as normal execution but
+are never rendered in the plan row. Planning never runs the emitted program, evaluator,
+or DML write target. Direct SELECT and DML plans stepped with a cancellation-capable
+token report evaluator fallback, matching their runtime cancellation boundaries. CTE
+plans report evaluator fallback because execution materializes CTE inputs before any
+later compiled phase. Unsupported non-query/non-DML statements fail explicitly.
+
+These rows intentionally do not claim table scans, index choices, costs, cardinalities,
+or other planner details that the managed engine does not expose. SQLite's column shape
+is the compatibility contract; the two managed `detail` strings and fixed IDs are the
+stable managed contract.
+
 ## Entity Framework Core
 
 `Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local and embedded Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through `Turso.Data.Sqlite`.
