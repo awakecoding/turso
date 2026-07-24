@@ -3650,9 +3650,9 @@ public sealed class EmbeddedDatabase : IDisposable
         };
     }
 
-    // Routes a SELECT through the bytecode compiler when it falls inside the
-    // supported constant-scalar subset, running the emitted program as a real
-    // execution path. Everything else keeps the tree-walking evaluator.
+    // Routes a SELECT through the bytecode compiler when its source and expression
+    // shapes are representable, running the emitted program as a real execution path.
+    // Deliberately unsupported semantic families keep the tree-walking evaluator.
     private ExecutionResult ExecuteSelectStatement(
         SelectStatement select,
         SqlValue[] parameters,
@@ -3667,7 +3667,10 @@ public sealed class EmbeddedDatabase : IDisposable
                 select.Projections,
                 GetOutputColumns(select.Source, context),
                 GetRawOutputColumns(select.Source, context));
-            return RunCompiledProgram(compiled, columns);
+            return RunCompiledProgram(
+                compiled,
+                columns,
+                BuildValuesBinding(compiled.ParameterIndices ?? [], parameters));
         }
 
         return ExecuteSelect(select, parameters, context, outerRow);
@@ -3691,30 +3694,6 @@ public sealed class EmbeddedDatabase : IDisposable
 
         // The direct scan / source-less constant projection subset.
         if (TryCompileScanOrConstant(select, parameters, context, outerRow, out compiled))
-            return true;
-
-        // A source-less list of bare literals and parameters has no evaluation semantics beyond preserving
-        // projection order, so it can stream directly through LoadConstant/ResultRow. Computed
-        // expressions deliberately stay with the evaluator: its left-to-right evaluation order owns their
-        // error timing.
-        if (TryCompileBareValueProjectionSelect(select, parameters, out compiled))
-            return true;
-
-        // Pure-constant scalar calls (e.g. abs(5)) fold in the constant route above; this route claims the
-        // shapes that route leaves behind — a single builtin scalar call over parameter arguments
-        // (source-less) or over base-table columns (a scan) — lowering them to the real Function opcode
-        // while reusing the evaluator's own function dispatch so values, NULLs, and errors stay identical.
-        if (TryCompileScalarFunctionSelect(select, parameters, context, outerRow, out compiled))
-            return true;
-
-        // Pure-constant arithmetic (e.g. 1 + 2) folds in the constant route above; this route claims the
-        // remaining exact subset -- a source-less binary +,-,*,/,% projection over baked numeric values, or a
-        // base-table scan whose arithmetic projection reads only numeric-or-NULL columns and whose optional
-        // WHERE is a simple built-in-collation column comparison --
-        // lowering it to the real Arithmetic opcode. Because VdbeArithmetic is byte-identical to the evaluator's
-        // numeric operators only for numeric/NULL operands, every text/blob/coercion/complex shape declines and
-        // stays on the tree-walking evaluator.
-        if (TryCompileArithmeticSelect(select, parameters, context, outerRow, out compiled))
             return true;
 
         // The unordered scan/constant compiler declines aggregation. Try the aggregate
@@ -3753,53 +3732,10 @@ public sealed class EmbeddedDatabase : IDisposable
             compiled: out compiled);
     }
 
-    // Lowers only SELECT <literal-or-parameter>, ... with no source or clauses. Parameters are resolved in
-    // projection order and baked as constants, so repeated ?NNN/named placeholders retain their parser-assigned
-    // identity and a missing binding fails at the same first projection the evaluator would evaluate. WHERE,
-    // ordering, DISTINCT, and every computed expression remain evaluator-owned because this one-row values
-    // program cannot reproduce their evaluation or error order.
-    private static bool TryCompileBareValueProjectionSelect(
-        SelectStatement select,
-        SqlValue[] parameters,
-        out CompiledSelect compiled)
-    {
-        compiled = null!;
-        if (select.Source is not null
-            || select.Where is not null
-            || select.Having is not null
-            || select.Distinct
-            || select.GroupBy.Count != 0
-            || select.OrderBy.Count != 0
-            || select.Limit is not null
-            || select.Offset is not null
-            || select.Projections.Count == 0)
-        {
-            return false;
-        }
-
-        var values = new SqlValue[select.Projections.Count];
-        for (var index = 0; index < select.Projections.Count; index++)
-        {
-            switch (select.Projections[index].Expression)
-            {
-                case LiteralExpression literal:
-                    values[index] = literal.Value;
-                    break;
-                case ParameterExpression parameter:
-                    values[index] = ReadParameter(parameters, parameter.Index);
-                    break;
-                default:
-                    return false;
-            }
-        }
-
-        compiled = new CompiledSelect(ValuesProgramBuilder.Build([values]), []);
-        return true;
-    }
-
-    // The direct-scan / source-less constant-projection subset, delegated to the shared
-    // SelectStatementCompiler. Constant folding, table resolution, and predicate compilation
-    // are supplied by the evaluator's own helpers so the emitted program matches it exactly.
+    // Generic source-less and direct-scan projections, delegated to the shared
+    // SelectStatementCompiler. Constant folding, scalar functions, numeric affinity,
+    // table resolution, and predicate compilation reuse evaluator helpers so the emitted
+    // program matches evaluator value semantics.
     private bool TryCompileScanOrConstant(
         SelectStatement select,
         SqlValue[] parameters,
@@ -3811,9 +3747,16 @@ public sealed class EmbeddedDatabase : IDisposable
             IsConstantScalarExpression,
             expression => Evaluate(expression, parameters, null, context),
             source => ResolveScanTarget(source, context),
-            (where, target) => CompileRowPredicate(where, target, parameters, context, outerRow),
+            (where, target) => IsStreamingSafeScalarScanPredicate(where, target, context)
+                ? CompileRowPredicate(where, target, parameters, context, outerRow)
+                : null,
             (where, target) => CompileSimpleRowIdPredicate(where, target, parameters, context, outerRow),
-            (select, target) => CompileDistinctScanEquality(select, target, context));
+            (select, target) => CompileDistinctScanEquality(select, target, context),
+            function => TryGetRoutableBuiltinScalarCall(function, out var routable)
+                ? BuildBuiltinScalarFunction(routable, parameters, context)
+                : null,
+            ArithmeticNumericAffinity,
+            ModuloNumericAffinity);
         return compiler.TryCompile(select, out compiled);
     }
 
@@ -3888,140 +3831,17 @@ public sealed class EmbeddedDatabase : IDisposable
         "UPPER",
     };
 
-    // Routes a SELECT whose only computed projection is a single allow-listed builtin scalar call to the
-    // real Function opcode, in two safely-expressible shapes:
-    //   * source-less: SELECT f(<literal|parameter>, ...)   -> ScalarFunctionProgramBuilder.BuildOverValues
-    //   * single scan: SELECT <col>, ..., f(<col>, ...) FROM t -> ScalarFunctionProgramBuilder.BuildOverScan
-    // Every other shape (nested/complex arguments, an unsupported scan predicate, aggregates, DISTINCT/FILTER/OVER,
-    // a UDF shadowing the name, and every excluded function) declines so the tree-walking evaluator keeps it.
-    private bool TryCompileScalarFunctionSelect(
-        SelectStatement select,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow,
-        out CompiledSelect compiled)
+    private static readonly VdbeNumericAffinity ArithmeticNumericAffinity = new()
     {
-        compiled = null!;
+        Name = "numeric",
+        Apply = value => value.Kind == SqlValueKind.Null ? value : ApplyNumericAffinity(value),
+    };
 
-        // Clauses that reshape or reorder the result set, or that the Function builders cannot express, stay
-        // on the evaluator. LIMIT/OFFSET are peeled off by TryCompileLimitedSelect before this point.
-        if (select.Distinct
-            || select.Having is not null
-            || select.GroupBy.Count != 0
-            || select.OrderBy.Count != 0
-            || select.Limit is not null
-            || select.Offset is not null
-            || select.Projections.Count == 0)
-        {
-            return false;
-        }
-
-        return select.Source is null
-            ? TryCompileScalarFunctionOverValues(select, parameters, context, out compiled)
-            : TryCompileScalarFunctionOverScan(select, parameters, context, outerRow, out compiled);
-    }
-
-    // Source-less shape: a single builtin scalar call whose arguments are all bare literals or parameters.
-    // Parameter arguments are baked as constants (the generic SELECT execution path supplies no parameter
-    // binding); because each Step re-runs compilation, a rebind re-bakes the fresh value, so rebind works.
-    private bool TryCompileScalarFunctionOverValues(
-        SelectStatement select,
-        SqlValue[] parameters,
-        QueryContext context,
-        out CompiledSelect compiled)
+    private static readonly VdbeNumericAffinity ModuloNumericAffinity = new()
     {
-        compiled = null!;
-
-        if (select.Where is not null || select.Projections.Count != 1)
-            return false;
-
-        if (!TryGetRoutableBuiltinScalarCall(select.Projections[0].Expression, out var function))
-            return false;
-
-        var cells = new List<ValuesCell>(function.Arguments.Count);
-        foreach (var argument in function.Arguments)
-        {
-            switch (argument)
-            {
-                case LiteralExpression literal:
-                    cells.Add(ValuesCell.Constant(literal.Value));
-                    break;
-                case ParameterExpression parameter:
-                    cells.Add(ValuesCell.Constant(ReadParameter(parameters, parameter.Index)));
-                    break;
-                default:
-                    return false;
-            }
-        }
-
-        var vdbeFunction = BuildBuiltinScalarFunction(function, parameters, context);
-        compiled = new CompiledSelect(ScalarFunctionProgramBuilder.BuildOverValues(vdbeFunction, cells), []);
-        return true;
-    }
-
-    // Single-table scan shape: zero or more leading bare-column passthrough projections followed by exactly
-    // one trailing builtin scalar call whose arguments are all bare columns of the scanned table. BuildOverScan
-    // emits the function result last, so the function must be the final projection for the output order to match.
-    private bool TryCompileScalarFunctionOverScan(
-        SelectStatement select,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow,
-        out CompiledSelect compiled)
-    {
-        compiled = null!;
-
-        var target = ResolveScanTarget(select.Source, context);
-        if (target is null || target.Columns.Length == 0)
-            return false;
-
-        var lastIndex = select.Projections.Count - 1;
-        if (!TryGetRoutableBuiltinScalarCall(select.Projections[lastIndex].Expression, out var function))
-            return false;
-
-        var passthrough = new List<int>(lastIndex);
-        for (var i = 0; i < lastIndex; i++)
-        {
-            if (!TryResolveScanColumnOrdinal(select.Projections[i].Expression, target, out var ordinal))
-                return false;
-
-            passthrough.Add(ordinal);
-        }
-
-        var argumentColumns = new List<int>(function.Arguments.Count);
-        foreach (var argument in function.Arguments)
-        {
-            if (!TryResolveScanColumnOrdinal(argument, target, out var ordinal))
-                return false;
-
-            argumentColumns.Add(ordinal);
-        }
-
-        VdbeRowPredicate? predicate = null;
-        if (select.Where is not null)
-        {
-            // The evaluator filters every input row before evaluating any projection. A streaming VDBE loop
-            // can preserve that error order only for a simple built-in-collation column comparison.
-            if (!IsStreamingSafeScalarScanPredicate(select.Where, target, context))
-                return false;
-
-            predicate = CompileRowPredicate(select.Where, target, parameters, context, outerRow);
-            if (predicate is null)
-                return false;
-        }
-
-        var vdbeFunction = BuildBuiltinScalarFunction(function, parameters, context);
-        var term = ScalarFunctionProgramBuilder.BuildOverScan(
-            vdbeFunction,
-            target.TableName,
-            target.Columns.Length,
-            argumentColumns,
-            target.Rows,
-            passthrough,
-            predicate);
-        compiled = new CompiledSelect(term.Program, term.CursorSources);
-        return true;
-    }
+        Name = "integer-numeric",
+        Apply = value => value.Kind == SqlValueKind.Null ? value : ApplyModuloNumericAffinity(value),
+    };
 
     private static bool IsStreamingSafeScalarScanPredicate(
         Expression expression,
@@ -4058,21 +3878,6 @@ public sealed class EmbeddedDatabase : IDisposable
         };
     }
 
-    // A bare column reference that resolves to a real ordinal of the scanned table. Anything else — a literal,
-    // parameter, expression, star, or an unbacked rowid the resolver rejects — declines so the evaluator keeps it.
-    private static bool TryResolveScanColumnOrdinal(Expression expression, ScanTarget target, out int ordinal)
-    {
-        ordinal = -1;
-        if (expression is not ColumnExpression column)
-            return false;
-
-        if (target.ResolveColumnIndex(column.Name) is not { } index)
-            return false;
-
-        ordinal = index;
-        return true;
-    }
-
     // Recognizes a plain builtin scalar call eligible for the Function opcode: an allow-listed name, no
     // OVER/FILTER/DISTINCT/COUNT(*) decoration, and no user-defined function registered under the name (for
     // this arity or variadically) that would shadow the builtin in the evaluator's own dispatch.
@@ -4104,206 +3909,6 @@ public sealed class EmbeddedDatabase : IDisposable
         return true;
     }
 
-    // Routes the exact arithmetic subset to ArithmeticProgramBuilder: source-less values use two baked
-    // INTEGER/REAL/NULL operands, while a scan reads two bare columns whose current live values are all
-    // INTEGER/REAL/NULL. The latter preflight is essential because the evaluator applies numeric affinity to
-    // text/blob values while the Arithmetic opcode rejects them. LIMIT/OFFSET are peeled off before this point.
-    private bool TryCompileArithmeticSelect(
-        SelectStatement select,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow,
-        out CompiledSelect compiled)
-    {
-        compiled = null!;
-
-        if (select.Distinct
-            || select.Having is not null
-            || select.GroupBy.Count != 0
-            || select.OrderBy.Count != 0
-            || select.Limit is not null
-            || select.Offset is not null)
-        {
-            return false;
-        }
-
-        return select.Source is null
-            ? TryCompileArithmeticOverValues(select, parameters, out compiled)
-            : TryCompileArithmeticOverScan(select, parameters, context, outerRow, out compiled);
-    }
-
-    private bool TryCompileArithmeticOverValues(
-        SelectStatement select,
-        SqlValue[] parameters,
-        out CompiledSelect compiled)
-    {
-        compiled = null!;
-
-        if (select.Where is not null || select.Projections.Count != 1)
-            return false;
-
-        if (select.Projections[0].Expression is not BinaryExpression binary
-            || !TryMapArithmeticOperator(binary.Operator, out var op))
-        {
-            return false;
-        }
-
-        if (!TryResolveNumericArithmeticOperand(binary.Left, parameters, out var left)
-            || !TryResolveNumericArithmeticOperand(binary.Right, parameters, out var right))
-        {
-            return false;
-        }
-
-        compiled = new CompiledSelect(ArithmeticProgramBuilder.BuildOverValues(op, [left, right]), []);
-        return true;
-    }
-
-    // The scan builder can place its one arithmetic result among direct declared-column projections. Its operands
-    // remain deliberately restricted to declared columns: literal/parameter operands need a distinct per-row load
-    // shape, and nested expressions need their own register lowering. A simple built-in-collation column
-    // comparison may gate the scan. Preflighting WHERE then arithmetic for every source row preserves the
-    // evaluator's filter-before-projection error ordering before the VDBE can yield an earlier row.
-    private bool TryCompileArithmeticOverScan(
-        SelectStatement select,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow,
-        out CompiledSelect compiled)
-    {
-        compiled = null!;
-
-        if (select.Projections.Count == 0)
-            return false;
-
-        var target = ResolveScanTarget(select.Source, context);
-        if (target is null || target.Columns.Length == 0)
-            return false;
-
-        var arithmeticIndex = -1;
-        BinaryExpression? binary = null;
-        for (var index = 0; index < select.Projections.Count; index++)
-        {
-            if (select.Projections[index].Expression is not BinaryExpression candidate
-                || !TryMapArithmeticOperator(candidate.Operator, out _))
-            {
-                continue;
-            }
-
-            if (arithmeticIndex >= 0)
-                return false;
-
-            arithmeticIndex = index;
-            binary = candidate;
-        }
-
-        if (arithmeticIndex < 0
-            || binary is null
-            || !TryMapArithmeticOperator(binary.Operator, out var op)
-            || !TryResolveScanColumnOrdinal(binary.Left, target, out var left)
-            || !TryResolveScanColumnOrdinal(binary.Right, target, out var right))
-        {
-            return false;
-        }
-
-        var projections = new List<ArithmeticProgramBuilder.ScanProjection>(select.Projections.Count);
-        for (var index = 0; index < arithmeticIndex; index++)
-        {
-            if (!TryResolveScanColumnOrdinal(select.Projections[index].Expression, target, out var column))
-                return false;
-
-            projections.Add(ArithmeticProgramBuilder.ScanProjection.ForColumn(column));
-        }
-
-        projections.Add(ArithmeticProgramBuilder.ScanProjection.ArithmeticResult());
-
-        for (var index = arithmeticIndex + 1; index < select.Projections.Count; index++)
-        {
-            if (!TryResolveScanColumnOrdinal(select.Projections[index].Expression, target, out var column))
-                return false;
-
-            projections.Add(ArithmeticProgramBuilder.ScanProjection.ForColumn(column));
-        }
-
-        VdbeRowPredicate? predicate = null;
-        if (select.Where is not null)
-        {
-            if (!IsStreamingSafeScalarScanPredicate(select.Where, target, context))
-                return false;
-
-            predicate = CompileRowPredicate(select.Where, target, parameters, context, outerRow);
-            if (predicate is null)
-                return false;
-        }
-
-        if (!HasOnlyNumericOrNullArithmeticOperands(
-                target,
-                left,
-                right,
-                select.Where,
-                parameters,
-                context,
-                outerRow))
-        {
-            return false;
-        }
-
-        ValidateArithmeticScanBeforeStreaming(target, binary, select.Where, parameters, context, outerRow);
-
-        var term = ArithmeticProgramBuilder.BuildOverScanWithProjectionOrder(
-            op,
-            target.TableName,
-            target.Columns.Length,
-            [left, right],
-            target.Rows,
-            projections,
-            predicate);
-        compiled = new CompiledSelect(term.Program, term.CursorSources);
-        return true;
-    }
-
-    private bool HasOnlyNumericOrNullArithmeticOperands(
-        ScanTarget target,
-        int left,
-        int right,
-        Expression? where,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow)
-    {
-        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, target.Columns);
-        foreach (var row in target.Rows)
-        {
-            var sourceRow = new SourceRow(target.Columns, row, qualifiedColumns, outerRow);
-            if (where is not null && !IsTrue(Evaluate(where, parameters, sourceRow, context)))
-                continue;
-
-            if (row[left].Kind is not (SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Null)
-                || row[right].Kind is not (SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Null))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private void ValidateArithmeticScanBeforeStreaming(
-        ScanTarget target,
-        BinaryExpression expression,
-        Expression? where,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow)
-    {
-        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, target.Columns);
-        foreach (var row in target.Rows)
-        {
-            var sourceRow = new SourceRow(target.Columns, row, qualifiedColumns, outerRow);
-            if (where is null || IsTrue(Evaluate(where, parameters, sourceRow, context)))
-                _ = Evaluate(expression, parameters, sourceRow, context);
-        }
-    }
-
     // Maps the arithmetic BinaryOperators to their ArithmeticOperator opcode. Only the numeric family the
     // Arithmetic opcode implements is routable; Concatenate, the comparison operators, And/Or, and Is/IsNot
     // carry text/comparison/collation/logical semantics VdbeArithmetic does not model, so they decline.
@@ -4330,37 +3935,6 @@ public sealed class EmbeddedDatabase : IDisposable
                 arithmetic = default;
                 return false;
         }
-    }
-
-    // Resolves an arithmetic operand to a baked constant cell IFF its value is one the Arithmetic opcode
-    // processes byte-identically to the evaluator: an INTEGER, REAL, or NULL. A literal contributes its value
-    // directly; a parameter is read and classified by its currently bound value (re-baked per execution, so a
-    // rebind re-classifies -- switching a parameter to text on a later Step declines and falls back). A text or
-    // blob value declines (the opcode raises a type error where the evaluator coerces via numeric affinity), as
-    // does every non-literal/parameter operand (a column, nested expression, function call, ...), keeping the
-    // evaluator authoritative for it.
-    private bool TryResolveNumericArithmeticOperand(Expression expression, SqlValue[] parameters, out ValuesCell cell)
-    {
-        cell = default;
-
-        SqlValue value;
-        switch (expression)
-        {
-            case LiteralExpression literal:
-                value = literal.Value;
-                break;
-            case ParameterExpression parameter:
-                value = ReadParameter(parameters, parameter.Index);
-                break;
-            default:
-                return false;
-        }
-
-        if (value.Kind is not (SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Null))
-            return false;
-
-        cell = ValuesCell.Constant(value);
-        return true;
     }
 
     // Wraps the evaluator's own EvaluateScalarFunction as a Function-opcode delegate: at execution the opcode
@@ -4453,16 +4027,20 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
 
         // Gate only the row-count-preserving routes whose unconditional ResultRows the builder
-        // can bound exactly. The join branch below is intentionally stricter than the existing
-        // unbounded join route: bounded joins claim only direct INNER/LEFT equi-joins or INNER
-        // cross joins over two base tables with direct projections. A narrowly validated LEFT
-        // WHERE runs after null extension inside the reusable nested loop. The scalar-function
-        // branch is restricted to source-less programs, whose one candidate row cannot change
-        // expression error timing when a gate stops the stream.
+        // can bound exactly. Any generic source-less expression is safe because it has one
+        // candidate row; scan projections remain direct-only so an early gate cannot change
+        // expression error timing. Bounded joins claim only direct INNER/LEFT equi-joins or
+        // INNER cross joins over two base tables with direct projections.
         var baseSelect = select with { Limit = null, Offset = null };
-        if (!TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase)
+        var directProjectionIsGateSafe = baseSelect.Source is null
+            || baseSelect.Projections.All(projection =>
+                projection.Expression is StarExpression
+                    or QualifiedStarExpression
+                    or ColumnExpression
+                || IsConstantScalarExpression(projection.Expression));
+        if (!(directProjectionIsGateSafe
+                && TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase))
             && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase)
-            && !TryCompileLimitedScalarFunctionValues(baseSelect, parameters, context, out compiledBase)
             && !TryCompileLimitedJoinSelect(baseSelect, parameters, context, outerRow, out compiledBase))
         {
             return false;
@@ -4473,27 +4051,8 @@ public sealed class EmbeddedDatabase : IDisposable
         var gated = LimitOffsetProgramBuilder.Apply(compiledBase.Program, offset, limit);
         compiled = ReferenceEquals(gated, compiledBase.Program)
             ? compiledBase
-            : new CompiledSelect(gated, compiledBase.CursorSources);
+            : new CompiledSelect(gated, compiledBase.CursorSources, compiledBase.ParameterIndices);
         return true;
-    }
-
-    // Gates only a source-less scalar Function program. A scalar scan might evaluate an erroring
-    // function on fewer rows when a VDBE LimitGate halts early, while the evaluator materializes
-    // its scan before trimming; retaining those scans preserves evaluator error timing. A source-less
-    // program has exactly one candidate row, so its Function instruction always runs before the
-    // gate exactly as the evaluator's projection does before it applies LIMIT/OFFSET.
-    private bool TryCompileLimitedScalarFunctionValues(
-        SelectStatement select,
-        SqlValue[] parameters,
-        QueryContext context,
-        out CompiledSelect compiled)
-    {
-        compiled = null!;
-
-        if (select.Source is not null || select.Where is not null)
-            return false;
-
-        return TryCompileScalarFunctionSelect(select, parameters, context, outerRow: null, out compiled);
     }
 
     // Bounded joins are deliberately a smaller contract than TryCompileJoinSelect. A LIMIT/OFFSET gate is
@@ -4823,7 +4382,8 @@ public sealed class EmbeddedDatabase : IDisposable
         foreach (var term in statement.Terms)
         {
             if (term is not SelectStatement { Distinct: false } select
-                || !TryCompileSelect(select, parameters, context, outerRow, out var compiledTerm))
+                || !TryCompileSelect(select, parameters, context, outerRow, out var compiledTerm)
+                || compiledTerm.ParameterIndices is { Count: > 0 })
             {
                 return false;
             }
@@ -6947,8 +6507,7 @@ public sealed class EmbeddedDatabase : IDisposable
         switch (statement.Inner)
         {
             case SelectStatement select
-                when !IsBareParameterProjection(select)
-                     && TryCompileSelect(select, parameters, context, outerRow: null, out var compiledSelect):
+                when TryCompileSelect(select, parameters, context, outerRow: null, out var compiledSelect):
                 return DescribeProgram(compiledSelect.Program);
             case CompoundSelectStatement compound
                 when TryCompileCompoundSelect(compound, parameters, context, outerRow: null, out var compiledCompound):
@@ -6974,16 +6533,6 @@ public sealed class EmbeddedDatabase : IDisposable
         throw new EmbeddedSqlException(
             "EXPLAIN is only supported for statements lowered to the bytecode compiler.");
     }
-
-    // EXPLAIN retains its established parameterized bare-projection boundary. Runtime compilation bakes bound
-    // parameter values per execution, but exposing those transient values as a plan would make EXPLAIN behavior
-    // depend on statement bindings rather than SQL shape.
-    private static bool IsBareParameterProjection(SelectStatement select)
-        => select.Source is null
-            && select.Projections.Count > 0
-            && select.Projections.All(projection =>
-                projection.Expression is LiteralExpression or ParameterExpression)
-            && select.Projections.Any(projection => projection.Expression is ParameterExpression);
 
     internal static string[] ExplainColumns() => ["addr", "opcode", "p1", "p2", "p3", "p4", "comment"];
 
@@ -7043,6 +6592,7 @@ public sealed class EmbeddedDatabase : IDisposable
             // Shared with the executor's own describe path (like the recursive-worktable opcodes below), so a
             // routed arithmetic projection renders byte-identically to the canonical instruction renderer.
             ArithmeticInstruction => VdbeExplain.Describe(instruction),
+            NumericAffinityInstruction => VdbeExplain.Describe(instruction),
             OpenReadCursorInstruction open => (
                 open.Cursor.Index,
                 0,

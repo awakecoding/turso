@@ -131,8 +131,8 @@ public class CompiledSelectExecutionTests
             "CloseCursor", "SorterSort", "SorterData", "Copy", "ResultRow", "SorterNext",
             "CloseSorter", "Halt");
 
-        // A projected expression over a column (not a bare column) is not lowered.
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN SELECT value + 1 FROM t;"));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT value + 1 FROM t;"))
+            .Should().ContainInOrder("Column", "LoadConstant", "NumericAffinity", "NumericAffinity", "Arithmetic");
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN SELECT DISTINCT 1;"));
         Opcodes(ReadRows(connection, "EXPLAIN SELECT value FROM t ORDER BY value LIMIT 1;"))
             .Should().Contain("SorterSort").And.Contain("LimitGate");
@@ -141,14 +141,19 @@ public class CompiledSelectExecutionTests
     }
 
     [Test]
-    public void ExplainRejectsParameterisedSelects()
+    public void ExplainDescribesLateBoundSelectParameters()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         using var statement = connection.Prepare("EXPLAIN SELECT ?1;");
         statement.Bind(1, SqlValue.Integer(5));
 
-        Assert.Throws<EmbeddedSqlException>(() => statement.Step());
+        var rows = new List<SqlValue[]>();
+        while (statement.Step() == StatementStepResult.Row)
+            rows.Add(Enumerable.Range(0, statement.GetColumnCount()).Select(statement.GetValue).ToArray());
+
+        Opcodes(rows).Should().Equal("LoadParameter", "ResultRow", "Halt");
+        rows[0][6].Should().Be(SqlValue.Text("r[0]=param[0]"));
     }
 
     [Test]

@@ -31,11 +31,10 @@ public class ScalarFunctionSqlRoutingTests
         statement.GetValue(0).Should().Be(SqlValue.Integer(5));
         statement.Step().Should().Be(StatementStepResult.Done);
 
-        // The parameter is baked to a LoadConstant, then the real Function opcode folds the argument register
-        // into the result; cursor-less, one ResultRow, a terminating Halt.
+        // The parameter remains late-bound and feeds the real Function opcode.
         var rows = ExplainBound(connection, "EXPLAIN SELECT abs(?)", SqlValue.Integer(-5));
-        Opcodes(rows).Should().Equal("LoadConstant", "Function", "ResultRow", "Halt");
-        Comments(rows).Should().Contain("r[1]=abs(r[0])");
+        Opcodes(rows).Should().Equal("LoadParameter", "Function", "ResultRow", "Halt");
+        Comments(rows).Should().Contain("r[0]=abs(r[1])");
     }
 
     [Test]
@@ -67,12 +66,12 @@ public class ScalarFunctionSqlRoutingTests
         statement.GetValue(0).Should().Be(SqlValue.Text("second"));
         statement.Step().Should().Be(StatementStepResult.Done);
 
-        // A variadic builtin routes with three baked argument registers feeding one Function opcode.
+        // A variadic builtin routes with three late-bound argument registers feeding one Function opcode.
         var rows = ExplainBound(
             connection, "EXPLAIN SELECT coalesce(?, ?, ?)", SqlValue.Null, SqlValue.Null, SqlValue.Null);
-        Opcodes(rows).Count(opcode => opcode == "LoadConstant").Should().Be(3);
+        Opcodes(rows).Count(opcode => opcode == "LoadParameter").Should().Be(3);
         Opcodes(rows).Count(opcode => opcode == "Function").Should().Be(1);
-        Comments(rows).Should().Contain("r[3]=coalesce(r[0..2])");
+        Comments(rows).Should().Contain("r[0]=coalesce(r[1..3])");
     }
 
     [Test]
@@ -154,18 +153,15 @@ public class ScalarFunctionSqlRoutingTests
     }
 
     [Test]
-    public void BakedArgumentIsVisibleInExplainConstant()
+    public void LateBoundArgumentKeepsExplainShapeIndependentOfValue()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
-        // Unlike late-bound VALUES, the scalar-function values route bakes the parameter, so its EXPLAIN p4
-        // carries the concrete value; a different binding produces a different baked constant.
         var withSeven = Dump(ExplainBound(connection, "EXPLAIN SELECT abs(?)", SqlValue.Integer(-7)));
         var withNine = Dump(ExplainBound(connection, "EXPLAIN SELECT abs(?)", SqlValue.Integer(-9)));
 
-        withSeven.Should().Contain(entry => entry.Contains("LoadConstant") && entry.Contains("-7"));
-        withNine.Should().Contain(entry => entry.Contains("LoadConstant") && entry.Contains("-9"));
-        withSeven.Should().NotEqual(withNine);
+        withSeven.Should().Equal(withNine);
+        withSeven.Should().Contain(entry => entry.Contains("LoadParameter") && entry.Contains("param[0]"));
     }
 
     // ---- error propagation (routed): byte-identical evaluator diagnostics ------------------------------
@@ -294,12 +290,10 @@ public class ScalarFunctionSqlRoutingTests
     // ---- fallback boundaries: evaluator keeps ownership, EXPLAIN refuses to describe -------------------
 
     [Test]
-    public void NestedFunctionArgumentFallsBackToEvaluator()
+    public void NestedFunctionArgumentRoutes()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
-        // The inner abs(?) is not a bare literal/parameter, so the values route declines; the evaluator
-        // still resolves the whole nested expression correctly.
         using (var statement = connection.Prepare("SELECT abs(abs(?))"))
         {
             statement.Bind(1, SqlValue.Integer(-5));
@@ -307,11 +301,12 @@ public class ScalarFunctionSqlRoutingTests
             statement.GetValue(0).Should().Be(SqlValue.Integer(5));
         }
 
-        ExplainRefused(connection, "EXPLAIN SELECT abs(abs(?))", SqlValue.Integer(-5));
+        Opcodes(ExplainBound(connection, "EXPLAIN SELECT abs(abs(?))", SqlValue.Integer(-5)))
+            .Count(opcode => opcode == "Function").Should().Be(2);
     }
 
     [Test]
-    public void ArithmeticArgumentFallsBackToEvaluator()
+    public void ArithmeticArgumentRoutes()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
@@ -322,7 +317,8 @@ public class ScalarFunctionSqlRoutingTests
             statement.GetValue(0).Should().Be(SqlValue.Integer(5));
         }
 
-        ExplainRefused(connection, "EXPLAIN SELECT abs(? + 1)", SqlValue.Integer(-6));
+        Opcodes(ExplainBound(connection, "EXPLAIN SELECT abs(? + 1)", SqlValue.Integer(-6)))
+            .Should().Contain("Arithmetic").And.Contain("Function");
     }
 
     [Test]
@@ -360,53 +356,45 @@ public class ScalarFunctionSqlRoutingTests
     }
 
     [Test]
-    public void UnbackedRowIdWhereOnScanFunctionFallsBackToEvaluator()
+    public void RowIdFilterOnScanFunctionRoutes()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(x INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (-3), (4), (-1);");
 
-        // The filtered Function route materializes declared columns only, so an unbacked rowid predicate
-        // remains evaluator-owned.
         ReadRows(connection, "SELECT abs(x) FROM t WHERE rowid = 1;").Select(row => row[0])
             .Should().Equal(SqlValue.Integer(3));
 
-        Assert.Throws<EmbeddedSqlException>(
-                () => ReadRows(connection, "EXPLAIN SELECT abs(x) FROM t WHERE rowid = 1;"))!
-            .Message.Should().Contain("EXPLAIN is only supported");
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT abs(x) FROM t WHERE rowid = 1;"))
+            .Should().Contain("FilterRowId").And.Contain("Function");
     }
 
     [Test]
-    public void FunctionNotLastProjectionInScanFallsBackToEvaluator()
+    public void FunctionMayAppearAnywhereInProjectionOrder()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, x INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1, -3);");
 
-        // BuildOverScan emits the function result last, so a function that is not the final projection stays
-        // on the evaluator to preserve column order.
         ReadRows(connection, "SELECT abs(x), id FROM t;")[0]
             .Should().Equal(SqlValue.Integer(3), SqlValue.Integer(1));
 
-        Assert.Throws<EmbeddedSqlException>(
-                () => ReadRows(connection, "EXPLAIN SELECT abs(x), id FROM t;"))!
-            .Message.Should().Contain("EXPLAIN is only supported");
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT abs(x), id FROM t;"))
+            .Should().Contain("Function");
     }
 
     [Test]
-    public void MixedColumnAndLiteralArgumentsOverScanFallBackToEvaluator()
+    public void MixedColumnAndLiteralArgumentsOverScanRoute()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(x INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (NULL), (5);");
 
-        // BuildOverScan reads only columns; a literal argument alongside a column keeps it on the evaluator.
         ReadRows(connection, "SELECT coalesce(x, 0) FROM t;").Select(row => row[0])
             .Should().Equal(SqlValue.Integer(0), SqlValue.Integer(5));
 
-        Assert.Throws<EmbeddedSqlException>(
-                () => ReadRows(connection, "EXPLAIN SELECT coalesce(x, 0) FROM t;"))!
-            .Message.Should().Contain("EXPLAIN is only supported");
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT coalesce(x, 0) FROM t;"))
+            .Should().Contain("Function");
     }
 
     [Test]

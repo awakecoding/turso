@@ -132,6 +132,7 @@ public enum VdbeOpcode
     Copy,
     Function,
     Arithmetic,
+    NumericAffinity,
     OpenReadCursor,
     OpenWriteCursor,
     Rewind,
@@ -355,6 +356,19 @@ public sealed class VdbeScalarFunction
 }
 
 /// <summary>
+/// Applies one named SQLite numeric-affinity rule to a materialized value. The compiler supplies the
+/// transformation so the opcode and tree-walking evaluator share one coercion implementation.
+/// </summary>
+public sealed class VdbeNumericAffinity
+{
+    /// <summary>The affinity name surfaced by <c>EXPLAIN</c>.</summary>
+    public required string Name { get; init; }
+
+    /// <summary>Coerces one value while preserving NULL.</summary>
+    public required Func<SqlValue, SqlValue> Apply { get; init; }
+}
+
+/// <summary>
 /// Raised by a scalar-function delegate to signal a function-level error (a domain error, an argument-type
 /// error, an overflow, and so on), the managed analogue of a SQLite function raising an error through
 /// <c>sqlite3_result_error</c>. The executor does not catch it: invoking a <see cref="FunctionInstruction"/>
@@ -537,6 +551,15 @@ public sealed record ArithmeticInstruction(
     RegisterRange Operands) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.Arithmetic;
+}
+
+/// <summary>
+/// Applies SQLite numeric affinity to one register before arithmetic consumes it. The value is replaced only
+/// after the supplied transformation succeeds, so a coercion error cannot publish a partial result.
+/// </summary>
+public sealed record NumericAffinityInstruction(Register Value, VdbeNumericAffinity Affinity) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.NumericAffinity;
 }
 
 public sealed record OpenReadCursorInstruction(Cursor Cursor, string? TableName = null, int ColumnCount = 0)
@@ -1177,6 +1200,27 @@ public sealed class VdbeProgram
                     {
                         throw new VdbeProgramValidationException(
                             $"VDBE instruction {instructionIndex} applies arithmetic operator '{VdbeArithmetic.Symbol(arithmetic.Operator)}' of arity {arithmeticArity} to {arithmetic.Operands.Count} operand(s).");
+                    }
+
+                    break;
+                case NumericAffinityInstruction numericAffinity:
+                    ValidateRegister(numericAffinity.Value, instructionIndex);
+                    if (numericAffinity.Affinity is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies a null numeric affinity.");
+                    }
+
+                    if (string.IsNullOrEmpty(numericAffinity.Affinity.Name))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies an unnamed numeric affinity.");
+                    }
+
+                    if (numericAffinity.Affinity.Apply is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies numeric affinity '{numericAffinity.Affinity.Name}' with a null delegate.");
                     }
 
                     break;

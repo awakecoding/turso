@@ -372,7 +372,7 @@ public class SetOperationSqlRoutingTests
     }
 
     [Test]
-    public void ExplicitCollateProjectionIntersectFallsBackToEvaluator()
+    public void ExplicitCollateProjectionIntersectRoutesWithFirstTermCollation()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(a TEXT);");
@@ -380,16 +380,16 @@ public class SetOperationSqlRoutingTests
         Execute(connection, "CREATE TABLE u(a TEXT);");
         Execute(connection, "INSERT INTO u VALUES ('x'), ('Y');");
 
-        // A COLLATE projection is not a bare column or constant, so no lowering route accepts the
-        // term and the whole compound stays on the evaluator. The evaluator still derives the NOCASE
-        // collation from the first term and applies it through RowsEqual: 'X'~'x' and 'y'~'Y' match,
-        // so the result is {'X','y'} in first-term order. Under BINARY this would be empty, which is
-        // how the test proves the collation is honored on the fallback path.
+        // The projection emitter treats COLLATE as a value-preserving wrapper, while the compound
+        // equality delegate derives NOCASE from the first term. 'X'~'x' and 'y'~'Y' therefore match,
+        // yielding {'X','y'} in first-term order; under BINARY the result would be empty.
         Column0(ReadRows(connection, "SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"))
             .Should().Equal(SqlValue.Text("X"), SqlValue.Text("y"));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"))
+            .Should().Contain("RowSetInsert").And.Contain("CompoundResultRow");
     }
 
     // ---- Seeding / helpers ------------------------------------------------------------------------

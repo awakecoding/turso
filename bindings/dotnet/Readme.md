@@ -121,6 +121,12 @@ according to their distribution channel.
 
 Native distribution is intentionally explicit: `make pack-native` creates the dynamic native companion packages after their runtime assets have been built. `Turso.Raw` carries its managed `Turso.Core` and `Turso.Data` closure for `net8.0`, `net9.0`, and `net10.0` alongside the runtime assets. Release validation restores only the packed artifacts and executes the dynamic Raw, Native, and Sync companions on `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`. That smoke verifies the versioned native ABI, every imported symbol, enum widths, managed/native structure sizes and offsets, UTF-8 values and errors, and owned handle cleanup before companion publication. `make pack-nativeaot-static` creates the RID-specific static-linking companions. `make pack-release` deliberately combines those optional companion steps with the managed packages for a full distribution cut; it is not the primary managed release path.
 
+### Managed SELECT bytecode
+
+The managed engine lowers generic source-less and single-table SELECT projections to VDBE bytecode when they contain literals or foldable constants, late-bound parameters, declared columns or rowid, nested `+`, `-`, `*`, `/`, and `%` arithmetic, and the built-in `abs`, `coalesce`, `hex`, `ifnull`, `instr`, `length`, `lower`, `typeof`, and `upper` scalar functions. Arithmetic bytecode applies the evaluator's SQLite numeric affinity first, including text/blob coercion, NULL propagation, modulo conversion, division-by-zero results, and error behavior. `EXPLAIN` exposes `LoadParameter`, `NumericAffinity`, `Arithmetic`, and `Function` instructions without baking parameter values into the plan.
+
+The tree-walking evaluator remains the explicit fallback for expression families not yet represented by this lowering, including comparison/logical/concatenation expressions, `CASE` and `CAST`, collation-sensitive or context-dependent functions, shadowing user-defined functions, complex scan predicates whose streaming error order would differ, computed `DISTINCT` or `ORDER BY` projections, and parameterized compound terms.
+
 ## Getting started
 
 ```C#
