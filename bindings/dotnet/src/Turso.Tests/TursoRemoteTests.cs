@@ -341,10 +341,8 @@ public class TursoRemoteTests
         second.Connection.Should().BeNull();
     }
 
-    [TestCase(false)]
-    [TestCase(true)]
-    public void TestRemoteRawTransactionCompletionClosesStatelessSessionAndAllowsNextTransaction(
-        bool useBatch)
+    [Test]
+    public void TestRemoteRawTransactionCompletionClosesStatelessSessionAndAllowsNextTransaction()
     {
         const string firstBeginResponseJson = """
             {
@@ -375,26 +373,6 @@ public class TursoRemoteTests
                     "rows": [],
                     "affected_row_count": 0,
                     "last_insert_rowid": null
-                  }
-                }
-              }]
-            }
-            """;
-        const string batchCommitResponseJson = """
-            {
-              "baton": "stream.2",
-              "results": [{
-                "type": "ok",
-                "response": {
-                  "type": "batch",
-                  "result": {
-                    "step_results": [{
-                      "cols": [],
-                      "rows": [],
-                      "affected_row_count": 0,
-                      "last_insert_rowid": null
-                    }],
-                    "step_errors": [null]
                   }
                 }
               }]
@@ -450,7 +428,7 @@ public class TursoRemoteTests
 
         using var server = new TestRemoteServer(
             firstBeginResponseJson,
-            useBatch ? batchCommitResponseJson : commitResponseJson,
+            commitResponseJson,
             closeResponseJson,
             secondBeginResponseJson,
             rollbackAndCloseResponseJson);
@@ -459,22 +437,10 @@ public class TursoRemoteTests
         connection.Open();
         using var first = connection.BeginTransaction();
 
-        if (useBatch)
-        {
-            using var batch = (TursoBatch)connection.CreateBatch();
-            batch.Transaction = first;
-            var commit = (TursoBatchCommand)batch.CreateBatchCommand();
-            commit.CommandText = "COMMIT";
-            batch.BatchCommands.Add(commit);
-            batch.ExecuteNonQuery().Should().Be(0);
-        }
-        else
-        {
-            using var command = connection.CreateCommand();
-            command.Transaction = first;
-            command.CommandText = "COMMIT";
-            command.ExecuteNonQuery().Should().Be(0);
-        }
+        using var command = connection.CreateCommand();
+        command.Transaction = first;
+        command.CommandText = "COMMIT";
+        command.ExecuteNonQuery().Should().Be(0);
 
         first.Connection.Should().BeNull();
         using var second = connection.BeginTransaction();

@@ -139,26 +139,16 @@ public sealed class TursoBatch : DbBatch
         return new TursoRemoteDataReader(_connection, results, behavior);
     }
 
-    private async Task<IReadOnlyList<RemoteStatementResult>> ExecuteBatch(
-        bool wantRows,
-        CancellationToken cancellationToken)
+    private Task<IReadOnlyList<RemoteStatementResult>> ExecuteBatch(bool wantRows, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<IReadOnlyList<RemoteStatementResult>>(cancellationToken);
 
         var connection = ValidateBatch();
         if (!connection.IsRemote)
             throw new NotSupportedException("Turso batch execution is currently supported only for remote connections.");
 
-        var results = await connection
-            .ExecuteRemoteBatchAsync(_batchCommands.AsReadOnly(), Timeout, wantRows, cancellationToken)
-            .ConfigureAwait(false);
-        if (_batchCommands.AsReadOnly().Any(command =>
-                SqlTransactionControl.GetCompletion(command.CommandText) != SqlTransactionCompletion.None))
-        {
-            connection.TransactionCompletedExternally();
-        }
-
-        return results;
+        return connection.ExecuteRemoteBatchAsync(_batchCommands.AsReadOnly(), Timeout, wantRows, cancellationToken);
     }
 
     private TursoConnection ValidateBatch()
