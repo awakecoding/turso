@@ -685,6 +685,69 @@ public sealed class SqlitePager : IDisposable
     }
 
     /// <summary>
+    /// Begins a rewrite while holding the exclusive checkpoint lease from before
+    /// the first write through WAL installation and reset.
+    /// </summary>
+    internal SqlitePagerTransaction BeginExclusiveRewriteTransaction(
+        uint targetDatabaseSizeInPages,
+        TimeSpan? busyTimeout = null)
+    {
+        var configuredBusyTimeout = ResolveBusyTimeout(busyTimeout);
+        var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
+            ? null
+            : Stopwatch.StartNew();
+        var transactionLock = _lockManager.EnterCheckpoint(configuredBusyTimeout);
+        try
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                ThrowIfReadOnly();
+                SynchronizeCommittedView();
+                if (_lockManager.UsesFileBackedWalLocks
+                    && HasUncommittedOrInvalidTail(_recoveryInfo))
+                {
+                    var recoveryLock = _lockManager.EnterRecoveryLock(
+                        SqlitePagerLockManager.RemainingFileLockTimeout(
+                            configuredBusyTimeout,
+                            lockStopwatch),
+                        configuredBusyTimeout);
+                    try
+                    {
+                        using (recoveryLock)
+                            RecoverUncommittedTailUnderWriterLock(transactionLock);
+                    }
+                    catch
+                    {
+                        TransitionToFaulted();
+                        throw;
+                    }
+                }
+                if (_state != SqlitePagerState.Ready)
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot begin an exclusive SQLite rewrite while the pager is {_state}.");
+                }
+                ArgumentOutOfRangeException.ThrowIfZero(targetDatabaseSizeInPages);
+
+                var transaction = new SqlitePagerTransaction(
+                    this,
+                    targetDatabaseSizeInPages,
+                    transactionLock,
+                    checkpointWalAfterCommit: true);
+                _activeTransaction = transaction;
+                _state = SqlitePagerState.TransactionActive;
+                return transaction;
+            }
+        }
+        catch
+        {
+            transactionLock.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Discards an uncommitted, partial, or corrupt WAL tail without publishing a
     /// new transaction. The recovery runs while holding the managed writer and
     /// recovery locks, so it honors the supplied busy timeout and cannot race a
@@ -1141,6 +1204,12 @@ public sealed class SqlitePager : IDisposable
                 _lockGeneration = transaction.PublishStorageChange();
                 _activeTransaction = null;
                 _state = SqlitePagerState.Ready;
+                if (transaction.CheckpointWalAfterCommit)
+                {
+                    _ = CheckpointToMainStoreUnderLock(
+                        transaction.TransactionLock,
+                        resetCommittedWal: true);
+                }
                 transaction.ReleaseWriterLock();
             }
             catch
@@ -1974,10 +2043,12 @@ public sealed class SqlitePagerTransaction : IDisposable
     internal SqlitePagerTransaction(
         SqlitePager pager,
         uint targetDatabaseSizeInPages,
-        SqlitePagerLockLease writerLock)
+        SqlitePagerLockLease writerLock,
+        bool checkpointWalAfterCommit = false)
     {
         _pager = pager;
         _writerLock = writerLock;
+        CheckpointWalAfterCommit = checkpointWalAfterCommit;
         TargetDatabaseSizeInPages = targetDatabaseSizeInPages;
     }
 
@@ -1997,6 +2068,20 @@ public sealed class SqlitePagerTransaction : IDisposable
     internal IReadOnlyDictionary<uint, byte[]> PageImages => _pageImages;
 
     internal IReadOnlyList<uint> WriteOrder => _writeOrder;
+
+    internal bool CheckpointWalAfterCommit { get; }
+
+    internal SqlitePagerLockLease TransactionLock
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _writerLock
+                    ?? throw new InvalidOperationException("SQLite pager transaction no longer owns its lock.");
+            }
+        }
+    }
 
     /// <summary>
     /// Stages a complete SQLite page image. Replacing a page retains its original

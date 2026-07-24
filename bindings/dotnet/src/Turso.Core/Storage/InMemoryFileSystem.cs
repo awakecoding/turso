@@ -109,7 +109,7 @@ public sealed class DeterministicFaultInjector
 /// the semantics of the engine's in-memory I/O backend. An optional
 /// <see cref="DeterministicFaultInjector"/> makes it usable for error-path tests.
 /// </summary>
-public sealed class InMemoryFileSystem : IFileSystem
+public sealed class InMemoryFileSystem : IFileSystem, IAtomicFileSystem
 {
     private const int BlockSize = 4096;
 
@@ -158,6 +158,32 @@ public sealed class InMemoryFileSystem : IFileSystem
         ArgumentException.ThrowIfNullOrEmpty(path);
         lock (_gate)
             _files.Remove(path);
+    }
+
+    void IAtomicFileSystem.ReplaceFileAtomically(
+        string sourcePath,
+        string destinationPath,
+        bool replaceEmptyDestination)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sourcePath);
+        ArgumentException.ThrowIfNullOrEmpty(destinationPath);
+        if (string.Equals(sourcePath, destinationPath, StringComparison.Ordinal))
+            throw new IOException("Atomic file replacement requires distinct source and destination paths.");
+
+        _faults?.BeforeOperation(FileSystemOperation.AtomicReplace);
+        lock (_gate)
+        {
+            if (!_files.TryGetValue(sourcePath, out var source))
+                throw new FileNotFoundException("The atomic replacement source does not exist.", sourcePath);
+            if (_files.TryGetValue(destinationPath, out var destination)
+                && (!replaceEmptyDestination || destination.Length != 0))
+            {
+                throw new IOException("output file already exists");
+            }
+
+            _files.Remove(sourcePath);
+            _files[destinationPath] = source;
+        }
     }
 
     internal void SignalOperation(FileSystemOperation operation) => _faults?.BeforeOperation(operation);
@@ -267,7 +293,7 @@ public sealed class InMemoryFileSystem : IFileSystem
             }
         }
 
-        private long Length
+        internal long Length
         {
             get
             {

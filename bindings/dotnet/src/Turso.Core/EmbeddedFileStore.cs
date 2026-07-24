@@ -1131,7 +1131,13 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
         PragmaHeaderMetadata? pragmaHeader = null)
-        => PersistCore(tables, views, triggers, reclaimTrailingPages: false, pragmaHeader);
+        => PersistCore(
+            tables,
+            views,
+            triggers,
+            reclaimTrailingPages: false,
+            incrementSchemaCookie: false,
+            pragmaHeader);
 
     internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
 
@@ -1144,7 +1150,13 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         ThrowIfDisposed();
         var catalog = Load();
-        _ = PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true, pragmaHeader: null);
+        _ = PersistCore(
+            catalog.Tables,
+            catalog.Views,
+            catalog.Triggers,
+            reclaimTrailingPages: true,
+            incrementSchemaCookie: true,
+            pragmaHeader: null);
     }
 
     internal SqliteJournalMode JournalMode => _pager.JournalMode;
@@ -1189,7 +1201,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 replacement.Persist(tables, views, triggers);
                 replacement.SwitchJournalMode(SqliteJournalMode.Delete);
-                replacement.RewriteMigrationHeader(_header);
+                replacement.RewriteVacuumHeader(_header);
             }
 
             _pager.ReplaceDatabaseFile(temporaryPath);
@@ -1211,7 +1223,96 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    private void RewriteMigrationHeader(SqliteDatabaseHeader sourceHeader)
+    internal void VacuumInto(
+        string destinationPath,
+        int pageSize,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        _ = SqlitePageSize.Encode(pageSize);
+
+        var atomicFileSystem = TursoEncryptionFileSystem.Unwrap(_fileSystem) as IAtomicFileSystem
+            ?? throw new EmbeddedSqlException(
+                "VACUUM INTO requires a file system with atomic replacement support.");
+        var replaceEmptyDestination = _fileSystem.FileExists(destinationPath);
+        if (replaceEmptyDestination)
+        {
+            using var destination = _fileSystem.OpenFile(
+                destinationPath,
+                FileOpenMode.OpenExisting,
+                readOnly: true);
+            if (destination.Length != 0)
+                throw new EmbeddedSqlException("output file already exists");
+        }
+        foreach (var suffix in new[] { "-wal", "-journal" })
+        {
+            if (_fileSystem.FileExists(destinationPath + suffix))
+                throw new EmbeddedSqlException("output file already exists");
+        }
+        var destinationShmPath = destinationPath + "-shm";
+        var replaceEmptyDestinationShm = _fileSystem.FileExists(destinationShmPath);
+        if (replaceEmptyDestinationShm)
+        {
+            using var destinationShm = _fileSystem.OpenFile(
+                destinationShmPath,
+                FileOpenMode.OpenExisting,
+                readOnly: true);
+            if (destinationShm.Length != 0)
+                throw new EmbeddedSqlException("output file already exists");
+        }
+
+        var temporaryPath = destinationPath + $".vacuum-{Guid.NewGuid():N}.tmp";
+        var temporaryWalPath = temporaryPath + "-wal";
+        var temporaryJournalPath = temporaryPath + "-journal";
+        var temporaryShmPath = temporaryPath + "-shm";
+        try
+        {
+            using (var replacement = Open(
+                       temporaryPath,
+                       _fileSystem,
+                       out _,
+                       initialPageSize: pageSize,
+                       initialTextEncoding: _textEncoding))
+            {
+                replacement.Persist(tables, views, triggers);
+                replacement.SwitchJournalMode(SqliteJournalMode.Delete);
+                replacement.RewriteVacuumHeader(_header);
+            }
+
+            try
+            {
+                atomicFileSystem.ReplaceFileAtomically(
+                    temporaryPath,
+                    destinationPath,
+                    replaceEmptyDestination);
+            }
+            catch (IOException exception) when (exception.Message == "output file already exists")
+            {
+                throw new EmbeddedSqlException("output file already exists", exception);
+            }
+
+            if (_fileSystem.FileExists(temporaryShmPath))
+            {
+                atomicFileSystem.ReplaceFileAtomically(
+                    temporaryShmPath,
+                    destinationShmPath,
+                    replaceEmptyDestinationShm);
+            }
+        }
+        finally
+        {
+            TryDeleteArtifact(temporaryJournalPath);
+            TryDeleteArtifact(temporaryWalPath);
+            TryDeleteArtifact(temporaryShmPath);
+            TryDeleteArtifact(temporaryPath);
+        }
+    }
+
+    private void RewriteVacuumHeader(SqliteDatabaseHeader sourceHeader)
     {
         var pageOne = _pager.ReadCommittedPage(SchemaRootPage);
         var current = SqliteDatabaseHeader.Parse(pageOne);
@@ -1221,7 +1322,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             ChangeCounter = changeCounter,
             VersionValidFor = changeCounter,
             DatabaseSizeInPages = _pager.CommittedPageCount,
-            SchemaCookie = sourceHeader.SchemaCookie,
+            SchemaCookie = unchecked(sourceHeader.SchemaCookie + 1),
             DefaultPageCacheSize = sourceHeader.DefaultPageCacheSize,
             TextEncoding = sourceHeader.TextEncoding,
             UserVersion = sourceHeader.UserVersion,
@@ -1252,6 +1353,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
         bool reclaimTrailingPages,
+        bool incrementSchemaCookie,
         PragmaHeaderMetadata? pragmaHeader)
     {
         ThrowIfDisposed();
@@ -1341,7 +1443,9 @@ internal sealed class EmbeddedFileStore : IDisposable
             FreelistPageCount = freelist.PageCount,
             SchemaCookie = pragmaHeader is { } metadata
                 ? unchecked((uint)metadata.SchemaVersion)
-                : schemaChanged ? currentHeader.SchemaCookie + 1 : currentHeader.SchemaCookie,
+                : schemaChanged || incrementSchemaCookie
+                    ? unchecked(currentHeader.SchemaCookie + 1)
+                    : currentHeader.SchemaCookie,
             UserVersion = pragmaHeader?.UserVersion ?? currentHeader.UserVersion,
             ApplicationId = pragmaHeader?.ApplicationId ?? currentHeader.ApplicationId,
         };
@@ -1357,7 +1461,9 @@ internal sealed class EmbeddedFileStore : IDisposable
             indexPages,
             freelist);
 
-        using (var transaction = _pager.BeginTransaction(target))
+        using (var transaction = reclaimTrailingPages
+                   ? _pager.BeginExclusiveRewriteTransaction(target)
+                   : _pager.BeginTransaction(target))
         {
             foreach (var name in tableNames)
             {

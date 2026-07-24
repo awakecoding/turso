@@ -222,7 +222,7 @@ internal sealed record PragmaJournalModeStatement(string? Mode) : ParsedStatemen
 
 internal sealed record PragmaPageSizeStatement(int? Value) : ParsedStatement;
 
-internal sealed record VacuumStatement(string? Schema) : ParsedStatement;
+internal sealed record VacuumStatement(string? Schema, Expression? Into) : ParsedStatement;
 
 internal sealed record AttachDatabaseStatement(
     Expression Path,

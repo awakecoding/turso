@@ -124,12 +124,15 @@ internal sealed class SqlParser
     private ParsedStatement ParseVacuum()
     {
         if (_lexer.Current.Kind is TokenKind.Semicolon or TokenKind.End)
-            return new VacuumStatement(null);
+            return new VacuumStatement(null, null);
+
+        if (ConsumeKeyword("INTO"))
+            return new VacuumStatement(null, ParseExpression());
 
         var schema = ExpectIdentifier();
-        if (!schema.Equals("main", StringComparison.OrdinalIgnoreCase))
-            throw Error($"Unsupported VACUUM database {schema}.");
-        return new VacuumStatement(schema);
+        return new VacuumStatement(
+            schema,
+            ConsumeKeyword("INTO") ? ParseExpression() : null);
     }
 
     private ParsedStatement ParsePragma()
