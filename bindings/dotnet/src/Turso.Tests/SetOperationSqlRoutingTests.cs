@@ -344,6 +344,52 @@ public class SetOperationSqlRoutingTests
             () => ReadRows(connection, "EXPLAIN SELECT DISTINCT a FROM t INTERSECT SELECT a FROM u;"));
     }
 
+    [TestCase("INTERSECT")]
+    [TestCase("EXCEPT")]
+    public void ErrorCapableTermsPreserveEvaluatorSourceOrder(string compoundOperator)
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE first_error(value);");
+        Execute(connection, "INSERT INTO first_error VALUES (-9223372036854775808);");
+        Execute(connection, "CREATE TABLE second_error(value);");
+        Execute(connection, "INSERT INTO second_error VALUES ('x');");
+        var query =
+            $"SELECT abs(value) FROM first_error {compoundOperator} SELECT instr(value) FROM second_error;";
+        var forcedEvaluator =
+            $"SELECT abs(value) FROM first_error {compoundOperator} SELECT instr(value) FROM second_error ORDER BY 1;";
+
+        var actual = Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query))!;
+        var expected = Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, forcedEvaluator))!;
+
+        actual.Message.Should().Be(expected.Message).And.Be("integer overflow");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query))!
+            .Message.Should().Contain("EXPLAIN is only supported");
+    }
+
+    [TestCase("INTERSECT")]
+    [TestCase("EXCEPT")]
+    public void ComputedArithmeticTermsStayEvaluatorOwned(string compoundOperator)
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE arithmetic_left(value);");
+        Execute(connection, "INSERT INTO arithmetic_left VALUES ('10');");
+        Execute(connection, "CREATE TABLE arithmetic_right(value);");
+        Execute(connection, "INSERT INTO arithmetic_right VALUES ('10');");
+        var query =
+            $"SELECT value + 1 FROM arithmetic_left {compoundOperator} SELECT value + 1 FROM arithmetic_right;";
+        var forcedEvaluator =
+            $"SELECT value + 1 FROM arithmetic_left {compoundOperator} SELECT value + 1 FROM arithmetic_right ORDER BY 1;";
+
+        var actual = ReadRows(connection, query);
+        var expected = ReadRows(connection, forcedEvaluator);
+
+        actual.Should().HaveCount(expected.Count);
+        for (var index = 0; index < actual.Count; index++)
+            actual[index].Should().Equal(expected[index]);
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query))!
+            .Message.Should().Contain("EXPLAIN is only supported");
+    }
+
     [Test]
     public void MismatchedColumnCountIntersectRaisesTheEvaluatorError()
     {
@@ -372,7 +418,7 @@ public class SetOperationSqlRoutingTests
     }
 
     [Test]
-    public void ExplicitCollateProjectionIntersectFallsBackToEvaluator()
+    public void ExplicitCollateProjectionIntersectRoutesWithFirstTermCollation()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(a TEXT);");
@@ -380,16 +426,16 @@ public class SetOperationSqlRoutingTests
         Execute(connection, "CREATE TABLE u(a TEXT);");
         Execute(connection, "INSERT INTO u VALUES ('x'), ('Y');");
 
-        // A COLLATE projection is not a bare column or constant, so no lowering route accepts the
-        // term and the whole compound stays on the evaluator. The evaluator still derives the NOCASE
-        // collation from the first term and applies it through RowsEqual: 'X'~'x' and 'y'~'Y' match,
-        // so the result is {'X','y'} in first-term order. Under BINARY this would be empty, which is
-        // how the test proves the collation is honored on the fallback path.
+        // The projection emitter treats COLLATE as a value-preserving wrapper, while the compound
+        // equality delegate derives NOCASE from the first term. 'X'~'x' and 'y'~'Y' therefore match,
+        // yielding {'X','y'} in first-term order; under BINARY the result would be empty.
         Column0(ReadRows(connection, "SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"))
             .Should().Equal(SqlValue.Text("X"), SqlValue.Text("y"));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"))
+            .Should().Contain("RowSetInsert").And.Contain("CompoundResultRow");
     }
 
     // ---- Seeding / helpers ------------------------------------------------------------------------

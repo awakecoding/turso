@@ -16,13 +16,17 @@ namespace Microsoft.EntityFrameworkCore;
 
 public static class TursoDbContextOptionsBuilderExtensions
 {
+    private const int SupportedEntityFrameworkCoreMajorVersion = 9;
+
     public static DbContextOptionsBuilder UseTurso(
         this DbContextOptionsBuilder optionsBuilder,
         string? connectionString,
         Action<SqliteDbContextOptionsBuilder>? sqliteOptionsAction = null)
     {
+        EnsureSupportedEntityFrameworkCoreVersion();
+        var usesManagedLocalProvider = UsesManagedLocalProvider(connectionString);
         optionsBuilder.UseSqlite(connectionString, sqliteOptionsAction);
-        return UseTursoServices(optionsBuilder, UsesManagedLocalProvider(connectionString));
+        return UseTursoServices(optionsBuilder, usesManagedLocalProvider);
     }
 
     public static DbContextOptionsBuilder UseTurso(
@@ -39,8 +43,10 @@ public static class TursoDbContextOptionsBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(connection);
 
+        EnsureSupportedEntityFrameworkCoreVersion();
+        var usesManagedLocalProvider = UsesManagedLocalProvider(connection.ConnectionString);
         optionsBuilder.UseSqlite(connection, contextOwnsConnection, sqliteOptionsAction);
-        return UseTursoServices(optionsBuilder, UsesManagedLocalProvider(connection.ConnectionString));
+        return UseTursoServices(optionsBuilder, usesManagedLocalProvider);
     }
 
     public static DbContextOptionsBuilder<TContext> UseTurso<TContext>(
@@ -79,6 +85,7 @@ public static class TursoDbContextOptionsBuilderExtensions
             ? configuredOptions
                 .ReplaceService<IQuerySqlGeneratorFactory, TursoManagedSqliteQuerySqlGeneratorFactory>()
                 .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, TursoManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
+                .ReplaceService<IHistoryRepository, TursoManagedSqliteHistoryRepository>()
                 .ReplaceService<IMigrationsSqlGenerator, TursoManagedSqliteMigrationsSqlGenerator>()
                 .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, TursoSqliteParameterBasedSqlProcessorFactory>()
             : configuredOptions
@@ -91,9 +98,24 @@ public static class TursoDbContextOptionsBuilderExtensions
             return false;
 
         var connectionOptions = new TursoSqliteConnectionStringBuilder(connectionString);
-        return !IsRemoteTursoUrl(connectionOptions.DataSource)
-            && (!connectionOptions.IsLocalProviderConfigured
-                || connectionOptions.LocalProvider == TursoLocalProvider.Managed);
+        if (IsRemoteTursoUrl(connectionOptions.DataSource))
+        {
+            throw new NotSupportedException(
+                "UseTurso supports only local Turso databases. Remote URLs require retry and transaction semantics that are not implemented yet; use TursoConnection directly for remote ADO.NET access.");
+        }
+
+        return !connectionOptions.IsLocalProviderConfigured
+            || connectionOptions.LocalProvider == TursoLocalProvider.Managed;
+    }
+
+    private static void EnsureSupportedEntityFrameworkCoreVersion()
+    {
+        var loadedVersion = typeof(DbContext).Assembly.GetName().Version;
+        if (loadedVersion?.Major != SupportedEntityFrameworkCoreMajorVersion)
+        {
+            throw new NotSupportedException(
+                $"Turso.EntityFrameworkCore.Sqlite supports EF Core 9.x, but EF Core {loadedVersion?.ToString() ?? "with an unknown version"} is loaded.");
+        }
     }
 
     private static bool IsRemoteTursoUrl(string dataSource)

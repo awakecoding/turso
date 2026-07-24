@@ -221,6 +221,8 @@ public static class LimitOffsetProgramBuilder
                 or AggStepInstruction
                 or AggFinalizeInstruction
                 or FunctionInstruction
+                or ArithmeticInstruction
+                or NumericAffinityInstruction
                 or YieldInstruction
                 or HaltInstruction => instruction,
             _ => throw new StatementCompilationException(

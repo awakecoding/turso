@@ -9,7 +9,7 @@
 
     <PackageId>Turso.EntityFrameworkCore.Sqlite</PackageId>
     <Title>Turso Entity Framework Core SQLite Provider</Title>
-    <Description>Entity Framework Core integration for Turso local databases using EF Core SQLite translation and Turso.Data.Sqlite execution.</Description>
+    <Description>Entity Framework Core 9.x integration for Turso local databases using EF Core SQLite translation and Turso.Data.Sqlite execution.</Description>
     <Authors>Turso authors</Authors>
     <PackageTags>turso;sqlite;database;entity-framework-core;efcore;linq</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -22,7 +22,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="9.0.9" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="$(TursoEntityFrameworkCoreVersionRange)" />
   </ItemGroup>
 
   <ItemGroup>

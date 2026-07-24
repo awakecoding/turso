@@ -118,6 +118,11 @@ public interface IManagedConnectionAdapter : IDisposable
 {
     IManagedStatementAdapter Prepare(string sql);
 
+    bool HasAttachedDatabases => true;
+
+    void ResetForPooling()
+        => throw new NotSupportedException("This managed connection adapter does not support pooling.");
+
     IManagedIncrementalBlobAdapter OpenBlob(
         string databaseName,
         string tableName,
@@ -160,6 +165,14 @@ public interface IManagedStatementAdapter : IDisposable
     int GetParameterIndex(string name);
 
     StatementStepResult Step();
+
+    StatementStepResult Step(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = Step();
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
 
     bool HasRows();
 
@@ -317,10 +330,17 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         return new ManagedConnectionAdapter(connection);
     }
 
+    public bool HasAttachedDatabases => GetConnection().HasAttachedDatabases;
+
     public IManagedStatementAdapter Prepare(string sql)
     {
         ArgumentNullException.ThrowIfNull(sql);
         return ManagedStatementAdapter.FromPreparedStatement(this, sql, GetConnection().Prepare(sql));
+    }
+
+    public void ResetForPooling()
+    {
+        GetConnection().ResetForPooling();
     }
 
     public IManagedIncrementalBlobAdapter OpenBlob(
@@ -394,19 +414,19 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         return GetConnection().Prepare(sql);
     }
 
-    internal IDisposable OpenBlobMutationLease(string tableName, long rowId)
+    internal IDisposable OpenBlobMutationLease(string databaseName, string tableName, long rowId)
     {
-        return GetConnection().OpenBlobMutationLease(tableName, rowId);
+        return GetConnection().OpenBlobMutationLease(databaseName, tableName, rowId);
     }
 
-    internal long GetBlobMutationGeneration(string tableName, long rowId)
+    internal long GetBlobMutationGeneration(string databaseName, string tableName, long rowId)
     {
-        return GetConnection().GetBlobMutationGeneration(tableName, rowId);
+        return GetConnection().GetBlobMutationGeneration(databaseName, tableName, rowId);
     }
 
-    internal bool HasUpdateTrigger(string tableName)
+    internal bool HasUpdateTrigger(string databaseName, string tableName)
     {
-        return GetConnection().HasUpdateTrigger(tableName);
+        return GetConnection().HasUpdateTrigger(databaseName, tableName);
     }
 
     private EmbeddedConnection GetConnection()
@@ -465,10 +485,13 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
     }
 
     public StatementStepResult Step()
+        => Step(CancellationToken.None);
+
+    public StatementStepResult Step(CancellationToken cancellationToken)
     {
         try
         {
-            var result = GetStatement().Step();
+            var result = GetStatement().Step(cancellationToken);
             lock (_gate)
                 _hasCurrentRow = result == StatementStepResult.Row;
             return result;

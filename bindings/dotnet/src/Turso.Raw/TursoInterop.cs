@@ -67,6 +67,15 @@ internal static class TursoInterop
             : IntPtr.Zero;
     }
 
+    [DllImport(DllName, EntryPoint = "turso_abi_version", CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint AbiVersion();
+
+    [DllImport(DllName, EntryPoint = "turso_abi_sizeof", CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint AbiSizeOf(uint type);
+
+    [DllImport(DllName, EntryPoint = "turso_abi_offsetof", CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint AbiOffsetOf(uint type, uint field);
+
     [DllImport(DllName, EntryPoint = "turso_database_new", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoStatusCode DatabaseNew(
         ref TursoDatabaseConfig config,
@@ -87,6 +96,12 @@ internal static class TursoInterop
 
     [DllImport(DllName, EntryPoint = "turso_connection_close", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoStatusCode ConnectionClose(IntPtr connection, out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_interrupt", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void ConnectionInterrupt(TursoDatabaseHandle connection);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_set_busy_timeout_ms", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void ConnectionSetBusyTimeout(TursoDatabaseHandle connection, long timeoutMilliseconds);
 
     [DllImport(DllName, EntryPoint = "turso_connection_deinit", CallingConvention = CallingConvention.Cdecl)]
     public static extern void ConnectionDeinit(IntPtr connection);

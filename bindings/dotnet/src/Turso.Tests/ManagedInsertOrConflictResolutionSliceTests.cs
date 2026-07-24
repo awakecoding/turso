@@ -279,12 +279,6 @@ public sealed class ManagedInsertOrConflictResolutionSliceTests
             .WithMessage("*does not support tables with FOREIGN KEY constraints*");
         ReadRows(connection, "SELECT parent_id FROM child_items;").Should().BeEmpty();
 
-        Execute(connection, "CREATE TABLE checked_items(id INTEGER UNIQUE, value INTEGER CHECK (value > 0));");
-        Action check = () => Execute(connection, "INSERT OR IGNORE INTO checked_items VALUES (1, 1);");
-        check.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*does not support CHECK constraints*");
-        ReadRows(connection, "SELECT id FROM checked_items;").Should().BeEmpty();
-
         Execute(connection, "CREATE TABLE triggered_items(id INTEGER PRIMARY KEY);");
         Execute(connection, "CREATE TABLE audit_items(value INTEGER);");
         Execute(

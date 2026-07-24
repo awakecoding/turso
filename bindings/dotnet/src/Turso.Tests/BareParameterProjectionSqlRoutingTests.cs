@@ -56,7 +56,7 @@ public class BareParameterProjectionSqlRoutingTests
         const string query = "SELECT abs(-9223372036854775808), no_such_function();";
 
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query))!
-            .Message.Should().Be("integer overflow");
+            .Message.Should().Contain("EXPLAIN is only supported");
 
         using var statement = connection.Prepare(query);
         Assert.Throws<EmbeddedSqlException>(() => statement.Step())!

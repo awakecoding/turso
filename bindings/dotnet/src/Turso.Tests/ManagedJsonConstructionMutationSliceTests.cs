@@ -94,6 +94,42 @@ public class ManagedJsonConstructionMutationSliceTests
     }
 
     [Test]
+    public void ArrowOperatorsMatchSqliteExtractionAndSubtypeSemantics()
+    {
+        const string document = """'{"array":[10,20,30],"text":"x","boolean":true,"nothing":null,"object":{"key":1}}'""";
+
+        AssertText($"{document} -> '$.array'", "[10,20,30]");
+        AssertText($"{document} ->> '$.array'", "[10,20,30]");
+        AssertText($"{document} -> '$.text'", "\"x\"");
+        AssertText($"{document} -> '$.boolean'", "true");
+        AssertText($"{document} -> '$.nothing'", "null");
+        AssertText($"{document} -> '$.object'", """{"key":1}""");
+
+        AssertText($"{document} ->> '$.text'", "x");
+        AssertInteger($"{document} ->> '$.boolean'", 1);
+        AssertNull($"{document} ->> '$.nothing'");
+        AssertText($"{document} ->> '$.object'", """{"key":1}""");
+
+        AssertText("'[10,20,30]' -> 1", "20");
+        AssertInteger("'[10,20,30]' ->> 1", 20);
+        AssertText("'[10,20,30]' -> -1", "30");
+        AssertInteger("'[10,20,30]' ->> -1", 30);
+        AssertText("""'{"a.b":1,"a":{"b":2}}' -> 'a.b'""", "1");
+        AssertInteger("""'{"a.b":1,"a":{"b":2}}' ->> '$.a.b'""", 2);
+        AssertInteger("""'{"a":{"b":7}}' -> 'a' ->> 'b'""", 7);
+        AssertText("""'{"text":"x"}' -> '$.text' || '!'""", "\"x\"!");
+        AssertNull($"{document} -> '$.missing'");
+        AssertNull($"{document} ->> '$.missing'");
+        AssertNull($"{document} -> 1.0");
+        AssertNull($"NULL -> '$.array'");
+        Assert.Throws<EmbeddedSqlException>(() => Scalar("'[1]' -> '$[bad]'"));
+        Assert.Throws<EmbeddedSqlException>(() => Scalar("""'{"":2}' -> ''"""));
+
+        AssertText("""json_array('{"array":[1,2]}' -> '$.array')""", "[[1,2]]");
+        AssertText("""json_array('{"array":[1,2]}' ->> '$.array')""", """["[1,2]"]""");
+    }
+
+    [Test]
     public void JsonSubtypeDoesNotCrossBindingOrStorageBoundaries()
     {
         using var database = new EmbeddedDatabase();

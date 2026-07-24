@@ -26,8 +26,8 @@ public class FilteredArithmeticSqlRoutingTests
             .Select(row => row[1].AsText())
             .ToList();
         opcodes.Should().Equal(
-            "OpenReadCursor", "Rewind", "Filter", "Column", "Column", "Column", "Column", "Arithmetic",
-            "ResultRow", "Next", "CloseCursor", "Halt");
+            "OpenReadCursor", "Rewind", "Filter", "Column", "Column", "Column", "NumericAffinity",
+            "NumericAffinity", "Arithmetic", "Column", "ResultRow", "Next", "CloseCursor", "Halt");
         opcodes.IndexOf("Filter").Should().BeLessThan(opcodes.IndexOf("Arithmetic"));
     }
 

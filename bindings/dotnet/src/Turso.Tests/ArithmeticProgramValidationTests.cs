@@ -99,4 +99,54 @@ public class ArithmeticProgramValidationTests
 
         program.Invoking(p => p.Validate()).Should().NotThrow();
     }
+
+    [Test]
+    public void RejectsNumericAffinityOutsideTheRegisterFile()
+    {
+        var affinity = NumericAffinity("numeric");
+
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new NumericAffinityInstruction(new Register(1), affinity),
+                new HaltInstruction(),
+            ]));
+    }
+
+    [Test]
+    public void RejectsUnnamedNumericAffinity()
+    {
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new NumericAffinityInstruction(new Register(0), NumericAffinity("")),
+                new HaltInstruction(),
+            ]));
+    }
+
+    [Test]
+    public void RejectsNumericAffinityWithANullDelegate()
+    {
+        var affinity = new VdbeNumericAffinity
+        {
+            Name = "numeric",
+            Apply = null!,
+        };
+
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 0,
+            [
+                new NumericAffinityInstruction(new Register(0), affinity),
+                new HaltInstruction(),
+            ]));
+    }
+
+    private static VdbeNumericAffinity NumericAffinity(string name) => new()
+    {
+        Name = name,
+        Apply = value => value,
+    };
 }

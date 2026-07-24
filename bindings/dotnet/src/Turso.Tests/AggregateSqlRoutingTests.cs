@@ -405,33 +405,115 @@ public class AggregateSqlRoutingTests
     }
 
     [Test]
-    public void MixingAggregateAndBareColumnStillRaisesEvaluatorError()
+    public void ScalarAggregateBareColumnUsesFirstScannedRow()
     {
         using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(value INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1), (2);");
+        Execute(connection, "CREATE TABLE t(label TEXT, value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES ('first', 10), ('second', 20);");
 
-        var error = Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "SELECT count(*), value FROM t;"))!;
-        error.Message.Should().Be("Mixing aggregate and non-aggregate expressions is not supported.");
+        ReadRows(connection, "SELECT label, count(*) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("first"), SqlValue.Integer(2));
 
         Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT count(*), value FROM t;"));
+            () => ReadRows(connection, "EXPLAIN SELECT label, count(*) FROM t;"));
     }
 
     [Test]
-    public void NonGroupedColumnStillRaisesEvaluatorError()
+    public void MinAndMaxSelectTheirFirstExtremumRow()
     {
         using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10);");
+        Execute(connection, "CREATE TABLE t(label TEXT, value INTEGER);");
+        Execute(
+            connection,
+            "INSERT INTO t VALUES ('ten', 10), ('thirty-first', 30), ('thirty-second', 30), ('five', 5);");
 
-        var error = Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "SELECT k, v FROM t GROUP BY k;"))!;
-        error.Message.Should().Be("Non-aggregate projections must appear in GROUP BY.");
+        ReadRows(connection, "SELECT label, min(value) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("five"), SqlValue.Integer(5));
+        ReadRows(connection, "SELECT label, max(value) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("thirty-first"), SqlValue.Integer(30));
+    }
+
+    [Test]
+    public void LastExtremumAggregateControlsBareColumns()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(label TEXT, value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES ('low', 1), ('high', 9);");
+
+        ReadRows(connection, "SELECT label, min(value), max(value) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("high"), SqlValue.Integer(1), SqlValue.Integer(9));
+        ReadRows(connection, "SELECT label, max(value), min(value) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("low"), SqlValue.Integer(9), SqlValue.Integer(1));
+    }
+
+    [Test]
+    public void GroupedBareColumnUsesRepresentativeWithinEachGroup()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(k INTEGER, label TEXT, value INTEGER);");
+        Execute(
+            connection,
+            "INSERT INTO t VALUES (1, 'one-first', 10), (1, 'one-max', 30),"
+                + " (2, 'two-max', 20), (2, 'two-second', 5);");
+
+        var rows = ReadRows(connection, "SELECT k, label, max(value) FROM t GROUP BY k;");
+
+        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Text("one-max"), SqlValue.Integer(30));
+        rows[1].Should().Equal(SqlValue.Integer(2), SqlValue.Text("two-max"), SqlValue.Integer(20));
+        ReadRows(connection, "SELECT k, label, count(*) FROM t GROUP BY k;")
+            .Select(row => row[1])
+            .Should().Equal(SqlValue.Text("one-first"), SqlValue.Text("two-max"));
 
         Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT k, v FROM t GROUP BY k;"));
+            () => ReadRows(connection, "EXPLAIN SELECT k, label, max(value) FROM t GROUP BY k;"));
+    }
+
+    [Test]
+    public void EmptyAndAllNullExtremaMatchSqliteBareColumnRules()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(label TEXT, value INTEGER);");
+
+        ReadRows(connection, "SELECT label, count(*) FROM t;")[0]
+            .Should().Equal(SqlValue.Null, SqlValue.Integer(0));
+
+        Execute(connection, "INSERT INTO t VALUES ('first', NULL), ('last', NULL);");
+        ReadRows(connection, "SELECT label, max(value) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("last"), SqlValue.Null);
+    }
+
+    [Test]
+    public void HiddenExtremumAggregatesAlsoSelectTheRepresentativeRow()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(label TEXT, value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES ('low', 1), ('high', 9);");
+
+        ReadRows(connection, "SELECT label, count(*) FROM t HAVING max(value) > 0;")[0]
+            .Should().Equal(SqlValue.Text("high"), SqlValue.Integer(2));
+        ReadRows(connection, "SELECT label, count(*) FROM t ORDER BY min(value);")[0]
+            .Should().Equal(SqlValue.Text("low"), SqlValue.Integer(2));
+        ReadRows(connection, "SELECT label, max(value) FILTER (WHERE value < 9) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("low"), SqlValue.Integer(1));
+        ReadRows(
+            connection,
+            "SELECT label, count(*) FROM t HAVING min(value) > 0 ORDER BY max(value);")[0]
+            .Should().Equal(SqlValue.Text("low"), SqlValue.Integer(2));
+    }
+
+    [Test]
+    public void WrappedExtremumAggregateControlsTheRepresentativeRow()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(label TEXT, value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES ('middle', 5), ('low', 1), ('high', 9);");
+
+        ReadRows(connection, "SELECT label, abs(max(value)) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("high"), SqlValue.Integer(9));
+        ReadRows(connection, "SELECT label, coalesce(min(value), max(value)) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("high"), SqlValue.Integer(1));
+        ReadRows(connection, "SELECT label, NOT max(value) FROM t;")[0]
+            .Should().Equal(SqlValue.Text("high"), SqlValue.Integer(0));
     }
 
     private static List<(SqlValue, SqlValue, SqlValue)> DrainGrouped(EmbeddedStatement statement)

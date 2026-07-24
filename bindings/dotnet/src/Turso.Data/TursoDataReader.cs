@@ -9,10 +9,12 @@ namespace Turso;
 
 public class TursoDataReader : DbDataReader
 {
+    private readonly TursoCommand _command;
     private readonly TursoConnection _connection;
     private readonly TursoNativeStatement? _nativeStatement;
     private readonly IManagedStatementAdapter? _managedStatement;
     private readonly CommandBehavior _behavior;
+    private readonly bool _completesTransaction;
     private bool _isClosed;
     private bool _hasCurrentRow;
 
@@ -86,11 +88,14 @@ public class TursoDataReader : DbDataReader
         if ((nativeStatement is null) == (managedStatement is null))
             throw new ArgumentException("A reader requires exactly one statement implementation.");
 
+        _command = command;
         _connection = command.Connection as TursoConnection
             ?? throw new InvalidOperationException("A data reader requires an associated TursoConnection.");
         _nativeStatement = nativeStatement;
         _managedStatement = managedStatement;
         _behavior = behavior;
+        _completesTransaction =
+            SqlTransactionControl.GetCompletion(command.CommandText) != SqlTransactionCompletion.None;
         _connection.ReaderOpened(this);
     }
 
@@ -292,19 +297,23 @@ public class TursoDataReader : DbDataReader
         || (_managedStatement is null && (_nativeStatement?.IsInvalid ?? true));
 
     public override bool NextResult()
+        => _command.RunOperation(NextResultCore);
+
+    private bool NextResultCore(CancellationToken cancellationToken)
     {
         EnsureOpen();
-        while (Step())
+        while (Step(cancellationToken))
         {
         }
 
+        MarkTransactionCompletedExternally();
         _hasCurrentRow = false;
         return false;
     }
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
-        return CompleteAsync(NextResult, cancellationToken);
+        return _command.RunOperationAsync(NextResultCore, cancellationToken);
     }
 
     protected override void Dispose(bool disposing)
@@ -318,15 +327,20 @@ public class TursoDataReader : DbDataReader
     internal void CloseFromConnection() => CloseCore(closeConnection: false);
 
     public override bool Read()
+        => _command.RunOperation(ReadCore);
+
+    private bool ReadCore(CancellationToken cancellationToken)
     {
         EnsureOpen();
-        _hasCurrentRow = Step();
+        _hasCurrentRow = Step(cancellationToken);
+        if (!_hasCurrentRow)
+            MarkTransactionCompletedExternally();
         return _hasCurrentRow;
     }
 
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
-        return CompleteAsync(Read, cancellationToken);
+        return _command.RunOperationAsync(ReadCore, cancellationToken);
     }
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
@@ -452,10 +466,10 @@ public class TursoDataReader : DbDataReader
             ? GetNativeStatement().HasRows
             : ExecuteManaged(statement => statement.HasRows());
 
-    private bool Step()
+    private bool Step(CancellationToken cancellationToken)
         => _managedStatement is null
-            ? GetNativeStatement().Read()
-            : ExecuteManaged(statement => statement.Step() == StatementStepResult.Row);
+            ? ReadNative(cancellationToken)
+            : ExecuteManaged(statement => statement.Step(cancellationToken) == StatementStepResult.Row);
 
     private T ExecuteManaged<T>(Func<IManagedStatementAdapter, T> operation)
     {
@@ -467,6 +481,27 @@ public class TursoDataReader : DbDataReader
         {
             throw TursoException.FromCore(exception);
         }
+    }
+
+    private bool ReadNative(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var statement = GetNativeStatement();
+        using var registration = cancellationToken.UnsafeRegister(
+            static state => ((TursoNativeStatement)state!).Interrupt(),
+            statement);
+        bool result;
+        try
+        {
+            result = statement.Read();
+        }
+        catch (TursoException) when (cancellationToken.IsCancellationRequested)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw;
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
     }
 
     private void ValidateOrdinal(int ordinal)
@@ -489,6 +524,7 @@ public class TursoDataReader : DbDataReader
         if (_isClosed)
             return;
 
+        _command.Cancel();
         try
         {
             _nativeStatement?.Dispose();
@@ -502,5 +538,11 @@ public class TursoDataReader : DbDataReader
             if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
                 _connection.Close();
         }
+    }
+
+    private void MarkTransactionCompletedExternally()
+    {
+        if (_completesTransaction)
+            _connection.TransactionCompletedExternally();
     }
 }

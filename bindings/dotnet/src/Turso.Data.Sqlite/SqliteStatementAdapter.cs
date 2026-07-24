@@ -44,9 +44,12 @@ internal sealed class SqliteStatementAdapter : IDisposable
         => GetNativeStatement().GetParameterName(index);
 
     public bool Read()
+        => Read(CancellationToken.None);
+
+    public bool Read(CancellationToken cancellationToken)
         => _managedStatement is null
-            ? GetNativeStatement().Read()
-            : _managedStatement.Step() == StatementStepResult.Row;
+            ? ReadNative(cancellationToken)
+            : _managedStatement.Step(cancellationToken) == StatementStepResult.Row;
 
     public bool HasRows()
         => _managedStatement?.HasRows() ?? GetNativeStatement().HasRows;
@@ -81,4 +84,12 @@ internal sealed class SqliteStatementAdapter : IDisposable
 
     private TursoNativeStatement GetNativeStatement()
         => _nativeStatement ?? throw new InvalidOperationException("The native statement is unavailable.");
+
+    private bool ReadNative(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = GetNativeStatement().Read();
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
 }

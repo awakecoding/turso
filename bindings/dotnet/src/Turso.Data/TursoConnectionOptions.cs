@@ -34,6 +34,8 @@ public class TursoConnectionOptions
 
     public bool ReadYourWrites => _builder.ReadYourWrites;
 
+    public bool Pooling => _builder.Pooling;
+
     public int SyncInterval => _builder.SyncInterval;
 
     public bool? Tls => _builder.Tls;
@@ -54,6 +56,29 @@ public class TursoConnectionOptions
     {
         var mode = ParseManagedOpenMode(Mode);
         var dataSource = string.IsNullOrEmpty(DataSource) ? ":memory:" : DataSource;
+        var cache = Cache;
+        var sharedMemoryName = default(string);
+        if (!string.IsNullOrWhiteSpace(cache)
+            && !cache.Equals("Default", StringComparison.OrdinalIgnoreCase)
+            && !cache.Equals("Private", StringComparison.OrdinalIgnoreCase))
+        {
+            if (cache.Equals("Shared", StringComparison.OrdinalIgnoreCase))
+            {
+                if (mode != ManagedLocalOpenMode.Memory
+                    || string.IsNullOrWhiteSpace(DataSource)
+                    || DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new NotSupportedException(ManagedSharedCacheContract.UnsupportedConfigurationMessage);
+                }
+
+                sharedMemoryName = DataSource;
+            }
+            else
+            {
+                throw new ArgumentException($"Invalid Cache value for Local Provider=Managed: {cache}.", nameof(Cache));
+            }
+        }
+
         if (mode is ManagedLocalOpenMode.ReadOnly or ManagedLocalOpenMode.ReadWrite
             && dataSource == ":memory:")
         {
@@ -62,20 +87,6 @@ public class TursoConnectionOptions
 
         if (mode is ManagedLocalOpenMode.ReadOnly or ManagedLocalOpenMode.ReadWrite && !File.Exists(dataSource))
             throw new InvalidOperationException($"Mode={Mode} requires an existing database file when Local Provider=Managed.");
-
-        var cache = Cache;
-        if (!string.IsNullOrWhiteSpace(cache)
-            && !cache.Equals("Default", StringComparison.OrdinalIgnoreCase)
-            && !cache.Equals("Private", StringComparison.OrdinalIgnoreCase))
-        {
-            if (cache.Equals("Shared", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new NotSupportedException(
-                    "Cache=Shared is not supported when Local Provider=Managed because managed connections do not share page caches.");
-            }
-
-            throw new ArgumentException($"Invalid Cache value for Local Provider=Managed: {cache}.", nameof(Cache));
-        }
 
         if (!string.IsNullOrWhiteSpace(_builder.GetOption("Password")))
             throw new NotSupportedException("Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.");
@@ -89,9 +100,6 @@ public class TursoConnectionOptions
             throw new NotSupportedException("Foreign Keys is not supported when Local Provider=Managed.");
         if (_builder.GetOption("Recursive Triggers") is not null)
             throw new NotSupportedException("Recursive Triggers is not supported when Local Provider=Managed.");
-        if (_builder.GetOption("Pooling") is { } pooling && Convert.ToBoolean(pooling, CultureInfo.InvariantCulture))
-            throw new NotSupportedException("Pooling=True is not supported when Local Provider=Managed.");
-
         var timeout = DefaultTimeout;
         if (timeout < 0)
             throw new ArgumentOutOfRangeException(nameof(DefaultTimeout), timeout, "Default Timeout cannot be negative.");
@@ -100,7 +108,8 @@ public class TursoConnectionOptions
         return new ManagedLocalOpenOptions(
             managedDataSource,
             mode == ManagedLocalOpenMode.ReadOnly,
-            CreateManagedEncryptionOptions(mode, managedDataSource));
+            CreateManagedEncryptionOptions(mode, managedDataSource),
+            sharedMemoryName);
     }
 
     public Uri GetRemoteUri()
@@ -139,6 +148,42 @@ public class TursoConnectionOptions
     public static TursoConnectionOptions Parse(string connectionString)
     {
         return new TursoConnectionOptions(new TursoConnectionStringBuilder(connectionString));
+    }
+
+    internal bool TryGetManagedPoolKey(out ManagedConnectionPoolKey key)
+    {
+        key = default;
+        if (!Pooling || IsRemote || LocalProvider != TursoLocalProvider.Managed)
+            return false;
+
+        var mode = ParseManagedOpenMode(Mode);
+        var dataSource = string.IsNullOrEmpty(DataSource) ? ":memory:" : DataSource;
+        if (mode == ManagedLocalOpenMode.Memory
+            || dataSource.Equals(":memory:", StringComparison.Ordinal)
+            || GetEncryptionCipher().HasValue
+            || _builder.GetOption("Encryption Key") is not null)
+        {
+            return false;
+        }
+
+        key = ManagedConnectionPoolKey.Create(
+            dataSource,
+            mode == ManagedLocalOpenMode.ReadOnly);
+        return true;
+    }
+
+    internal static TursoConnectionOptions FromReplica(TursoReplicaOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var builder = new TursoConnectionStringBuilder
+        {
+            DataSource = options.RemoteUri.AbsoluteUri,
+            ReplicaPath = options.Path,
+            LocalProvider = TursoLocalProvider.Native,
+        };
+        if (!string.IsNullOrWhiteSpace(options.AuthToken))
+            builder.AuthToken = options.AuthToken;
+        return new TursoConnectionOptions(builder);
     }
 
     private static bool IsRemoteDataSource(string dataSource)
@@ -198,9 +243,9 @@ public class TursoConnectionOptions
         ManagedLocalOpenMode mode,
         string dataSource)
     {
-        var cipher = GetEncryptionCipher();
+        var cipher = _builder.GetOption("Encryption Cipher");
         var key = _builder.GetOption("Encryption Key");
-        if (!cipher.HasValue)
+        if (string.IsNullOrWhiteSpace(cipher))
         {
             if (key is not null)
                 throw new NotSupportedException("Encryption is not available for the managed engine.");
@@ -216,16 +261,17 @@ public class TursoConnectionOptions
                 "Encryption is supported only for file-backed databases when Local Provider=Managed.");
         }
 
-        return cipher.Value switch
+        return cipher.ToLowerInvariant() switch
         {
-            TursoEncryptionCipher.Aes128Gcm => ManagedEncryptionOptions.FromHex(
+            "aes128gcm" => ManagedEncryptionOptions.FromHex(
                 Turso.Core.Storage.TursoEncryptionCipher.Aes128Gcm,
                 key),
-            TursoEncryptionCipher.Aes256Gcm => ManagedEncryptionOptions.FromHex(
+            "aes256gcm" => ManagedEncryptionOptions.FromHex(
                 Turso.Core.Storage.TursoEncryptionCipher.Aes256Gcm,
                 key),
             _ => throw new NotSupportedException(
-                "Local Provider=Managed supports only AES128GCM and AES256GCM encryption ciphers."),
+                "Local Provider=Managed supports only Turso encrypted format version 0 with "
+                + "AES128GCM (cipher ID 1) or AES256GCM (cipher ID 2); cipher fallback is not permitted."),
         };
     }
 }
@@ -233,9 +279,19 @@ public class TursoConnectionOptions
 internal readonly record struct ManagedLocalOpenOptions(
     string DataSource,
     bool ReadOnly,
-    ManagedEncryptionOptions? Encryption) : IDisposable
+    ManagedEncryptionOptions? Encryption,
+    string? SharedMemoryName) : IDisposable
 {
     public void Dispose() => Encryption?.Dispose();
+}
+
+internal static class ManagedSharedCacheContract
+{
+    public const string UnsupportedConfigurationMessage =
+        "Cache=Shared with Local Provider=Managed is supported only for named in-memory databases using Mode=Memory and a non-empty Data Source other than :memory:; file-backed and anonymous in-memory shared caches are not supported.";
+
+    public const string ReadUncommittedNotSupportedMessage =
+        "PRAGMA read_uncommitted and IsolationLevel.ReadUncommitted are not supported for managed shared-memory databases because the managed engine preserves transaction isolation and does not expose dirty reads.";
 }
 
 internal enum ManagedLocalOpenMode
