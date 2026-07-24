@@ -277,7 +277,8 @@ public sealed class EmbeddedDatabase : IDisposable
         int TriggerDepth = 0,
         int ForeignKeyActionDepth = 0,
         ForeignKeyStatementState? ForeignKeyStatement = null,
-        CancellationToken CancellationToken = default);
+        CancellationToken CancellationToken = default,
+        bool SchemaValidation = false);
 
     internal sealed class ForeignKeyStatementState
     {
@@ -584,12 +585,14 @@ public sealed class EmbeddedDatabase : IDisposable
         CreateTableStatement or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
+        or AlterTableDropColumnStatement
         or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement;
 
     internal static bool MayChangeSchema(ParsedStatement statement) => statement is
         CreateTableStatement or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
-        or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement;
+        or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
+        or AlterTableDropColumnStatement;
 
     internal TransactionSnapshot CreateTransactionSnapshot()
     {
@@ -1166,6 +1169,7 @@ public sealed class EmbeddedDatabase : IDisposable
             AlterTableAddColumnStatement addColumn => ExecuteAlterTableAddColumn(addColumn, parameters, context),
             AlterTableRenameStatement rename => ExecuteAlterTableRename(rename, tables),
             AlterTableRenameColumnStatement renameColumn => ExecuteAlterTableRenameColumn(renameColumn, tables),
+            AlterTableDropColumnStatement dropColumn => ExecuteAlterTableDropColumn(dropColumn, catalog, context),
             InsertStatement insert => ExecuteInsert(insert, parameters, context),
             UpdateStatement update => ExecuteUpdate(update, parameters, context),
             DeleteStatement delete => ExecuteDelete(delete, parameters, context),
@@ -1811,6 +1815,516 @@ public sealed class EmbeddedDatabase : IDisposable
 
         table.RenameColumn(statement.ColumnName, statement.NewName);
         return new ExecutionResult([], [], 0, true);
+    }
+
+    private ExecutionResult ExecuteAlterTableDropColumn(
+        AlterTableDropColumnStatement statement,
+        SchemaCatalog catalog,
+        QueryContext context)
+    {
+        if (!catalog.Tables.TryGetValue(statement.TableName, out var table))
+            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+
+        var replacement = table.CreateWithoutColumn(statement.ColumnName, context.CancellationToken);
+        var candidateTables = new Dictionary<string, EmbeddedTable>(
+            catalog.Tables,
+            StringComparer.OrdinalIgnoreCase)
+        {
+            [statement.TableName] = replacement,
+        };
+        var candidateContext = context with
+        {
+            Tables = candidateTables,
+            SchemaValidation = true,
+        };
+
+        foreach (var view in catalog.Views.Values.OrderBy(view => view.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var viewContext = EnterView(candidateContext, view.Name);
+                ValidateQuerySchema(view.Query, viewContext, outerRow: null, context.CancellationToken);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                throw new EmbeddedSqlException(
+                    $"error in view {view.Name} after drop column: {exception.Message}",
+                    exception);
+            }
+        }
+
+        foreach (var trigger in catalog.Triggers.Values.OrderBy(trigger => trigger.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                ValidateTriggerSchema(trigger, candidateContext, context.CancellationToken);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                throw new EmbeddedSqlException(
+                    $"error in trigger {trigger.Name} after drop column: {exception.Message}",
+                    exception);
+            }
+        }
+
+        catalog.Tables[statement.TableName] = replacement;
+        return new ExecutionResult([], [], 0, true);
+    }
+
+    private void ValidateTriggerSchema(
+        TriggerDefinition trigger,
+        QueryContext context,
+        CancellationToken cancellationToken)
+    {
+        if (!context.Tables.TryGetValue(trigger.TableName, out var triggerTable))
+            throw new EmbeddedSqlException($"no such table: {trigger.TableName}");
+
+        var triggerQualifiedColumns = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var columnIndex = 0; columnIndex < triggerTable.Columns.Length; columnIndex++)
+        {
+            triggerQualifiedColumns.Add($"OLD.{triggerTable.Columns[columnIndex]}", columnIndex);
+            triggerQualifiedColumns.Add($"NEW.{triggerTable.Columns[columnIndex]}", columnIndex);
+        }
+        var triggerRow = new SourceRow(
+            triggerTable.Columns,
+            Enumerable.Repeat(SqlValue.Null, triggerTable.Columns.Length).ToArray(),
+            triggerQualifiedColumns);
+
+        foreach (var statement in trigger.Body)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            switch (statement)
+            {
+                case InsertStatement insert:
+                    ValidateTriggerInsert(insert, context, triggerRow, cancellationToken);
+                    break;
+                case UpdateStatement update:
+                    ValidateTriggerUpdate(update, context, triggerRow, cancellationToken);
+                    break;
+                case DeleteStatement delete:
+                    ValidateTriggerDelete(delete, context, triggerRow, cancellationToken);
+                    break;
+                default:
+                    throw new EmbeddedSqlException(
+                        $"unsupported trigger body statement {statement.GetType().Name}");
+            }
+        }
+    }
+
+    private void ValidateTriggerInsert(
+        InsertStatement statement,
+        QueryContext context,
+        SourceRow triggerRow,
+        CancellationToken cancellationToken)
+    {
+        if (!context.Tables.TryGetValue(statement.TableName, out var table))
+            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+
+        if (statement.Columns is { } columns)
+        {
+            foreach (var column in columns)
+                _ = table.GetColumnIndex(column);
+        }
+        else if (statement.Source is null
+                 && statement.Rows.Any(row => row.Length != table.Columns.Length))
+        {
+            throw new EmbeddedSqlException(
+                $"table {statement.TableName} has {table.Columns.Length} columns but "
+                + $"{statement.Rows.First(row => row.Length != table.Columns.Length).Length} values were supplied");
+        }
+
+        foreach (var row in statement.Rows)
+        {
+            foreach (var expression in row)
+                ValidateExpressionSchema(expression, triggerRow, context, cancellationToken);
+        }
+        if (statement.Source is not null)
+            ValidateQuerySchema(statement.Source, context, triggerRow, cancellationToken);
+
+        var targetRow = CreateSchemaValidationRow(statement.TableName, table, triggerRow);
+        if (statement.Upsert is { } upsert)
+        {
+            foreach (var target in upsert.Target)
+                _ = table.GetColumnIndex(target.Name);
+            if (upsert.Action is DoUpdateUpsertAction update)
+            {
+                foreach (var assignment in update.Assignments)
+                {
+                    _ = table.GetColumnIndex(assignment.Column);
+                    ValidateExpressionSchema(assignment.Value, targetRow, context, cancellationToken);
+                }
+                ValidateExpressionSchema(update.Where, targetRow, context, cancellationToken);
+            }
+        }
+        if (statement.Returning is not null)
+        {
+            foreach (var projection in statement.Returning)
+                ValidateExpressionSchema(projection.Expression, targetRow, context, cancellationToken);
+        }
+    }
+
+    private void ValidateTriggerUpdate(
+        UpdateStatement statement,
+        QueryContext context,
+        SourceRow triggerRow,
+        CancellationToken cancellationToken)
+    {
+        if (!context.Tables.TryGetValue(statement.TableName, out var table))
+            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+
+        var row = CreateSchemaValidationRow(statement.TableName, table, triggerRow);
+        foreach (var assignment in statement.Assignments)
+        {
+            _ = table.GetColumnIndex(assignment.Column);
+            ValidateExpressionSchema(assignment.Value, row, context, cancellationToken);
+        }
+        ValidateExpressionSchema(statement.Where, row, context, cancellationToken);
+        foreach (var term in ResolveOrderBy(statement.EffectiveOrderBy, statement.Returning ?? []))
+            ValidateExpressionSchema(term.Expression, row, context, cancellationToken);
+        ValidateExpressionSchema(statement.Limit, row, context, cancellationToken);
+        ValidateExpressionSchema(statement.Offset, row, context, cancellationToken);
+        if (statement.Returning is not null)
+        {
+            foreach (var projection in statement.Returning)
+                ValidateExpressionSchema(projection.Expression, row, context, cancellationToken);
+        }
+    }
+
+    private void ValidateTriggerDelete(
+        DeleteStatement statement,
+        QueryContext context,
+        SourceRow triggerRow,
+        CancellationToken cancellationToken)
+    {
+        if (!context.Tables.TryGetValue(statement.TableName, out var table))
+            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+
+        var row = CreateSchemaValidationRow(statement.TableName, table, triggerRow);
+        ValidateExpressionSchema(statement.Where, row, context, cancellationToken);
+        foreach (var term in ResolveOrderBy(statement.EffectiveOrderBy, statement.Returning ?? []))
+            ValidateExpressionSchema(term.Expression, row, context, cancellationToken);
+        ValidateExpressionSchema(statement.Limit, row, context, cancellationToken);
+        ValidateExpressionSchema(statement.Offset, row, context, cancellationToken);
+        if (statement.Returning is not null)
+        {
+            foreach (var projection in statement.Returning)
+                ValidateExpressionSchema(projection.Expression, row, context, cancellationToken);
+        }
+    }
+
+    private static SourceRow CreateSchemaValidationRow(
+        string tableName,
+        EmbeddedTable table,
+        SourceRow? parent)
+        => new(
+            table.Columns,
+            Enumerable.Repeat(SqlValue.Null, table.Columns.Length).ToArray(),
+            BuildQualifiedColumns(tableName, table.Columns),
+            parent,
+            BuildOutputColumns(tableName, table.Columns),
+            RowId: table.HasRowid ? 0 : null,
+            RowIdQualifier: tableName);
+
+    private static SourceRow CreateQuerySchemaValidationRow(
+        TableSource? source,
+        QueryContext context,
+        IReadOnlyList<string> columns,
+        IReadOnlyList<OutputColumn> outputColumns,
+        SourceRow? outerRow)
+    {
+        var values = Enumerable.Repeat(SqlValue.Null, columns.Count).ToList();
+        Dictionary<string, int>? qualifiedColumns = null;
+        long? rowId = null;
+        string? rowIdQualifier = null;
+        if (source is not null)
+        {
+            qualifiedColumns = new Dictionary<string, int>(
+                GetQualifiedColumns(source, context),
+                StringComparer.OrdinalIgnoreCase);
+            AppendSchemaRowidBindings(source, context, values, qualifiedColumns);
+            if (source is NamedTableSource named
+                && !context.CommonTableExpressions.ContainsKey(named.Name)
+                && context.Tables.TryGetValue(named.Name, out var table)
+                && table.HasRowid)
+            {
+                rowId = 0;
+                rowIdQualifier = named.Alias ?? named.Name;
+            }
+        }
+
+        return new SourceRow(
+            columns.ToArray(),
+            values.ToArray(),
+            qualifiedColumns,
+            outerRow,
+            outputColumns,
+            rowId,
+            rowIdQualifier);
+    }
+
+    private static void AppendSchemaRowidBindings(
+        TableSource source,
+        QueryContext context,
+        List<SqlValue> values,
+        Dictionary<string, int> qualifiedColumns)
+    {
+        switch (source)
+        {
+            case NamedTableSource named
+                when !context.CommonTableExpressions.ContainsKey(named.Name)
+                     && context.Tables.TryGetValue(named.Name, out var table)
+                     && table.HasRowid:
+                var rowIdIndex = values.Count;
+                values.Add(SqlValue.Integer(0));
+                var qualifier = named.Alias ?? named.Name;
+                qualifiedColumns.TryAdd($"{qualifier}.rowid", rowIdIndex);
+                qualifiedColumns.TryAdd($"{qualifier}._rowid_", rowIdIndex);
+                qualifiedColumns.TryAdd($"{qualifier}.oid", rowIdIndex);
+                return;
+            case JoinTableSource join:
+                AppendSchemaRowidBindings(join.Left, context, values, qualifiedColumns);
+                AppendSchemaRowidBindings(join.Right, context, values, qualifiedColumns);
+                return;
+        }
+    }
+
+    private void ValidateQuerySchema(
+        QueryStatement statement,
+        QueryContext context,
+        SourceRow? outerRow,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        switch (statement)
+        {
+            case SelectStatement select:
+                ValidateTableSourceSchema(select.Source, context, outerRow, cancellationToken);
+                var sourceColumns = GetSourceColumns(select.Source, context);
+                var outputColumns = GetOutputColumns(select.Source, context);
+                var rawOutputColumns = GetRawOutputColumns(select.Source, context);
+                var row = CreateQuerySchemaValidationRow(
+                    select.Source,
+                    context,
+                    sourceColumns,
+                    outputColumns,
+                    outerRow);
+                foreach (var projection in select.Projections)
+                    ValidateExpressionSchema(projection.Expression, row, context, cancellationToken);
+                ValidateExpressionSchema(select.Where, row, context, cancellationToken);
+                foreach (var expression in select.GroupBy)
+                    ValidateExpressionSchema(expression, row, context, cancellationToken);
+                ValidateExpressionSchema(select.Having, row, context, cancellationToken);
+                foreach (var term in ResolveOrderBy(select.OrderBy, select.Projections))
+                    ValidateExpressionSchema(term.Expression, row, context, cancellationToken);
+                ValidateExpressionSchema(select.Limit, row, context, cancellationToken);
+                ValidateExpressionSchema(select.Offset, row, context, cancellationToken);
+                _ = GetColumnNames(select.Projections, outputColumns, rawOutputColumns);
+                return;
+            case ValuesClause values:
+                foreach (var valueRow in values.Rows)
+                {
+                    foreach (var expression in valueRow)
+                        ValidateExpressionSchema(expression, outerRow, context, cancellationToken);
+                }
+                return;
+            case CompoundSelectStatement compound:
+                foreach (var term in compound.Terms)
+                    ValidateQuerySchema(term, context, outerRow, cancellationToken);
+                ValidateExpressionSchema(compound.Limit, outerRow, context, cancellationToken);
+                ValidateExpressionSchema(compound.Offset, outerRow, context, cancellationToken);
+                return;
+            case WithSelectStatement with:
+                ValidateWithQuerySchema(
+                    with.CommonTableExpressions,
+                    with.Query,
+                    context,
+                    outerRow,
+                    cancellationToken);
+                return;
+            default:
+                throw new EmbeddedSqlException($"Unsupported query type {statement.GetType().Name}.");
+        }
+    }
+
+    private void ValidateWithQuerySchema(
+        IReadOnlyList<CommonTableExpression> expressions,
+        QueryStatement query,
+        QueryContext context,
+        SourceRow? outerRow,
+        CancellationToken cancellationToken)
+    {
+        var resolved = new Dictionary<string, SourceData>(
+            context.CommonTableExpressions,
+            StringComparer.OrdinalIgnoreCase);
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var expression in expressions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!names.Add(expression.Name))
+                throw new EmbeddedSqlException($"duplicate WITH table name: {expression.Name}");
+
+            var expressionContext = context with { CommonTableExpressions = resolved };
+            var descriptor = expression.Query is CompoundSelectStatement { Terms.Count: > 0 } compound
+                ? compound.Terms[0]
+                : expression.Query;
+            ValidateQuerySchema(descriptor, expressionContext, outerRow, cancellationToken);
+            var columns = ResolveCommonTableExpressionColumns(
+                expression,
+                DescribeQuery(descriptor, expressionContext));
+            resolved[expression.Name] = new SourceData(columns, []);
+            if (!ReferenceEquals(descriptor, expression.Query))
+            {
+                ValidateQuerySchema(
+                    expression.Query,
+                    context with { CommonTableExpressions = resolved },
+                    outerRow,
+                    cancellationToken);
+            }
+        }
+
+        ValidateQuerySchema(
+            query,
+            context with { CommonTableExpressions = resolved },
+            outerRow,
+            cancellationToken);
+    }
+
+    private void ValidateTableSourceSchema(
+        TableSource? source,
+        QueryContext context,
+        SourceRow? outerRow,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        switch (source)
+        {
+            case null:
+                return;
+            case NamedTableSource named when TryGetView(context, named.Name, out var view):
+                var viewContext = EnterView(context, view.Name);
+                ValidateQuerySchema(view.Query, viewContext, outerRow, cancellationToken);
+                _ = ResolveViewColumns(view, viewContext);
+                return;
+            case NamedTableSource named:
+                _ = GetSourceColumns(named, context);
+                return;
+            case GenerateSeriesSource series:
+                ValidateExpressionSchema(series.Start, outerRow, context, cancellationToken);
+                ValidateExpressionSchema(series.Stop, outerRow, context, cancellationToken);
+                ValidateExpressionSchema(series.Step, outerRow, context, cancellationToken);
+                return;
+            case DerivedTableSource derived:
+                ValidateQuerySchema(derived.Query, context, outerRow, cancellationToken);
+                return;
+            case JoinTableSource join:
+                ValidateTableSourceSchema(join.Left, context, outerRow, cancellationToken);
+                ValidateTableSourceSchema(join.Right, context, outerRow, cancellationToken);
+                var columns = GetSourceColumns(join, context);
+                var outputColumns = GetOutputColumns(join, context);
+                var row = new SourceRow(
+                    columns,
+                    Enumerable.Repeat(SqlValue.Null, columns.Length).ToArray(),
+                    GetQualifiedColumns(join, context),
+                    outerRow,
+                    outputColumns);
+                ValidateExpressionSchema(join.Condition, row, context, cancellationToken);
+                return;
+            default:
+                throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}.");
+        }
+    }
+
+    private void ValidateExpressionSchema(
+        Expression? expression,
+        SourceRow? row,
+        QueryContext context,
+        CancellationToken cancellationToken)
+    {
+        if (expression is null)
+            return;
+
+        cancellationToken.ThrowIfCancellationRequested();
+        switch (expression)
+        {
+            case LiteralExpression or CurrentTimeExpression or ParameterExpression
+                or StarExpression or QualifiedStarExpression:
+                return;
+            case ColumnExpression column:
+                (row ?? new SourceRow([], [])).GetValue(column);
+                return;
+            case FunctionExpression function:
+                foreach (var argument in function.Arguments)
+                    ValidateExpressionSchema(argument, row, context, cancellationToken);
+                ValidateExpressionSchema(function.Filter, row, context, cancellationToken);
+                if (function.Window is not null)
+                {
+                    foreach (var partition in function.Window.PartitionBy)
+                        ValidateExpressionSchema(partition, row, context, cancellationToken);
+                    foreach (var term in function.Window.OrderBy)
+                        ValidateExpressionSchema(term.Expression, row, context, cancellationToken);
+                    if (function.Window.Frame is { } frame)
+                    {
+                        ValidateExpressionSchema(frame.Start.Offset, row, context, cancellationToken);
+                        ValidateExpressionSchema(frame.End.Offset, row, context, cancellationToken);
+                    }
+                }
+                return;
+            case ScalarSubqueryExpression scalar:
+                ValidateQuerySchema(scalar.Query, context, row, cancellationToken);
+                return;
+            case ExistsExpression exists:
+                ValidateQuerySchema(exists.Query, context, row, cancellationToken);
+                return;
+            case CollationExpression collation:
+                ValidateExpressionSchema(collation.Expression, row, context, cancellationToken);
+                return;
+            case CastExpression cast:
+                ValidateExpressionSchema(cast.Expression, row, context, cancellationToken);
+                return;
+            case CaseExpression @case:
+                ValidateExpressionSchema(@case.Operand, row, context, cancellationToken);
+                foreach (var clause in @case.Clauses)
+                {
+                    ValidateExpressionSchema(clause.When, row, context, cancellationToken);
+                    ValidateExpressionSchema(clause.Then, row, context, cancellationToken);
+                }
+                ValidateExpressionSchema(@case.Else, row, context, cancellationToken);
+                return;
+            case LikeExpression like:
+                ValidateExpressionSchema(like.Value, row, context, cancellationToken);
+                ValidateExpressionSchema(like.Pattern, row, context, cancellationToken);
+                ValidateExpressionSchema(like.Escape, row, context, cancellationToken);
+                return;
+            case GlobExpression glob:
+                ValidateExpressionSchema(glob.Value, row, context, cancellationToken);
+                ValidateExpressionSchema(glob.Pattern, row, context, cancellationToken);
+                return;
+            case InExpression @in:
+                ValidateExpressionSchema(@in.Value, row, context, cancellationToken);
+                foreach (var value in @in.Values)
+                    ValidateExpressionSchema(value, row, context, cancellationToken);
+                return;
+            case InSubqueryExpression inSubquery:
+                ValidateExpressionSchema(inSubquery.Value, row, context, cancellationToken);
+                ValidateQuerySchema(inSubquery.Query, context, row, cancellationToken);
+                return;
+            case BetweenExpression between:
+                ValidateExpressionSchema(between.Value, row, context, cancellationToken);
+                ValidateExpressionSchema(between.Lower, row, context, cancellationToken);
+                ValidateExpressionSchema(between.Upper, row, context, cancellationToken);
+                return;
+            case UnaryExpression unary:
+                ValidateExpressionSchema(unary.Operand, row, context, cancellationToken);
+                return;
+            case BinaryExpression binary:
+                ValidateExpressionSchema(binary.Left, row, context, cancellationToken);
+                ValidateExpressionSchema(binary.Right, row, context, cancellationToken);
+                return;
+            default:
+                throw new EmbeddedSqlException($"Unsupported expression type {expression.GetType().Name}.");
+        }
     }
 
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
@@ -10638,7 +11152,9 @@ public sealed class EmbeddedDatabase : IDisposable
     }
 
     private static string[] ResolveViewColumns(ViewDefinition view, QueryContext viewContext)
-        => ApplyViewColumnNames(view, DescribeQuery(view.Query, viewContext));
+        => viewContext.SchemaValidation && view.Columns is not null
+            ? view.Columns.ToArray()
+            : ApplyViewColumnNames(view, DescribeQuery(view.Query, viewContext));
 
     private static string[] ApplyViewColumnNames(ViewDefinition view, string[] queryColumns)
     {
@@ -17897,6 +18413,10 @@ public sealed class EmbeddedConnection : IDisposable
                 renameColumn.TableName,
                 ManagedSchemaObjectKind.Table,
                 name => renameColumn with { TableName = name }),
+            AlterTableDropColumnStatement dropColumn => RouteExistingNamedStatement(
+                dropColumn.TableName,
+                ManagedSchemaObjectKind.Table,
+                name => dropColumn with { TableName = name }),
             WithDmlStatement with => RouteDataStatement(with),
             InsertStatement insert => RouteDataStatement(insert),
             UpdateStatement update => RouteDataStatement(update),
@@ -18685,6 +19205,7 @@ public sealed class EmbeddedConnection : IDisposable
             AlterTableAddColumnStatement addColumn => ManagedSchemaName.TrySplit(addColumn.TableName, out _, out _),
             AlterTableRenameStatement rename => ManagedSchemaName.TrySplit(rename.TableName, out _, out _),
             AlterTableRenameColumnStatement renameColumn => ManagedSchemaName.TrySplit(renameColumn.TableName, out _, out _),
+            AlterTableDropColumnStatement dropColumn => ManagedSchemaName.TrySplit(dropColumn.TableName, out _, out _),
             InsertStatement insert => ManagedSchemaName.TrySplit(insert.TableName, out _, out _)
                 || insert.Rows.SelectMany(row => row).Any(ExpressionContainsSchemaQualification)
                 || (insert.Source is not null && QueryContainsSchemaQualification(insert.Source))
@@ -20645,6 +21166,94 @@ internal sealed class EmbeddedTable
             row[index] = defaultValue;
             Rows[rowIndex] = row;
         }
+    }
+
+    public EmbeddedTable CreateWithoutColumn(string name, CancellationToken cancellationToken)
+    {
+        if (!_columnIndices.TryGetValue(name, out var droppedColumnIndex))
+            throw new EmbeddedSqlException($"no such column: \"{name}\"");
+
+        var droppedColumn = ColumnDefinitions[droppedColumnIndex];
+        if (droppedColumn.PrimaryKey || IsPrimaryKeyColumn(droppedColumnIndex))
+            throw new EmbeddedSqlException($"cannot drop PRIMARY KEY column: \"{name}\"");
+        if (droppedColumn.Unique
+            || TableUniqueConstraints.Any(constraint =>
+                constraint.Columns.Any(column =>
+                    string.Equals(column.Name, name, StringComparison.OrdinalIgnoreCase))))
+        {
+            throw new EmbeddedSqlException($"cannot drop UNIQUE column: \"{name}\"");
+        }
+        if (ColumnDefinitions.Length == 1)
+            throw new EmbeddedSqlException($"cannot drop column \"{name}\": no other columns exist");
+
+        var dependentIndex = Indexes.FirstOrDefault(index =>
+            index.Origin == EmbeddedIndexOrigin.Explicit
+            && index.Columns.Any(column => column.ColumnIndex == droppedColumnIndex));
+        if (dependentIndex is not null)
+        {
+            throw new EmbeddedSqlException(
+                $"error in index {dependentIndex.Name} after drop column: no such column: {name}");
+        }
+
+        EmbeddedTable replacement;
+        try
+        {
+            replacement = new EmbeddedTable(
+                Name,
+                ColumnDefinitions.Where((_, index) => index != droppedColumnIndex).ToArray(),
+                WithoutRowid,
+                TableLevelPrimaryKey,
+                TableUniqueConstraints,
+                CheckConstraints,
+                TablePrimaryKeyConflictAlgorithm,
+                TablePrimaryKeyConstraintName,
+                TablePrimaryKeyDeclarationOrder,
+                TableForeignKeys);
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            throw new EmbeddedSqlException(
+                $"error in table {Name} after drop column: {exception.Message}",
+                exception);
+        }
+
+        foreach (var index in Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            replacement.Indexes.Add(index with
+            {
+                Columns = index.Columns
+                    .Select(column => column with
+                    {
+                        ColumnIndex = replacement.GetColumnIndex(column.Name),
+                    })
+                    .ToArray(),
+            });
+        }
+
+        if (RowIds.Count != Rows.Count)
+            throw new InvalidOperationException($"Table '{Name}' has inconsistent row identity metadata.");
+        for (var rowIndex = 0; rowIndex < Rows.Count; rowIndex++)
+        {
+            if ((rowIndex & 0xff) == 0)
+                cancellationToken.ThrowIfCancellationRequested();
+
+            var row = Rows[rowIndex];
+            if (row.Length != ColumnDefinitions.Length)
+                throw new InvalidOperationException($"Table '{Name}' has an inconsistent row width.");
+            var rewritten = new SqlValue[row.Length - 1];
+            Array.Copy(row, 0, rewritten, 0, droppedColumnIndex);
+            Array.Copy(
+                row,
+                droppedColumnIndex + 1,
+                rewritten,
+                droppedColumnIndex,
+                row.Length - droppedColumnIndex - 1);
+            replacement.Rows.Add(rewritten);
+        }
+
+        replacement.RowIds.AddRange(RowIds);
+        return replacement;
     }
 
     public void Rename(string newName)

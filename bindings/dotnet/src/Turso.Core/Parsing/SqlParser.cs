@@ -726,8 +726,13 @@ internal sealed class SqlParser
             ExpectKeyword("TO");
             return new AlterTableRenameStatement(tableName, ExpectIdentifier());
         }
+        if (ConsumeKeyword("DROP"))
+        {
+            ConsumeKeyword("COLUMN");
+            return new AlterTableDropColumnStatement(tableName, ExpectIdentifier());
+        }
 
-        throw Error("Expected ADD or RENAME after ALTER TABLE.");
+        throw Error("Expected ADD, DROP, or RENAME after ALTER TABLE.");
     }
 
     private ParsedStatement ParseDrop()

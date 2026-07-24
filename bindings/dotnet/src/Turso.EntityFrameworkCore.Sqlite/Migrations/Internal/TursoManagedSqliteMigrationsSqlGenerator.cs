@@ -24,7 +24,7 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
         }
 
         ValidateOperations(operations, model);
-        return base.Generate(operations, model, options);
+        return base.Generate(RewriteDropColumnOperations(operations), model, options);
     }
 
     protected override void ColumnDefinition(
@@ -65,6 +65,28 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
         MigrationCommandListBuilder builder)
     {
         base.ForeignKeyConstraint(operation, model, builder);
+    }
+
+    private IReadOnlyList<MigrationOperation> RewriteDropColumnOperations(
+        IReadOnlyList<MigrationOperation> operations)
+    {
+        var rewritten = new MigrationOperation[operations.Count];
+        var sql = Dependencies.SqlGenerationHelper;
+        for (var index = 0; index < operations.Count; index++)
+        {
+            rewritten[index] = operations[index] is DropColumnOperation dropColumn
+                ? new SqlOperation
+                {
+                    Sql = "ALTER TABLE "
+                        + sql.DelimitIdentifier(dropColumn.Table, dropColumn.Schema)
+                        + " DROP COLUMN "
+                        + sql.DelimitIdentifier(dropColumn.Name)
+                        + sql.StatementTerminator,
+                }
+                : operations[index];
+        }
+
+        return rewritten;
     }
 
     private static void ValidateOperations(IReadOnlyList<MigrationOperation> operations, IModel? model)
