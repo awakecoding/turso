@@ -114,6 +114,8 @@ internal sealed record AlterTableRenameStatement(string TableName, string NewNam
 
 internal sealed record AlterTableRenameColumnStatement(string TableName, string ColumnName, string NewName) : ParsedStatement;
 
+internal sealed record AlterTableDropColumnStatement(string TableName, string ColumnName) : ParsedStatement;
+
 internal sealed record InsertStatement(
     string TableName,
     string[]? Columns,
