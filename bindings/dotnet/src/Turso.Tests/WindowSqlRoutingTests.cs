@@ -413,6 +413,143 @@ public class WindowSqlRoutingTests
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
     }
 
+    [Test]
+    public void PartitionCollationMatchesSqliteAndMissingCollationIsRejected()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(value TEXT);",
+            "INSERT INTO t VALUES ('A'), ('a'), ('B');",
+        ];
+        const string query =
+            "SELECT value, count(*) OVER (PARTITION BY value COLLATE NOCASE) " +
+            "FROM t ORDER BY value COLLATE NOCASE, value;";
+
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var rows = ReadRows(connection, query);
+        AssertMatchesSqlite(rows, setup, query);
+        rows.Select(row => row[1].AsInteger()).Should().Equal(2, 2, 1);
+
+        string[] nonContiguousSetup =
+        [
+            "CREATE TABLE t(value TEXT);",
+            "INSERT INTO t VALUES ('A'), ('B'), ('a');",
+        ];
+        var nonContiguous =
+            $"SELECT value, count(*) OVER (PARTITION BY value COLLATE NOCASE {RunningFrame}) " +
+            "FROM t ORDER BY value;";
+        using var nonContiguousConnection = new EmbeddedDatabase().Connect();
+        foreach (var statement in nonContiguousSetup)
+            Execute(nonContiguousConnection, statement);
+        var nonContiguousRows = ReadRows(nonContiguousConnection, nonContiguous);
+        AssertMatchesSqlite(nonContiguousRows, nonContiguousSetup, nonContiguous);
+        nonContiguousRows[^1][1].Should().Be(SqlValue.Integer(2));
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(nonContiguousConnection, "EXPLAIN " + nonContiguous));
+
+        var contiguous =
+            $"SELECT value, count(*) OVER (PARTITION BY value COLLATE NOCASE {RunningFrame}) " +
+            "FROM t ORDER BY value COLLATE NOCASE;";
+        var contiguousRows = ReadRows(nonContiguousConnection, contiguous);
+        AssertMatchesSqlite(contiguousRows, nonContiguousSetup, contiguous);
+        Opcodes(ReadRows(nonContiguousConnection, "EXPLAIN " + contiguous))
+            .Should().Contain("SameGroup");
+
+        const string missing =
+            "SELECT count(*) OVER (PARTITION BY value COLLATE missing) FROM t;";
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, missing))!
+            .Message.Should().Be("no such collation sequence: missing");
+    }
+
+    [Test]
+    public void DeclaredPartitionCollationRoutesWhileCustomCallbacksStayOnEvaluator()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE t(value TEXT COLLATE NOCASE);",
+            "INSERT INTO t VALUES ('A'), ('B'), ('a');",
+        ];
+        var declared =
+            $"SELECT value, count(*) OVER (PARTITION BY value {RunningFrame}) " +
+            "FROM t ORDER BY value;";
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+
+        var declaredRows = ReadRows(connection, declared);
+        AssertMatchesSqlite(declaredRows, setup, declared);
+        declaredRows.Select(row => row[1].AsInteger()).Should().Equal(1, 2, 1);
+        Opcodes(ReadRows(connection, "EXPLAIN " + declared))
+            .Should().Contain("SameGroup");
+
+        var database = new EmbeddedDatabase();
+        database.RegisterCollation(
+            "throwing",
+            (_, _) => throw new InvalidOperationException("partition collation failed"));
+        using var custom = database.Connect();
+        Execute(custom, "CREATE TABLE t(value TEXT);");
+        Execute(custom, "INSERT INTO t VALUES ('A'), ('a');");
+        var customQuery =
+            $"SELECT value, count(*) OVER (PARTITION BY value COLLATE throwing {RunningFrame}) " +
+            "FROM t ORDER BY value COLLATE throwing;";
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(custom, "EXPLAIN " + customQuery));
+        Assert.Throws<InvalidOperationException>(() => ReadRows(custom, customQuery))!
+            .Message.Should().Be("partition collation failed");
+    }
+
+    [Test]
+    public void DeclaredCustomWindowOrderAndDistinctStarPreserveEvaluatorSemantics()
+    {
+        var callbacks = 0;
+        var database = new EmbeddedDatabase();
+        database.RegisterCollation("observed", (left, right) =>
+        {
+            callbacks++;
+            return string.CompareOrdinal(left, right);
+        });
+        using var custom = database.Connect();
+        Execute(custom, "CREATE TABLE t(value TEXT COLLATE observed);");
+        Execute(custom, "INSERT INTO t VALUES ('b'), ('a'), ('c');");
+        var ordered =
+            $"SELECT value, count(*) OVER (ORDER BY value {RunningFrame}) " +
+            "FROM t ORDER BY value;";
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(custom, "EXPLAIN " + ordered));
+        ReadRows(custom, ordered).Should().HaveCount(3);
+        callbacks.Should().BeGreaterThan(0);
+
+        string[] distinctSetup =
+        [
+            "CREATE TABLE t(value TEXT COLLATE NOCASE);",
+            "INSERT INTO t VALUES ('x'), ('X');",
+        ];
+        const string distinct =
+            "SELECT DISTINCT *, count(*) OVER () FROM t;";
+        using var declared = new EmbeddedDatabase().Connect();
+        foreach (var statement in distinctSetup)
+            Execute(declared, statement);
+        var rows = ReadRows(declared, distinct);
+        AssertMatchesSqlite(rows, distinctSetup, distinct);
+        rows.Should().ContainSingle();
+    }
+
+    [Test]
+    public void LimitZeroStillValidatesDistinctWindowCalls()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+
+        Assert.Throws<EmbeddedSqlException>(
+                () => ReadRows(
+                    connection,
+                    "SELECT count(DISTINCT value) OVER () FROM t LIMIT 0;"))!
+            .Message.Should().Contain("DISTINCT is not supported for window functions");
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------
 
     private static void AssertMatchesSqlite(IReadOnlyList<SqlValue[]> managed, IReadOnlyList<string> setup, string query)

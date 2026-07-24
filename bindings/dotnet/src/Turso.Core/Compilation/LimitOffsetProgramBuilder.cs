@@ -30,12 +30,14 @@ namespace Turso.Core.Compilation;
 /// Composition: because a shared pair of counters gates <em>every</em> <c>ResultRow</c> in the program,
 /// this composes with any program whose output is emitted through unconditional <c>ResultRow</c> opcodes —
 /// direct table scans, sorted scans, joins, aggregations, constant and source-less scalar-function
-/// projections, and <c>UNION ALL</c> compounds (whose per-term <c>ResultRow</c>s share the counters,
-/// so LIMIT/OFFSET spans the concatenated stream). Programs that emit through the conditional compound primitives
-/// (<see cref="DistinctResultRowInstruction"/>, <see cref="CompoundResultRowInstruction"/>,
-/// <see cref="RowSetInsertInstruction"/> — i.e. <c>UNION</c>/<c>DISTINCT</c>, <c>INTERSECT</c>,
-/// <c>EXCEPT</c>) are rejected with <see cref="StatementCompilationException"/>, because a pre-emit gate
-/// counts candidates rather than emitted rows and so cannot bound those streams exactly.
+/// projections, row-aware aggregates whose <see cref="DistinctGateInstruction"/> has already skipped
+/// duplicate candidates, and <c>UNION ALL</c> compounds (whose per-term <c>ResultRow</c>s share the
+/// counters, so LIMIT/OFFSET spans the concatenated stream). Programs that combine de-duplication and
+/// emission in conditional primitives (<see cref="DistinctResultRowInstruction"/>,
+/// <see cref="CompoundResultRowInstruction"/>, <see cref="RowSetInsertInstruction"/> — i.e. direct
+/// <c>DISTINCT</c>/<c>UNION</c>, <c>INTERSECT</c>, <c>EXCEPT</c>) are rejected with
+/// <see cref="StatementCompilationException"/>, because a pre-emit gate counts candidates rather than
+/// emitted rows and so cannot bound those streams exactly.
 /// </para>
 /// <para>
 /// The transform owns only control flow; it never inspects row values, so LIMIT/OFFSET semantics stay
@@ -195,6 +197,11 @@ public static class LimitOffsetProgramBuilder
             FilterInstruction x => new FilterInstruction(x.Cursor, x.Predicate, Pc(x.FalseTarget), x.Description),
             FilterRowIdInstruction x => new FilterRowIdInstruction(x.Cursor, x.Predicate, Pc(x.FalseTarget), x.Description),
             FilterRegistersInstruction x => new FilterRegistersInstruction(x.Row, x.Predicate, Pc(x.FalseTarget), x.Description),
+            DistinctGateInstruction x => new DistinctGateInstruction(
+                x.Values,
+                x.Equality,
+                x.DistinctSetIndex,
+                Pc(x.DuplicateTarget)),
             NextInstruction x => new NextInstruction(x.Cursor, Pc(x.LoopTarget)),
             SorterSortInstruction x => new SorterSortInstruction(x.Sorter, Pc(x.EmptyTarget)),
             SorterNextInstruction x => new SorterNextInstruction(x.Sorter, Pc(x.LoopTarget)),
@@ -223,6 +230,7 @@ public static class LimitOffsetProgramBuilder
                 or FunctionInstruction
                 or ArithmeticInstruction
                 or NumericAffinityInstruction
+                or GroupKeyInstruction
                 or YieldInstruction
                 or HaltInstruction => instruction,
             _ => throw new StatementCompilationException(

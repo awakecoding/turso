@@ -53,13 +53,14 @@ public sealed class OrderByNullOrderingTests
     }
 
     [Test]
-    public void EvaluatorFallbacksMatchSqliteForComputedCompoundAndAggregateOrdering()
+    public void ComputedAndCompoundFallbacksAndCompiledAggregateOrderingMatchSqlite()
     {
         var cases = new[]
         {
             (
                 Setup: ScalarSetup,
-                Query: "SELECT value + 0 AS computed FROM t ORDER BY computed DESC NULLS FIRST;"
+                Query: "SELECT value + 0 AS computed FROM t ORDER BY computed DESC NULLS FIRST;",
+                UsesSorter: false
             ),
             (
                 Setup: new[]
@@ -71,7 +72,8 @@ public sealed class OrderByNullOrderingTests
                 },
                 Query:
                     "SELECT value AS x FROM a UNION ALL SELECT value FROM b " +
-                    "ORDER BY x COLLATE NOCASE DESC NULLS FIRST LIMIT 4 OFFSET 1;"
+                    "ORDER BY x COLLATE NOCASE DESC NULLS FIRST LIMIT 4 OFFSET 1;",
+                UsesSorter: false
             ),
             (
                 Setup: new[]
@@ -81,7 +83,8 @@ public sealed class OrderByNullOrderingTests
                 },
                 Query:
                     "SELECT k, count(v) AS c FROM grouped GROUP BY k " +
-                    "ORDER BY c ASC NULLS LAST, k DESC NULLS FIRST;"
+                    "ORDER BY c ASC NULLS LAST, k DESC NULLS FIRST;",
+                UsesSorter: true
             ),
             (
                 Setup: new[]
@@ -91,7 +94,8 @@ public sealed class OrderByNullOrderingTests
                 },
                 Query:
                     "SELECT * FROM pairs UNION ALL SELECT * FROM pairs WHERE 0 " +
-                    "ORDER BY 2 COLLATE NOCASE ASC NULLS LAST;"
+                    "ORDER BY 2 COLLATE NOCASE ASC NULLS LAST;",
+                UsesSorter: false
             ),
         };
 
@@ -100,7 +104,7 @@ public sealed class OrderByNullOrderingTests
             AssertMatchesSqlite(testCase.Setup, testCase.Query);
 
             using var connection = OpenManaged(testCase.Setup);
-            UsesSorter(connection, testCase.Query).Should().BeFalse(testCase.Query);
+            UsesSorter(connection, testCase.Query).Should().Be(testCase.UsesSorter, testCase.Query);
         }
     }
 

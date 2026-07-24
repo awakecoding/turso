@@ -86,6 +86,15 @@ public sealed record AggregateHavingFilter(
     string Description);
 
 /// <summary>
+/// A row-aware aggregate finalizer whose value controls whether a finalized
+/// scalar result or grouped row is emitted.
+/// </summary>
+public sealed record AggregateFinalizerFilter(
+    VdbeAggregate Aggregate,
+    VdbeRowPredicate Predicate,
+    string Description);
+
+/// <summary>
 /// Lowers whole-table (scalar) and <c>GROUP BY</c> aggregations into runnable
 /// <see cref="VdbeProgram"/>s built from the aggregate opcode family (<c>AggReset</c>,
 /// <c>AggStep</c>, <c>AggFinalize</c>) plus, for grouping, the sorter opcodes and
@@ -371,6 +380,431 @@ public static class AggregateProgramBuilder
             ins,
             sorterCount: 1,
             accumulatorCount: aggregates.Count);
+    }
+
+    /// <summary>
+    /// Builds a scalar aggregate program whose single accumulator collects each
+    /// complete filtered source row. Different finalizer descriptors may then
+    /// evaluate HAVING and each result expression against that shared row set.
+    /// </summary>
+    public static VdbeProgram BuildRowScalar(
+        string tableName,
+        int tableColumnCount,
+        VdbeAggregate collector,
+        IReadOnlyList<VdbeAggregate> outputs,
+        VdbeRowPredicate? predicate = null,
+        AggregateFinalizerFilter? having = null,
+        VdbeRowEquality? distinctEquality = null)
+    {
+        ValidateRowPlan(tableName, tableColumnCount, collector, outputs, having);
+
+        var rowBase = 0;
+        var outputBase = tableColumnCount;
+        var havingRegister = outputBase + outputs.Count;
+        var registerCount = havingRegister + (having is null ? 0 : 1);
+        var row = new RegisterRange(new Register(rowBase), tableColumnCount);
+        var cursor = new Cursor(0);
+        var accumulator = new Accumulator(0);
+        var ins = new List<VdbeInstruction>
+        {
+            new OpenReadCursorInstruction(cursor, tableName, tableColumnCount),
+            new AggResetInstruction(accumulator),
+        };
+
+        var rewindIndex = ins.Count;
+        ins.Add(new RewindCursorInstruction(cursor, new ProgramCounter(0)));
+
+        var loopStart = ins.Count;
+        var whereIndex = -1;
+        if (predicate is not null)
+        {
+            whereIndex = ins.Count;
+            ins.Add(new FilterInstruction(cursor, predicate, new ProgramCounter(0), string.Empty));
+        }
+
+        for (var column = 0; column < tableColumnCount; column++)
+            ins.Add(new ColumnInstruction(cursor, column, new Register(rowBase + column)));
+        ins.Add(new AggStepInstruction(accumulator, collector, row));
+
+        var nextAddress = ins.Count;
+        ins.Add(new NextInstruction(cursor, new ProgramCounter(loopStart)));
+        var closeAddress = ins.Count;
+        ins.Add(new CloseCursorInstruction(cursor));
+
+        var havingFilterIndex = -1;
+        if (having is not null)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                accumulator,
+                having.Aggregate,
+                new Register(havingRegister)));
+            havingFilterIndex = ins.Count;
+            ins.Add(new FilterRegistersInstruction(
+                new RegisterRange(new Register(havingRegister), 1),
+                having.Predicate,
+                new ProgramCounter(0),
+                having.Description));
+        }
+
+        for (var index = 0; index < outputs.Count; index++)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                accumulator,
+                outputs[index],
+                new Register(outputBase + index)));
+        }
+
+        var output = new RegisterRange(new Register(outputBase), outputs.Count);
+        var distinctGateIndex = -1;
+        if (distinctEquality is not null)
+        {
+            distinctGateIndex = ins.Count;
+            ins.Add(new DistinctGateInstruction(
+                output,
+                distinctEquality,
+                DistinctSetIndex: 0,
+                DuplicateTarget: new ProgramCounter(0)));
+        }
+
+        ins.Add(new ResultRowInstruction(output));
+        var haltAddress = ins.Count;
+        ins.Add(new HaltInstruction());
+
+        ins[rewindIndex] = new RewindCursorInstruction(cursor, new ProgramCounter(closeAddress));
+        if (whereIndex >= 0)
+        {
+            ins[whereIndex] = new FilterInstruction(
+                cursor,
+                predicate!,
+                new ProgramCounter(nextAddress),
+                $"skip row when WHERE is false, goto {nextAddress}");
+        }
+
+        if (havingFilterIndex >= 0)
+        {
+            ins[havingFilterIndex] = new FilterRegistersInstruction(
+                new RegisterRange(new Register(havingRegister), 1),
+                having!.Predicate,
+                new ProgramCounter(haltAddress),
+                having.Description);
+        }
+        if (distinctGateIndex >= 0)
+        {
+            ins[distinctGateIndex] = new DistinctGateInstruction(
+                output,
+                distinctEquality!,
+                DistinctSetIndex: 0,
+                DuplicateTarget: new ProgramCounter(haltAddress));
+        }
+
+        return new VdbeProgram(
+            registerCount,
+            cursorCount: 1,
+            ins,
+            accumulatorCount: 1,
+            distinctSetCount: distinctEquality is null ? 0 : 1);
+    }
+
+    /// <summary>
+    /// Builds a row-aware GROUP BY program. Computed keys are projected once in
+    /// filtered source order and assigned a stable first-seen group id. The first
+    /// sorter makes each group's rows contiguous; the second buffers finalized
+    /// result records so HAVING, ORDER BY, and result DISTINCT occur after every
+    /// group has been aggregated.
+    /// </summary>
+    public static VdbeProgram BuildRowGrouped(
+        string tableName,
+        int tableColumnCount,
+        int groupKeyCount,
+        VdbeGroupKeyProjector groupKeyProjector,
+        VdbeGroupComparer groupEquality,
+        VdbeAggregate collector,
+        IReadOnlyList<VdbeAggregate> outputs,
+        IReadOnlyList<VdbeAggregate> orderKeys,
+        VdbeRowComparer outputOrderComparer,
+        VdbeRowPredicate? predicate = null,
+        AggregateFinalizerFilter? having = null,
+        VdbeRowEquality? distinctEquality = null,
+        VdbeGroupHasher? groupHasher = null)
+    {
+        ValidateRowPlan(tableName, tableColumnCount, collector, outputs, having);
+        ArgumentNullException.ThrowIfNull(groupKeyProjector);
+        ArgumentNullException.ThrowIfNull(groupEquality);
+        ArgumentNullException.ThrowIfNull(orderKeys);
+        ArgumentNullException.ThrowIfNull(outputOrderComparer);
+        if (groupKeyCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(groupKeyCount));
+        foreach (var orderKey in orderKeys)
+            ValidateAggregate(orderKey, nameof(orderKeys));
+
+        var sourceRecordBase = 0;
+        var groupIdRegister = tableColumnCount;
+        var sourceRecordCount = tableColumnCount + 1;
+        var savedGroupIdRegister = sourceRecordCount;
+        var outputRecordBase = savedGroupIdRegister + 1;
+        var orderBase = outputRecordBase;
+        var firstSeenBase = orderBase + orderKeys.Count;
+        var havingBase = firstSeenBase + 1;
+        var outputBase = havingBase + 1;
+        var outputRecordCount = orderKeys.Count + 2 + outputs.Count;
+        var registerCount = outputRecordBase + outputRecordCount;
+
+        var cursor = new Cursor(0);
+        var sourceSorter = new Sorter(0);
+        var outputSorter = new Sorter(1);
+        var accumulator = new Accumulator(0);
+        var row = new RegisterRange(new Register(sourceRecordBase), tableColumnCount);
+        var sourceRecord = new RegisterRange(new Register(sourceRecordBase), sourceRecordCount);
+        var savedGroup = new RegisterRange(new Register(savedGroupIdRegister), 1);
+        var currentGroup = new RegisterRange(new Register(groupIdRegister), 1);
+        var outputRecord = new RegisterRange(new Register(outputRecordBase), outputRecordCount);
+        var output = new RegisterRange(new Register(outputBase), outputs.Count);
+        var emitPredicate = having?.Predicate
+            ?? (static values => values[0].AsInteger() != 0);
+        var emitDescription = having?.Description ?? "emit finalized group";
+
+        VdbeRowComparer sourceOrder = (left, right) =>
+            left[tableColumnCount].AsInteger().CompareTo(right[tableColumnCount].AsInteger());
+
+        var ins = new List<VdbeInstruction>
+        {
+            new OpenReadCursorInstruction(cursor, tableName, tableColumnCount),
+            new OpenSorterInstruction(sourceSorter, sourceOrder, sourceRecordCount),
+            new OpenSorterInstruction(outputSorter, outputOrderComparer, outputRecordCount),
+        };
+
+        var rewindIndex = ins.Count;
+        ins.Add(new RewindCursorInstruction(cursor, new ProgramCounter(0)));
+
+        var ingestLoop = ins.Count;
+        var whereIndex = -1;
+        if (predicate is not null)
+        {
+            whereIndex = ins.Count;
+            ins.Add(new FilterInstruction(cursor, predicate, new ProgramCounter(0), string.Empty));
+        }
+
+        for (var column = 0; column < tableColumnCount; column++)
+            ins.Add(new ColumnInstruction(cursor, column, new Register(sourceRecordBase + column)));
+        ins.Add(new GroupKeyInstruction(
+            row,
+            new Register(groupIdRegister),
+            groupKeyCount,
+            groupKeyProjector,
+            groupEquality,
+            GroupSetIndex: 0,
+            Hasher: groupHasher));
+        ins.Add(new SorterInsertInstruction(sourceSorter, sourceRecord));
+
+        var nextIngestAddress = ins.Count;
+        ins.Add(new NextInstruction(cursor, new ProgramCounter(ingestLoop)));
+        var closeCursorAddress = ins.Count;
+        ins.Add(new CloseCursorInstruction(cursor));
+
+        var sourceSortIndex = ins.Count;
+        ins.Add(new SorterSortInstruction(sourceSorter, new ProgramCounter(0)));
+        ins.Add(new SorterDataInstruction(sourceSorter, sourceRecord));
+        ins.Add(new CopyInstruction(new Register(groupIdRegister), new Register(savedGroupIdRegister)));
+        ins.Add(new AggResetInstruction(accumulator));
+        ins.Add(new AggStepInstruction(accumulator, collector, row));
+
+        var primeNextIndex = ins.Count;
+        ins.Add(new SorterNextInstruction(sourceSorter, new ProgramCounter(0)));
+        var primeGotoIndex = ins.Count;
+        ins.Add(new GotoInstruction(new ProgramCounter(0)));
+
+        var drainLoop = ins.Count;
+        ins.Add(new SorterDataInstruction(sourceSorter, sourceRecord));
+        var sameGroupIndex = ins.Count;
+        ins.Add(new SameGroupInstruction(
+            currentGroup,
+            savedGroup,
+            static (left, right) => left[0].AsInteger() == right[0].AsInteger(),
+            new ProgramCounter(0)));
+
+        EmitRowGroupFinalization(
+            ins,
+            accumulator,
+            outputs,
+            orderKeys,
+            outputSorter,
+            outputRecord,
+            outputBase,
+            orderBase,
+            havingBase,
+            firstSeenBase,
+            savedGroupIdRegister,
+            having);
+        ins.Add(new AggResetInstruction(accumulator));
+        ins.Add(new CopyInstruction(new Register(groupIdRegister), new Register(savedGroupIdRegister)));
+
+        var sameGroupStep = ins.Count;
+        ins.Add(new AggStepInstruction(accumulator, collector, row));
+        ins.Add(new SorterNextInstruction(sourceSorter, new ProgramCounter(drainLoop)));
+
+        var finalizeLast = ins.Count;
+        EmitRowGroupFinalization(
+            ins,
+            accumulator,
+            outputs,
+            orderKeys,
+            outputSorter,
+            outputRecord,
+            outputBase,
+            orderBase,
+            havingBase,
+            firstSeenBase,
+            savedGroupIdRegister,
+            having);
+
+        var closeSourceAddress = ins.Count;
+        ins.Add(new CloseSorterInstruction(sourceSorter));
+        var outputSortIndex = ins.Count;
+        ins.Add(new SorterSortInstruction(outputSorter, new ProgramCounter(0)));
+
+        var outputLoop = ins.Count;
+        ins.Add(new SorterDataInstruction(outputSorter, outputRecord));
+        var havingFilterIndex = ins.Count;
+        ins.Add(new FilterRegistersInstruction(
+            new RegisterRange(new Register(havingBase), 1),
+            emitPredicate,
+            new ProgramCounter(0),
+            emitDescription));
+        var distinctGateIndex = -1;
+        if (distinctEquality is not null)
+        {
+            distinctGateIndex = ins.Count;
+            ins.Add(new DistinctGateInstruction(
+                output,
+                distinctEquality,
+                DistinctSetIndex: 1,
+                DuplicateTarget: new ProgramCounter(0)));
+        }
+
+        ins.Add(new ResultRowInstruction(output));
+        var nextOutputAddress = ins.Count;
+        ins.Add(new SorterNextInstruction(outputSorter, new ProgramCounter(outputLoop)));
+
+        var closeOutputAddress = ins.Count;
+        ins.Add(new CloseSorterInstruction(outputSorter));
+        ins.Add(new HaltInstruction());
+
+        ins[rewindIndex] = new RewindCursorInstruction(cursor, new ProgramCounter(closeCursorAddress));
+        if (whereIndex >= 0)
+        {
+            ins[whereIndex] = new FilterInstruction(
+                cursor,
+                predicate!,
+                new ProgramCounter(nextIngestAddress),
+                $"skip row when WHERE is false, goto {nextIngestAddress}");
+        }
+
+        ins[sourceSortIndex] = new SorterSortInstruction(sourceSorter, new ProgramCounter(closeSourceAddress));
+        ins[primeNextIndex] = new SorterNextInstruction(sourceSorter, new ProgramCounter(drainLoop));
+        ins[primeGotoIndex] = new GotoInstruction(new ProgramCounter(finalizeLast));
+        ins[sameGroupIndex] = new SameGroupInstruction(
+            currentGroup,
+            savedGroup,
+            static (left, right) => left[0].AsInteger() == right[0].AsInteger(),
+            new ProgramCounter(sameGroupStep));
+        ins[outputSortIndex] = new SorterSortInstruction(outputSorter, new ProgramCounter(closeOutputAddress));
+        ins[havingFilterIndex] = new FilterRegistersInstruction(
+            new RegisterRange(new Register(havingBase), 1),
+            emitPredicate,
+            new ProgramCounter(nextOutputAddress),
+            emitDescription);
+        if (distinctGateIndex >= 0)
+        {
+            ins[distinctGateIndex] = new DistinctGateInstruction(
+                output,
+                distinctEquality!,
+                DistinctSetIndex: 1,
+                DuplicateTarget: new ProgramCounter(nextOutputAddress));
+        }
+
+        return new VdbeProgram(
+            registerCount,
+            cursorCount: 1,
+            ins,
+            sorterCount: 2,
+            accumulatorCount: 1,
+            distinctSetCount: distinctEquality is null ? 1 : 2);
+    }
+
+    private static void EmitRowGroupFinalization(
+        List<VdbeInstruction> ins,
+        Accumulator accumulator,
+        IReadOnlyList<VdbeAggregate> outputs,
+        IReadOnlyList<VdbeAggregate> orderKeys,
+        Sorter outputSorter,
+        RegisterRange outputRecord,
+        int outputBase,
+        int orderBase,
+        int havingBase,
+        int firstSeenBase,
+        int savedGroupIdRegister,
+        AggregateFinalizerFilter? having)
+    {
+        for (var index = 0; index < outputs.Count; index++)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                accumulator,
+                outputs[index],
+                new Register(outputBase + index)));
+        }
+
+        if (having is null)
+            ins.Add(new LoadConstantInstruction(new Register(havingBase), SqlValue.Integer(1)));
+        else
+            ins.Add(new AggFinalizeInstruction(accumulator, having.Aggregate, new Register(havingBase)));
+
+        for (var index = 0; index < orderKeys.Count; index++)
+        {
+            ins.Add(new AggFinalizeInstruction(
+                accumulator,
+                orderKeys[index],
+                new Register(orderBase + index)));
+        }
+
+        ins.Add(new CopyInstruction(
+            new Register(savedGroupIdRegister),
+            new Register(firstSeenBase)));
+        ins.Add(new SorterInsertInstruction(outputSorter, outputRecord));
+    }
+
+    private static void ValidateRowPlan(
+        string tableName,
+        int tableColumnCount,
+        VdbeAggregate collector,
+        IReadOnlyList<VdbeAggregate> outputs,
+        AggregateFinalizerFilter? having)
+    {
+        ArgumentNullException.ThrowIfNull(tableName);
+        ArgumentNullException.ThrowIfNull(outputs);
+        if (tableColumnCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(tableColumnCount));
+        if (outputs.Count == 0)
+            throw new ArgumentException("An aggregation must project at least one output column.", nameof(outputs));
+
+        ValidateAggregate(collector, nameof(collector));
+        foreach (var output in outputs)
+            ValidateAggregate(output, nameof(outputs));
+        if (having is not null)
+        {
+            ValidateAggregate(having.Aggregate, nameof(having));
+            ArgumentNullException.ThrowIfNull(having.Predicate);
+            ArgumentNullException.ThrowIfNull(having.Description);
+        }
+    }
+
+    private static void ValidateAggregate(VdbeAggregate aggregate, string parameterName)
+    {
+        ArgumentNullException.ThrowIfNull(aggregate, parameterName);
+        if (string.IsNullOrEmpty(aggregate.Name))
+            throw new ArgumentException("Aggregate descriptors must have a name.", parameterName);
+        ArgumentNullException.ThrowIfNull(aggregate.CreateContext, parameterName);
+        ArgumentNullException.ThrowIfNull(aggregate.Accumulate, parameterName);
+        ArgumentNullException.ThrowIfNull(aggregate.Finalize, parameterName);
     }
 
     // Steps every aggregate from the live cursor row: gathers each aggregate's argument

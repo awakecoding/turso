@@ -316,6 +316,35 @@ public class AggregateOpcodeExecutionTests
                 new HaltInstruction(),
             ]));
 
+        // Computed group keys require a positive key width and an allocated group set.
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 2,
+            cursorCount: 0,
+            [
+                new GroupKeyInstruction(
+                    new RegisterRange(new Register(0), 1),
+                    new Register(1),
+                    KeyCount: 0,
+                    Projector: row => row,
+                    Equality: comparer,
+                    GroupSetIndex: 0),
+                new HaltInstruction(),
+            ],
+            distinctSetCount: 1));
+        Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
+            registerCount: 2,
+            cursorCount: 0,
+            [
+                new GroupKeyInstruction(
+                    new RegisterRange(new Register(0), 1),
+                    new Register(1),
+                    KeyCount: 1,
+                    Projector: row => row,
+                    Equality: comparer,
+                    GroupSetIndex: 0),
+                new HaltInstruction(),
+            ]));
+
         // Goto jump target outside the program.
         Assert.Throws<VdbeProgramValidationException>(() => new VdbeProgram(
             registerCount: 0,
@@ -337,6 +366,29 @@ public class AggregateOpcodeExecutionTests
     public void AccumulatorHandleRejectsNegativeIndex()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new Accumulator(-1));
+    }
+
+    [Test]
+    public void ResumableStatementRetainsTheParameterlessStepAbi()
+    {
+        typeof(ResumableStatement)
+            .GetMethod(nameof(ResumableStatement.StepResumable), Type.EmptyTypes)
+            .Should().NotBeNull();
+        typeof(ResumableStatement)
+            .GetMethod(
+                nameof(ResumableStatement.StepResumable),
+                [typeof(CancellationToken)])
+            .Should().NotBeNull();
+    }
+
+    [Test]
+    public void NewAggregateOpcodesPreserveExistingNumericValues()
+    {
+        ((int)VdbeOpcode.Next).Should().Be(14);
+        ((int)VdbeOpcode.RowSetInsert).Should().Be(35);
+        ((int)VdbeOpcode.Halt).Should().Be(50);
+        ((int)VdbeOpcode.GroupKey).Should().Be(51);
+        ((int)VdbeOpcode.DistinctGate).Should().Be(52);
     }
 
     // Loads saved/current keys, compares them with SameGroup, and returns the value the

@@ -41,12 +41,10 @@ public sealed record CompoundTerm(VdbeProgram Program, IReadOnlyList<VdbeCursorS
 /// (NULL==NULL together with affinity- and collation-aware comparison) rather than re-deriving it here.
 /// </para>
 /// <para>
-/// <c>UNION ALL</c> preserves any de-duplication a term already performs internally (its
-/// <c>DistinctResultRow</c> opcodes and distinct sets are relocated intact), so a distinct sub-query can
-/// appear as a <c>UNION ALL</c> term. <see cref="BuildUnionDistinct"/> layers one outer distinct set over
-/// terms that do not already de-duplicate; because same-operator <c>UNION</c> chains are associative and
-/// idempotent, a router should flatten them into a single <see cref="BuildUnionDistinct"/> call over all
-/// terms rather than nesting distinct compounds.
+/// <c>UNION ALL</c> preserves a term's internal group/distinct sets by relocating them intact.
+/// <see cref="BuildUnionDistinct"/> layers one outer distinct set over terms that carry no internal
+/// sets; because same-operator <c>UNION</c> chains are associative and idempotent, a router should
+/// flatten them into one call over all terms rather than nesting distinct compounds.
 /// </para>
 /// </remarks>
 public static class CompoundProgramBuilder
@@ -64,8 +62,8 @@ public static class CompoundProgramBuilder
     /// is emitted once, at its first occurrence across all terms, in arrival order.
     /// De-duplication uses <paramref name="rowEquality"/>, so the caller owns the exact row-equality
     /// contract. Requires at least two terms, all projecting the same number of columns, and none of
-    /// which already de-duplicates internally (flatten same-operator chains into one call instead of
-    /// nesting distinct compounds).
+    /// which carries internal group/distinct sets (flatten same-operator chains into one call instead
+    /// of nesting distinct compounds).
     /// </summary>
     public static CompoundTerm BuildUnionDistinct(IReadOnlyList<CompoundTerm> terms, VdbeRowEquality rowEquality)
     {
@@ -126,7 +124,7 @@ public static class CompoundProgramBuilder
             if (distinctEquality is not null && term.Program.DistinctSetCount != 0)
             {
                 throw new ArgumentException(
-                    $"Compound term {i} already de-duplicates internally; flatten same-operator UNION chains into one BuildUnionDistinct call instead of nesting distinct compounds.",
+                    $"Compound term {i} already uses internal group/distinct sets; flatten same-operator UNION chains or keep the compound on its evaluator route.",
                     nameof(terms));
             }
 
@@ -430,9 +428,23 @@ public static class CompoundProgramBuilder
 
         Register Reg(Register register) => new(register.Index + registerBase);
         RegisterRange Range(RegisterRange range) => new(Reg(range.Start), range.Count);
+        ProgramCounter Pc(ProgramCounter counter) => new(counter.Offset + instructionBase);
 
         return instruction switch
         {
+            GroupKeyInstruction x => new GroupKeyInstruction(
+                Range(x.Row),
+                Reg(x.Destination),
+                x.KeyCount,
+                x.Projector,
+                x.Equality,
+                x.GroupSetIndex + distinctBase,
+                x.Hasher),
+            DistinctGateInstruction x => new DistinctGateInstruction(
+                Range(x.Values),
+                x.Equality,
+                x.DistinctSetIndex + distinctBase,
+                Pc(x.DuplicateTarget)),
             DistinctResultRowInstruction x => new DistinctResultRowInstruction(Range(x.Values), x.Equality, x.DistinctSetIndex + distinctBase),
             RowSetInsertInstruction x => new RowSetInsertInstruction(Range(x.Values), x.Equality, x.RowSetIndex + distinctBase),
             CompoundResultRowInstruction x => new CompoundResultRowInstruction(
@@ -487,9 +499,9 @@ public static class CompoundProgramBuilder
         };
     }
 
-    // Relocates the register/cursor/sorter/accumulator/parameter-slot indices and jump targets shared by
-    // every non emit-family opcode, returning null for the emit family (ResultRow, DistinctResultRow,
-    // RowSetInsert, CompoundResultRow) so each caller rewrites it according to its own compound semantics.
+    // Relocates every opcode that has no distinct-set index, returning null for the emit/set family
+    // (GroupKey, ResultRow, DistinctResultRow, DistinctGate, RowSetInsert, CompoundResultRow) so each
+    // caller can relocate or rewrite it according to its compound semantics.
     private static VdbeInstruction? RelocateStructural(
         VdbeInstruction instruction,
         int registerBase,
@@ -544,7 +556,9 @@ public static class CompoundProgramBuilder
             YieldInstruction => instruction,
             HaltInstruction => instruction,
             ResultRowInstruction => null,
+            GroupKeyInstruction => null,
             DistinctResultRowInstruction => null,
+            DistinctGateInstruction => null,
             RowSetInsertInstruction => null,
             CompoundResultRowInstruction => null,
             _ => throw new StatementCompilationException(
