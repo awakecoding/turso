@@ -410,19 +410,19 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         return GetConnection().Prepare(sql);
     }
 
-    internal IDisposable OpenBlobMutationLease(string tableName, long rowId)
+    internal IDisposable OpenBlobMutationLease(string databaseName, string tableName, long rowId)
     {
-        return GetConnection().OpenBlobMutationLease(tableName, rowId);
+        return GetConnection().OpenBlobMutationLease(databaseName, tableName, rowId);
     }
 
-    internal long GetBlobMutationGeneration(string tableName, long rowId)
+    internal long GetBlobMutationGeneration(string databaseName, string tableName, long rowId)
     {
-        return GetConnection().GetBlobMutationGeneration(tableName, rowId);
+        return GetConnection().GetBlobMutationGeneration(databaseName, tableName, rowId);
     }
 
-    internal bool HasUpdateTrigger(string tableName)
+    internal bool HasUpdateTrigger(string databaseName, string tableName)
     {
-        return GetConnection().HasUpdateTrigger(tableName);
+        return GetConnection().HasUpdateTrigger(databaseName, tableName);
     }
 
     private EmbeddedConnection GetConnection()

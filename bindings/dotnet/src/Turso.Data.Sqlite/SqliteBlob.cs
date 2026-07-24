@@ -9,6 +9,7 @@ public class SqliteBlob : Stream
     private readonly MemoryStream? _stream;
     private readonly IManagedIncrementalBlobAdapter? _managedBlob;
     private readonly SqliteConnection? _connection;
+    private readonly string? _databaseName;
     private readonly string? _tableName;
     private readonly string? _columnName;
     private readonly long _rowId;
@@ -37,6 +38,7 @@ public class SqliteBlob : Stream
             throw new InvalidOperationException(Properties.Resources.SqlBlobRequiresOpenConnection);
 
         _connection = connection;
+        _databaseName = databaseName;
         _tableName = tableName;
         _columnName = columnName;
         _rowId = rowId;
@@ -60,10 +62,7 @@ public class SqliteBlob : Stream
             return;
         }
 
-        if (!string.Equals(databaseName, "main", StringComparison.OrdinalIgnoreCase))
-            throw new SqliteException(Properties.Resources.SqliteNativeError(1, $"unknown database: {databaseName}"), 1);
-
-        _stream = new MemoryStream(GetBlobValue(connection, tableName, columnName, rowId), writable: true);
+        _stream = new MemoryStream(GetBlobValue(connection, databaseName, tableName, columnName, rowId), writable: true);
     }
 
     internal SqliteBlob(byte[] value)
@@ -259,20 +258,31 @@ public class SqliteBlob : Stream
 
     private void Persist()
     {
-        if (_connection is null || _tableName is null || _columnName is null || _readOnly)
+        if (_connection is null
+            || _databaseName is null
+            || _tableName is null
+            || _columnName is null
+            || _readOnly)
             return;
 
         using var command = _connection.CreateCommand();
-        command.CommandText = "UPDATE " + QuoteIdentifier(_tableName) + " SET " + QuoteIdentifier(_columnName) + " = $value WHERE rowid = $rowid;";
+        command.CommandText = "UPDATE " + QualifyTable(_databaseName, _tableName)
+            + " SET " + QuoteIdentifier(_columnName) + " = $value WHERE rowid = $rowid;";
         command.Parameters.Add("$value", SqliteType.Blob).Value = GetStream().ToArray();
         command.Parameters.Add("$rowid", SqliteType.Integer).Value = _rowId;
         command.ExecuteNonQuery();
     }
 
-    private static byte[] GetBlobValue(SqliteConnection connection, string tableName, string columnName, long rowId)
+    private static byte[] GetBlobValue(
+        SqliteConnection connection,
+        string databaseName,
+        string tableName,
+        string columnName,
+        long rowId)
     {
         using var command = connection.CreateCommand();
-        command.CommandText = "SELECT " + QuoteIdentifier(columnName) + " FROM " + QuoteIdentifier(tableName) + " WHERE rowid = $rowid;";
+        command.CommandText = "SELECT " + QuoteIdentifier(columnName)
+            + " FROM " + QualifyTable(databaseName, tableName) + " WHERE rowid = $rowid;";
         command.Parameters.Add("$rowid", SqliteType.Integer).Value = rowId;
         var value = command.ExecuteScalar();
         return value switch
@@ -297,6 +307,9 @@ public class SqliteBlob : Stream
 
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+
+    private static string QualifyTable(string databaseName, string tableName)
+        => QuoteIdentifier(databaseName) + "." + QuoteIdentifier(tableName);
 
     private static SqliteException ToSqliteException(ManagedBlobException exception)
         => new(

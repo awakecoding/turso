@@ -16171,24 +16171,25 @@ public sealed class EmbeddedConnection : IDisposable
         return removed;
     }
 
-    internal IDisposable OpenBlobMutationLease(string tableName, long rowId)
+    internal IDisposable OpenBlobMutationLease(string databaseName, string tableName, long rowId)
     {
         ThrowIfDisposed();
-        return _database.OpenBlobMutationLease(tableName, rowId);
+        return ResolveBlobDatabase(databaseName).OpenBlobMutationLease(tableName, rowId);
     }
 
-    internal long GetBlobMutationGeneration(string tableName, long rowId)
+    internal long GetBlobMutationGeneration(string databaseName, string tableName, long rowId)
     {
         ThrowIfDisposed();
-        return _database.GetBlobMutationGeneration(tableName, rowId);
+        return ResolveBlobDatabase(databaseName).GetBlobMutationGeneration(tableName, rowId);
     }
 
-    internal bool HasUpdateTrigger(string tableName)
+    internal bool HasUpdateTrigger(string databaseName, string tableName)
     {
         ThrowIfDisposed();
+        var database = ResolveBlobDatabase(databaseName);
         var catalog = _transactionCatalog;
-        return catalog is null
-            ? _database.HasUpdateTrigger(tableName)
+        return catalog is null || !ReferenceEquals(database, _database)
+            ? database.HasUpdateTrigger(tableName)
             : catalog.Triggers.Values.Any(trigger =>
                 trigger.Event == TriggerEvent.Update
                 && string.Equals(trigger.TableName, tableName, StringComparison.OrdinalIgnoreCase));
@@ -16415,9 +16416,12 @@ public sealed class EmbeddedConnection : IDisposable
     private ExecutionResult ExecuteDetach(DetachDatabaseStatement statement)
     {
         EnsureAutocommitAttachmentLifecycle();
-        if (!_attachedDatabases.Remove(statement.Alias, out var attachment))
+        if (!_attachedDatabases.TryGetValue(statement.Alias, out var attachment))
             throw new EmbeddedSqlException($"no such database: {statement.Alias}");
+        if (attachment.Database.HasOpenBlobHandles)
+            throw new EmbeddedSqlException("database is locked");
 
+        _attachedDatabases.Remove(statement.Alias);
         attachment.Database.Dispose();
         return ExecutionResult.Empty;
     }
@@ -16595,6 +16599,16 @@ public sealed class EmbeddedConnection : IDisposable
             throw new EmbeddedSqlException($"no such database: {schema}");
 
         return new RoutedStatement(attachment.Database, rewrite(localName), IsAttached: true);
+    }
+
+    private EmbeddedDatabase ResolveBlobDatabase(string databaseName)
+    {
+        if (databaseName.Equals("main", StringComparison.OrdinalIgnoreCase))
+            return _database;
+        if (_attachedDatabases.TryGetValue(databaseName, out var attachment))
+            return attachment.Database;
+
+        throw new EmbeddedSqlException($"no such database: {databaseName}");
     }
 
     private static bool ContainsSchemaQualification(ParsedStatement statement)
