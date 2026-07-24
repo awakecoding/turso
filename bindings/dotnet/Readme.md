@@ -197,6 +197,27 @@ Supported common connection string keywords include:
 - SQLite virtual-table modules such as FTS3/FTS5 are not built in unless provided by a Turso extension/module.
 - Async methods currently use the base ADO.NET behavior rather than a dedicated async native path.
 
+### Managed query-plan diagnostics
+
+The managed provider supports both SQLite diagnostic statement forms. `EXPLAIN` returns
+`addr`, `opcode`, `p1`, `p2`, `p3`, `p4`, and `comment` for a statement that is fully
+lowered to the managed VDBE. It returns an error for evaluator-owned statements rather
+than fabricating bytecode. Bound parameter values participate in lowering and can appear
+in the VDBE dump, so parameterized `EXPLAIN` output can change after rebinding.
+
+`EXPLAIN QUERY PLAN` keeps SQLite's public `id`, `parent`, `notused`, and `detail`
+columns but reports the managed execution boundary, not SQLite optimizer internals. It
+returns one deterministic row: the first three columns are `0`, and `detail` is either
+`MANAGED COMPILED VDBE` or `MANAGED EVALUATOR FALLBACK`. All parameters must be bound
+before stepping; their values are used to choose the same route as normal execution but
+are never rendered in the plan row. Planning never runs the emitted program, evaluator,
+or DML write target. Unsupported non-query/non-DML statements fail explicitly.
+
+These rows intentionally do not claim table scans, index choices, costs, cardinalities,
+or other planner details that the managed engine does not expose. SQLite's column shape
+is the compatibility contract; the two managed `detail` strings and fixed IDs are the
+stable managed contract.
+
 ## Entity Framework Core
 
 `Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local and embedded Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through `Turso.Data.Sqlite`.

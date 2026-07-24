@@ -850,6 +850,7 @@ public sealed class EmbeddedDatabase : IDisposable
             PragmaDatabaseListStatement => ExecutePragmaDatabaseList(),
             PragmaEncodingStatement => ExecutePragmaEncoding(),
             ExplainStatement explain => ExecuteExplain(explain, parameters, context),
+            ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(explainQueryPlan, parameters, context),
             BeginStatement => ExecutionResult.Empty,
             CommitStatement => ExecutionResult.Empty,
             RollbackStatement => ExecutionResult.Empty,
@@ -3987,8 +3988,7 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!RoutableBuiltinScalarFunctions.Contains(name))
             return false;
 
-        if (_scalarFunctions.ContainsKey((name, candidate.Arguments.Count))
-            || _scalarFunctions.ContainsKey((name, -1)))
+        if (HasRegisteredScalarFunction(candidate))
         {
             return false;
         }
@@ -6826,10 +6826,18 @@ public sealed class EmbeddedDatabase : IDisposable
                     && !function.Distinct
                     && function.Filter is null
                     && !ContainsAggregate(function)
+                    && !HasRegisteredScalarFunction(function)
                     && function.Arguments.All(IsConstantScalarExpression);
             default:
                 return false;
         }
+    }
+
+    private bool HasRegisteredScalarFunction(FunctionExpression function)
+    {
+        var name = function.Name.ToUpperInvariant();
+        return _scalarFunctions.ContainsKey((name, function.Arguments.Count))
+            || _scalarFunctions.ContainsKey((name, -1));
     }
 
     private ExecutionResult ExecuteExplain(
@@ -6879,6 +6887,55 @@ public sealed class EmbeddedDatabase : IDisposable
             && select.Projections.Any(projection => projection.Expression is ParameterExpression);
 
     internal static string[] ExplainColumns() => ["addr", "opcode", "p1", "p2", "p3", "p4", "comment"];
+
+    private ExecutionResult ExecuteExplainQueryPlan(
+        ExplainQueryPlanStatement statement,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var usesCompiledProgram = statement.Inner switch
+        {
+            SelectStatement select => TryCompileSelect(select, parameters, context, outerRow: null, out _),
+            CompoundSelectStatement compound => TryCompileCompoundSelect(
+                compound,
+                parameters,
+                context,
+                outerRow: null,
+                out _),
+            ValuesClause values => TryPrepareValuesLowering(values, out _),
+            WithSelectStatement with => TryBuildRecursiveCteExplainProgram(
+                with,
+                parameters,
+                context,
+                out _),
+            InsertStatement insert => CanCompileDml(context)
+                && TryCompileInsert(insert, parameters, context, out _, out _, out _),
+            UpdateStatement update => CanCompileDml(context)
+                && TryCompileUpdate(update, parameters, context, out _, out _, out _),
+            DeleteStatement delete => CanCompileDml(context)
+                && TryCompileDelete(delete, parameters, context, out _, out _, out _),
+            QueryStatement or WithDmlStatement => false,
+            _ => throw new EmbeddedSqlException(
+                "EXPLAIN QUERY PLAN is only supported for queries and INSERT, UPDATE, or DELETE statements."),
+        };
+
+        var detail = usesCompiledProgram
+            ? "MANAGED COMPILED VDBE"
+            : "MANAGED EVALUATOR FALLBACK";
+        return new ExecutionResult(
+            ExplainQueryPlanColumns(),
+            [
+                [
+                    SqlValue.Integer(0),
+                    SqlValue.Integer(0),
+                    SqlValue.Integer(0),
+                    SqlValue.Text(detail),
+                ],
+            ],
+            0);
+    }
+
+    internal static string[] ExplainQueryPlanColumns() => ["id", "parent", "notused", "detail"];
 
     private static ExecutionResult DescribeProgram(VdbeProgram program)
     {
@@ -15872,6 +15929,9 @@ public sealed class EmbeddedConnection : IDisposable
             QueryStatement query => RouteQuery(query),
             ExplainStatement { Inner: var inner } when ContainsSchemaQualification(inner)
                 => throw new EmbeddedSqlException("EXPLAIN for schema-qualified managed ATTACH statements is not supported."),
+            ExplainQueryPlanStatement { Inner: var inner } when ContainsSchemaQualification(inner)
+                => throw new EmbeddedSqlException(
+                    "EXPLAIN QUERY PLAN for schema-qualified managed ATTACH statements is not supported."),
             _ when ContainsSchemaQualification(statement)
                 => throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH."),
             _ => new RoutedStatement(_database, statement, IsAttached: false),
@@ -16018,6 +16078,7 @@ public sealed class EmbeddedConnection : IDisposable
                 || ContainsSchemaQualification(with.Dml),
             QueryStatement query => QueryContainsSchemaQualification(query),
             ExplainStatement explain => ContainsSchemaQualification(explain.Inner),
+            ExplainQueryPlanStatement explainQueryPlan => ContainsSchemaQualification(explainQueryPlan.Inner),
             _ => false,
         };
     }
@@ -16330,6 +16391,8 @@ public sealed class EmbeddedConnection : IDisposable
     {
         if (statement is ExplainStatement)
             return EmbeddedDatabase.ExplainColumns();
+        if (statement is ExplainQueryPlanStatement)
+            return EmbeddedDatabase.ExplainQueryPlanColumns();
         if (statement is PragmaTableInfoStatement)
             return ["cid", "name", "type", "notnull", "dflt_value", "pk"];
         if (statement is PragmaTableXInfoStatement)
@@ -16540,6 +16603,7 @@ public sealed class EmbeddedStatement : IDisposable
         if (_statement is (QueryStatement or PragmaTableInfoStatement or PragmaTableXInfoStatement
             or PragmaIndexListStatement or PragmaIndexInfoStatement or PragmaTableListStatement
             or PragmaDatabaseListStatement or PragmaEncodingStatement or ExplainStatement)
+            || _statement is ExplainQueryPlanStatement
             || _statement is PragmaQueryOnlyStatement { Enabled: null }
             || _statement is PragmaForeignKeysStatement { Enabled: null }
             || _statement is PragmaRecursiveTriggersStatement { Enabled: null }
@@ -17739,6 +17803,8 @@ internal sealed record DetachDatabaseStatement(string Alias) : ParsedStatement;
 
 internal sealed record ExplainStatement(ParsedStatement Inner) : ParsedStatement;
 
+internal sealed record ExplainQueryPlanStatement(ParsedStatement Inner) : ParsedStatement;
+
 internal sealed record SelectStatement(
     bool Distinct,
     IReadOnlyList<Projection> Projections,
@@ -17987,7 +18053,7 @@ internal sealed class SqlParser
             if (ConsumeKeyword("QUERY"))
             {
                 ExpectKeyword("PLAN");
-                throw Error("EXPLAIN QUERY PLAN is not supported.");
+                return new ExplainQueryPlanStatement(ParseStatement());
             }
 
             return new ExplainStatement(ParseStatement());
