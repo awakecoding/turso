@@ -16,7 +16,7 @@ internal sealed record EmbeddedFileCatalog(
 /// Bridges the managed <see cref="EmbeddedDatabase"/> catalog to durable,
 /// SQLite-format storage. It persists the schema on page 1 as a real
 /// <c>sqlite_schema</c> table b-tree and stores each ordinary user table's
-/// rows and BINARY ascending secondary indexes in recursively constructed
+/// rows and metadata-ordered secondary indexes in recursively constructed
 /// SQLite b-trees. The supported WITHOUT ROWID subset uses recursively
 /// constructed SQLite index b-trees. Table and index records may use standard
 /// SQLite overflow pages. All bytes are genuine SQLite page, cell, and record encodings;
@@ -38,12 +38,12 @@ internal sealed class EmbeddedFileStore : IDisposable
     private readonly IFileSystem _fileSystem;
     private readonly string _databasePath;
     private readonly string _walPath;
-    private readonly int _pageSize;
-    private readonly int _usableSpace;
+    private int _pageSize;
+    private int _usableSpace;
     private SqliteDatabaseHeader _header;
-    private readonly SqliteTextEncoding _textEncoding;
+    private SqliteTextEncoding _textEncoding;
 
-    private readonly SqlitePager _pager;
+    private SqlitePager _pager;
     private Dictionary<string, uint> _tableRootPages = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, uint> _indexRootPages = new(StringComparer.OrdinalIgnoreCase);
     private string _lastSchemaSignature = string.Empty;
@@ -73,7 +73,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         IFileSystem fileSystem,
         out EmbeddedFileCatalog catalog,
         TursoEncryptionOptions? encryption = null,
-        bool readOnly = false)
+        bool readOnly = false,
+        int? initialPageSize = null,
+        SqliteTextEncoding? initialTextEncoding = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(fileSystem);
@@ -81,6 +83,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         var walPath = path + "-wal";
         var databaseExists = fileSystem.FileExists(path);
         var walExists = fileSystem.FileExists(walPath);
+        if (initialPageSize is { } requestedPageSize)
+            _ = SqlitePageSize.Encode(requestedPageSize);
 
         SqlitePager pager;
         if (!databaseExists && !walExists)
@@ -91,28 +95,30 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"Cannot open managed database '{path}' read-only because neither its database file nor write-ahead log exists.");
             }
 
-            var header = SqliteDatabaseHeader.CreateDefault();
+            var header = SqliteDatabaseHeader.CreateDefault() with
+            {
+                PageSize = initialPageSize ?? SqlitePageSize.Default,
+                TextEncoding = initialTextEncoding ?? SqliteTextEncoding.Utf8,
+            };
             var walHeader = SqliteWalHeader.Create(
                 header.PageSize,
                 unchecked((uint)Random.Shared.Next()),
                 unchecked((uint)Random.Shared.Next()));
             pager = SqlitePager.Create(fileSystem, path, walPath, walHeader, header, encryption: encryption);
         }
-        else if (databaseExists && walExists)
+        else if (databaseExists)
         {
+            if (initialPageSize is not null || initialTextEncoding is not null)
+            {
+                throw new InvalidOperationException(
+                    "Initial page size and text encoding can be specified only when creating a database.");
+            }
             pager = SqlitePager.Open(fileSystem, path, walPath, readOnly, encryption: encryption);
         }
         else
         {
-            if (readOnly)
-            {
-                throw new EmbeddedSqlException(
-                    $"Cannot open managed database '{path}' read-only because its database file and write-ahead log must both exist. "
-                    + "Creating or recovering the missing companion file would mutate storage.");
-            }
-
             throw new EmbeddedSqlException(
-                $"The managed file database '{path}' is missing its companion write-ahead log; the managed file engine only reopens databases it created.");
+                $"The managed file database '{path}' is missing its main database file.");
         }
 
         try
@@ -151,7 +157,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (!string.Equals(entry.Type, "table", StringComparison.Ordinal))
                 continue;
 
-            var statement = SqlParser.Parse(entry.Sql, SqlParameterMap.Parse(entry.Sql));
+            var statement = SqlParser.Parse(entry.Sql!, SqlParameterMap.Parse(entry.Sql!));
             if (statement is not CreateTableStatement create)
                 throw new EmbeddedSqlException($"Stored schema for table '{entry.Name}' is not a CREATE TABLE statement.");
             if (!string.Equals(create.Name, entry.Name, StringComparison.OrdinalIgnoreCase))
@@ -159,7 +165,15 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new EmbeddedSqlException(
                     $"Stored schema entry for table '{entry.Name}' does not match its CREATE TABLE name.");
             }
-            var table = new EmbeddedTable(create.Columns, create.WithoutRowid, create.PrimaryKeyColumns);
+            var table = new EmbeddedTable(
+                entry.Name,
+                create.Columns,
+                create.WithoutRowid,
+                create.PrimaryKeyColumns,
+                create.UniqueConstraints,
+                create.CheckConstraints,
+                create.PrimaryKeyConflictAlgorithm,
+                create.PrimaryKeyConstraintName);
             LoadTableRows(entry.Name, table, entry.RootPage, occupiedBtreePages);
             tables[entry.Name] = table;
             rootPages[entry.Name] = entry.RootPage;
@@ -179,6 +193,23 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 throw new EmbeddedSqlException(
                     $"Stored index '{entry.Name}' references WITHOUT ROWID table '{entry.TableName}', but secondary indexes on the managed WITHOUT ROWID persistence subset are not supported.");
+            }
+
+            if (entry.Sql is null)
+            {
+                var implicitIndex = table.Indexes.SingleOrDefault(index =>
+                    index.Origin != EmbeddedIndexOrigin.Explicit
+                    && string.Equals(index.Name, entry.Name, StringComparison.OrdinalIgnoreCase));
+                if (implicitIndex is null)
+                {
+                    throw new EmbeddedSqlException(
+                        $"Stored implicit index '{entry.Name}' does not match a UNIQUE or PRIMARY KEY constraint on table '{entry.TableName}'.");
+                }
+
+                ValidateIndexRepresentable(entry.TableName, table, implicitIndex);
+                ValidateStoredIndex(entry, table, implicitIndex, occupiedBtreePages);
+                indexRootPages.Add(entry.Name, entry.RootPage);
+                continue;
             }
 
             var statement = SqlParser.Parse(entry.Sql, SqlParameterMap.Parse(entry.Sql));
@@ -202,12 +233,14 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         foreach (var entry in schemaEntries)
         {
+            if (entry.Type is "table" or "index")
+                continue;
+
+            if (entry.Sql is null)
+                throw new EmbeddedSqlException($"Stored schema entry '{entry.Name}' is missing SQL text.");
             var statement = SqlParser.Parse(entry.Sql, SqlParameterMap.Parse(entry.Sql));
             switch (entry.Type)
             {
-                case "table":
-                case "index":
-                    continue;
                 case "view" when statement is CreateViewStatement view:
                     ValidateStoredView(entry, view);
                     views[entry.Name] = new ViewDefinition(view.Name, view.Columns, view.Query, view.Sql);
@@ -270,7 +303,21 @@ internal sealed class EmbeddedFileStore : IDisposable
                         CollectTableTreePages(entry, table, activePages, pageCount, overflowReader);
                         break;
                     case "index":
-                        CollectIndexTreePages(entry, activePages, pageCount, overflowReader);
+                        if (!tables.TryGetValue(entry.TableName, out var indexedTable))
+                        {
+                            throw new InvalidDataException(
+                                $"Managed file database is missing table '{entry.TableName}' for index '{entry.Name}'.");
+                        }
+                        var index = indexedTable.Indexes.SingleOrDefault(candidate =>
+                            string.Equals(candidate.Name, entry.Name, StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidDataException(
+                                $"Managed file database is missing the loaded definition for index '{entry.Name}'.");
+                        CollectIndexTreePages(
+                            entry,
+                            activePages,
+                            pageCount,
+                            overflowReader,
+                            CreateIndexComparer(index));
                         break;
                 }
             }
@@ -412,7 +459,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         SchemaEntry entry,
         ISet<uint> activePages,
         uint pageCount,
-        SqliteOverflowChainReader overflowReader)
+        SqliteOverflowChainReader overflowReader,
+        SqliteIndexRecordComparer comparer)
     {
         AddOwnedPage(activePages, entry.RootPage, pageCount, $"index '{entry.Name}' root");
         _ = CollectIndexTreeNodePages(
@@ -422,7 +470,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             activePages,
             pageCount,
             overflowReader,
-            "root");
+            "root",
+            comparer);
     }
 
     private int CollectIndexTreeNodePages(
@@ -432,8 +481,10 @@ internal sealed class EmbeddedFileStore : IDisposable
         ISet<uint> activePages,
         uint pageCount,
         SqliteOverflowChainReader overflowReader,
-        string owner)
+        string owner,
+        SqliteIndexRecordComparer? comparer = null)
     {
+        comparer ??= new SqliteIndexRecordComparer(_textEncoding);
         var header = SqliteBtreePageHeader.Parse(pageImage);
         switch (header.PageType)
         {
@@ -443,7 +494,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                         pageImage,
                         _usableSpace,
                         _textEncoding,
-                        overflowReader: overflowReader),
+                        overflowReader: overflowReader,
+                        recordComparer: comparer),
                     activePages,
                     pageCount,
                     overflowReader,
@@ -455,7 +507,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                         pageImage,
                         _usableSpace,
                         _textEncoding,
-                        overflowReader: overflowReader);
+                        overflowReader: overflowReader,
+                        recordComparer: comparer);
                     foreach (var cell in interior.Cells)
                     {
                         CollectIndexOverflowPages(
@@ -483,7 +536,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                             activePages,
                             pageCount,
                             overflowReader,
-                            $"interior child {pageNumber}");
+                            $"interior child {pageNumber}",
+                            comparer);
                         if (childHeight is { } expectedHeight && height != expectedHeight)
                         {
                             throw new InvalidDataException(
@@ -654,7 +708,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                             RequireText(values[1], "name"),
                             RequireText(values[2], "tbl_name"),
                             checked((uint)RequireInteger(values[3], "rootpage")),
-                            RequireText(values[4], "sql")));
+                            RequireNullableText(values[4], "sql")));
                         previousRowId = cell.Cell.RowId;
                     }
 
@@ -933,12 +987,11 @@ internal sealed class EmbeddedFileStore : IDisposable
                     "Managed file database table leaves are not globally ordered by rowid.");
             }
 
-            var values = DecodeCellRecord(cell.Cell);
-            if (values.Length != table.ColumnDefinitions.Length)
-                throw new EmbeddedSqlException($"Managed file database row for table has {values.Length} column(s) but the schema declares {table.ColumnDefinitions.Length}.");
+            var values = RestoreRowidTableRecord(table, DecodeCellRecord(cell.Cell));
 
             if (aliasIndex >= 0)
                 values[aliasIndex] = SqlValue.Integer(cell.Cell.RowId);
+            EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, table.Name, values);
 
             // Preserve the on-disk rowid so both alias and hidden-rowid tables keep their
             // identity across reopen, exactly as SQLite does.
@@ -998,7 +1051,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 previousKey = key;
             }
 
-            table.ValidateRows(table.Rows);
+            table.ValidateRows(tableName, table.Rows);
         }
         catch (EmbeddedSqlException)
         {
@@ -1020,36 +1073,164 @@ internal sealed class EmbeddedFileStore : IDisposable
         return SqliteRecordCodec.Decode(payload, _textEncoding);
     }
 
+    private static SqlValue[] RestoreRowidTableRecord(
+        EmbeddedTable table,
+        IReadOnlyList<SqlValue> storedValues)
+    {
+        var storedColumnCount = table.ColumnDefinitions.Count(
+            column => !column.IsGenerated || column.GeneratedStored);
+        if (storedValues.Count != storedColumnCount)
+        {
+            throw new EmbeddedSqlException(
+                $"Managed file database row for table has {storedValues.Count} stored column(s), "
+                + $"but the schema requires {storedColumnCount}.");
+        }
+
+        var row = new SqlValue[table.ColumnDefinitions.Length];
+        var source = 0;
+        for (var columnIndex = 0; columnIndex < row.Length; columnIndex++)
+        {
+            var column = table.ColumnDefinitions[columnIndex];
+            row[columnIndex] = column.IsGenerated && !column.GeneratedStored
+                ? SqlValue.Null
+                : storedValues[source++];
+        }
+
+        return row;
+    }
+
     /// <summary>
     /// Validates and durably persists the full managed catalog as SQLite pages in
     /// a single atomic WAL transaction. Any unsupported schema or data is rejected
     /// before a byte is written so the on-disk database is never left invalid.
     /// </summary>
-    public void Persist(
+    public FileCatalogVersion Persist(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
-        => PersistCore(tables, views, triggers, reclaimTrailingPages: false);
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        PragmaHeaderMetadata? pragmaHeader = null)
+        => PersistCore(tables, views, triggers, reclaimTrailingPages: false, pragmaHeader);
+
+    internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
 
     /// <summary>
     /// Rebuilds the current managed catalog into the smallest complete page image
     /// the managed writer can represent, then checkpoints and physically removes
-    /// its retired suffix. It is intentionally not wired to SQL <c>VACUUM</c>:
-    /// this limited writer has not implemented VACUUM's full SQL and transaction
-    /// semantics.
+    /// its retired suffix.
     /// </summary>
     internal void Compact()
     {
         ThrowIfDisposed();
         var catalog = Load();
-        PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true);
+        _ = PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true, pragmaHeader: null);
     }
 
-    private void PersistCore(
+    internal SqliteJournalMode JournalMode => _pager.JournalMode;
+
+    internal SqliteJournalMode SwitchJournalMode(SqliteJournalMode journalMode)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        var result = _pager.SwitchJournalMode(journalMode);
+        _header = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
+        return result;
+    }
+
+    internal void MigratePageSize(
+        int pageSize,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        _ = SqlitePageSize.Encode(pageSize);
+        if (pageSize == _pageSize)
+            return;
+        if (_pager.JournalMode != SqliteJournalMode.Delete)
+        {
+            throw new EmbeddedSqlException(
+                "cannot change page size while in WAL mode; set PRAGMA journal_mode=DELETE first");
+        }
+
+        var temporaryPath = _databasePath + $".page-size-{Guid.NewGuid():N}.tmp";
+        var temporaryWalPath = temporaryPath + "-wal";
+        var temporaryJournalPath = temporaryPath + "-journal";
+        try
+        {
+            using (var replacement = Open(
+                       temporaryPath,
+                       _fileSystem,
+                       out _,
+                       initialPageSize: pageSize,
+                       initialTextEncoding: _textEncoding))
+            {
+                replacement.Persist(tables, views, triggers);
+                replacement.SwitchJournalMode(SqliteJournalMode.Delete);
+                replacement.RewriteMigrationHeader(_header);
+            }
+
+            _pager.ReplaceDatabaseFile(temporaryPath);
+            _pager.Dispose();
+            _pager = SqlitePager.Open(_fileSystem, _databasePath, _walPath);
+            _header = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
+            _pageSize = _header.PageSize;
+            _usableSpace = _header.UsableSpace;
+            _textEncoding = _header.TextEncoding == SqliteTextEncoding.Unset
+                ? SqliteTextEncoding.Utf8
+                : _header.TextEncoding;
+            _ = Load();
+        }
+        finally
+        {
+            TryDeleteArtifact(temporaryJournalPath);
+            TryDeleteArtifact(temporaryWalPath);
+            TryDeleteArtifact(temporaryPath);
+        }
+    }
+
+    private void RewriteMigrationHeader(SqliteDatabaseHeader sourceHeader)
+    {
+        var pageOne = _pager.ReadCommittedPage(SchemaRootPage);
+        var current = SqliteDatabaseHeader.Parse(pageOne);
+        var changeCounter = unchecked(sourceHeader.ChangeCounter + 1);
+        var migrated = current with
+        {
+            ChangeCounter = changeCounter,
+            VersionValidFor = changeCounter,
+            DatabaseSizeInPages = _pager.CommittedPageCount,
+            SchemaCookie = sourceHeader.SchemaCookie,
+            DefaultPageCacheSize = sourceHeader.DefaultPageCacheSize,
+            TextEncoding = sourceHeader.TextEncoding,
+            UserVersion = sourceHeader.UserVersion,
+            ApplicationId = sourceHeader.ApplicationId,
+            SqliteVersion = sourceHeader.SqliteVersion,
+        };
+        migrated.WriteTo(pageOne);
+        using var transaction = _pager.BeginTransaction(_pager.CommittedPageCount);
+        transaction.WritePage(SchemaRootPage, pageOne);
+        transaction.Commit();
+        _header = migrated;
+    }
+
+    private void TryDeleteArtifact(string path)
+    {
+        try
+        {
+            _fileSystem.DeleteFile(path);
+        }
+        catch
+        {
+            // Migration is already committed; stale temporary artifacts are non-authoritative.
+        }
+    }
+
+    private FileCatalogVersion PersistCore(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
-        bool reclaimTrailingPages)
+        bool reclaimTrailingPages,
+        PragmaHeaderMetadata? pragmaHeader)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1059,8 +1240,12 @@ internal sealed class EmbeddedFileStore : IDisposable
             EmbeddedFileStore.ValidateTableRepresentable(name, table);
         ValidateSchemaDefinitions(tables, views, triggers);
 
-        if (!reclaimTrailingPages && TryPersistBoundedTableLeafMutation(tables, views, triggers))
-            return;
+        if (!reclaimTrailingPages
+            && pragmaHeader is null
+            && TryPersistBoundedTableLeafMutation(tables, views, triggers))
+        {
+            return CommittedCatalogVersion;
+        }
 
         var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
         var currentFreelist = SqliteFreelist.Read(
@@ -1131,7 +1316,11 @@ internal sealed class EmbeddedFileStore : IDisposable
             DatabaseSizeInPages = target,
             FirstFreelistTrunkPage = freelist.FirstTrunkPage,
             FreelistPageCount = freelist.PageCount,
-            SchemaCookie = schemaChanged ? currentHeader.SchemaCookie + 1 : currentHeader.SchemaCookie,
+            SchemaCookie = pragmaHeader is { } metadata
+                ? unchecked((uint)metadata.SchemaVersion)
+                : schemaChanged ? currentHeader.SchemaCookie + 1 : currentHeader.SchemaCookie,
+            UserVersion = pragmaHeader?.UserVersion ?? currentHeader.UserVersion,
+            ApplicationId = pragmaHeader?.ApplicationId ?? currentHeader.ApplicationId,
         };
         newHeader.WriteTo(schemaTree.RootPage);
         ValidateRewritePlan(
@@ -1186,12 +1375,12 @@ internal sealed class EmbeddedFileStore : IDisposable
         // A full catalog rewrite rewrites every managed page. Once its exclusive
         // checkpoint has durably installed that view, retain neither its WAL frames
         // nor overlay so later rewrites do not rescan an unbounded history.
-        CheckpointCommittedMutation(reclaimTrailingPages);
-
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages);
         _tableRootPages = rootPages;
         _indexRootPages = indexRootPages;
         _lastSchemaSignature = signature;
+        return CommittedCatalogVersion;
     }
 
     /// <summary>
@@ -1632,8 +1821,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             transaction.Commit();
         }
 
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -1769,8 +1958,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -1883,8 +2072,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 appendedCell,
                 targetSchemaPage);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -2092,8 +2281,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -2205,83 +2394,83 @@ internal sealed class EmbeddedFileStore : IDisposable
             switch (SqliteBtreePageHeader.Parse(sourcePage).PageType)
             {
                 case SqliteBtreePageType.IndexLeaf:
-                {
-                    var leaf = SqliteIndexLeafPageView.Parse(
-                        sourcePage,
-                        _usableSpace,
-                        _textEncoding,
-                        overflowReader: overflowReader);
-                    if (leaf.Cells.Count == 0
-                        || (leafDepth is { } expectedDepth && expectedDepth != depth))
                     {
-                        return false;
-                    }
-
-                    leafDepth ??= depth;
-                    for (var recordIndex = 0; recordIndex < leaf.Cells.Count; recordIndex++)
-                    {
-                        if (!AddOverflowPages(leaf.Cells[recordIndex].Cell))
-                            return false;
-
-                        var record = leaf.GetRecord(recordIndex);
-                        if (!AddRecord(record))
-                            return false;
-                        maximumRecord = record;
-                    }
-
-                    return true;
-                }
-
-                case SqliteBtreePageType.IndexInterior:
-                {
-                    var interior = SqliteIndexInteriorPageView.Parse(
-                        sourcePage,
-                        _usableSpace,
-                        _textEncoding,
-                        overflowReader: overflowReader);
-                    if (interior.Cells.Count == 0)
-                    {
-                        return false;
-                    }
-
-                    var childPages = interior.Cells
-                        .Select(cell => cell.Cell.LeftChildPage)
-                        .Append(interior.Header.RightMostChildPage)
-                        .ToArray();
-                    if (childPages.Length != interior.Cells.Count + 1)
-                        return false;
-
-                    for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
-                    {
-                        if (!Visit(
-                                childPages[childIndex],
-                                _pager.ReadCommittedPage(childPages[childIndex]),
-                                depth + 1,
-                                out var childMaximum))
+                        var leaf = SqliteIndexLeafPageView.Parse(
+                            sourcePage,
+                            _usableSpace,
+                            _textEncoding,
+                            overflowReader: overflowReader);
+                        if (leaf.Cells.Count == 0
+                            || (leafDepth is { } expectedDepth && expectedDepth != depth))
                         {
                             return false;
                         }
 
-                        if (childIndex < interior.Cells.Count)
+                        leafDepth ??= depth;
+                        for (var recordIndex = 0; recordIndex < leaf.Cells.Count; recordIndex++)
                         {
-                            if (!AddOverflowPages(interior.Cells[childIndex].Cell.Key))
+                            if (!AddOverflowPages(leaf.Cells[recordIndex].Cell))
                                 return false;
 
-                            var separator = interior.GetRecord(childIndex);
-                            if (comparer.Compare(childMaximum, separator) >= 0
-                                || !AddRecord(separator))
+                            var record = leaf.GetRecord(recordIndex);
+                            if (!AddRecord(record))
+                                return false;
+                            maximumRecord = record;
+                        }
+
+                        return true;
+                    }
+
+                case SqliteBtreePageType.IndexInterior:
+                    {
+                        var interior = SqliteIndexInteriorPageView.Parse(
+                            sourcePage,
+                            _usableSpace,
+                            _textEncoding,
+                            overflowReader: overflowReader);
+                        if (interior.Cells.Count == 0)
+                        {
+                            return false;
+                        }
+
+                        var childPages = interior.Cells
+                            .Select(cell => cell.Cell.LeftChildPage)
+                            .Append(interior.Header.RightMostChildPage)
+                            .ToArray();
+                        if (childPages.Length != interior.Cells.Count + 1)
+                            return false;
+
+                        for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
+                        {
+                            if (!Visit(
+                                    childPages[childIndex],
+                                    _pager.ReadCommittedPage(childPages[childIndex]),
+                                    depth + 1,
+                                    out var childMaximum))
                             {
                                 return false;
                             }
-                        }
-                        else
-                        {
-                            maximumRecord = childMaximum;
-                        }
-                    }
 
-                    return maximumRecord is not null;
-                }
+                            if (childIndex < interior.Cells.Count)
+                            {
+                                if (!AddOverflowPages(interior.Cells[childIndex].Cell.Key))
+                                    return false;
+
+                                var separator = interior.GetRecord(childIndex);
+                                if (comparer.Compare(childMaximum, separator) >= 0
+                                    || !AddRecord(separator))
+                                {
+                                    return false;
+                                }
+                            }
+                            else
+                            {
+                                maximumRecord = childMaximum;
+                            }
+                        }
+
+                        return maximumRecord is not null;
+                    }
 
                 default:
                     return false;
@@ -2374,20 +2563,20 @@ internal sealed class EmbeddedFileStore : IDisposable
             switch (SqliteBtreePageHeader.Parse(sourcePage).PageType)
             {
                 case SqliteBtreePageType.IndexInterior:
-                {
-                    interiorDepth++;
-                    var interior = SqliteIndexInteriorPageView.Parse(
-                        sourcePage,
-                        _usableSpace,
-                        _textEncoding,
-                        overflowReader: overflowReader);
-                    var route = interior.SearchChild(addedRecord);
-                    if (route.IsSeparatorKey || route.ChildPage == 0)
-                        return false;
+                    {
+                        interiorDepth++;
+                        var interior = SqliteIndexInteriorPageView.Parse(
+                            sourcePage,
+                            _usableSpace,
+                            _textEncoding,
+                            overflowReader: overflowReader);
+                        var route = interior.SearchChild(addedRecord);
+                        if (route.IsSeparatorKey || route.ChildPage == 0)
+                            return false;
 
-                    routedPage = route.ChildPage;
-                    break;
-                }
+                        routedPage = route.ChildPage;
+                        break;
+                    }
 
                 case SqliteBtreePageType.IndexLeaf:
                     sourceLeafPage = sourcePage;
@@ -2461,8 +2650,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -2686,8 +2875,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -2962,8 +3151,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -3240,8 +3429,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -3326,8 +3515,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -3617,8 +3806,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -3995,8 +4184,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                     new SqlitePageImage(SchemaRootPage, leafTargetSchemaPage),
                 ]);
             leafMutation.CommitTo(_pager);
-            CheckpointCommittedMutation(reclaimTrailingPages: false);
             _header = leafHeader;
+            CheckpointCommittedMutation(reclaimTrailingPages: false);
             return true;
         }
 
@@ -4123,8 +4312,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -4418,8 +4607,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -4762,8 +4951,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -4806,93 +4995,93 @@ internal sealed class EmbeddedFileStore : IDisposable
             switch (SqliteBtreePageHeader.Parse(pageImage).PageType)
             {
                 case SqliteBtreePageType.TableLeaf:
-                {
-                    var leaf = SqliteTableLeafPageView.Parse(pageImage, _usableSpace);
-                    if (leaf.Cells.Count == 0
-                        || leaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
-                        || (leafDepth is { } expectedDepth && expectedDepth != depth))
                     {
-                        return false;
-                    }
-
-                    leafDepth ??= depth;
-                    var precedingRowId = previousRowId;
-                    foreach (var cell in leaf.Cells)
-                    {
-                        if (persistedCellIndex >= persistedCells.Count
-                            || cell.Cell.RowId != persistedCells[persistedCellIndex].RowId
-                            || !cell.Cell.LocalPayload.Span.SequenceEqual(
-                                persistedCells[persistedCellIndex].Record)
-                            || (previousRowId is { } previous && cell.Cell.RowId <= previous))
+                        var leaf = SqliteTableLeafPageView.Parse(pageImage, _usableSpace);
+                        if (leaf.Cells.Count == 0
+                            || leaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
+                            || (leafDepth is { } expectedDepth && expectedDepth != depth))
                         {
                             return false;
                         }
 
-                        persistedCellIndex++;
-                        previousRowId = cell.Cell.RowId;
+                        leafDepth ??= depth;
+                        var precedingRowId = previousRowId;
+                        foreach (var cell in leaf.Cells)
+                        {
+                            if (persistedCellIndex >= persistedCells.Count
+                                || cell.Cell.RowId != persistedCells[persistedCellIndex].RowId
+                                || !cell.Cell.LocalPayload.Span.SequenceEqual(
+                                    persistedCells[persistedCellIndex].Record)
+                                || (previousRowId is { } previous && cell.Cell.RowId <= previous))
+                            {
+                                return false;
+                            }
+
+                            persistedCellIndex++;
+                            previousRowId = cell.Cell.RowId;
+                        }
+
+                        var insertion = leaf.Search(insertedCell.RowId);
+                        if ((precedingRowId is null || insertedCell.RowId > precedingRowId)
+                            && !insertion.IsExact
+                            && insertion.Index < leaf.Cells.Count
+                            && insertedCell.RowId < leaf.Cells[^1].Cell.RowId)
+                        {
+                            if (sourceLeaf is not null)
+                                return false;
+
+                            sourceLeaf = leaf;
+                            sourceLeafPage = pageImage;
+                            targetLeafPage = pageNumber;
+                            targetInsertionIndex = insertion.Index;
+                            targetInteriorDepth = depth - 1;
+                        }
+
+                        maximumRowId = leaf.Cells[^1].Cell.RowId;
+                        return true;
                     }
-
-                    var insertion = leaf.Search(insertedCell.RowId);
-                    if ((precedingRowId is null || insertedCell.RowId > precedingRowId)
-                        && !insertion.IsExact
-                        && insertion.Index < leaf.Cells.Count
-                        && insertedCell.RowId < leaf.Cells[^1].Cell.RowId)
-                    {
-                        if (sourceLeaf is not null)
-                            return false;
-
-                        sourceLeaf = leaf;
-                        sourceLeafPage = pageImage;
-                        targetLeafPage = pageNumber;
-                        targetInsertionIndex = insertion.Index;
-                        targetInteriorDepth = depth - 1;
-                    }
-
-                    maximumRowId = leaf.Cells[^1].Cell.RowId;
-                    return true;
-                }
 
                 case SqliteBtreePageType.TableInterior:
-                {
-                    var interior = SqliteTableInteriorPageView.Parse(pageImage, _usableSpace);
-                    if (interior.Cells.Count == 0)
-                        return false;
-
-                    var childPages = interior.Cells
-                        .Select(cell => cell.Cell.LeftChildPage)
-                        .Append(interior.Header.RightMostChildPage)
-                        .ToArray();
-                    if (childPages.Length != interior.Cells.Count + 1)
-                        return false;
-
-                    long? childMaximumRowId = null;
-                    for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
                     {
-                        var childPage = childPages[childIndex];
-                        if (childPage < 2
-                            || childPage > sourcePageCount
-                            || !ownedPages.Add(childPage))
-                        {
+                        var interior = SqliteTableInteriorPageView.Parse(pageImage, _usableSpace);
+                        if (interior.Cells.Count == 0)
                             return false;
+
+                        var childPages = interior.Cells
+                            .Select(cell => cell.Cell.LeftChildPage)
+                            .Append(interior.Header.RightMostChildPage)
+                            .ToArray();
+                        if (childPages.Length != interior.Cells.Count + 1)
+                            return false;
+
+                        long? childMaximumRowId = null;
+                        for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
+                        {
+                            var childPage = childPages[childIndex];
+                            if (childPage < 2
+                                || childPage > sourcePageCount
+                                || !ownedPages.Add(childPage))
+                            {
+                                return false;
+                            }
+
+                            if (!Visit(childPage, _pager.ReadCommittedPage(childPage), depth + 1, out var childMaximum))
+                                return false;
+                            if (childIndex < interior.Cells.Count
+                                && interior.Cells[childIndex].Cell.RowId != childMaximum)
+                            {
+                                return false;
+                            }
+
+                            childMaximumRowId = childMaximum;
                         }
 
-                        if (!Visit(childPage, _pager.ReadCommittedPage(childPage), depth + 1, out var childMaximum))
+                        if (childMaximumRowId is null)
                             return false;
-                        if (childIndex < interior.Cells.Count
-                            && interior.Cells[childIndex].Cell.RowId != childMaximum)
-                        {
-                            return false;
-                        }
 
-                        childMaximumRowId = childMaximum;
+                        maximumRowId = childMaximumRowId.Value;
+                        return true;
                     }
-
-                    if (childMaximumRowId is null)
-                        return false;
-
-                    maximumRowId = childMaximumRowId.Value;
-                    return true;
-                }
 
                 default:
                     return false;
@@ -4952,8 +5141,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5000,99 +5189,99 @@ internal sealed class EmbeddedFileStore : IDisposable
             switch (SqliteBtreePageHeader.Parse(pageImage).PageType)
             {
                 case SqliteBtreePageType.TableLeaf:
-                {
-                    var leaf = SqliteTableLeafPageView.Parse(pageImage, _usableSpace);
-                    if (leaf.Cells.Count == 0
-                        || leaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
-                        || (leafDepth is { } expectedDepth && expectedDepth != depth))
                     {
-                        return false;
-                    }
-
-                    leafDepth ??= depth;
-                    foreach (var cell in leaf.Cells)
-                    {
-                        if (persistedCellIndex >= persistedCells.Count
-                            || cell.Cell.RowId != persistedCells[persistedCellIndex].RowId
-                            || !cell.Cell.LocalPayload.Span.SequenceEqual(
-                                persistedCells[persistedCellIndex].Record)
-                            || (previousRowId is { } previous && cell.Cell.RowId <= previous))
+                        var leaf = SqliteTableLeafPageView.Parse(pageImage, _usableSpace);
+                        if (leaf.Cells.Count == 0
+                            || leaf.Cells.Any(cell => cell.Cell.FirstOverflowPage is not null)
+                            || (leafDepth is { } expectedDepth && expectedDepth != depth))
                         {
                             return false;
                         }
 
-                        persistedCellIndex++;
-                        previousRowId = cell.Cell.RowId;
+                        leafDepth ??= depth;
+                        foreach (var cell in leaf.Cells)
+                        {
+                            if (persistedCellIndex >= persistedCells.Count
+                                || cell.Cell.RowId != persistedCells[persistedCellIndex].RowId
+                                || !cell.Cell.LocalPayload.Span.SequenceEqual(
+                                    persistedCells[persistedCellIndex].Record)
+                                || (previousRowId is { } previous && cell.Cell.RowId <= previous))
+                            {
+                                return false;
+                            }
+
+                            persistedCellIndex++;
+                            previousRowId = cell.Cell.RowId;
+                        }
+
+                        if (leaf.Search(change.RowId).IsExact)
+                        {
+                            if (sourceLeaf is not null)
+                                return false;
+
+                            sourceLeaf = leaf;
+                            sourceLeafPage = pageImage;
+                            targetLeafPage = pageNumber;
+                            targetPath = path.ToArray();
+                        }
+
+                        maximumRowId = leaf.Cells[^1].Cell.RowId;
+                        return true;
                     }
-
-                    if (leaf.Search(change.RowId).IsExact)
-                    {
-                        if (sourceLeaf is not null)
-                            return false;
-
-                        sourceLeaf = leaf;
-                        sourceLeafPage = pageImage;
-                        targetLeafPage = pageNumber;
-                        targetPath = path.ToArray();
-                    }
-
-                    maximumRowId = leaf.Cells[^1].Cell.RowId;
-                    return true;
-                }
 
                 case SqliteBtreePageType.TableInterior:
-                {
-                    var interior = SqliteTableInteriorPageView.Parse(pageImage, _usableSpace);
-                    if (interior.Cells.Count == 0)
-                        return false;
-
-                    var childPages = interior.Cells
-                        .Select(cell => cell.Cell.LeftChildPage)
-                        .Append(interior.Header.RightMostChildPage)
-                        .ToArray();
-                    if (childPages.Length != interior.Cells.Count + 1)
-                        return false;
-
-                    long? childMaximumRowId = null;
-                    for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
                     {
-                        var childPage = childPages[childIndex];
-                        if (childPage < 2
-                            || childPage > sourcePageCount
-                            || !ownedPages.Add(childPage))
-                        {
+                        var interior = SqliteTableInteriorPageView.Parse(pageImage, _usableSpace);
+                        if (interior.Cells.Count == 0)
                             return false;
-                        }
 
-                        var childImage = _pager.ReadCommittedPage(childPage);
-                        path.Add(new BoundedTableInteriorPathEntry(
-                            pageNumber,
-                            pageImage,
-                            interior,
-                            childIndex,
-                            childPage));
-                        if (!Visit(childPage, childImage, path, depth + 1, out var childMaximum))
+                        var childPages = interior.Cells
+                            .Select(cell => cell.Cell.LeftChildPage)
+                            .Append(interior.Header.RightMostChildPage)
+                            .ToArray();
+                        if (childPages.Length != interior.Cells.Count + 1)
+                            return false;
+
+                        long? childMaximumRowId = null;
+                        for (var childIndex = 0; childIndex < childPages.Length; childIndex++)
                         {
+                            var childPage = childPages[childIndex];
+                            if (childPage < 2
+                                || childPage > sourcePageCount
+                                || !ownedPages.Add(childPage))
+                            {
+                                return false;
+                            }
+
+                            var childImage = _pager.ReadCommittedPage(childPage);
+                            path.Add(new BoundedTableInteriorPathEntry(
+                                pageNumber,
+                                pageImage,
+                                interior,
+                                childIndex,
+                                childPage));
+                            if (!Visit(childPage, childImage, path, depth + 1, out var childMaximum))
+                            {
+                                path.RemoveAt(path.Count - 1);
+                                return false;
+                            }
+
                             path.RemoveAt(path.Count - 1);
-                            return false;
+                            if (childIndex < interior.Cells.Count
+                                && interior.Cells[childIndex].Cell.RowId != childMaximum)
+                            {
+                                return false;
+                            }
+
+                            childMaximumRowId = childMaximum;
                         }
 
-                        path.RemoveAt(path.Count - 1);
-                        if (childIndex < interior.Cells.Count
-                            && interior.Cells[childIndex].Cell.RowId != childMaximum)
-                        {
+                        if (childMaximumRowId is null)
                             return false;
-                        }
 
-                        childMaximumRowId = childMaximum;
+                        maximumRowId = childMaximumRowId.Value;
+                        return true;
                     }
-
-                    if (childMaximumRowId is null)
-                        return false;
-
-                    maximumRowId = childMaximumRowId.Value;
-                    return true;
-                }
 
                 default:
                     return false;
@@ -5207,8 +5396,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5637,8 +5826,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5752,8 +5941,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5869,8 +6058,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5904,8 +6093,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -6176,8 +6365,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -6275,8 +6464,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -6924,37 +7113,14 @@ internal sealed class EmbeddedFileStore : IDisposable
             return;
         }
 
-        // A table-level PRIMARY KEY(...) is backed by a separate unique index b-tree in
-        // SQLite (unlike a column-level INTEGER PRIMARY KEY rowid alias), so it cannot be
-        // persisted honestly here.
-        if (table.TableLevelPrimaryKey is not null)
-        {
-            ValidatePrimaryKeyIndexPrerequisites(name, table, "a table-level PRIMARY KEY");
-            throw new EmbeddedSqlException(
-                $"The managed file engine cannot persist table '{name}' because its table-level PRIMARY KEY requires an on-disk index b-tree.");
-        }
-
-        // A VIRTUAL generated column has no stored value in SQLite's record format; writing
-        // its computed value would produce records a real SQLite library would misread, so
-        // only STORED generated columns (which are physically stored) can be persisted.
-        var virtualGenerated = Array.FindIndex(table.ColumnDefinitions, column => column.IsGenerated && !column.GeneratedStored);
-        if (virtualGenerated >= 0)
-        {
-            throw new EmbeddedSqlException(
-                $"The managed file engine cannot persist table '{name}' because column '{table.ColumnDefinitions[virtualGenerated].Name}' is a VIRTUAL generated column, whose value is not stored in the SQLite record format; declare it STORED to persist it.");
-        }
+        if (table.TableLevelPrimaryKey is not null && !table.HasRowidAlias)
+            ValidatePrimaryKeyIndexPrerequisites(name, table, "a table-level PRIMARY KEY", allowDescending: true);
 
         var columns = table.ColumnDefinitions;
         var primaryKeyCount = 0;
         var primaryKeyIndex = -1;
         for (var index = 0; index < columns.Length; index++)
         {
-            if (columns[index].Unique)
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist table '{name}' because column '{columns[index].Name}' has a UNIQUE constraint, which requires an on-disk index b-tree.");
-            }
-
             if (columns[index].PrimaryKey)
             {
                 primaryKeyCount++;
@@ -7006,7 +7172,8 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static void ValidatePrimaryKeyIndexPrerequisites(
         string tableName,
         EmbeddedTable table,
-        string primaryKeyKind)
+        string primaryKeyKind,
+        bool allowDescending = false)
     {
         var primaryKeySchema = table.PrimaryKeySchema;
         if (primaryKeySchema is null)
@@ -7017,7 +7184,10 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         try
         {
-            primaryKeySchema.EnsureSupportedByBinaryAscendingIndexWriter();
+            if (allowDescending)
+                primaryKeySchema.EnsureSupportedByPersistedIndexWriter();
+            else
+                primaryKeySchema.EnsureSupportedByBinaryAscendingIndexWriter();
         }
         catch (ArgumentException exception)
         {
@@ -7029,7 +7199,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             throw new EmbeddedSqlException(
                 $"The managed file engine cannot persist {primaryKeyKind} table '{tableName}' because {exception.Message} "
-                + "The managed primary-key index writer supports only ascending BINARY terms.",
+                + (allowDescending
+                    ? "The managed primary-key index writer supports ASC/DESC terms with BINARY, NOCASE, or RTRIM collation."
+                    : "The managed primary-key index writer supports only ascending BINARY terms."),
                 exception);
         }
     }
@@ -7038,6 +7210,12 @@ internal sealed class EmbeddedFileStore : IDisposable
         string tableName,
         EmbeddedTable table)
     {
+        if (table.HasVirtualGeneratedColumns)
+        {
+            throw new EmbeddedSqlException(
+                $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because VIRTUAL generated columns are outside the supported WITHOUT ROWID subset.");
+        }
+
         ValidatePrimaryKeyIndexPrerequisites(tableName, table, "WITHOUT ROWID");
         var primaryKeySchema = table.PrimaryKeySchema
             ?? throw new InvalidOperationException("Validated WITHOUT ROWID table is missing its primary-key schema.");
@@ -7685,7 +7863,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         EmbeddedIndex index,
         RebuildPageAllocator allocator)
     {
-        var comparer = new SqliteIndexRecordComparer(_textEncoding);
+        var comparer = CreateIndexComparer(index);
         var leafGroups = PartitionIndexLeafRecords(
             $"index '{index.Name}' on table '{tableName}'",
             BuildIndexRecords(tableName, table, index, comparer),
@@ -7785,15 +7963,21 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
         }
 
-        var separators = new List<byte[]>(children.Count - 1);
+        var plannedChildren = children.ToArray();
+        var separators = new List<byte[]>(plannedChildren.Length - 1);
         try
         {
-            for (var childIndex = 0; childIndex < children.Count - 1; childIndex++)
+            for (var childIndex = 0; childIndex < plannedChildren.Length - 1; childIndex++)
             {
                 separators.Add(PromoteIndexTreeSeparator(
-                    children[childIndex],
-                    children[childIndex + 1],
-                    indexName));
+                    plannedChildren[childIndex],
+                    plannedChildren[childIndex + 1],
+                    indexName,
+                    comparer,
+                    out var left,
+                    out var right));
+                plannedChildren[childIndex] = left;
+                plannedChildren[childIndex + 1] = right;
             }
         }
         catch (EmbeddedSqlException) when (!throwOnPromotionFailure)
@@ -7806,20 +7990,20 @@ internal sealed class EmbeddedFileStore : IDisposable
             var builder = new SqliteIndexInteriorPageBuilder(
                 _pageSize,
                 _usableSpace,
-                children[^1].PageNumber,
+                plannedChildren[^1].PageNumber,
                 comparer);
             for (var childIndex = 0; childIndex < separators.Count; childIndex++)
             {
                 var separator = separators[childIndex];
                 builder.Append(
                     SqliteIndexInteriorCell.Create(
-                        children[childIndex].PageNumber,
+                        plannedChildren[childIndex].PageNumber,
                         CreateIndexLeafPlanningCell(separator)),
                     separator);
             }
 
             _ = builder.Build();
-            return new IndexInteriorPlan(children, separators);
+            return new IndexInteriorPlan(plannedChildren, separators);
         }
         catch (InvalidOperationException)
         {
@@ -7864,7 +8048,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (bestCount == 0)
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist {treeDescription} because promoting its index separators would require rebalancing, which this storage layer does not implement.");
+                    $"The managed file engine cannot persist {treeDescription} because its index records cannot be partitioned into non-empty equal-height child trees.");
             }
 
             groups.Add(new IndexInteriorGroupRange(start, bestCount));
@@ -7876,7 +8060,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (groups.Count < 2 || groups[^2].Count < 3)
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist {treeDescription} because promoting its index separators would require rebalancing, which this storage layer does not implement.");
+                    $"The managed file engine cannot persist {treeDescription} because its index records cannot be partitioned into non-empty equal-height child trees.");
             }
 
             var previous = groups[^2];
@@ -7905,29 +8089,316 @@ internal sealed class EmbeddedFileStore : IDisposable
         return plans;
     }
 
-    private static byte[] PromoteIndexTreeSeparator(
+    private byte[] PromoteIndexTreeSeparator(
         IndexTreeNode left,
         IndexTreeNode right,
-        string treeDescription)
+        string treeDescription,
+        SqliteIndexRecordComparer comparer,
+        out IndexTreeNode plannedLeft,
+        out IndexTreeNode plannedRight)
     {
-        var leftLeaf = FindRightmostIndexLeaf(left);
-        if (leftLeaf.Records.Count >= 2)
+        if (TryExtractMaximumIndexRecord(left, comparer, out var separator, out plannedLeft))
         {
-            var separator = leftLeaf.Records[^1];
-            leftLeaf.Records.RemoveAt(leftLeaf.Records.Count - 1);
+            plannedRight = right;
             return separator;
         }
 
-        var rightLeaf = FindLeftmostIndexLeaf(right);
-        if (rightLeaf.Records.Count >= 2)
+        if (TryExtractMinimumIndexRecord(right, comparer, out separator, out plannedRight))
         {
-            var separator = rightLeaf.Records[0];
-            rightLeaf.Records.RemoveAt(0);
+            plannedLeft = left;
             return separator;
         }
 
         throw new EmbeddedSqlException(
-            $"The managed file engine cannot persist {treeDescription} because promoting index separators would require rebalancing, which this storage layer does not implement.");
+            $"The managed file engine cannot persist {treeDescription} because no separator can be promoted while retaining non-empty equal-height child trees.");
+    }
+
+    private bool TryExtractMaximumIndexRecord(
+        IndexTreeNode node,
+        SqliteIndexRecordComparer comparer,
+        out byte[] record,
+        out IndexTreeNode remainder)
+    {
+        if (node.IsLeaf)
+        {
+            if (node.Records.Count < 2)
+            {
+                record = null!;
+                remainder = null!;
+                return false;
+            }
+
+            var records = new List<byte[]>(node.Records);
+            record = records[^1];
+            records.RemoveAt(records.Count - 1);
+            remainder = IndexTreeNode.CreateLeaf(node.PageNumber, records);
+            return true;
+        }
+
+        var plan = node.InteriorPlan
+            ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan.");
+        var lastChildIndex = plan.Children.Count - 1;
+        if (TryExtractMaximumIndexRecord(
+                plan.Children[lastChildIndex],
+                comparer,
+                out record,
+                out var lastRemainder))
+        {
+            var children = plan.Children.ToArray();
+            children[lastChildIndex] = lastRemainder;
+            return TryCreateIndexInteriorNode(
+                node.PageNumber,
+                children,
+                plan.Separators,
+                comparer,
+                out remainder);
+        }
+
+        var previousChildIndex = lastChildIndex - 1;
+        if (!TryExtractMaximumIndexRecord(
+                plan.Children[previousChildIndex],
+                comparer,
+                out var replacementSeparator,
+                out var previousRemainder)
+            || !TryInsertMinimumIndexRecord(
+                plan.Children[lastChildIndex],
+                plan.Separators[^1],
+                comparer,
+                out var expandedLast)
+            || !TryExtractMaximumIndexRecord(
+                expandedLast,
+                comparer,
+                out record,
+                out lastRemainder))
+        {
+            record = null!;
+            remainder = null!;
+            return false;
+        }
+
+        var rebalancedChildren = plan.Children.ToArray();
+        rebalancedChildren[previousChildIndex] = previousRemainder;
+        rebalancedChildren[lastChildIndex] = lastRemainder;
+        var rebalancedSeparators = plan.Separators.Select(value => value.ToArray()).ToArray();
+        rebalancedSeparators[^1] = replacementSeparator;
+        return TryCreateIndexInteriorNode(
+            node.PageNumber,
+            rebalancedChildren,
+            rebalancedSeparators,
+            comparer,
+            out remainder);
+    }
+
+    private bool TryExtractMinimumIndexRecord(
+        IndexTreeNode node,
+        SqliteIndexRecordComparer comparer,
+        out byte[] record,
+        out IndexTreeNode remainder)
+    {
+        if (node.IsLeaf)
+        {
+            if (node.Records.Count < 2)
+            {
+                record = null!;
+                remainder = null!;
+                return false;
+            }
+
+            var records = new List<byte[]>(node.Records);
+            record = records[0];
+            records.RemoveAt(0);
+            remainder = IndexTreeNode.CreateLeaf(node.PageNumber, records);
+            return true;
+        }
+
+        var plan = node.InteriorPlan
+            ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan.");
+        if (TryExtractMinimumIndexRecord(
+                plan.Children[0],
+                comparer,
+                out record,
+                out var firstRemainder))
+        {
+            var children = plan.Children.ToArray();
+            children[0] = firstRemainder;
+            return TryCreateIndexInteriorNode(
+                node.PageNumber,
+                children,
+                plan.Separators,
+                comparer,
+                out remainder);
+        }
+
+        if (!TryExtractMinimumIndexRecord(
+                plan.Children[1],
+                comparer,
+                out var replacementSeparator,
+                out var secondRemainder)
+            || !TryInsertMaximumIndexRecord(
+                plan.Children[0],
+                plan.Separators[0],
+                comparer,
+                out var expandedFirst)
+            || !TryExtractMinimumIndexRecord(
+                expandedFirst,
+                comparer,
+                out record,
+                out firstRemainder))
+        {
+            record = null!;
+            remainder = null!;
+            return false;
+        }
+
+        var rebalancedChildren = plan.Children.ToArray();
+        rebalancedChildren[0] = firstRemainder;
+        rebalancedChildren[1] = secondRemainder;
+        var rebalancedSeparators = plan.Separators.Select(value => value.ToArray()).ToArray();
+        rebalancedSeparators[0] = replacementSeparator;
+        return TryCreateIndexInteriorNode(
+            node.PageNumber,
+            rebalancedChildren,
+            rebalancedSeparators,
+            comparer,
+            out remainder);
+    }
+
+    private bool TryInsertMinimumIndexRecord(
+        IndexTreeNode node,
+        byte[] record,
+        SqliteIndexRecordComparer comparer,
+        out IndexTreeNode expanded)
+    {
+        if (node.IsLeaf)
+        {
+            var records = new List<byte[]>(node.Records.Count + 1) { record };
+            records.AddRange(node.Records);
+            if (!CanBuildIndexLeafPage(records, comparer))
+            {
+                expanded = null!;
+                return false;
+            }
+
+            expanded = IndexTreeNode.CreateLeaf(node.PageNumber, records);
+            return true;
+        }
+
+        var plan = node.InteriorPlan
+            ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan.");
+        if (!TryInsertMinimumIndexRecord(plan.Children[0], record, comparer, out var firstChild))
+        {
+            expanded = null!;
+            return false;
+        }
+
+        var children = plan.Children.ToArray();
+        children[0] = firstChild;
+        return TryCreateIndexInteriorNode(
+            node.PageNumber,
+            children,
+            plan.Separators,
+            comparer,
+            out expanded);
+    }
+
+    private bool TryInsertMaximumIndexRecord(
+        IndexTreeNode node,
+        byte[] record,
+        SqliteIndexRecordComparer comparer,
+        out IndexTreeNode expanded)
+    {
+        if (node.IsLeaf)
+        {
+            var records = new List<byte[]>(node.Records.Count + 1);
+            records.AddRange(node.Records);
+            records.Add(record);
+            if (!CanBuildIndexLeafPage(records, comparer))
+            {
+                expanded = null!;
+                return false;
+            }
+
+            expanded = IndexTreeNode.CreateLeaf(node.PageNumber, records);
+            return true;
+        }
+
+        var plan = node.InteriorPlan
+            ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan.");
+        var lastChildIndex = plan.Children.Count - 1;
+        if (!TryInsertMaximumIndexRecord(
+                plan.Children[lastChildIndex],
+                record,
+                comparer,
+                out var lastChild))
+        {
+            expanded = null!;
+            return false;
+        }
+
+        var children = plan.Children.ToArray();
+        children[lastChildIndex] = lastChild;
+        return TryCreateIndexInteriorNode(
+            node.PageNumber,
+            children,
+            plan.Separators,
+            comparer,
+            out expanded);
+    }
+
+    private bool TryCreateIndexInteriorNode(
+        uint pageNumber,
+        IReadOnlyList<IndexTreeNode> children,
+        IReadOnlyList<byte[]> separators,
+        SqliteIndexRecordComparer comparer,
+        out IndexTreeNode node)
+    {
+        try
+        {
+            var builder = new SqliteIndexInteriorPageBuilder(
+                _pageSize,
+                _usableSpace,
+                children[^1].PageNumber,
+                comparer);
+            for (var index = 0; index < separators.Count; index++)
+            {
+                builder.Append(
+                    SqliteIndexInteriorCell.Create(
+                        children[index].PageNumber,
+                        CreateIndexLeafPlanningCell(separators[index])),
+                    separators[index]);
+            }
+
+            _ = builder.Build();
+            node = IndexTreeNode.CreateInterior(
+                pageNumber,
+                new IndexInteriorPlan(
+                    children.ToArray(),
+                    separators.Select(value => value.ToArray()).ToArray()));
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            node = null!;
+            return false;
+        }
+    }
+
+    private bool CanBuildIndexLeafPage(
+        IReadOnlyList<byte[]> records,
+        SqliteIndexRecordComparer comparer)
+    {
+        try
+        {
+            var builder = new SqliteIndexLeafPageBuilder(_pageSize, _usableSpace, comparer);
+            foreach (var record in records)
+                builder.Append(CreateIndexLeafPlanningCell(record), record);
+            _ = builder.Build();
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
     }
 
     private byte[] BuildIndexInteriorPage(
@@ -7987,28 +8458,6 @@ internal sealed class EmbeddedFileStore : IDisposable
                 child.PageNumber,
                 BuildIndexInteriorPage(plan, comparer, allocator, overflowPages)));
         }
-    }
-
-    private static IndexTreeNode FindLeftmostIndexLeaf(IndexTreeNode node)
-    {
-        while (!node.IsLeaf)
-            node = (node.InteriorPlan
-                ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan."))
-                .Children[0];
-        return node;
-    }
-
-    private static IndexTreeNode FindRightmostIndexLeaf(IndexTreeNode node)
-    {
-        while (!node.IsLeaf)
-        {
-            var children = (node.InteriorPlan
-                ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan."))
-                .Children;
-            node = children[^1];
-        }
-
-        return node;
     }
 
     private static int GetIndexTreeHeight(IndexTreeNode node)
@@ -8221,19 +8670,43 @@ internal sealed class EmbeddedFileStore : IDisposable
             .OrderBy(entry => entry.RowId);
         foreach (var (rowId, row) in ordered)
         {
+            var record = ProjectStoredRow(table, row);
             if (aliasIndex >= 0)
             {
                 // A single-column INTEGER PRIMARY KEY is a rowid alias: store its value as
                 // the SQLite rowid and NULL in the record, exactly as SQLite does.
-                var record = (SqlValue[])row.Clone();
-                record[aliasIndex] = SqlValue.Null;
-                yield return (rowId, SqliteRecordCodec.Encode(record, _textEncoding));
+                var storedAliasIndex = 0;
+                for (var columnIndex = 0; columnIndex < aliasIndex; columnIndex++)
+                {
+                    if (!table.ColumnDefinitions[columnIndex].IsGenerated
+                        || table.ColumnDefinitions[columnIndex].GeneratedStored)
+                    {
+                        storedAliasIndex++;
+                    }
+                }
+                record[storedAliasIndex] = SqlValue.Null;
             }
-            else
-            {
-                yield return (rowId, SqliteRecordCodec.Encode(row, _textEncoding));
-            }
+
+            yield return (rowId, SqliteRecordCodec.Encode(record, _textEncoding));
         }
+    }
+
+    private static SqlValue[] ProjectStoredRow(
+        EmbeddedTable table,
+        IReadOnlyList<SqlValue> row)
+    {
+        if (row.Count != table.ColumnDefinitions.Length)
+            throw new EmbeddedSqlException($"The managed file engine cannot persist table '{table.Name}' because a row has an invalid column count.");
+
+        var stored = new List<SqlValue>(row.Count);
+        for (var columnIndex = 0; columnIndex < row.Count; columnIndex++)
+        {
+            var column = table.ColumnDefinitions[columnIndex];
+            if (!column.IsGenerated || column.GeneratedStored)
+                stored.Add(row[columnIndex]);
+        }
+
+        return stored.ToArray();
     }
 
     private IReadOnlyList<byte[]> BuildWithoutRowidTableRecords(
@@ -8248,7 +8721,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because its row and rowid counts are inconsistent.");
         }
 
-        table.ValidateRows(table.Rows);
+        table.ValidateRows(tableName, table.Rows);
         var records = new List<WithoutRowidRecord>(table.Rows.Count);
         foreach (var row in table.Rows)
         {
@@ -8406,6 +8879,12 @@ internal sealed class EmbeddedFileStore : IDisposable
         return records;
     }
 
+    private SqliteIndexRecordComparer CreateIndexComparer(EmbeddedIndex index)
+        => new(
+            _textEncoding,
+            index.Columns.Select(column => column.Descending).ToArray(),
+            index.Columns.Select(column => column.Collation).ToArray());
+
     private PreparedSchemaTree BuildSchemaTree(
         IReadOnlyList<SchemaEntry> entries,
         RebuildPageAllocator allocator)
@@ -8420,7 +8899,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                     SqlValue.Text(entry.Name),
                     SqlValue.Text(entry.TableName),
                     SqlValue.Integer(entry.RootPage),
-                    SqlValue.Text(entry.Sql),
+                    entry.Sql is null ? SqlValue.Null : SqlValue.Text(entry.Sql),
                 ],
                 _textEncoding);
             if (SqlitePayloadLayout.Calculate(
@@ -8599,7 +9078,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                     index.Name,
                     tableName,
                     rootPage,
-                    BuildCreateIndexSql(tableName, index)));
+                    index.Origin == EmbeddedIndexOrigin.Explicit
+                        ? BuildCreateIndexSql(tableName, index)
+                        : null));
             }
         }
 
@@ -8679,16 +9160,10 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new EmbeddedSqlException(
                     $"The managed file engine cannot persist index '{index.Name}' because its column metadata is inconsistent.");
             }
-            if (column.Descending)
+            if (!SqliteIndexRecordComparer.IsSupportedCollation(column.Collation))
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist index '{index.Name}' because descending index terms are not yet supported for file-backed databases.");
-            }
-            if (column.Collation is not null
-                && !string.Equals(column.Collation, "BINARY", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist index '{index.Name}' because collation '{column.Collation}' is not BINARY.");
+                    $"The managed file engine cannot persist index '{index.Name}' because collation '{column.Collation}' is not a supported SQLite built-in collation.");
             }
         }
     }
@@ -8717,7 +9192,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             columns[index] = new EmbeddedIndexColumn(
                 table.Columns[columnIndex],
                 columnIndex,
-                column.Collation,
+                column.Collation ?? table.ColumnDefinitions[columnIndex].Collation,
                 column.Descending);
         }
 
@@ -8737,6 +9212,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         var overflowReader = new SqliteOverflowChainReader(_pager, _header);
+        var comparer = CreateIndexComparer(index);
         IReadOnlyList<byte[]> actualRecords;
         try
         {
@@ -8744,12 +9220,13 @@ internal sealed class EmbeddedFileStore : IDisposable
             var rootHeader = SqliteBtreePageHeader.Parse(rootPage);
             actualRecords = rootHeader.PageType switch
             {
-                SqliteBtreePageType.IndexLeaf => ReadIndexLeafRecords(rootPage, overflowReader),
+                SqliteBtreePageType.IndexLeaf => ReadIndexLeafRecords(rootPage, overflowReader, comparer),
                 SqliteBtreePageType.IndexInterior => ReadIndexInteriorRecords(
                     entry,
                     rootPage,
                     overflowReader,
-                    occupiedBtreePages),
+                    occupiedBtreePages,
+                    comparer),
                 _ => throw new InvalidDataException(
                     $"SQLite index root page has unsupported page type {rootHeader.PageType}."),
             };
@@ -8761,7 +9238,6 @@ internal sealed class EmbeddedFileStore : IDisposable
                 exception);
         }
 
-        var comparer = new SqliteIndexRecordComparer(_textEncoding);
         var expectedRecords = BuildIndexRecords(entry.TableName, table, index, comparer);
         if (actualRecords.Count != expectedRecords.Count)
         {
@@ -8781,13 +9257,15 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private IReadOnlyList<byte[]> ReadIndexLeafRecords(
         ReadOnlySpan<byte> page,
-        SqliteOverflowChainReader overflowReader)
+        SqliteOverflowChainReader overflowReader,
+        SqliteIndexRecordComparer? comparer = null)
     {
         var leaf = SqliteIndexLeafPageView.Parse(
             page,
             _usableSpace,
             _textEncoding,
-            overflowReader: overflowReader);
+            overflowReader: overflowReader,
+            recordComparer: comparer);
         var records = new byte[leaf.Cells.Count][];
         for (var index = 0; index < records.Length; index++)
             records[index] = leaf.GetRecord(index);
@@ -8798,14 +9276,16 @@ internal sealed class EmbeddedFileStore : IDisposable
         SchemaEntry entry,
         ReadOnlySpan<byte> rootPage,
         SqliteOverflowChainReader overflowReader,
-        ISet<uint> occupiedBtreePages)
+        ISet<uint> occupiedBtreePages,
+        SqliteIndexRecordComparer? comparer = null)
     {
         return ReadIndexInteriorNodeRecords(
             entry,
             entry.RootPage,
             rootPage,
             overflowReader,
-            occupiedBtreePages).Records;
+            occupiedBtreePages,
+            comparer ?? new SqliteIndexRecordComparer(_textEncoding)).Records;
     }
 
     private IndexTreeReadResult ReadIndexInteriorNodeRecords(
@@ -8813,13 +9293,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         uint pageNumber,
         ReadOnlySpan<byte> pageImage,
         SqliteOverflowChainReader overflowReader,
-        ISet<uint> occupiedBtreePages)
+        ISet<uint> occupiedBtreePages,
+        SqliteIndexRecordComparer comparer)
     {
         var interior = SqliteIndexInteriorPageView.Parse(
             pageImage,
             _usableSpace,
             _textEncoding,
-            overflowReader: overflowReader);
+            overflowReader: overflowReader,
+            recordComparer: comparer);
         if (interior.Cells.Count == 0)
         {
             throw new InvalidDataException(
@@ -8852,7 +9334,6 @@ internal sealed class EmbeddedFileStore : IDisposable
             directChildType = currentChildType;
         }
 
-        var comparer = new SqliteIndexRecordComparer(_textEncoding);
         var records = new List<byte[]>();
         byte[]? previousRecord = null;
         int? childHeight = null;
@@ -8892,7 +9373,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 case SqliteBtreePageType.IndexLeaf:
                     {
-                        var leafRecords = ReadIndexLeafRecords(childPageImage, overflowReader);
+                        var leafRecords = ReadIndexLeafRecords(childPageImage, overflowReader, comparer);
                         if (leafRecords.Count == 0)
                         {
                             throw new InvalidDataException(
@@ -8908,7 +9389,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                         childPage,
                         childPageImage,
                         overflowReader,
-                        occupiedBtreePages);
+                        occupiedBtreePages,
+                        comparer);
                     break;
                 default:
                     throw new InvalidOperationException("SQLite index child type validation is incomplete.");
@@ -8976,7 +9458,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (previousRecord is not null && comparer.Compare(previousRecord, value) >= 0)
         {
             throw new InvalidDataException(
-                $"Stored index '{indexName}' {level} are not globally ordered by their complete BINARY keys.");
+                $"Stored index '{indexName}' {level} are not globally ordered by their complete keys.");
         }
 
         records.Add(value);
@@ -8995,6 +9477,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             switch (entry.Type)
             {
                 case "table":
+                    if (entry.Sql is null)
+                        throw new EmbeddedSqlException($"Managed file database table '{entry.Name}' is missing SQL text.");
                     if (!string.Equals(entry.Name, entry.TableName, StringComparison.OrdinalIgnoreCase))
                     {
                         throw new EmbeddedSqlException(
@@ -9002,6 +9486,14 @@ internal sealed class EmbeddedFileStore : IDisposable
                     }
                     goto case "index";
                 case "index":
+                    if (entry.Sql is null
+                        && !entry.Name.StartsWith(
+                            $"sqlite_autoindex_{entry.TableName}_",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new EmbeddedSqlException(
+                            $"Managed file database index '{entry.Name}' has NULL SQL but is not an implicit constraint index.");
+                    }
                     if (entry.RootPage < 2 || entry.RootPage > _pager.CommittedPageCount)
                     {
                         throw new EmbeddedSqlException(
@@ -9065,6 +9557,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         => value.Kind == SqlValueKind.Text
             ? value.AsText()
             : throw new EmbeddedSqlException($"Managed file database sqlite_schema column '{field}' is not text.");
+
+    private static string? RequireNullableText(SqlValue value, string field)
+        => value.Kind switch
+        {
+            SqlValueKind.Null => null,
+            SqlValueKind.Text => value.AsText(),
+            _ => throw new EmbeddedSqlException(
+                $"Managed file database sqlite_schema column '{field}' is neither text nor NULL."),
+        };
 
     private static long RequireInteger(SqlValue value, string field)
         => value.Kind == SqlValueKind.Integer
@@ -9158,7 +9659,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    private sealed record SchemaEntry(string Type, string Name, string TableName, uint RootPage, string Sql);
+    private sealed record SchemaEntry(string Type, string Name, string TableName, uint RootPage, string? Sql);
 
     private sealed record PageImage(uint PageNumber, byte[] Page);
 

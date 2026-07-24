@@ -13,8 +13,6 @@ public class ManagedEfRawSqlMigrationTests
     {
         await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         await connection.OpenAsync();
-        // EF's SQLite migration lock verifies its update through changes().
-        connection.CreateFunction("changes", () => 1L);
 
         var options = new DbContextOptionsBuilder<RawSqlMigrationContext>()
             .UseTurso(connection)

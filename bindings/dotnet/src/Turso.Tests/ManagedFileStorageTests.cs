@@ -88,7 +88,7 @@ public class ManagedFileStorageTests
     }
 
     [Test]
-    public void PersistsSecondaryIndexAndRollsBackUnsupportedDescendingIndex()
+    public void PersistsAscendingAndDescendingSecondaryIndexesAcrossReopen()
     {
         var fileSystem = new InMemoryFileSystem();
         using (var database = EmbeddedDatabase.OpenFile("secondary-index.db", fileSystem))
@@ -103,20 +103,22 @@ public class ManagedFileStorageTests
                 .Select(row => row[0].AsText())
                 .Should().Equal("a", "z");
 
-            var act = () => Execute(connection, "CREATE INDEX idx_name_desc ON t(name DESC);");
-            act.Should().Throw<EmbeddedSqlException>().WithMessage("*descending index terms*");
-
-            // The rejected statement must not corrupt the live catalog, table, or supported index.
+            Execute(connection, "CREATE INDEX idx_name_desc ON t(name DESC);");
+            Query(connection, "PRAGMA index_list(t);")
+                .Select(row => row[1].AsText())
+                .Should().BeEquivalentTo(["idx_name", "idx_name_desc"]);
             Query(connection, "SELECT COUNT(*) FROM t;")[0][0].AsInteger().Should().Be(2);
         }
 
         using (var reopened = EmbeddedDatabase.OpenFile("secondary-index.db", fileSystem))
         using (var connection = reopened.Connect())
         {
-            // Reopen validates the persisted index records against the table rows.
             Query(connection, "SELECT name FROM t ORDER BY name;")
                 .Select(row => row[0].AsText())
                 .Should().Equal("a", "z");
+            Query(connection, "PRAGMA index_list(t);")
+                .Select(row => row[1].AsText())
+                .Should().BeEquivalentTo(["idx_name", "idx_name_desc"]);
             Execute(connection, "INSERT INTO t VALUES (3, 'm');");
         }
 
@@ -128,18 +130,22 @@ public class ManagedFileStorageTests
     }
 
     [Test]
-    public void RejectsUniqueColumnBeforeAnyBytesArePersisted()
+    public void PersistsUniqueColumnAndEnforcesItAfterReopen()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var database = EmbeddedDatabase.OpenFile("reject-unique.db", fileSystem);
-        using var connection = database.Connect();
+        using (var database = EmbeddedDatabase.OpenFile("unique-column.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(id INTEGER, code TEXT UNIQUE);");
+            Execute(connection, "INSERT INTO t VALUES (1, 'one');");
+        }
 
-        var act = () => Execute(connection, "CREATE TABLE t(id INTEGER, code TEXT UNIQUE);");
-        act.Should().Throw<EmbeddedSqlException>().WithMessage("*UNIQUE*");
-
-        // The table must not exist after the reject, in memory or on disk.
-        var missing = () => Query(connection, "SELECT * FROM t;");
-        missing.Should().Throw<EmbeddedSqlException>();
+        using var reopened = EmbeddedDatabase.OpenFile("unique-column.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        var duplicate = () => Execute(reopenedConnection, "INSERT INTO t VALUES (2, 'one');");
+        duplicate.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("UNIQUE constraint failed: t.code");
+        Query(reopenedConnection, "SELECT id, code FROM t;").Should().HaveCount(1);
     }
 
     [Test]

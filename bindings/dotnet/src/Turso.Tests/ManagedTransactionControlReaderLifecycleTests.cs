@@ -28,7 +28,7 @@ public sealed class ManagedTransactionControlReaderLifecycleTests
     }
 
     [Test]
-    public void ManagedReaderCloseTracksSqlRollbackAfterDrainingIt()
+    public void ManagedReaderCloseDetachesSqlRollbackAfterDrainingIt()
     {
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         connection.Open();
@@ -41,13 +41,15 @@ public sealed class ManagedTransactionControlReaderLifecycleTests
         using (var reader = command.ExecuteReader())
             reader.Read().Should().BeTrue();
 
-        connection.Invoking(static value => value.ExecuteNonQuery("SELECT 1;"))
+        connection.Transaction.Should().BeNull();
+        transaction.Connection.Should().BeNull();
+        transaction.Invoking(static value => value.Rollback())
             .Should()
             .Throw<InvalidOperationException>()
             .WithMessage(Data.Sqlite.Properties.Resources.TransactionCompleted);
-        transaction.Rollback();
-        connection.Transaction.Should().BeNull();
-        transaction.Connection.Should().BeNull();
         connection.ExecuteScalar<long>("SELECT COUNT(*) FROM data;").Should().Be(0);
+
+        using var nextTransaction = connection.BeginTransaction();
+        nextTransaction.Rollback();
     }
 }

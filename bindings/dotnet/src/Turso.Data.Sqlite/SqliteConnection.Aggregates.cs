@@ -9,6 +9,8 @@ public partial class SqliteConnection
     private void RegisterAggregateFunction(string name, int argc, bool isDeterministic, object? seed, Func<object?, object?[], object?>? step, Func<object?, object?> resultSelector)
     {
         ArgumentNullException.ThrowIfNull(name);
+        if (step is not null && IsManagedSharedMemory)
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheCallbacksNotSupported);
         if (step is null)
         {
             RemoveFunctionRegistrations(_aggregateFunctions, name);

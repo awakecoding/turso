@@ -1,6 +1,8 @@
 # Managed Turso package NativeAOT smoke
 
-This smoke executable restores the packed `Turso.Data.Sqlite` package, opens a file-backed managed database, and verifies create, insert, and select operations without a native provider or runtime asset.
+This smoke executable restores the packed `Turso.Data.Sqlite` package and uses
+its bundled `Turso.Core` managed engine to open a file-backed database and verify
+create, insert, and select operations without a native provider or runtime asset.
 
 ```bash
 make validate-managed-nativeaot

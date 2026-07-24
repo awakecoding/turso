@@ -143,28 +143,49 @@ public sealed class ManagedModuloAndPrintfConformanceTests
             .Should().BeLessThan(maximumExecutionAllocation);
     }
 
-    [TestCase("%*d")]
-    [TestCase("%p")]
-    [TestCase("%#x")]
-    [TestCase("%!f")]
-    [TestCase("%,d")]
-    [TestCase("%ld")]
-    public void PrintfRejectsUnsupportedFormatExtensions(string format)
+    [Test]
+    public void PrintfSupportsDynamicWidthPrecisionAndLengthModifiers()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
-        var exception = Assert.Throws<EmbeddedSqlException>(() => ReadRow(connection, $"SELECT printf('{format}', 42)"));
+        ReadRow(
+            connection,
+            "SELECT printf('%*.*f|%*s|%.*s|%ld|%lld', 10, 2, 3.14, -5, 'x', 3, 'hello', 4, 5)")[0]
+            .Should().Be(SqlValue.Text("      3.14|x    |hel|4|5"));
+    }
 
-        exception!.Message.Should().Be(format switch
-        {
-            "%*d" => "unsupported printf dynamic width or precision.",
-            "%p" => "unsupported printf format conversion: %p",
-            "%#x" => "unsupported printf format flag: #",
-            "%!f" => "unsupported printf format flag: !",
-            "%,d" => "unsupported printf format flag: ,",
-            "%ld" => "unsupported printf length modifier: l",
-            _ => throw new InvalidOperationException($"Unexpected test format {format}."),
-        });
+    [Test]
+    public void PrintfSupportsAlternateCommaAndCharacterFlags()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadRow(
+            connection,
+            """
+            SELECT printf(
+                '%#x|%#X|%#o|%#.0f|%#g|%,d|%,.2f|%!5.1s|%#08x|%#08o|%0,10d|%!g|%-05d|%,x|%,o',
+                255, 255, 8, 1.0, 1.2, 123456789, 1234567.25, 'éx', 255, 8, 1234567, 1.0, 12,
+                123456789, 123456789)
+            """)[0].AsText().Should().Be(
+            "0xff|0XFF|010|1.|1.20000|123,456,789|1,234,567.25|    é"
+                + "|0x000000ff|000000010|0,001,234,567|1.0|00012|75bcd15|726746425");
+    }
+
+    [Test]
+    public void PrintfSupportsPointerOrdinalCountAndControlEscaping()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        ReadRow(
+            connection,
+            """
+            SELECT printf(
+                '%p|%#p|%z|%n%d|%r|%r|%r|%r|%#q|%#Q',
+                255, 255, 'abc', 123, 1, 2, 3, 11,
+                x'01610A',
+                x'01610A')
+            """)[0].Should().Be(SqlValue.Text(
+            "FF|0xFF|abc|123|1st|2nd|3rd|11th|\\u0001a\\u000a|unistr('\\u0001a\\u000a')"));
     }
 
     private static SqlValue[] ReadRow(EmbeddedConnection connection, string sql)

@@ -7,7 +7,7 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
         <Title>Turso Native Interop</Title>
-        <Description>Native interop and runtime assets used by the Turso ADO.NET provider.</Description>
+        <Description>Dynamic native interop and runtime assets for the optional Turso.Data.Sqlite.Native local provider on Windows, Linux, macOS, Android, and iOS.</Description>
         <Authors>Turso authors</Authors>
         <PackageTags>turso;sqlite;database;native;interop</PackageTags>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -132,19 +132,19 @@
             <Pack>true</Pack>
             <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/</PackagePath>
         </None>
-        <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64-simulator\libturso_sdk_kit.framework\Info.plist"
+        <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sdk_kit.framework\Info.plist"
               Visible="false"
-              Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64-simulator\libturso_sdk_kit.framework\Info.plist')">
+              Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sdk_kit.framework\Info.plist')">
             <CopyToOutputDirectory>Never</CopyToOutputDirectory>
             <Pack>true</Pack>
-            <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/</PackagePath>
+            <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sdk_kit.framework/</PackagePath>
         </None>
-        <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64-simulator\libturso_sdk_kit.framework\libturso_sdk_kit"
+        <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sdk_kit.framework\libturso_sdk_kit"
               Visible="false"
-              Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64-simulator\libturso_sdk_kit.framework\libturso_sdk_kit')">
+              Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sdk_kit.framework\libturso_sdk_kit')">
             <CopyToOutputDirectory>Never</CopyToOutputDirectory>
             <Pack>true</Pack>
-            <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/</PackagePath>
+            <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sdk_kit.framework/</PackagePath>
         </None>
     </ItemGroup>
     <ItemGroup Condition="'$(Configuration)'=='Release'">
@@ -329,19 +329,19 @@
             <Pack>true</Pack>
             <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/</PackagePath>
         </None>
-        <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64-simulator\libturso_sdk_kit.framework\Info.plist"
+        <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sdk_kit.framework\Info.plist"
               Visible="false"
-              Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64-simulator\libturso_sdk_kit.framework\Info.plist')">
+              Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sdk_kit.framework\Info.plist')">
             <CopyToOutputDirectory>Never</CopyToOutputDirectory>
             <Pack>true</Pack>
-            <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/</PackagePath>
+            <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sdk_kit.framework/</PackagePath>
         </None>
-        <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64-simulator\libturso_sdk_kit.framework\libturso_sdk_kit"
+        <None Include="..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sdk_kit.framework\libturso_sdk_kit"
               Visible="false"
-              Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64-simulator\libturso_sdk_kit.framework\libturso_sdk_kit')">
+              Condition="Exists('..\..\rs_compiled\ios-universal\native\libturso_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sdk_kit.framework\libturso_sdk_kit')">
             <CopyToOutputDirectory>Never</CopyToOutputDirectory>
             <Pack>true</Pack>
-            <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/</PackagePath>
+            <PackagePath>runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sdk_kit.framework/</PackagePath>
         </None>
     </ItemGroup>
 

@@ -90,6 +90,11 @@ public abstract class TursoNativeDatabase : IDisposable
     /// </summary>
     public abstract TursoNativeStatement PrepareStatement(string sql);
 
+    /// <summary>
+    /// Sets the native connection busy timeout.
+    /// </summary>
+    public abstract void SetBusyTimeout(TimeSpan timeout);
+
     /// <inheritdoc />
     public abstract void Dispose();
 }
@@ -128,6 +133,11 @@ public abstract class TursoNativeStatement : IDisposable
     /// Advances the statement to its next row.
     /// </summary>
     public abstract bool Read();
+
+    /// <summary>
+    /// Requests interruption of an in-flight statement operation.
+    /// </summary>
+    public abstract void Interrupt();
 
     /// <summary>
     /// Gets the current-row value at a zero-based column index.

@@ -142,6 +142,13 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         set => this["Read Your Writes"] = value;
     }
 
+    /// <summary>
+    /// Gets or sets the reserved automatic synchronization interval.
+    /// </summary>
+    /// <remarks>
+    /// Only zero is supported. Positive values are preserved for connection-string
+    /// compatibility but are rejected when the connection opens.
+    /// </remarks>
     public int SyncInterval
     {
         get => GetInt("Sync Interval", 0);

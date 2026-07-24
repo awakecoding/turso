@@ -2,6 +2,9 @@
   <PropertyGroup>
     <_TursoDataSqliteStaticNativeEnabled Condition="'$(PublishAot)' == 'true' and '$(TursoUseStaticNativeLibrary)' == 'true'">true</_TursoDataSqliteStaticNativeEnabled>
     <_TursoDataSqliteStaticNativeSupportedRid Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64' or '$(RuntimeIdentifier)' == 'linux-x64' or '$(RuntimeIdentifier)' == 'linux-arm64' or '$(RuntimeIdentifier)' == 'osx-x64' or '$(RuntimeIdentifier)' == 'osx-arm64'">true</_TursoDataSqliteStaticNativeSupportedRid>
+    <_TursoDataSqliteStaticNativeSupportedTargetFramework Condition="'$(TargetFramework)' == 'net8.0' or '$(TargetFramework)' == 'net9.0' or '$(TargetFramework)' == 'net10.0'">true</_TursoDataSqliteStaticNativeSupportedTargetFramework>
+    <_TursoDataSqliteStaticNativeTargetPlatform>$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)'))</_TursoDataSqliteStaticNativeTargetPlatform>
+    <_TursoDataSqliteStaticNativeMobileTargetFramework Condition="'$(_TursoDataSqliteStaticNativeTargetPlatform)' == 'android' or '$(_TursoDataSqliteStaticNativeTargetPlatform)' == 'ios' or '$(_TursoDataSqliteStaticNativeTargetPlatform)' == 'maccatalyst' or '$(_TursoDataSqliteStaticNativeTargetPlatform)' == 'tvos'">true</_TursoDataSqliteStaticNativeMobileTargetFramework>
     <_TursoDataSqliteStaticNativePackageId>Turso.Data.Sqlite.NativeAot.$(RuntimeIdentifier)</_TursoDataSqliteStaticNativePackageId>
     <_TursoDataSqliteStaticNativeProviderAssembly>Turso.Data.Native</_TursoDataSqliteStaticNativeProviderAssembly>
 
@@ -21,6 +24,10 @@
           Condition="'$(_TursoDataSqliteStaticNativeEnabled)' == 'true'">
     <Error Condition="'$(RuntimeIdentifier)' == ''"
            Text="TursoUseStaticNativeLibrary requires a RuntimeIdentifier, for example win-x64, linux-x64, or osx-arm64." />
+    <Error Condition="'$(_TursoDataSqliteStaticNativeMobileTargetFramework)' == 'true'"
+           Text="TursoUseStaticNativeLibrary does not support mobile target framework '$(TargetFramework)'. Use the dynamic Android or iOS companion assets instead of Turso.Data.Sqlite.NativeAot.*." />
+    <Error Condition="'$(TargetFramework)' != '' and '$(_TursoDataSqliteStaticNativeMobileTargetFramework)' != 'true' and '$(_TursoDataSqliteStaticNativeSupportedTargetFramework)' != 'true'"
+           Text="TursoUseStaticNativeLibrary supports the generic net8.0, net9.0, and net10.0 target frameworks; '$(TargetFramework)' is not release-gated." />
     <Error Condition="'$(RuntimeIdentifier)' != '' and '$(_TursoDataSqliteStaticNativeSupportedRid)' != 'true'"
            Text="TursoUseStaticNativeLibrary does not support RuntimeIdentifier '$(RuntimeIdentifier)'." />
     <Error Condition="'$(_TursoDataSqliteStaticNativeSupportedRid)' == 'true' and '$(_TursoDataSqliteStaticNativeLibrary)' == ''"

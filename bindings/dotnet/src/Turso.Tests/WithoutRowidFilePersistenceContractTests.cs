@@ -31,10 +31,11 @@ public class WithoutRowidFilePersistenceContractTests
     }
 
     [Test]
-    public void TableLevelPrimaryKeyRejectionLeavesThePriorDurableCatalogRecoverable()
+    public void FailedTableLevelPrimaryKeyPublicationLeavesThePriorDurableCatalogRecoverable()
     {
         const string path = "table-primary-key-atomic-rejection.db";
-        var fileSystem = new InMemoryFileSystem();
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
 
         using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
         using (var connection = database.Connect())
@@ -42,11 +43,10 @@ public class WithoutRowidFilePersistenceContractTests
             Execute(connection, "CREATE TABLE retained(id INTEGER PRIMARY KEY, value TEXT);");
             Execute(connection, "INSERT INTO retained VALUES (1, 'durable');");
 
-            var act = () => Execute(
+            faults.FailNext(FileSystemOperation.Write);
+            Assert.Throws<IOException>(() => Execute(
                 connection,
-                "CREATE TABLE rejected(a INTEGER, b TEXT, PRIMARY KEY(a, b));");
-
-            act.Should().Throw<EmbeddedSqlException>().WithMessage("*table-level PRIMARY KEY*");
+                "CREATE TABLE rejected(a INTEGER, b TEXT, PRIMARY KEY(a, b));"));
             Scalar(connection, "SELECT value FROM retained WHERE id = 1;").AsText().Should().Be("durable");
             Assert.Throws<EmbeddedSqlException>(() => Scalar(connection, "SELECT COUNT(*) FROM rejected;"));
         }

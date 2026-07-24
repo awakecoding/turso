@@ -76,7 +76,7 @@ public class TursoEncryptedStorageTests
 
         var unsupportedFailure = Assert.Throws<InvalidDataException>(
             () => SqlitePageStore.Open(fileSystem, "unsupported.db", encryption: encryption));
-        unsupportedFailure!.Message.Should().Contain("does not provide a format-compatible implementation");
+        unsupportedFailure!.Message.Should().Contain("will not infer or fall back to another cipher");
 
         using (SqlitePageStore.Create(fileSystem, "tampered.db", encryption: encryption))
         {

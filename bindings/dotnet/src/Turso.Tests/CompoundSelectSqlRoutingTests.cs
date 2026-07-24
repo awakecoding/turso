@@ -362,6 +362,46 @@ public class CompoundSelectSqlRoutingTests
             () => ReadRows(connection, "EXPLAIN SELECT * FROM t UNION SELECT * FROM u;"));
     }
 
+    [Test]
+    public void CustomCollationCallbacksDoNotRunBeforeLaterTermErrors()
+    {
+        var routedCandidate = RunCustomCollationError(
+            "SELECT value COLLATE tracking FROM first_rows UNION SELECT abs(value) FROM later_error;");
+        var forcedEvaluator = RunCustomCollationError(
+            "SELECT value COLLATE tracking FROM first_rows UNION SELECT abs(value) FROM later_error ORDER BY 1;");
+
+        routedCandidate.Error.Should().Be(forcedEvaluator.Error).And.Be("integer overflow");
+        routedCandidate.CallbackCount.Should().Be(forcedEvaluator.CallbackCount).And.Be(0);
+    }
+
+    private static (string Error, int CallbackCount) RunCustomCollationError(string sql)
+    {
+        var callbackCount = 0;
+        var database = new EmbeddedDatabase();
+        database.RegisterCollation(
+            "tracking",
+            (left, right) =>
+            {
+                callbackCount++;
+                return string.CompareOrdinal(left, right);
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE first_rows(value);");
+        Execute(connection, "INSERT INTO first_rows VALUES ('same'), ('same');");
+        Execute(connection, "CREATE TABLE later_error(value);");
+        Execute(connection, "INSERT INTO later_error VALUES (-9223372036854775808);");
+
+        var error = Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, sql))!;
+
+        if (!sql.Contains("ORDER BY", StringComparison.Ordinal))
+        {
+            Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + sql))!
+                .Message.Should().Contain("EXPLAIN is only supported");
+        }
+
+        return (error.Message, callbackCount);
+    }
+
     private static void SeedSingleColumn(EmbeddedConnection connection)
     {
         Execute(connection, "CREATE TABLE t(a INTEGER);");
