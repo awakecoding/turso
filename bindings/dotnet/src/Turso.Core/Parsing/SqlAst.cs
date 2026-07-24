@@ -353,7 +353,8 @@ internal sealed record EmbeddedColumn(
     string? ForeignKeyConstraintName = null,
     string? NullConstraintName = null,
     bool ExplicitNull = false,
-    bool GenerationAlways = false)
+    bool GenerationAlways = false,
+    bool AutoIncrement = false)
 {
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether
@@ -369,7 +370,11 @@ internal sealed record EmbeddedColumn(
 // A column participating in a table-level PRIMARY KEY(...) clause, preserving the
 // declared collation and ASC/DESC direction so its physical-key descriptor does not
 // lose SQLite's comparison semantics.
-internal sealed record TablePrimaryKeyColumn(string Name, bool Descending, string? Collation = null);
+internal sealed record TablePrimaryKeyColumn(
+    string Name,
+    bool Descending,
+    string? Collation = null,
+    bool AutoIncrement = false);
 
 internal sealed record TableUniqueConstraint(
     string? Name,

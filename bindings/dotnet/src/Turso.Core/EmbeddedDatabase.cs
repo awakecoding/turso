@@ -80,15 +80,29 @@ internal readonly record struct FileCatalogVersion(
 
 internal sealed class EmbeddedConflictRollbackException : EmbeddedSqlException
 {
-    public EmbeddedConflictRollbackException(EmbeddedSqlException conflict)
+    public EmbeddedConflictRollbackException(EmbeddedSqlException conflict, long? lastInsertRowId = null)
         : base(conflict.Message, conflict)
     {
+        LastInsertRowId = lastInsertRowId;
     }
+
+    public long? LastInsertRowId { get; }
 }
 
 internal sealed class EmbeddedConflictFailException : EmbeddedSqlException
 {
     public EmbeddedConflictFailException(EmbeddedSqlException conflict, long lastInsertRowId)
+        : base(conflict.Message, conflict)
+    {
+        LastInsertRowId = lastInsertRowId;
+    }
+
+    public long LastInsertRowId { get; }
+}
+
+internal sealed class EmbeddedStatementAbortException : EmbeddedSqlException
+{
+    public EmbeddedStatementAbortException(EmbeddedSqlException conflict, long lastInsertRowId)
         : base(conflict.Message, conflict)
     {
         LastInsertRowId = lastInsertRowId;
@@ -120,6 +134,7 @@ public sealed class EmbeddedPostCommitMaintenanceException : EmbeddedSqlExceptio
 public sealed class EmbeddedDatabase : IDisposable
 {
     private const int MaximumTriggerDepth = 1_000;
+    internal const string SqliteSequenceTableName = "sqlite_sequence";
     private static readonly ConditionalWeakTable<IFileSystem, FileCatalogWriteLockScope> FileCatalogWriteLocks = new();
     private readonly object _gate = new();
     private Dictionary<string, EmbeddedTable> _tables = new(StringComparer.OrdinalIgnoreCase);
@@ -273,6 +288,7 @@ public sealed class EmbeddedDatabase : IDisposable
         bool RecursiveTriggersEnabled = false,
         IReadOnlySet<string>? ActiveTriggers = null,
         int TriggerDepth = 0,
+        AutoIncrementStatementState? AutoIncrementState = null,
         CancellationToken CancellationToken = default);
 
     // Bundles the mutable schema (tables, views, triggers) so a transaction can
@@ -299,6 +315,142 @@ public sealed class EmbeddedDatabase : IDisposable
             CloneTables(Tables),
             new Dictionary<string, ViewDefinition>(Views, StringComparer.OrdinalIgnoreCase),
             new Dictionary<string, TriggerDefinition>(Triggers, StringComparer.OrdinalIgnoreCase));
+    }
+
+    internal sealed class AutoIncrementStatementState
+    {
+        private readonly Dictionary<string, AutoIncrementTracker> _trackers =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public AutoIncrementTracker GetTracker(
+            string tableName,
+            EmbeddedTable table,
+            IReadOnlyDictionary<string, EmbeddedTable> tables)
+        {
+            if (!table.IsAutoIncrement)
+                throw new InvalidOperationException($"Table '{tableName}' is not AUTOINCREMENT.");
+            if (_trackers.TryGetValue(table.Name, out var tracker))
+                return tracker;
+
+            ValidateSqliteSequenceCatalog(tables);
+            var sequence = tables[SqliteSequenceTableName];
+            var sequenceRowIndex = -1;
+            for (var index = 0; index < sequence.Rows.Count; index++)
+            {
+                var name = sequence.Rows[index][0];
+                if (name.Kind == SqlValueKind.Text
+                    && string.Equals(name.AsText(), table.Name, StringComparison.Ordinal))
+                {
+                    if (sequenceRowIndex < 0
+                        || sequence.RowIds[index] < sequence.RowIds[sequenceRowIndex])
+                    {
+                        sequenceRowIndex = index;
+                    }
+                }
+            }
+
+            var originalSequence = sequenceRowIndex < 0
+                ? 0
+                : CoerceSqliteSequenceInteger(sequence.Rows[sequenceRowIndex][1]);
+            tracker = new AutoIncrementTracker(
+                table.Name,
+                sequenceRowIndex < 0 ? null : sequence.RowIds[sequenceRowIndex],
+                originalSequence);
+            _trackers.Add(table.Name, tracker);
+            return tracker;
+        }
+
+        public bool Commit(IReadOnlyDictionary<string, EmbeddedTable> tables)
+        {
+            if (_trackers.Count == 0)
+                return false;
+
+            ValidateSqliteSequenceCatalog(tables);
+            var sequence = tables[SqliteSequenceTableName];
+            var changed = false;
+            foreach (var tracker in _trackers.Values)
+                changed |= tracker.Commit(sequence);
+            return changed;
+        }
+    }
+
+    internal sealed class AutoIncrementTracker
+    {
+        private readonly string _tableName;
+        private readonly long? _originalSequenceRowId;
+        private readonly long _originalSequence;
+        private long _highWaterMark;
+
+        public AutoIncrementTracker(
+            string tableName,
+            long? originalSequenceRowId,
+            long originalSequence)
+        {
+            _tableName = tableName;
+            _originalSequenceRowId = originalSequenceRowId;
+            _originalSequence = originalSequence;
+            _highWaterMark = originalSequence;
+        }
+
+        public long NextRowId(bool anyRow, long largestRowId)
+        {
+            HasAttempt = true;
+            if (_highWaterMark == long.MaxValue || (anyRow && largestRowId == long.MaxValue))
+                throw new EmbeddedSqlException("database or disk is full");
+
+            var candidate = anyRow ? largestRowId + 1 : 1;
+            if (candidate <= _highWaterMark)
+                candidate = _highWaterMark + 1;
+            Observe(candidate);
+            return candidate;
+        }
+
+        public void Observe(long rowId)
+        {
+            HasAttempt = true;
+            if (rowId > _highWaterMark)
+                _highWaterMark = rowId;
+        }
+
+        private bool HasAttempt { get; set; }
+
+        public bool Commit(EmbeddedTable sequence)
+        {
+            if (!HasAttempt && _originalSequenceRowId is not null)
+                return false;
+
+            var sequenceRowIndex = _originalSequenceRowId is { } rowId
+                ? sequence.RowIds.IndexOf(rowId)
+                : -1;
+            if (_originalSequenceRowId is not null && _highWaterMark <= _originalSequence)
+                return false;
+
+            if (sequenceRowIndex < 0)
+            {
+                var newRowId = _originalSequenceRowId
+                    ?? (sequence.RowIds.Count == 0
+                        ? 1
+                        : NextAutoRowId(sequence.RowIds.Max(), new HashSet<long>(sequence.RowIds)));
+                var insertionIndex = sequence.RowIds.FindIndex(existingRowId => existingRowId > newRowId);
+                if (insertionIndex < 0)
+                {
+                    sequence.Rows.Add([SqlValue.Text(_tableName), SqlValue.Integer(_highWaterMark)]);
+                    sequence.RowIds.Add(newRowId);
+                }
+                else
+                {
+                    sequence.Rows.Insert(
+                        insertionIndex,
+                        [SqlValue.Text(_tableName), SqlValue.Integer(_highWaterMark)]);
+                    sequence.RowIds.Insert(insertionIndex, newRowId);
+                }
+                return true;
+            }
+
+            sequence.Rows[sequenceRowIndex][0] = SqlValue.Text(_tableName);
+            sequence.Rows[sequenceRowIndex][1] = SqlValue.Integer(_highWaterMark);
+            return true;
+        }
     }
 
     public EmbeddedConnection Connect() => new(this);
@@ -473,6 +625,7 @@ public sealed class EmbeddedDatabase : IDisposable
                             SchemaVersion = unchecked(_inMemoryPragmaHeader.SchemaVersion + 1),
                         };
                     }
+
                     PublishCatalog(cancellableWorking);
                 }
                 else
@@ -1131,12 +1284,20 @@ public sealed class EmbeddedDatabase : IDisposable
             CreateTriggerStatement createTrigger => ExecuteCreateTrigger(createTrigger, catalog),
             DropTriggerStatement dropTrigger => ExecuteDropTrigger(dropTrigger, catalog),
             AlterTableAddColumnStatement addColumn => ExecuteAlterTableAddColumn(addColumn, parameters, context),
-            AlterTableRenameStatement rename => ExecuteAlterTableRename(rename, tables),
+            AlterTableRenameStatement rename => ExecuteAlterTableRename(rename, catalog),
             AlterTableRenameColumnStatement renameColumn => ExecuteAlterTableRenameColumn(renameColumn, tables),
-            InsertStatement insert => ExecuteInsert(insert, parameters, context),
-            UpdateStatement update => ExecuteUpdate(update, parameters, context),
-            DeleteStatement delete => ExecuteDelete(delete, parameters, context),
-            WithDmlStatement with => ExecuteWithDml(with, parameters, context),
+            InsertStatement insert => ExecuteDmlWithAutoIncrementState(
+                context,
+                scoped => ExecuteInsert(insert, parameters, scoped)),
+            UpdateStatement update => ExecuteDmlWithAutoIncrementState(
+                context,
+                scoped => ExecuteUpdate(update, parameters, scoped)),
+            DeleteStatement delete => ExecuteDmlWithAutoIncrementState(
+                context,
+                scoped => ExecuteDelete(delete, parameters, scoped)),
+            WithDmlStatement with => ExecuteDmlWithAutoIncrementState(
+                context,
+                scoped => ExecuteWithDml(with, parameters, scoped)),
             ValuesClause values => ExecuteValuesStatement(values, parameters, context, null),
             QueryStatement query => ExecuteQuery(query, parameters, context, null),
             PragmaTableInfoStatement tableInfo => ExecutePragmaTableInfo(tableInfo, tables),
@@ -1349,6 +1510,8 @@ public sealed class EmbeddedDatabase : IDisposable
     private ExecutionResult ExecuteCreateTable(CreateTableStatement statement, SchemaCatalog catalog)
     {
         var tables = catalog.Tables;
+        if (IsSqliteSequenceTable(statement.Name))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
         if (tables.ContainsKey(statement.Name))
         {
             if (statement.IfNotExists)
@@ -1372,28 +1535,34 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"PRIMARY KEY missing on table {statement.Name}");
         }
 
-        tables.Add(
+        var table = new EmbeddedTable(
             statement.Name,
-            new EmbeddedTable(
-                statement.Name,
-                statement.Columns,
-                statement.WithoutRowid,
-                statement.PrimaryKeyColumns,
-                statement.UniqueConstraints,
-                statement.CheckConstraints,
-                statement.PrimaryKeyConflictAlgorithm,
-                statement.PrimaryKeyConstraintName));
+            statement.Columns,
+            statement.WithoutRowid,
+            statement.PrimaryKeyColumns,
+            statement.UniqueConstraints,
+            statement.CheckConstraints,
+            statement.PrimaryKeyConflictAlgorithm,
+            statement.PrimaryKeyConstraintName);
+        if (table.IsAutoIncrement)
+            EnsureSqliteSequenceTable(catalog);
+
+        tables.Add(statement.Name, table);
         return new ExecutionResult([], [], 0, true);
     }
 
     private static ExecutionResult ExecuteDropTable(DropTableStatement statement, SchemaCatalog catalog)
     {
         var tables = catalog.Tables;
+        if (IsSqliteSequenceTable(statement.Name) && tables.ContainsKey(statement.Name))
+            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be dropped");
         if (catalog.Views.ContainsKey(statement.Name))
             throw new EmbeddedSqlException($"use DROP VIEW to delete view {statement.Name}");
 
-        if (tables.Remove(statement.Name))
+        if (tables.TryGetValue(statement.Name, out var table) && tables.Remove(statement.Name))
         {
+            if (table.IsAutoIncrement)
+                DeleteSqliteSequenceRows(tables, table.Name);
             RemoveTriggersForTable(catalog, statement.Name);
             return new ExecutionResult([], [], 0, true);
         }
@@ -1414,9 +1583,79 @@ public sealed class EmbeddedDatabase : IDisposable
             catalog.Triggers.Remove(trigger);
     }
 
+    private static void EnsureSqliteSequenceTable(SchemaCatalog catalog)
+    {
+        if (catalog.Tables.TryGetValue(SqliteSequenceTableName, out _))
+        {
+            ValidateSqliteSequenceCatalog(catalog.Tables);
+            return;
+        }
+        if (catalog.Views.ContainsKey(SqliteSequenceTableName)
+            || catalog.Triggers.ContainsKey(SqliteSequenceTableName)
+            || TryFindIndex(catalog.Tables, SqliteSequenceTableName, out _, out _))
+        {
+            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
+        }
+
+        catalog.Tables.Add(
+            SqliteSequenceTableName,
+            new EmbeddedTable(
+                SqliteSequenceTableName,
+                [
+                    new EmbeddedColumn("name", null, false, false, false, null),
+                    new EmbeddedColumn("seq", null, false, false, false, null),
+                ]));
+    }
+
+    internal static void ValidateSqliteSequenceCatalog(
+        IReadOnlyDictionary<string, EmbeddedTable> tables)
+    {
+        var requiresSequence = tables.Any(entry =>
+            !IsSqliteSequenceTable(entry.Key) && entry.Value.IsAutoIncrement);
+        if (!tables.TryGetValue(SqliteSequenceTableName, out var sequence))
+        {
+            if (requiresSequence)
+                throw new EmbeddedSqlException("database disk image is malformed");
+            return;
+        }
+
+        if (!sequence.HasRowid
+            || sequence.ColumnDefinitions.Length != 2
+            || !string.Equals(sequence.ColumnDefinitions[0].Name, "name", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(sequence.ColumnDefinitions[1].Name, "seq", StringComparison.OrdinalIgnoreCase)
+            || sequence.PrimaryKeyColumns.Count != 0
+            || sequence.Indexes.Count != 0)
+        {
+            throw new EmbeddedSqlException("database disk image is malformed");
+        }
+    }
+
+    private static void DeleteSqliteSequenceRows(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        string tableName)
+    {
+        if (!tables.TryGetValue(SqliteSequenceTableName, out var sequence))
+            throw new InvalidOperationException("An AUTOINCREMENT table is missing sqlite_sequence.");
+
+        for (var index = sequence.Rows.Count - 1; index >= 0; index--)
+        {
+            var name = sequence.Rows[index][0];
+            if (name.Kind != SqlValueKind.Text
+                || !string.Equals(name.AsText(), tableName, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            sequence.Rows.RemoveAt(index);
+            sequence.RowIds.RemoveAt(index);
+        }
+    }
+
     private ExecutionResult ExecuteCreateIndex(CreateIndexStatement statement, SchemaCatalog catalog)
     {
         var tables = catalog.Tables;
+        if (IsSqliteSequenceTable(statement.Name))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
         if (tables.ContainsKey(statement.Name))
             throw new EmbeddedSqlException($"there is already a table named {statement.Name}");
         if (catalog.Views.ContainsKey(statement.Name))
@@ -1434,6 +1673,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (IsSchemaTable(statement.TableName))
             throw new EmbeddedSqlException($"table {statement.TableName} may not be indexed");
+        if (IsSqliteSequenceTable(statement.TableName))
+            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be indexed");
         if (catalog.Views.ContainsKey(statement.TableName))
             throw new EmbeddedSqlException($"views may not be indexed");
         if (!tables.TryGetValue(statement.TableName, out var table))
@@ -1511,6 +1752,8 @@ public sealed class EmbeddedDatabase : IDisposable
     private static ExecutionResult ExecuteCreateView(CreateViewStatement statement, SchemaCatalog catalog)
     {
         var tables = catalog.Tables;
+        if (IsSqliteSequenceTable(statement.Name))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
         if (catalog.Views.ContainsKey(statement.Name))
         {
             if (statement.IfNotExists)
@@ -1565,6 +1808,8 @@ public sealed class EmbeddedDatabase : IDisposable
     private static ExecutionResult ExecuteCreateTrigger(CreateTriggerStatement statement, SchemaCatalog catalog)
     {
         var tables = catalog.Tables;
+        if (IsSqliteSequenceTable(statement.Name))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
         if (catalog.Triggers.ContainsKey(statement.Name))
         {
             if (statement.IfNotExists)
@@ -1581,6 +1826,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (catalog.Views.ContainsKey(statement.TableName))
             throw new EmbeddedSqlException($"cannot create trigger on view: {statement.TableName}");
+        if (IsSqliteSequenceTable(statement.TableName) && tables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException("cannot create trigger on system table");
         if (!tables.ContainsKey(statement.TableName))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
@@ -1605,6 +1852,8 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        if (IsSqliteSequenceTable(statement.TableName) && context.Tables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
@@ -1627,8 +1876,13 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private static ExecutionResult ExecuteAlterTableRename(
         AlterTableRenameStatement statement,
-        Dictionary<string, EmbeddedTable> tables)
+        SchemaCatalog catalog)
     {
+        var tables = catalog.Tables;
+        if (IsSqliteSequenceTable(statement.TableName) && tables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
+        if (IsSqliteSequenceTable(statement.NewName))
+            throw new EmbeddedSqlException($"object name reserved for internal use: {SqliteSequenceTableName}");
         if (tables.ContainsKey(statement.NewName))
             throw new EmbeddedSqlException($"table {statement.NewName} already exists");
         if (TryFindIndex(tables, statement.NewName, out _, out _))
@@ -1644,15 +1898,38 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (!tables.Remove(statement.TableName))
             throw new InvalidOperationException($"Table '{statement.TableName}' disappeared during rename.");
+        var previousName = table.Name;
         table.Rename(statement.NewName);
         tables.Add(statement.NewName, table);
+        if (table.IsAutoIncrement)
+            RenameSqliteSequenceRows(tables, previousName, statement.NewName);
         return new ExecutionResult([], [], 0, true);
+    }
+
+    private static void RenameSqliteSequenceRows(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        string previousName,
+        string newName)
+    {
+        if (!tables.TryGetValue(SqliteSequenceTableName, out var sequence))
+            throw new InvalidOperationException("An AUTOINCREMENT table is missing sqlite_sequence.");
+
+        foreach (var row in sequence.Rows)
+        {
+            if (row[0].Kind == SqlValueKind.Text
+                && string.Equals(row[0].AsText(), previousName, StringComparison.Ordinal))
+            {
+                row[0] = SqlValue.Text(newName);
+            }
+        }
     }
 
     private static ExecutionResult ExecuteAlterTableRenameColumn(
         AlterTableRenameColumnStatement statement,
         Dictionary<string, EmbeddedTable> tables)
     {
+        if (IsSqliteSequenceTable(statement.TableName) && tables.ContainsKey(statement.TableName))
+            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
         if (!tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
@@ -1681,6 +1958,22 @@ public sealed class EmbeddedDatabase : IDisposable
             TriggerEvent.Insert,
             context,
             () => PerformInsert(statement, parameters, context));
+    }
+
+    private static ExecutionResult ExecuteDmlWithAutoIncrementState(
+        QueryContext context,
+        Func<QueryContext, ExecutionResult> execute)
+    {
+        if (context.AutoIncrementState is not null)
+            return execute(context);
+
+        var state = new AutoIncrementStatementState();
+        var scoped = context with { AutoIncrementState = state };
+        var result = execute(scoped);
+        var sequenceChanged = state.Commit(scoped.Tables);
+        return sequenceChanged && !result.Changed
+            ? result with { Changed = true }
+            : result;
     }
 
     private ExecutionResult ExecuteConstraintResolvedInsert(
@@ -1741,7 +2034,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         void InsertExpressions(Expression[] values)
         {
-            var plan = PrepareInsert(statement, table);
+            var plan = PrepareInsert(statement, table, context);
             BuildAndCommitCandidate(() => BuildInsertRow(
                 statement,
                 table,
@@ -1754,7 +2047,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         void InsertValues(IReadOnlyList<SqlValue> values)
         {
-            var plan = PrepareInsert(statement, table);
+            var plan = PrepareInsert(statement, table, context);
             BuildAndCommitCandidate(() => BuildInsertRow(
                 statement,
                 table,
@@ -1887,6 +2180,18 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             return PerformInsertEvaluated(statement, parameters, context);
         }
+        catch (EmbeddedStatementAbortException exception)
+        {
+            RestoreTables(context.Tables, backup);
+            if (IsConflictAlgorithmConstraint(exception))
+            {
+                throw new EmbeddedConflictRollbackException(
+                    exception,
+                    exception.LastInsertRowId);
+            }
+
+            throw;
+        }
         catch (EmbeddedSqlException exception)
         {
             RestoreTables(context.Tables, backup);
@@ -1965,7 +2270,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         void InsertConflictExpressions(Expression[] values)
         {
-            var plan = PrepareInsert(statement, table);
+            var plan = PrepareInsert(statement, table, context);
             try
             {
                 var (row, rowId) = BuildInsertRow(statement, table, plan, values, parameters, context);
@@ -1981,7 +2286,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         void InsertConflictValues(IReadOnlyList<SqlValue> values)
         {
-            var plan = PrepareInsert(statement, table);
+            var plan = PrepareInsert(statement, table, context);
             try
             {
                 var (row, rowId) = BuildInsertRow(statement, table, plan, values, parameters, context);
@@ -2053,7 +2358,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         void ReplaceExpressions(Expression[] values)
         {
-            var plan = PrepareInsert(statement, table);
+            var plan = PrepareInsert(statement, table, context);
             var (row, rowId) = BuildInsertRow(
                 statement,
                 table,
@@ -2076,7 +2381,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         void ReplaceValues(IReadOnlyList<SqlValue> values)
         {
-            var plan = PrepareInsert(statement, table);
+            var plan = PrepareInsert(statement, table, context);
             var (row, rowId) = BuildInsertRow(
                 statement,
                 table,
@@ -2309,7 +2614,7 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         var conflictTarget = ResolveUpsertConflictTarget(statement.TableName, table, statement.Upsert.Target);
-        var insertPlan = PrepareInsert(statement, table);
+        var insertPlan = PrepareInsert(statement, table, context);
         var updateAction = statement.Upsert.Action as DoUpdateUpsertAction;
         UpdatePlan? updatePlan = null;
         if (updateAction is null && statement.Upsert.Action is not DoNothingUpsertAction)
@@ -2916,8 +3221,10 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+        if (table.IsAutoIncrement)
+            return PerformAutoIncrementInsertEvaluated(statement, parameters, context, table);
 
-        var plan = PrepareInsert(statement, table);
+        var plan = PrepareInsert(statement, table, context);
         var sourceRows = statement.Source is null
             ? null
             : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
@@ -2967,10 +3274,139 @@ public sealed class EmbeddedDatabase : IDisposable
         };
     }
 
+    private ExecutionResult PerformAutoIncrementInsertEvaluated(
+        InsertStatement statement,
+        SqlValue[] parameters,
+        QueryContext context,
+        EmbeddedTable table)
+    {
+        var plan = PrepareInsert(statement, table, context);
+        var sourceRows = statement.Source is null
+            ? null
+            : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
+        var rowCount = sourceRows?.Count ?? statement.Rows.Count;
+        var rowsToInsert = new List<SqlValue[]>(rowCount);
+        var insertedRowIds = new List<long>(rowCount);
+        var backup = CloneTables(context.Tables);
+        try
+        {
+            if (sourceRows is not null)
+            {
+                foreach (var sourceRow in sourceRows)
+                    InsertCandidate(sourceRow);
+            }
+            else
+            {
+                foreach (var valueExpressions in statement.Rows)
+                {
+                    var (row, rowId) = BuildInsertRow(
+                        statement,
+                        table,
+                        plan,
+                        valueExpressions,
+                        parameters,
+                        context);
+                    AddCandidate(row, rowId);
+                }
+            }
+
+            CommitInserts(context, statement.TableName, table, rowsToInsert, insertedRowIds);
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            var validPrefixLastInsertRowId = FindLastValidInsertRowId(
+                context,
+                statement.TableName,
+                table,
+                rowsToInsert,
+                insertedRowIds);
+            RestoreTables(context.Tables, backup);
+            if (validPrefixLastInsertRowId is { } insertedRowId)
+                throw new EmbeddedStatementAbortException(exception, insertedRowId);
+            throw;
+        }
+        catch
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+
+        var lastInsertRowId = insertedRowIds.Count > 0 ? insertedRowIds[^1] : (long?)null;
+        if (statement.Returning is not null)
+        {
+            return BuildReturningResult(
+                statement.Returning,
+                statement.TableName,
+                table,
+                rowsToInsert,
+                insertedRowIds,
+                rowsToInsert.Count,
+                rowsToInsert.Count > 0,
+                parameters,
+                context,
+                lastInsertRowId);
+        }
+
+        return new ExecutionResult([], [], rowsToInsert.Count, rowsToInsert.Count > 0)
+        {
+            LastInsertRowId = lastInsertRowId,
+        };
+
+        void InsertCandidate(IReadOnlyList<SqlValue> values)
+        {
+            var (row, rowId) = BuildInsertRow(
+                statement,
+                table,
+                plan,
+                values,
+                parameters,
+                context);
+            AddCandidate(row, rowId);
+        }
+
+        void AddCandidate(SqlValue[] row, long rowId)
+        {
+            rowsToInsert.Add(row);
+            insertedRowIds.Add(rowId);
+        }
+    }
+
+    private long? FindLastValidInsertRowId(
+        QueryContext context,
+        string tableName,
+        EmbeddedTable table,
+        List<SqlValue[]> candidateRows,
+        List<long> candidateRowIds)
+    {
+        long? lastInsertRowId = null;
+        for (var count = 1; count <= candidateRows.Count; count++)
+        {
+            try
+            {
+                ValidateInserts(
+                    context,
+                    tableName,
+                    table,
+                    candidateRows.GetRange(0, count),
+                    candidateRowIds.GetRange(0, count));
+                lastInsertRowId = candidateRowIds[count - 1];
+            }
+            catch (EmbeddedSqlException)
+            {
+                break;
+            }
+        }
+
+        return lastInsertRowId;
+    }
+
     // Resolves the INSERT's target columns and the mutable rowid-allocation state shared
     // across every value row. Extracted so the evaluated loop and the compiled write
     // target build rows through identical logic.
-    private InsertPlan PrepareInsert(InsertStatement statement, EmbeddedTable table)
+    private InsertPlan PrepareInsert(
+        InsertStatement statement,
+        EmbeddedTable table,
+        QueryContext context)
     {
         // The default column list excludes generated columns, which are computed rather than
         // supplied, matching SQLite's INSERT ... VALUES arity for generated-column tables.
@@ -3011,6 +3447,10 @@ public sealed class EmbeddedDatabase : IDisposable
             Used = new HashSet<long>(table.RowIds),
             AnyRow = anyRow,
             LargestRowId = anyRow ? table.RowIds.Max() : long.MinValue,
+            AutoIncrement = table.IsAutoIncrement
+                ? context.AutoIncrementState?.GetTracker(statement.TableName, table, context.Tables)
+                    ?? throw new InvalidOperationException("AUTOINCREMENT allocation is missing statement state.")
+                : null,
         };
     }
 
@@ -3086,12 +3526,15 @@ public sealed class EmbeddedDatabase : IDisposable
         long rowid;
         if (rowidSource.Kind == SqlValueKind.Null)
         {
-            rowid = plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1;
+            rowid = plan.AutoIncrement is null
+                ? plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1
+                : plan.AutoIncrement.NextRowId(plan.AnyRow, plan.LargestRowId);
             plan.Used.Add(rowid);
         }
         else if (EmbeddedTable.TryCoerceRowid(rowidSource, out var explicitRowid))
         {
             rowid = explicitRowid;
+            plan.AutoIncrement?.Observe(rowid);
             if (!plan.Used.Add(rowid))
             {
                 if (!allowExistingRowid)
@@ -3135,6 +3578,24 @@ public sealed class EmbeddedDatabase : IDisposable
         List<SqlValue[]> rowsToInsert,
         List<long> insertedRowIds)
     {
+        ValidateInserts(context, tableName, table, rowsToInsert, insertedRowIds);
+        table.Rows.AddRange(rowsToInsert);
+        table.RowIds.AddRange(insertedRowIds);
+        SortWithoutRowid(table);
+        if (table.HasRowid)
+        {
+            foreach (var rowId in insertedRowIds)
+                RecordBlobMutation(tableName, rowId);
+        }
+    }
+
+    private void ValidateInserts(
+        QueryContext context,
+        string tableName,
+        EmbeddedTable table,
+        IReadOnlyList<SqlValue[]> rowsToInsert,
+        IReadOnlyList<long> insertedRowIds)
+    {
         ValidateRowids(tableName, table, insertedRowIds);
         var allRows = new List<SqlValue[]>(table.Rows.Count + rowsToInsert.Count);
         allRows.AddRange(table.Rows);
@@ -3144,14 +3605,6 @@ public sealed class EmbeddedDatabase : IDisposable
         ValidatePrimaryKey(tableName, table, allRows);
         ValidateUniqueIndexes(tableName, table, allRows);
         ValidateForeignKeysAfterInsert(context, tableName, table, rowsToInsert, allRows);
-        table.Rows.AddRange(rowsToInsert);
-        table.RowIds.AddRange(insertedRowIds);
-        SortWithoutRowid(table);
-        if (table.HasRowid)
-        {
-            foreach (var rowId in insertedRowIds)
-                RecordBlobMutation(tableName, rowId);
-        }
     }
 
     private static void ValidateRowids(
@@ -3193,6 +3646,73 @@ public sealed class EmbeddedDatabase : IDisposable
         public bool AnyRow { get; set; }
 
         public long LargestRowId { get; set; }
+
+        public AutoIncrementTracker? AutoIncrement { get; init; }
+    }
+
+    private static long CoerceSqliteSequenceInteger(SqlValue value)
+    {
+        switch (value.Kind)
+        {
+            case SqlValueKind.Integer:
+                return value.AsInteger();
+            case SqlValueKind.Real:
+                return TruncateSqliteInteger(value.AsReal());
+            case SqlValueKind.Text:
+                return ParseSqliteIntegerPrefix(value.AsText());
+            case SqlValueKind.Blob:
+                return ParseSqliteIntegerPrefix(Encoding.UTF8.GetString(value.AsBlob().Span));
+            default:
+                return 0;
+        }
+    }
+
+    private static long ParseSqliteIntegerPrefix(ReadOnlySpan<char> text)
+    {
+        var index = 0;
+        while (index < text.Length && IsSqliteNumericWhitespace(text[index]))
+            index++;
+
+        var negative = false;
+        if (index < text.Length && text[index] is '+' or '-')
+        {
+            negative = text[index] == '-';
+            index++;
+        }
+
+        var start = index;
+        var limit = negative ? 1UL << 63 : long.MaxValue;
+        ulong magnitude = 0;
+        while (index < text.Length && text[index] is >= '0' and <= '9')
+        {
+            var digit = (uint)(text[index] - '0');
+            if (magnitude > (limit - digit) / 10)
+                return negative ? long.MinValue : long.MaxValue;
+            magnitude = magnitude * 10 + digit;
+            index++;
+        }
+
+        if (index == start)
+            return 0;
+        if (!negative)
+            return (long)magnitude;
+        if (magnitude == 1UL << 63)
+            return long.MinValue;
+        return -(long)magnitude;
+    }
+
+    private static bool IsSqliteNumericWhitespace(char value)
+        => value is ' ' or '\t' or '\n' or '\r' or '\v' or '\f';
+
+    private static long TruncateSqliteInteger(double value)
+    {
+        if (double.IsNaN(value))
+            return 0;
+        if (value >= long.MaxValue)
+            return long.MaxValue;
+        if (value <= long.MinValue)
+            return long.MinValue;
+        return (long)value;
     }
 
     // Computes the next autogenerated rowid: one greater than the largest rowid in use,
@@ -6756,6 +7276,8 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             return false;
         }
+        if (table.IsAutoIncrement && statement.Rows.Count > 1)
+            return false;
 
         if (!TryCompileReturningClause(
                 statement.Returning,
@@ -6768,7 +7290,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 out hasReturning))
             return false;
 
-        var plan = PrepareInsert(statement, table);
+        var plan = PrepareInsert(statement, table, context);
         var rowsToInsert = new List<SqlValue[]>(statement.Rows.Count);
         var insertedRowIds = new List<long>(statement.Rows.Count);
         var returningRows = hasReturning ? new List<SqlValue[]>(statement.Rows.Count) : null;
@@ -7152,31 +7674,59 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        var compilationContext = EnsureAutoIncrementStatementState(context);
         switch (statement.Inner)
         {
             case SelectStatement select
-                when TryCompileSelect(select, parameters, context, outerRow: null, out var compiledSelect):
+                when TryCompileSelect(select, parameters, compilationContext, outerRow: null, out var compiledSelect):
                 return DescribeProgram(compiledSelect.Program);
             case CompoundSelectStatement compound
-                when TryCompileCompoundSelect(compound, parameters, context, outerRow: null, out var compiledCompound):
+                when TryCompileCompoundSelect(
+                    compound,
+                    parameters,
+                    compilationContext,
+                    outerRow: null,
+                    out var compiledCompound):
                 return DescribeProgram(compiledCompound.Program);
             case InsertStatement insert
-                when CanRouteInsertThroughCompiler(insert, context)
-                    && TryCompileInsert(insert, parameters, context, out var compiledInsert, out _, out _):
+                when CanRouteInsertThroughCompiler(insert, compilationContext)
+                    && TryCompileInsert(
+                        insert,
+                        parameters,
+                        compilationContext,
+                        out var compiledInsert,
+                        out _,
+                        out _):
                 return DescribeProgram(compiledInsert.Program);
             case UpdateStatement update
-                when CanRouteUpdateThroughCompiler(update, context)
-                    && TryCompileUpdate(update, parameters, context, out var compiledUpdate, out _, out _):
+                when CanRouteUpdateThroughCompiler(update, compilationContext)
+                    && TryCompileUpdate(
+                        update,
+                        parameters,
+                        compilationContext,
+                        out var compiledUpdate,
+                        out _,
+                        out _):
                 return DescribeProgram(compiledUpdate.Program);
             case DeleteStatement delete
-                when CanCompileDml(context)
-                    && TryCompileDelete(delete, parameters, context, out var compiledDelete, out _, out _):
+                when CanCompileDml(compilationContext)
+                    && TryCompileDelete(
+                        delete,
+                        parameters,
+                        compilationContext,
+                        out var compiledDelete,
+                        out _,
+                        out _):
                 return DescribeProgram(compiledDelete.Program);
             case ValuesClause values
                 when TryCompileValues(values, out var compiledValues, out _):
                 return DescribeProgram(compiledValues.Program);
             case WithSelectStatement with
-                when TryBuildRecursiveCteExplainProgram(with, parameters, context, out var recursiveProgram):
+                when TryBuildRecursiveCteExplainProgram(
+                    with,
+                    parameters,
+                    compilationContext,
+                    out var recursiveProgram):
                 return DescribeProgram(recursiveProgram);
         }
 
@@ -7192,27 +7742,28 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        var compilationContext = EnsureAutoIncrementStatementState(context);
         var usesCompiledProgram = statement.Inner switch
         {
-            SelectStatement select => !context.CancellationToken.CanBeCanceled
-                && TryCompileSelect(select, parameters, context, outerRow: null, out _),
-            CompoundSelectStatement compound => !context.CancellationToken.CanBeCanceled
+            SelectStatement select => !compilationContext.CancellationToken.CanBeCanceled
+                && TryCompileSelect(select, parameters, compilationContext, outerRow: null, out _),
+            CompoundSelectStatement compound => !compilationContext.CancellationToken.CanBeCanceled
                 && TryCompileCompoundSelect(
                     compound,
                     parameters,
-                    context,
+                    compilationContext,
                     outerRow: null,
                     out _),
             ValuesClause values => TryPrepareValuesLowering(values, out _),
             // WITH execution starts by materializing CTE inputs. Report the evaluator boundary
             // rather than evaluating those inputs merely to discover a later compiled phase.
             WithSelectStatement => false,
-            InsertStatement insert => CanRouteInsertThroughCompiler(insert, context)
-                && TryCompileInsert(insert, parameters, context, out _, out _, out _),
-            UpdateStatement update => CanRouteUpdateThroughCompiler(update, context)
-                && TryCompileUpdate(update, parameters, context, out _, out _, out _),
-            DeleteStatement delete => CanCompileDml(context)
-                && TryCompileDelete(delete, parameters, context, out _, out _, out _),
+            InsertStatement insert => CanRouteInsertThroughCompiler(insert, compilationContext)
+                && TryCompileInsert(insert, parameters, compilationContext, out _, out _, out _),
+            UpdateStatement update => CanRouteUpdateThroughCompiler(update, compilationContext)
+                && TryCompileUpdate(update, parameters, compilationContext, out _, out _, out _),
+            DeleteStatement delete => CanCompileDml(compilationContext)
+                && TryCompileDelete(delete, parameters, compilationContext, out _, out _, out _),
             QueryStatement or WithDmlStatement => false,
             _ => throw new EmbeddedSqlException(
                 "EXPLAIN QUERY PLAN is only supported for queries and INSERT, UPDATE, or DELETE statements."),
@@ -7233,6 +7784,11 @@ public sealed class EmbeddedDatabase : IDisposable
             ],
             0);
     }
+
+    private static QueryContext EnsureAutoIncrementStatementState(QueryContext context)
+        => context.AutoIncrementState is null
+            ? context with { AutoIncrementState = new AutoIncrementStatementState() }
+            : context;
 
     internal static string[] ExplainQueryPlanColumns() => ["id", "parent", "notused", "detail"];
 
@@ -9732,6 +10288,9 @@ public sealed class EmbeddedDatabase : IDisposable
         => string.Equals(name, "sqlite_master", StringComparison.OrdinalIgnoreCase)
             || string.Equals(name, "sqlite_schema", StringComparison.OrdinalIgnoreCase);
 
+    private static bool IsSqliteSequenceTable(string name)
+        => string.Equals(name, SqliteSequenceTableName, StringComparison.OrdinalIgnoreCase);
+
     private static SourceData GetNamedTableRows(
         NamedTableSource source,
         QueryContext context,
@@ -9962,6 +10521,16 @@ public sealed class EmbeddedDatabase : IDisposable
 
     internal static string BuildCreateTableSql(string name, EmbeddedTable table)
     {
+        if (IsSqliteSequenceTable(name))
+        {
+            ValidateSqliteSequenceCatalog(
+                new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [SqliteSequenceTableName] = table,
+                });
+            return "CREATE TABLE sqlite_sequence(name,seq)";
+        }
+
         var columns = table.ColumnDefinitions.Select(column =>
         {
             var definition = QuoteIdentifier(column.Name);
@@ -10007,7 +10576,8 @@ public sealed class EmbeddedDatabase : IDisposable
             {
                 definition += FormatConstraintName(column.PrimaryKeyConstraintName)
                     + (column.PrimaryKeyDescending ? " PRIMARY KEY DESC" : " PRIMARY KEY")
-                    + FormatConflictClause(column.PrimaryKeyConflictAlgorithm);
+                    + FormatConflictClause(column.PrimaryKeyConflictAlgorithm)
+                    + (column.AutoIncrement ? " AUTOINCREMENT" : string.Empty);
             }
             if (column.NotNull)
             {
@@ -10051,7 +10621,8 @@ public sealed class EmbeddedDatabase : IDisposable
             var keyColumns = tablePrimaryKey.Select(keyColumn =>
                 QuoteIdentifier(keyColumn.Name)
                 + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
-                + (keyColumn.Descending ? " DESC" : string.Empty));
+                + (keyColumn.Descending ? " DESC" : string.Empty)
+                + (keyColumn.AutoIncrement ? " AUTOINCREMENT" : string.Empty));
             columns.Add(
                 FormatConstraintName(table.TablePrimaryKeyConstraintName).TrimStart()
                 + (table.TablePrimaryKeyConstraintName is null ? string.Empty : " ")
@@ -16878,9 +17449,16 @@ public sealed class EmbeddedConnection : IDisposable
                 }
                 catch (EmbeddedConflictRollbackException exception)
                 {
+                    if (exception.LastInsertRowId is { } rolledBackInsertRowId)
+                        _lastInsertRowId = rolledBackInsertRowId;
                     if (_transactionDatabases is not null)
                         ResetTransactionState();
 
+                    throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
+                }
+                catch (EmbeddedStatementAbortException exception)
+                {
+                    _lastInsertRowId = exception.LastInsertRowId;
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
                 catch (EmbeddedConflictFailException exception)
@@ -18875,6 +19453,29 @@ internal sealed class EmbeddedTable
                 ColumnDefinitions,
                 TableLevelPrimaryKey,
                 PrimaryKeyColumns);
+        var columnAutoIncrement = ColumnDefinitions
+            .Select((column, index) => (column, index))
+            .Where(entry => entry.column.AutoIncrement)
+            .Select(entry => entry.index)
+            .ToArray();
+        var tableAutoIncrement = TableLevelPrimaryKey?
+            .Where(column => column.AutoIncrement)
+            .Select(column => _columnIndices[column.Name])
+            .ToArray() ?? [];
+        var autoIncrementColumns = columnAutoIncrement.Concat(tableAutoIncrement).ToArray();
+        if (autoIncrementColumns.Length > 0)
+        {
+            if (withoutRowid)
+                throw new EmbeddedSqlException("AUTOINCREMENT not allowed on WITHOUT ROWID tables");
+            if (autoIncrementColumns.Length != 1
+                || RowidAliasColumnIndex < 0
+                || autoIncrementColumns[0] != RowidAliasColumnIndex)
+            {
+                throw new EmbeddedSqlException("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+            }
+
+            IsAutoIncrement = true;
+        }
 
         GeneratedColumnOrder = ValidateAndOrderGeneratedColumns(ColumnDefinitions, PrimaryKeyColumns, _columnIndices);
         ForeignKeys = Array.AsReadOnly(
@@ -19090,6 +19691,8 @@ internal sealed class EmbeddedTable
     public int RowidAliasColumnIndex { get; private set; }
 
     public bool HasRowidAlias => RowidAliasColumnIndex >= 0;
+
+    public bool IsAutoIncrement { get; }
 
     public InsertConflictAlgorithm? RowidAliasConflictAlgorithm
         => !HasRowidAlias
