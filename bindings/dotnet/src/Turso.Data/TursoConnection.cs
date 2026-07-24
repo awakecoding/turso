@@ -6,7 +6,7 @@ using Turso.Core.Storage;
 
 namespace Turso;
 
-public class TursoConnection : DbConnection
+public class TursoConnection : DbConnection, ILocalReaderConnection
 {
     private TursoNativeDatabase? _nativeDatabase;
     private IManagedDatabaseAdapter? _managedDatabase;
@@ -17,7 +17,8 @@ public class TursoConnection : DbConnection
     private bool _readUncommitted;
     private bool _remoteTransactionActive;
     private bool _managedReadOnly;
-    private readonly HashSet<TursoDataReader> _openReaders = [];
+    private TursoTransaction? _transaction;
+    private readonly HashSet<IConnectionOwnedReader> _openReaders = [];
 
     [AllowNull]
     public override string ConnectionString
@@ -42,7 +43,7 @@ public class TursoConnection : DbConnection
         ? ConnectionState.Open
         : ConnectionState.Closed;
 
-    public override bool CanCreateBatch => _connectionOptions.IsRemote && !_connectionOptions.IsReplica;
+    public override bool CanCreateBatch => !_connectionOptions.IsReplica;
 
     protected override DbProviderFactory DbProviderFactory => TursoFactory.Instance;
 
@@ -121,7 +122,15 @@ public class TursoConnection : DbConnection
     {
         if (_remoteClient is not null)
         {
-            CloseRemote();
+            try
+            {
+                _transaction?.Dispose();
+            }
+            finally
+            {
+                CloseRemote();
+                _transaction = null;
+            }
             return;
         }
 
@@ -131,6 +140,7 @@ public class TursoConnection : DbConnection
         try
         {
             CloseOpenReaders();
+            _transaction?.Dispose();
         }
         finally
         {
@@ -152,6 +162,7 @@ public class TursoConnection : DbConnection
                     managedEncryptionFileSystem?.Dispose();
                     _readUncommitted = false;
                     _managedReadOnly = false;
+                    _transaction = null;
                 }
             }
         }
@@ -172,8 +183,12 @@ public class TursoConnection : DbConnection
         {
             throw new InvalidOperationException("Turso database is closed.");
         }
+        if (_transaction is not null)
+            throw new InvalidOperationException("Parallel transactions are not supported.");
 
-        return new TursoTransaction(this, isolationLevel);
+        var transaction = new TursoTransaction(this, isolationLevel);
+        _transaction = transaction;
+        return transaction;
     }
 
     protected override DbCommand CreateDbCommand()
@@ -184,7 +199,7 @@ public class TursoConnection : DbConnection
     protected override DbBatch CreateDbBatch()
     {
         if (!CanCreateBatch)
-            throw new NotSupportedException("Turso batch execution is currently supported only for remote connections.");
+            throw new NotSupportedException("Turso batch execution is not supported for embedded replica connections.");
 
         return new TursoBatch(this);
     }
@@ -228,6 +243,8 @@ public class TursoConnection : DbConnection
 
     internal bool IsManaged => _managedDatabase is not null;
 
+    internal TursoTransaction? Transaction => _transaction;
+
     internal bool ReadUncommitted
     {
         get => _readUncommitted;
@@ -240,9 +257,29 @@ public class TursoConnection : DbConnection
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("Turso database is closed.");
 
-    internal void ReaderOpened(TursoDataReader reader) => _openReaders.Add(reader);
+    void ILocalReaderConnection.ReaderOpened(IConnectionOwnedReader reader) => _openReaders.Add(reader);
 
-    internal void ReaderClosed(TursoDataReader reader) => _openReaders.Remove(reader);
+    void ILocalReaderConnection.ReaderClosed(IConnectionOwnedReader reader) => _openReaders.Remove(reader);
+
+    internal void TransactionCompleted(TursoTransaction transaction)
+    {
+        if (ReferenceEquals(_transaction, transaction))
+            _transaction = null;
+    }
+
+    internal void MarkTransactionCompletedExternally(string commandText)
+    {
+        if (_transaction is null || !IsTransactionCompletionCommand(commandText))
+            return;
+
+        var completedRemoteTransaction = IsRemote && _remoteTransactionActive;
+        _transaction.MarkCompletedExternally();
+        if (completedRemoteTransaction)
+        {
+            _remoteTransactionActive = false;
+            CloseRemoteSessionIfStateless();
+        }
+    }
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
         string sql,
@@ -279,7 +316,13 @@ public class TursoConnection : DbConnection
         var closeAfter = !_connectionOptions.ReadYourWrites && !_remoteTransactionActive;
         try
         {
-            return await remoteClient.ExecuteBatchAsync(batchCommands, commandTimeout, wantRows, closeAfter, cancellationToken)
+            return await remoteClient.ExecuteBatchAsync(
+                    batchCommands,
+                    commandTimeout,
+                    wantRows,
+                    closeAfter,
+                    cancellationToken,
+                    step => MarkTransactionCompletedExternally(batchCommands[step].CommandText))
                 .ConfigureAwait(false);
         }
         catch (TursoRemoteSqlException)
@@ -533,5 +576,24 @@ public class TursoConnection : DbConnection
     {
         foreach (var reader in _openReaders.ToArray())
             reader.CloseFromConnection();
+    }
+
+    private static bool IsTransactionCompletionCommand(string commandText)
+    {
+        var trimmed = commandText.TrimStart();
+        return GetCommandTail(trimmed, "COMMIT") is not null
+               || GetCommandTail(trimmed, "END") is not null
+               || GetCommandTail(trimmed, "ROLLBACK") is { } rollbackTail
+               && !rollbackTail.StartsWith("TO", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? GetCommandTail(string commandText, string command)
+    {
+        if (!commandText.StartsWith(command, StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (commandText.Length > command.Length && char.IsLetterOrDigit(commandText[command.Length]))
+            return null;
+
+        return commandText[command.Length..].TrimStart();
     }
 }

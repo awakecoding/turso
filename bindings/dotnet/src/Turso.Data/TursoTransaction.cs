@@ -40,6 +40,12 @@ public class TursoTransaction : DbTransaction
 
     internal bool IsCompleted => _completed;
 
+    internal void MarkCompletedExternally()
+    {
+        if (!_completed)
+            CompleteTransaction();
+    }
+
     protected override DbConnection? DbConnection => _connection;
 
     public override void Commit()
@@ -105,6 +111,7 @@ public class TursoTransaction : DbTransaction
         if (_isolationLevel == IsolationLevel.ReadUncommitted)
             _connection.ReadUncommitted = false;
         _completed = true;
+        _connection.TransactionCompleted(this);
     }
 
     private void ThrowIfCompleted()

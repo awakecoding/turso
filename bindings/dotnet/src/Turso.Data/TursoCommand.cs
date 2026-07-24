@@ -313,7 +313,13 @@ public class TursoCommand : DbCommand
             throw new InvalidOperationException("Command was not prepared.");
         _nativeStatement = null;
         _managedStatement = null;
-        var reader = new TursoDataReader(this, nativeStatement, managedStatement, behavior);
+        var commandText = CommandText;
+        var reader = new TursoDataReader(
+            this,
+            nativeStatement,
+            managedStatement,
+            behavior,
+            () => _connection!.MarkTransactionCompletedExternally(commandText));
         return reader;
     }
 
@@ -375,6 +381,7 @@ public class TursoCommand : DbCommand
         var result = await _connection
             .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: true, CommandTimeout, cancellationToken)
             .ConfigureAwait(false);
+        _connection.MarkTransactionCompletedExternally(CommandText);
         return new TursoRemoteDataReader(this, result, behavior);
     }
 
@@ -392,6 +399,7 @@ public class TursoCommand : DbCommand
         var result = await _connection
             .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: false, CommandTimeout, cancellationToken)
             .ConfigureAwait(false);
+        _connection.MarkTransactionCompletedExternally(CommandText);
         return checked((int)result.AffectedRowCount);
     }
 

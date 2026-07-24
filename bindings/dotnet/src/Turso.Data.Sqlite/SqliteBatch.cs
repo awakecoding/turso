@@ -1,23 +1,24 @@
 using System.Data;
 using System.Data.Common;
+using Turso;
 
-namespace Turso;
+namespace Turso.Data.Sqlite;
 
-public sealed class TursoBatch : DbBatch
+public sealed class SqliteBatch : DbBatch
 {
-    private readonly TursoBatchCommandCollection _batchCommands = new();
+    private readonly SqliteBatchCommandCollection _batchCommands = new();
     private readonly object _executionSync = new();
-    private TursoConnection? _connection;
-    private TursoTransaction? _transaction;
+    private SqliteConnection? _connection;
+    private SqliteTransaction? _transaction;
     private BatchExecutionControl? _activeExecution;
     private int _timeout = 30;
     private bool _disposed;
 
-    public TursoBatch()
+    public SqliteBatch()
     {
     }
 
-    public TursoBatch(TursoConnection connection)
+    public SqliteBatch(SqliteConnection connection)
     {
         _connection = connection;
         _transaction = connection.Transaction;
@@ -26,7 +27,19 @@ public sealed class TursoBatch : DbBatch
 
     protected override DbBatchCommandCollection DbBatchCommands => _batchCommands;
 
-    public new TursoBatchCommandCollection BatchCommands => _batchCommands;
+    public new SqliteBatchCommandCollection BatchCommands => _batchCommands;
+
+    public new SqliteConnection? Connection
+    {
+        get => _connection;
+        set => DbConnection = value;
+    }
+
+    public new SqliteTransaction? Transaction
+    {
+        get => _transaction;
+        set => DbTransaction = value;
+    }
 
     protected override DbConnection? DbConnection
     {
@@ -39,8 +52,8 @@ public sealed class TursoBatch : DbBatch
                 return;
             }
 
-            _connection = value as TursoConnection
-                          ?? throw new ArgumentException("Connection must be a TursoConnection.", nameof(value));
+            _connection = value as SqliteConnection
+                          ?? throw new ArgumentException("Connection must be a SqliteConnection.", nameof(value));
             _transaction ??= _connection.Transaction;
             _timeout = _connection.DefaultTimeout;
         }
@@ -57,8 +70,8 @@ public sealed class TursoBatch : DbBatch
                 return;
             }
 
-            _transaction = value as TursoTransaction
-                           ?? throw new ArgumentException("Transaction must be a TursoTransaction.", nameof(value));
+            _transaction = value as SqliteTransaction
+                           ?? throw new ArgumentException("Transaction must be a SqliteTransaction.", nameof(value));
         }
     }
 
@@ -83,31 +96,19 @@ public sealed class TursoBatch : DbBatch
 
     public override int ExecuteNonQuery()
     {
-        if (_connection?.IsRemote != true)
-        {
-            var connection = ValidateBatch();
-            var (commands, execution) = CreateLocalExecution(connection, CancellationToken.None);
-            return SequentialBatchExecutor.ExecuteNonQuery(commands, execution);
-        }
-
-        var results = ExecuteBatch(wantRows: false, CancellationToken.None).GetAwaiter().GetResult();
-        return SetRecordsAffected(results);
+        var connection = ValidateBatch();
+        var (commands, execution) = CreateExecution(connection, CancellationToken.None);
+        return SequentialBatchExecutor.ExecuteNonQuery(commands, execution);
     }
 
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (_connection?.IsRemote != true)
-        {
-            var connection = ValidateBatch();
-            var (commands, execution) = CreateLocalExecution(connection, cancellationToken);
-            return await SequentialBatchExecutor
-                .ExecuteNonQueryAsync(commands, execution)
-                .ConfigureAwait(false);
-        }
-
-        var results = await ExecuteBatch(wantRows: false, cancellationToken).ConfigureAwait(false);
-        return SetRecordsAffected(results);
+        var connection = ValidateBatch();
+        var (commands, execution) = CreateExecution(connection, cancellationToken);
+        return await SequentialBatchExecutor
+            .ExecuteNonQueryAsync(commands, execution)
+            .ConfigureAwait(false);
     }
 
     public override object? ExecuteScalar()
@@ -122,13 +123,16 @@ public sealed class TursoBatch : DbBatch
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
-        await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
+        await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken)
+            .ConfigureAwait(false);
         while (reader.FieldCount == 0
                && await reader.NextResultAsync(cancellationToken).ConfigureAwait(false))
         {
         }
 
-        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? reader.GetValue(0) : null;
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? reader.GetValue(0)
+            : null;
     }
 
     public override void Prepare()
@@ -145,23 +149,13 @@ public sealed class TursoBatch : DbBatch
         return Task.CompletedTask;
     }
 
-    protected override DbBatchCommand CreateDbBatchCommand()
-    {
-        return new TursoBatchCommand();
-    }
+    protected override DbBatchCommand CreateDbBatchCommand() => new SqliteBatchCommand();
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
-        if (_connection?.IsRemote != true)
-        {
-            var connection = ValidateBatch();
-            var (commands, execution) = CreateLocalExecution(connection, CancellationToken.None);
-            return SequentialBatchExecutor.ExecuteReader(commands, execution, behavior);
-        }
-
-        var results = ExecuteBatch(wantRows: true, CancellationToken.None).GetAwaiter().GetResult();
-        SetRecordsAffected(results);
-        return new TursoRemoteDataReader(_connection, results, behavior);
+        var connection = ValidateBatch();
+        var (commands, execution) = CreateExecution(connection, CancellationToken.None);
+        return SequentialBatchExecutor.ExecuteReader(commands, execution, behavior);
     }
 
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(
@@ -169,18 +163,11 @@ public sealed class TursoBatch : DbBatch
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (_connection?.IsRemote != true)
-        {
-            var connection = ValidateBatch();
-            var (commands, execution) = CreateLocalExecution(connection, cancellationToken);
-            return await SequentialBatchExecutor
-                .ExecuteReaderAsync(commands, execution, behavior)
-                .ConfigureAwait(false);
-        }
-
-        var results = await ExecuteBatch(wantRows: true, cancellationToken).ConfigureAwait(false);
-        SetRecordsAffected(results);
-        return new TursoRemoteDataReader(_connection, results, behavior);
+        var connection = ValidateBatch();
+        var (commands, execution) = CreateExecution(connection, cancellationToken);
+        return await SequentialBatchExecutor
+            .ExecuteReaderAsync(commands, execution, behavior)
+            .ConfigureAwait(false);
     }
 
     public override void Dispose()
@@ -205,33 +192,19 @@ public sealed class TursoBatch : DbBatch
         return ValueTask.CompletedTask;
     }
 
-    private async Task<IReadOnlyList<RemoteStatementResult>> ExecuteBatch(
-        bool wantRows,
-        CancellationToken cancellationToken)
-    {
-        var connection = ValidateBatch();
-        if (!connection.IsRemote)
-            throw new NotSupportedException("Turso batch execution is currently supported only for remote connections.");
-
-        using var execution = BeginExecution(cancellationToken);
-        var results = await connection
-            .ExecuteRemoteBatchAsync(_batchCommands.AsReadOnly(), Timeout, wantRows, execution.Token)
-            .ConfigureAwait(false);
-        return results;
-    }
-
-    private TursoConnection ValidateBatch()
+    private SqliteConnection ValidateBatch()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var connection = _connection ?? throw new InvalidOperationException("Connection must be set before executing a batch.");
+        var connection = _connection
+            ?? throw new InvalidOperationException("Connection must be set before executing a batch.");
         if (connection.State != ConnectionState.Open)
-            throw new InvalidOperationException("Turso database is closed.");
-        if (_transaction is { IsCompleted: true })
-            throw new InvalidOperationException("The transaction associated with this batch has completed.");
+            throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection("ExecuteBatch"));
+        if (_transaction is { IsCompleted: true } or { WasRolledBackExternally: true })
+            throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
         if (_transaction is not null && !ReferenceEquals(_transaction.Connection, connection))
-            throw new InvalidOperationException("The transaction is not associated with the batch's connection.");
+            throw new InvalidOperationException(Properties.Resources.TransactionConnectionMismatch);
         if (connection.Transaction is not null && !ReferenceEquals(_transaction, connection.Transaction))
-            throw new InvalidOperationException("The batch must be associated with the connection's active transaction.");
+            throw new InvalidOperationException(Properties.Resources.TransactionRequired);
         if (_batchCommands.Count == 0)
             throw new InvalidOperationException("Batch must contain at least one command.");
 
@@ -240,7 +213,7 @@ public sealed class TursoBatch : DbBatch
             if (string.IsNullOrWhiteSpace(command.CommandText))
                 throw new InvalidOperationException("Batch command text must be set before executing a batch.");
             if (command.CommandType != CommandType.Text)
-                throw new NotSupportedException("TursoBatchCommand only supports CommandType.Text.");
+                throw new ArgumentException(Properties.Resources.InvalidCommandType(command.CommandType));
         }
 
         return connection;
@@ -248,14 +221,14 @@ public sealed class TursoBatch : DbBatch
 
     private (
         IReadOnlyList<SequentialBatchCommand> Commands,
-        BatchExecutionControl Execution) CreateLocalExecution(
-        TursoConnection connection,
+        BatchExecutionControl Execution) CreateExecution(
+        SqliteConnection connection,
         CancellationToken cancellationToken)
     {
         var execution = BeginExecution(cancellationToken);
         try
         {
-            return (CreateLocalCommands(connection), execution);
+            return (CreateCommands(connection), execution);
         }
         catch
         {
@@ -264,16 +237,15 @@ public sealed class TursoBatch : DbBatch
         }
     }
 
-    private IReadOnlyList<SequentialBatchCommand> CreateLocalCommands(TursoConnection connection)
+    private IReadOnlyList<SequentialBatchCommand> CreateCommands(SqliteConnection connection)
     {
         var commands = new List<SequentialBatchCommand>(_batchCommands.Count);
         try
         {
             foreach (var batchCommand in _batchCommands.AsReadOnly())
             {
-                var command = new TursoCommand(connection, _transaction)
+                var command = new SqliteCommand(batchCommand.CommandText, connection, _transaction)
                 {
-                    CommandText = batchCommand.CommandText,
                     CommandTimeout = Timeout,
                 };
                 CopyParameters(batchCommand.Parameters, command.Parameters);
@@ -314,22 +286,26 @@ public sealed class TursoBatch : DbBatch
     }
 
     private static void CopyParameters(
-        TursoParameterCollection source,
-        TursoParameterCollection destination)
+        SqliteParameterCollection source,
+        SqliteParameterCollection destination)
     {
-        foreach (TursoParameter parameter in source)
+        foreach (SqliteParameter parameter in source)
         {
-            destination.Add(new TursoParameter
+            var copy = new SqliteParameter
             {
                 ParameterName = parameter.ParameterName,
-                DbType = parameter.DbType,
+                SqliteType = parameter.SqliteType,
                 Direction = parameter.Direction,
                 IsNullable = parameter.IsNullable,
                 SourceColumn = parameter.SourceColumn,
                 SourceColumnNullMapping = parameter.SourceColumnNullMapping,
-                Size = parameter.Size,
-                Value = SnapshotValue(parameter.Value),
-            });
+            };
+            if (parameter.HasSize)
+                copy.Size = parameter.Size;
+            if (parameter.HasValue)
+                copy.Value = SnapshotValue(parameter.Value);
+
+            destination.Add(copy);
         }
     }
 
@@ -341,20 +317,4 @@ public sealed class TursoBatch : DbBatch
             ReadOnlyMemory<byte> memory => memory.ToArray(),
             _ => value,
         };
-
-    private int SetRecordsAffected(IReadOnlyList<RemoteStatementResult> results)
-    {
-        if (results.Count != _batchCommands.Count)
-            throw new TursoException($"Batch result count {results.Count} did not match command count {_batchCommands.Count}.");
-
-        var total = 0;
-        for (var i = 0; i < results.Count; i++)
-        {
-            var recordsAffected = checked((int)results[i].AffectedRowCount);
-            _batchCommands.AsReadOnly()[i].SetRecordsAffected(recordsAffected);
-            total = checked(total + recordsAffected);
-        }
-
-        return total;
-    }
 }

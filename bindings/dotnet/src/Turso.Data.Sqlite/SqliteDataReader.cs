@@ -12,7 +12,7 @@ using Turso.Core;
 
 namespace Turso.Data.Sqlite;
 
-public class SqliteDataReader : DbDataReader
+public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 {
     private readonly SqliteCommand _command;
     private readonly SqliteConnection _connection;
@@ -101,7 +101,7 @@ public class SqliteDataReader : DbDataReader
         _recordsAffected = recordsAffected;
         _behavior = behavior;
         _closeCallback = closeCallback;
-        _connection.ReaderOpened(this);
+        ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
     internal SqliteDataReader(SqliteCommand command, int recordsAffected, CommandBehavior behavior, Action closeCallback)
@@ -112,7 +112,7 @@ public class SqliteDataReader : DbDataReader
         _recordsAffected = recordsAffected;
         _behavior = behavior;
         _closeCallback = closeCallback;
-        _connection.ReaderOpened(this);
+        ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
     public override int Depth => 0;
@@ -704,7 +704,7 @@ public class SqliteDataReader : DbDataReader
 
     public override void Close() => CloseCore();
 
-    internal void CloseFromConnection()
+    void IConnectionOwnedReader.CloseFromConnection()
     {
         if (_isClosed)
             return;
@@ -770,7 +770,7 @@ public class SqliteDataReader : DbDataReader
             return;
 
         _closeCallback();
-        _connection.ReaderClosed(this);
+        ((ILocalReaderConnection)_connection).ReaderClosed(this);
         if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
             _connection.Close();
 
