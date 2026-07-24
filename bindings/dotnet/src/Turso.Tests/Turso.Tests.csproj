@@ -12,7 +12,7 @@
         <PackageReference Include="AwesomeAssertions" Version="9.1.0" />
         <PackageReference Include="coverlet.collector" Version="6.0.2"/>
         <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.8" />
-        <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="9.0.9" />
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="$(TursoEntityFrameworkCoreVersion)" />
         <!-- Microsoft.Data.Sqlite 9.x transitively resolves vulnerable SQLitePCLRaw.lib.e_sqlite3 2.1.10. -->
         <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0"/>
@@ -30,6 +30,7 @@
         <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" />
         <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
         <ProjectReference Include="..\Turso.Data.Native\Turso.Data.Native.csproj" />
+        <ProjectReference Include="..\Turso.Data.Sync\Turso.Data.Sync.csproj" />
         <ProjectReference Include="..\Turso.EntityFrameworkCore.Sqlite\Turso.EntityFrameworkCore.Sqlite.csproj" />
         <ProjectReference Include="..\Turso.Core\Turso.Core.csproj" />
         <ProjectReference Include="..\Turso.Platform.Client\Turso.Platform.Client.csproj" />

@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using Turso.Core;
 
 namespace Turso;
@@ -14,6 +15,7 @@ public class TursoCommand : DbCommand
     private TursoNativeStatement? _nativeStatement;
     private IManagedStatementAdapter? _managedStatement;
     private int _commandTimeout = 30;
+    private readonly CommandCancellationController _cancellation = new();
 
     public TursoCommand()
     {
@@ -22,6 +24,7 @@ public class TursoCommand : DbCommand
     public TursoCommand(TursoConnection connection, TursoTransaction? transaction = null)
     {
         _connection = connection;
+        connection.CommandOpened(this);
         _transaction = transaction;
         _commandTimeout = connection.DefaultTimeout;
     }
@@ -29,6 +32,7 @@ public class TursoCommand : DbCommand
     public TursoCommand(TursoConnection connection, string command)
     {
         _connection = connection;
+        connection.CommandOpened(this);
         _transaction = null;
         _commandTimeout = connection.DefaultTimeout;
         CommandText = command;
@@ -66,12 +70,23 @@ public class TursoCommand : DbCommand
         {
             if (value is null)
             {
+                _connection?.CommandClosed(this);
                 _connection = null;
                 return;
             }
 
-            _connection = value as TursoConnection
-                          ?? throw new ArgumentException("Connection must be a TursoConnection.", nameof(value));
+            var connection = value as TursoConnection
+                            ?? throw new ArgumentException("Connection must be a TursoConnection.", nameof(value));
+            if (ReferenceEquals(connection, _connection))
+                return;
+
+            _nativeStatement?.Dispose();
+            _managedStatement?.Dispose();
+            _nativeStatement = null;
+            _managedStatement = null;
+            _connection?.CommandClosed(this);
+            _connection = connection;
+            connection.CommandOpened(this);
             _commandTimeout = _connection.DefaultTimeout;
         }
     }
@@ -99,21 +114,40 @@ public class TursoCommand : DbCommand
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing)
+        {
+            _cancellation.Cancel();
+            _nativeStatement?.Dispose();
+            _managedStatement?.Dispose();
+        }
+
         base.Dispose(disposing);
-        _nativeStatement?.Dispose();
-        _managedStatement?.Dispose();
+        _nativeStatement = null;
+        _managedStatement = null;
+        _connection?.CommandClosed(this);
     }
 
-    public override void Cancel()
+    internal void ResetFromConnection()
     {
+        _nativeStatement?.Dispose();
+        _managedStatement?.Dispose();
+        _nativeStatement = null;
+        _managedStatement = null;
     }
+
+    public override void Cancel() => _cancellation.Cancel();
 
     public override int ExecuteNonQuery()
     {
         if (_connection?.IsRemote == true)
-            return ExecuteRemoteNonQueryAsync(CancellationToken.None).GetAwaiter().GetResult();
+        {
+            return _cancellation
+                .RunAsync(ExecuteRemoteNonQueryAsync, CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+        }
 
-        using var reader = Execute();
+        using var reader = _cancellation.Run(token => Execute(CommandBehavior.Default, token));
         while (reader.Read())
         {
         }
@@ -124,7 +158,11 @@ public class TursoCommand : DbCommand
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
         if (_connection?.IsRemote == true)
-            return await ExecuteRemoteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        {
+            return await _cancellation
+                .RunAsync(ExecuteRemoteNonQueryAsync, cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -136,18 +174,20 @@ public class TursoCommand : DbCommand
 
     public override object? ExecuteScalar()
     {
-        using var reader = Execute();
-        return reader.Read()
+        using var reader = _cancellation.Run(token => Execute(CommandBehavior.Default, token));
+        var result = reader.Read()
             ? reader.GetValue(0)
             : null;
+        return result;
     }
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
         await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
-        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+        var result = await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
             ? reader.GetValue(0)
             : null;
+        return result;
     }
 
     public override void Prepare()
@@ -193,6 +233,10 @@ public class TursoCommand : DbCommand
         try
         {
             var sql = RewriteFacadePragmas(CommandText, _connection);
+            _connection.NativeDatabase.SetBusyTimeout(
+                CommandTimeout == 0
+                    ? TimeSpan.MaxValue
+                    : TimeSpan.FromSeconds(CommandTimeout));
             preparedStatement = _connection.NativeDatabase.PrepareStatement(sql);
             var parameterCount = preparedStatement.ParameterCount;
             var boundParameters = new bool[parameterCount + 1];
@@ -254,18 +298,21 @@ public class TursoCommand : DbCommand
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
-        return Execute(behavior);
+        return _cancellation.Run(token => Execute(behavior, token));
     }
 
     protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
     {
-        if (cancellationToken.IsCancellationRequested)
-            return Task.FromCanceled<DbDataReader>(cancellationToken);
-
         if (_connection?.IsRemote == true)
-            return ExecuteRemoteAsync(behavior, cancellationToken);
+        {
+            return _cancellation.RunAsync(
+                token => ExecuteRemoteAsync(behavior, token),
+                cancellationToken);
+        }
 
-        return Task.FromResult(Execute(behavior));
+        return _cancellation.RunAsync<DbDataReader>(
+            token => Execute(behavior, token),
+            cancellationToken);
     }
 
     private static string RewriteFacadePragmas(string sql, TursoConnection connection)
@@ -283,29 +330,78 @@ public class TursoCommand : DbCommand
             connection.ReadUncommitted = ParsePragmaEnabled(value[1..].Trim());
             return "SELECT 1 WHERE 0";
         }
+        if (connection.IsManaged
+            && value.StartsWith("(", StringComparison.Ordinal)
+            && value.EndsWith(")", StringComparison.Ordinal))
+        {
+            connection.ReadUncommitted = ParsePragmaEnabled(value[1..^1].Trim());
+            return "SELECT 1 WHERE 0";
+        }
 
         return sql;
     }
 
-    private static bool ParsePragmaEnabled(string value)
+    internal static bool ParsePragmaEnabled(string value)
     {
-        value = value.Trim('\'', '"');
-        return long.TryParse(value, out var number)
-            ? number != 0
-            : value.Equals("ON", StringComparison.OrdinalIgnoreCase)
-              || value.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
-              || value.Equals("YES", StringComparison.OrdinalIgnoreCase);
+        var quoted = value.Length >= 2
+                     && ((value[0] == '\'' && value[^1] == '\'')
+                         || (value[0] == '"' && value[^1] == '"'));
+        if (quoted)
+            value = value[1..^1];
+        else if (value.StartsWith("+", StringComparison.Ordinal))
+            value = value[1..];
+        if (value.Length > 0 && char.IsAsciiDigit(value[0]))
+            return ParseSqlitePragmaInteger(value) is { } integer && (byte)integer != 0;
+
+        return value.Equals("ON", StringComparison.OrdinalIgnoreCase)
+               || value.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
+               || value.Equals("YES", StringComparison.OrdinalIgnoreCase);
     }
 
-    private DbDataReader Execute(CommandBehavior behavior = CommandBehavior.Default)
+    private static int? ParseSqlitePragmaInteger(string value)
     {
+        if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            var end = 2;
+            while (end < value.Length && Uri.IsHexDigit(value[end]))
+                end++;
+            if (end == 2)
+                return 0;
+            return uint.TryParse(
+                    value.AsSpan(2, end - 2),
+                    NumberStyles.AllowHexSpecifier,
+                    CultureInfo.InvariantCulture,
+                    out var hexadecimal)
+                   && hexadecimal <= int.MaxValue
+                ? (int)hexadecimal
+                : null;
+        }
+
+        var length = 0;
+        while (length < value.Length && char.IsAsciiDigit(value[length]))
+            length++;
+        return int.TryParse(
+            value.AsSpan(0, length),
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out var decimalInteger)
+            ? decimalInteger
+            : null;
+    }
+
+    private DbDataReader Execute(
+        CommandBehavior behavior = CommandBehavior.Default,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
         if (_connection is null)
             throw new InvalidOperationException("Connection must be set before executing a command.");
 
         if (_connection.IsRemote)
-            return ExecuteRemoteAsync(behavior, CancellationToken.None).GetAwaiter().GetResult();
+            return ExecuteRemoteAsync(behavior, cancellationToken).GetAwaiter().GetResult();
 
         Prepare();
+        cancellationToken.ThrowIfCancellationRequested();
 
         var nativeStatement = _nativeStatement;
         var managedStatement = _managedStatement;
@@ -313,9 +409,25 @@ public class TursoCommand : DbCommand
             throw new InvalidOperationException("Command was not prepared.");
         _nativeStatement = null;
         _managedStatement = null;
-        var reader = new TursoDataReader(this, nativeStatement, managedStatement, behavior);
+        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
+        var reader = new TursoDataReader(
+            this,
+            nativeStatement,
+            managedStatement,
+            behavior,
+            () => MarkTransactionCompletedExternally(transactionCompletion));
         return reader;
     }
+
+    internal T RunOperation<T>(
+        Func<CancellationToken, T> operation,
+        CancellationToken cancellationToken = default)
+        => _cancellation.Run(operation, cancellationToken);
+
+    internal Task<T> RunOperationAsync<T>(
+        Func<CancellationToken, T> operation,
+        CancellationToken cancellationToken = default)
+        => _cancellation.RunAsync(operation, cancellationToken);
 
     private void BindManagedParameters(IManagedStatementAdapter statement)
     {
@@ -371,10 +483,12 @@ public class TursoCommand : DbCommand
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
         var sql = RewriteFacadePragmas(CommandText, _connection);
         var result = await _connection
             .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: true, CommandTimeout, cancellationToken)
             .ConfigureAwait(false);
+        MarkTransactionCompletedExternally(transactionCompletion);
         return new TursoRemoteDataReader(this, result, behavior);
     }
 
@@ -388,11 +502,18 @@ public class TursoCommand : DbCommand
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
         var sql = RewriteFacadePragmas(CommandText, _connection);
         var result = await _connection
             .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: false, CommandTimeout, cancellationToken)
             .ConfigureAwait(false);
+        MarkTransactionCompletedExternally(transactionCompletion);
         return checked((int)result.AffectedRowCount);
+    }
+
+    private void MarkTransactionCompletedExternally(SqlTransactionCompletion completion)
+    {
+        _connection?.TransactionCompletedExternally(completion);
     }
 
     private void ValidateTransaction()

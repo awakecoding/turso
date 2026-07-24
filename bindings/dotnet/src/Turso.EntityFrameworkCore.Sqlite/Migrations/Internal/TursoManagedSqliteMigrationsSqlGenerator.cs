@@ -1,3 +1,5 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Migrations.Operations;
@@ -15,7 +17,13 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
         IModel? model = null,
         MigrationsSqlGenerationOptions options = MigrationsSqlGenerationOptions.Default)
     {
-        ValidateOperations(operations);
+        if (options.HasFlag(MigrationsSqlGenerationOptions.Idempotent))
+        {
+            throw new NotSupportedException(
+                "The managed local provider does not support idempotent migration scripts because the engine cannot conditionally execute DDL blocks.");
+        }
+
+        ValidateOperations(operations, model);
         return base.Generate(operations, model, options);
     }
 
@@ -85,7 +93,7 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
             "Configure both actions as NoAction.");
     }
 
-    private static void ValidateOperations(IReadOnlyList<MigrationOperation> operations)
+    private static void ValidateOperations(IReadOnlyList<MigrationOperation> operations, IModel? model)
     {
         foreach (var operation in operations)
         {
@@ -137,30 +145,101 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                     "Use modeled migration operations so managed-local compatibility can be validated before schema mutation.");
             }
 
-            if (operation is CreateIndexOperation { Filter: not null } createIndex)
-            {
-                throw new NotSupportedException(
-                    $"The managed local provider does not support filtered indexes ('{createIndex.Name}' on '{createIndex.Table}').");
-            }
+            if (operation is CreateIndexOperation createIndex)
+                ValidateCreateIndex(createIndex);
 
             if (operation is RenameIndexOperation renameIndex)
-            {
-                throw new NotSupportedException(
-                    $"The managed local provider does not support renaming indexes ('{renameIndex.Name}' on '{renameIndex.Table}').");
-            }
+                ValidateRenameIndex(renameIndex, model);
 
             if (operation is RenameTableOperation renameTable)
-            {
-                throw new NotSupportedException(
-                    $"The managed local provider does not support renaming tables ('{renameTable.Name}' to '{renameTable.NewName}').");
-            }
+                ValidateRenameTable(renameTable, model);
 
-            if (operation is CreateIndexOperation { IsDescending: { } sortOrders } descendingIndex
-                && (sortOrders.Length == 0 || sortOrders.Any(static descending => descending)))
-            {
-                throw new NotSupportedException(
-                    $"The managed local provider does not support descending indexes ('{descendingIndex.Name}' on '{descendingIndex.Table}').");
-            }
+            if (operation is RenameColumnOperation renameColumn)
+                ValidateRenameColumn(renameColumn, model);
+        }
+    }
+
+    private static void ValidateRenameTable(RenameTableOperation operation, IModel? model)
+    {
+        if (operation.NewName is null || operation.NewName == operation.Name)
+            return;
+
+        var targetTable = model?.GetRelationalModel()
+            .FindTable(operation.NewName, operation.NewSchema);
+        if (targetTable is null)
+        {
+            throw new NotSupportedException(
+                $"The managed local provider can rename table '{operation.Name}' only when the target model contains '{operation.NewName}'.");
+        }
+
+        if (targetTable.ForeignKeyConstraints.Any()
+            || targetTable.ReferencingForeignKeyConstraints.Any()
+            || targetTable.Triggers.Any())
+        {
+            throw new NotSupportedException(
+                $"The managed local provider cannot safely rename table '{operation.Name}' because the target table '{operation.NewName}' has foreign key or trigger dependencies.");
+        }
+    }
+
+    private static void ValidateRenameColumn(RenameColumnOperation operation, IModel? model)
+    {
+        var targetTable = model?.GetRelationalModel()
+            .FindTable(operation.Table, operation.Schema);
+        var targetColumn = targetTable?.FindColumn(operation.NewName);
+        if (targetTable is null || targetColumn is null)
+        {
+            throw new NotSupportedException(
+                $"The managed local provider can rename column '{operation.Name}' on '{operation.Table}' only when the target model contains '{operation.NewName}'.");
+        }
+
+        var hasForeignKeyDependency = targetTable.ForeignKeyConstraints
+                .Concat(targetTable.ReferencingForeignKeyConstraints)
+                .Any(foreignKey => foreignKey.Columns.Contains(targetColumn)
+                    || foreignKey.PrincipalColumns.Contains(targetColumn));
+        var hasTableConstraintDependency = targetTable.PrimaryKey is { Columns.Count: > 1 } primaryKey
+                && primaryKey.Columns.Contains(targetColumn)
+            || targetTable.UniqueConstraints.Any(uniqueConstraint =>
+                uniqueConstraint != targetTable.PrimaryKey
+                && uniqueConstraint.Columns.Contains(targetColumn));
+        if (hasForeignKeyDependency
+            || hasTableConstraintDependency
+            || targetTable.Triggers.Any()
+            || targetTable.Columns.Any(column => column.ComputedColumnSql is not null))
+        {
+            throw new NotSupportedException(
+                $"The managed local provider cannot safely rename column '{operation.Name}' on '{operation.Table}' because the target table has foreign key, table-constraint, trigger, or computed-column dependencies.");
+        }
+    }
+
+    private static void ValidateRenameIndex(RenameIndexOperation operation, IModel? model)
+    {
+        var targetIndex = operation.Table is null
+            ? null
+            : model?.GetRelationalModel()
+                .FindTable(operation.Table, operation.Schema)?
+                .Indexes.FirstOrDefault(index => index.Name == operation.NewName);
+        if (targetIndex is null)
+        {
+            throw new NotSupportedException(
+                $"The managed local provider can rename index '{operation.Name}' on '{operation.Table}' only when the target model contains '{operation.NewName}'.");
+        }
+
+        ValidateCreateIndex(CreateIndexOperation.CreateFrom(targetIndex));
+    }
+
+    private static void ValidateCreateIndex(CreateIndexOperation operation)
+    {
+        if (operation.Filter is not null)
+        {
+            throw new NotSupportedException(
+                $"The managed local provider does not support filtered indexes ('{operation.Name}' on '{operation.Table}').");
+        }
+
+        if (operation.IsDescending is { } sortOrders
+            && (sortOrders.Length == 0 || sortOrders.Any(static descending => descending)))
+        {
+            throw new NotSupportedException(
+                $"The managed local provider does not support descending indexes on file-backed databases ('{operation.Name}' on '{operation.Table}').");
         }
     }
 

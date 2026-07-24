@@ -144,6 +144,8 @@ public class SqliteParameter : DbParameter
 
     internal bool HasValue => _hasValue;
 
+    internal bool HasSize => _size.HasValue;
+
     internal TursoValue ToNativeValue()
     {
         if (Value is null || Value == DBNull.Value)

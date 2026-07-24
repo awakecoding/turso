@@ -237,6 +237,53 @@ public class ArithmeticOpcodeExecutionTests
         statement.GetRegister(new Register(2)).Kind.Should().Be(SqlValueKind.Null);
     }
 
+    [Test]
+    public void NumericAffinityTransformsARegisterBeforeArithmetic()
+    {
+        var affinity = new VdbeNumericAffinity
+        {
+            Name = "test-numeric",
+            Apply = value => value.Kind == SqlValueKind.Text
+                ? SqlValue.Integer(long.Parse(value.AsText()))
+                : value,
+        };
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Text("40")),
+            new NumericAffinityInstruction(new Register(0), affinity),
+            new LoadConstantInstruction(new Register(1), SqlValue.Integer(2)),
+            new ArithmeticInstruction(new Register(2), ArithmeticOperator.Add, new RegisterRange(new Register(0), 2)),
+            new ResultRowInstruction(new RegisterRange(new Register(2), 1)),
+            new HaltInstruction(),
+        ];
+
+        var program = new VdbeProgram(registerCount: 3, cursorCount: 0, instructions);
+
+        RunToCompletion(program)[0][0].Should().Be(SqlValue.Integer(42));
+    }
+
+    [Test]
+    public void ThrowingNumericAffinityLeavesTheRegisterUntouched()
+    {
+        var affinity = new VdbeNumericAffinity
+        {
+            Name = "throwing",
+            Apply = _ => throw new InvalidOperationException("coercion failed"),
+        };
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Text("unchanged")),
+            new NumericAffinityInstruction(new Register(0), affinity),
+            new HaltInstruction(),
+        ];
+        var program = new VdbeProgram(registerCount: 1, cursorCount: 0, instructions);
+        using var statement = new ResumableStatement(program);
+
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable())!
+            .Message.Should().Be("coercion failed");
+        statement.GetRegister(new Register(0)).Should().Be(SqlValue.Text("unchanged"));
+    }
+
     // ---- Operand snapshotting ------------------------------------------------------------------------
 
     [Test]

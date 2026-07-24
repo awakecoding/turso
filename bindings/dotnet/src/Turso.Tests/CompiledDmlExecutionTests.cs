@@ -43,13 +43,13 @@ public class CompiledDmlExecutionTests
 
         var rows = ReadRows(connection, "EXPLAIN INSERT INTO t VALUES (1, 'a') RETURNING id, name;");
         Opcodes(rows).Should().Equal(
-            "OpenWriteCursor", "Rewind", "Insert", "Column", "Column", "ResultRow", "Next",
-            "Commit", "CloseCursor", "Halt");
+            "OpenWriteCursor", "Rewind", "Insert", "Next", "OpenReadCursor", "Rewind",
+            "Column", "Column", "ResultRow", "Next", "CloseCursor", "Commit", "CloseCursor", "Halt");
 
-        // RETURNING columns read the freshly written row into consecutive registers.
-        rows[3][6].Should().Be(SqlValue.Text("r[0]=c0.col[0]"));
-        rows[4][6].Should().Be(SqlValue.Text("r[1]=c0.col[1]"));
-        rows[5][6].Should().Be(SqlValue.Text("output=r[0..1]"));
+        // RETURNING reads the source-ordered affected-row buffer through cursor 1.
+        rows[6][6].Should().Be(SqlValue.Text("r[0]=c1.col[0]"));
+        rows[7][6].Should().Be(SqlValue.Text("r[1]=c1.col[1]"));
+        rows[8][6].Should().Be(SqlValue.Text("output=r[0..1]"));
     }
 
     [Test]
@@ -61,11 +61,10 @@ public class CompiledDmlExecutionTests
 
         var rows = ReadRows(connection, "EXPLAIN INSERT INTO t VALUES (1) RETURNING rowid;");
         Opcodes(rows).Should().Equal(
-            "OpenWriteCursor", "Rewind", "Insert", "RowId", "ResultRow", "Next",
-            "Commit", "CloseCursor", "Halt");
+            "OpenWriteCursor", "Rewind", "Insert", "Next", "OpenReadCursor", "Rewind",
+            "RowId", "ResultRow", "Next", "CloseCursor", "Commit", "CloseCursor", "Halt");
 
-        // The rowid pseudo-column is read through a dedicated RowId opcode.
-        rows[3][6].Should().Be(SqlValue.Text("r[0]=c0.rowid"));
+        rows[6][6].Should().Be(SqlValue.Text("r[0]=c1.rowid"));
     }
 
     [Test]
@@ -131,8 +130,8 @@ public class CompiledDmlExecutionTests
 
         var rows = ReadRows(connection, "EXPLAIN DELETE FROM t WHERE id > 1 RETURNING *;");
         Opcodes(rows).Should().Equal(
-            "OpenWriteCursor", "Rewind", "Filter", "Delete", "Column", "Column", "ResultRow",
-            "Next", "Commit", "CloseCursor", "Halt");
+            "OpenWriteCursor", "Rewind", "Filter", "Delete", "Next", "OpenReadCursor", "Rewind",
+            "Column", "Column", "ResultRow", "Next", "CloseCursor", "Commit", "CloseCursor", "Halt");
     }
 
     [Test]

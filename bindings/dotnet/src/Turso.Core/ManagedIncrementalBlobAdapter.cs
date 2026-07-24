@@ -1,3 +1,5 @@
+using Turso.Core.Parsing;
+
 namespace Turso.Core;
 
 public interface IManagedIncrementalBlobAdapter : IDisposable
@@ -27,6 +29,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
 
     private readonly object _gate = new();
     private readonly ManagedConnectionAdapter _connection;
+    private readonly string _databaseName;
     private readonly string _tableName;
     private readonly string _columnName;
     private readonly long _rowId;
@@ -39,6 +42,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
 
     private ManagedIncrementalBlobAdapter(
         ManagedConnectionAdapter connection,
+        string databaseName,
         string tableName,
         string columnName,
         long rowId,
@@ -48,6 +52,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
         long mutationGeneration)
     {
         _connection = connection;
+        _databaseName = databaseName;
         _tableName = tableName;
         _columnName = columnName;
         _rowId = rowId;
@@ -71,21 +76,19 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
         ArgumentNullException.ThrowIfNull(tableName);
         ArgumentNullException.ThrowIfNull(columnName);
 
-        if (!string.Equals(databaseName, "main", StringComparison.OrdinalIgnoreCase))
-            throw new ManagedBlobException(SqliteError, $"unknown database: {databaseName}");
-
-        EnsureTable(connection, tableName);
-        var mutationLease = connection.OpenBlobMutationLease(tableName, rowId);
+        EnsureTable(connection, databaseName, tableName);
+        var mutationLease = connection.OpenBlobMutationLease(databaseName, tableName, rowId);
         try
         {
-            var generationBeforeRead = connection.GetBlobMutationGeneration(tableName, rowId);
-            var snapshot = ReadSnapshot(connection, tableName, columnName, rowId, missingIsAbort: false);
-            var generationAfterRead = connection.GetBlobMutationGeneration(tableName, rowId);
+            var generationBeforeRead = connection.GetBlobMutationGeneration(databaseName, tableName, rowId);
+            var snapshot = ReadSnapshot(connection, databaseName, tableName, columnName, rowId, missingIsAbort: false);
+            var generationAfterRead = connection.GetBlobMutationGeneration(databaseName, tableName, rowId);
             if (generationBeforeRead != generationAfterRead)
                 throw Aborted();
 
             return new ManagedIncrementalBlobAdapter(
                 connection,
+                databaseName,
                 tableName,
                 columnName,
                 rowId,
@@ -146,7 +149,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
                 return;
 
             EnsureCurrent();
-            if (_connection.HasUpdateTrigger(_tableName))
+            if (_connection.HasUpdateTrigger(_databaseName, _tableName))
             {
                 throw new ManagedBlobException(
                     SqliteError,
@@ -157,7 +160,7 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             source.CopyTo(updated.AsSpan((int)offset, source.Length));
 
             using var statement = _connection.Prepare(
-                "UPDATE " + QuoteIdentifier(_tableName)
+                "UPDATE " + QualifyTable(_databaseName, _tableName)
                 + " SET " + QuoteIdentifier(_columnName) + " = $value"
                 + " WHERE rowid = $rowid AND " + QuoteIdentifier(_columnName) + " = $expected;");
             statement.Bind(statement.GetParameterIndex("$value"), SqlValue.Blob(updated));
@@ -168,10 +171,16 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             if (statement.RowsAffected != 1)
                 throw Aborted();
 
-            var snapshot = ReadSnapshot(_connection, _tableName, _columnName, _rowId, missingIsAbort: true);
+            var snapshot = ReadSnapshot(
+                _connection,
+                _databaseName,
+                _tableName,
+                _columnName,
+                _rowId,
+                missingIsAbort: true);
             _value = snapshot.Value;
             _rowSnapshot = snapshot.Row;
-            _mutationGeneration = _connection.GetBlobMutationGeneration(_tableName, _rowId);
+            _mutationGeneration = _connection.GetBlobMutationGeneration(_databaseName, _tableName, _rowId);
         }
     }
 
@@ -190,9 +199,15 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
 
     private void EnsureCurrent()
     {
-        var generationBeforeRead = _connection.GetBlobMutationGeneration(_tableName, _rowId);
-        var snapshot = ReadSnapshot(_connection, _tableName, _columnName, _rowId, missingIsAbort: true);
-        var generationAfterRead = _connection.GetBlobMutationGeneration(_tableName, _rowId);
+        var generationBeforeRead = _connection.GetBlobMutationGeneration(_databaseName, _tableName, _rowId);
+        var snapshot = ReadSnapshot(
+            _connection,
+            _databaseName,
+            _tableName,
+            _columnName,
+            _rowId,
+            missingIsAbort: true);
+        var generationAfterRead = _connection.GetBlobMutationGeneration(_databaseName, _tableName, _rowId);
         if (generationBeforeRead != generationAfterRead
             || generationAfterRead != _mutationGeneration
             || !RowsEqual(snapshot.Row, _rowSnapshot))
@@ -203,13 +218,14 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
 
     private static BlobSnapshot ReadSnapshot(
         IManagedConnectionAdapter connection,
+        string databaseName,
         string tableName,
         string columnName,
         long rowId,
         bool missingIsAbort)
     {
         using var statement = connection.Prepare(
-            "SELECT * FROM " + QuoteIdentifier(tableName)
+            "SELECT * FROM " + QualifyTable(databaseName, tableName)
             + " WHERE rowid = $rowid;");
         statement.Bind(statement.GetParameterIndex("$rowid"), SqlValue.Integer(rowId));
         if (statement.Step() != StatementStepResult.Row)
@@ -234,10 +250,14 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
         return new BlobSnapshot(value.AsBlob().ToArray(), row);
     }
 
-    private static void EnsureTable(IManagedConnectionAdapter connection, string tableName)
+    private static void EnsureTable(
+        IManagedConnectionAdapter connection,
+        string databaseName,
+        string tableName)
     {
         using var statement = connection.Prepare(
-            "SELECT type, name FROM sqlite_master WHERE sql IS NOT NULL;");
+            "SELECT type, name, sql FROM " + QualifyTable(databaseName, "sqlite_master")
+            + " WHERE sql IS NOT NULL;");
         while (statement.Step() == StatementStepResult.Row)
         {
             var name = statement.GetValue(1);
@@ -254,6 +274,15 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
             var objectType = type.AsText();
             if (string.Equals(objectType, "table", StringComparison.OrdinalIgnoreCase))
             {
+                var sql = statement.GetValue(2);
+                if (sql.Kind != SqlValueKind.Text)
+                    throw new InvalidOperationException("sqlite_master returned non-text table SQL.");
+                var parsed = SqlParser.Parse(sql.AsText(), SqlParameterMap.Parse(sql.AsText()));
+                if (parsed is not CreateTableStatement createTable)
+                    throw new InvalidOperationException("sqlite_master returned table SQL that is not CREATE TABLE.");
+                if (createTable.WithoutRowid)
+                    throw new ManagedBlobException(SqliteError, $"cannot open table without rowid: {tableName}");
+
                 return;
             }
 
@@ -302,6 +331,9 @@ internal sealed class ManagedIncrementalBlobAdapter : IManagedIncrementalBlobAda
 
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+
+    private static string QualifyTable(string databaseName, string tableName)
+        => QuoteIdentifier(databaseName) + "." + QuoteIdentifier(tableName);
 
     private sealed record BlobSnapshot(byte[] Value, SqlValue[] Row);
 }

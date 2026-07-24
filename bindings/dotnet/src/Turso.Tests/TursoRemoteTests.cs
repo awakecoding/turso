@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using AwesomeAssertions;
+using Turso.Data.Sync;
 using Turso.Raw.Public;
 
 namespace Turso.Tests;
@@ -27,14 +28,146 @@ public class TursoRemoteTests
     }
 
     [Test]
-    public void TestRemoteReplicaFailsBeforeNetworkAccess()
+    public void TestReplicaOptionsPreserveOriginalConstructor()
+    {
+        var options = new TursoReplicaOptions(
+            ":memory:",
+            new Uri("https://example.turso.io"),
+            authToken: null);
+
+        options.BootstrapIfEmpty.Should().BeTrue();
+    }
+
+    [Test]
+    public void TestRemoteReplicaRejectsAutomaticSyncBeforeNetworkAccess()
     {
         using var connection = new TursoConnection(
-            "Data Source=libsql://example.turso.io;Auth Token=secret;Replica Path=replica.db");
+            "Data Source=libsql://example.turso.io;Auth Token=secret;Replica Path=replica.db;Sync Interval=1");
 
         connection.Invoking(x => x.Open())
             .Should().Throw<NotSupportedException>()
-            .WithMessage("Embedded replica connections are not supported yet by the .NET provider.*");
+            .WithMessage("Sync Interval is not supported yet for embedded replica connections. Call Sync or SyncAsync explicitly.");
+    }
+
+    [Test]
+    public void TestRemoteReplicaDrivesBootstrapIoAndSurfacesTransportFailure()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+
+        var replicaPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.db");
+        try
+        {
+            using var connection = new TursoConnection(
+                $"Data Source=http://127.0.0.1:{port};Replica Path={replicaPath}");
+
+            connection.Invoking(x => x.Open())
+                .Should().Throw<TursoException>();
+            connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        }
+
+        finally
+        {
+            foreach (var file in Directory.EnumerateFiles(
+                         Path.GetDirectoryName(replicaPath)!,
+                         Path.GetFileName(replicaPath) + "*"))
+            {
+                File.Delete(file);
+            }
+        }
+    }
+
+    [Test]
+    public void TestReplicaCompanionConnectsDeferredBootstrapDatabase()
+    {
+        using var replica = SyncReplicaDatabase.Open(
+            new TursoReplicaOptions(
+                ":memory:",
+                new Uri("http://127.0.0.1:1"),
+                authToken: null,
+                bootstrapIfEmpty: false));
+        using var statement = replica.PrepareStatement("SELECT 42");
+
+        statement.Read().Should().BeTrue();
+        statement.GetValue(0).IntValue.Should().Be(42);
+        statement.Read().Should().BeFalse();
+    }
+
+    [Test]
+    public async Task TestReplicaCompanionCancelsPendingSyncIo()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var serverCancellation = new CancellationTokenSource();
+        var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var server = HoldFirstRequestAsync(listener, requestStarted, serverCancellation.Token);
+
+        try
+        {
+            using var replica = SyncReplicaDatabase.Open(
+                new TursoReplicaOptions(
+                    ":memory:",
+                    new Uri($"http://127.0.0.1:{port}"),
+                    authToken: null,
+                    bootstrapIfEmpty: false));
+            using var cancellation = new CancellationTokenSource();
+            var sync = replica.SyncAsync(cancellation.Token);
+
+            await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await cancellation.CancelAsync();
+
+            var synchronize = async () => await sync;
+            await synchronize.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            await serverCancellation.CancelAsync();
+            listener.Stop();
+            await server;
+        }
+    }
+
+    [Test]
+    public async Task TestRemoteReplicaOpenAsyncCancelsPendingBootstrapIo()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        using var serverCancellation = new CancellationTokenSource();
+        var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var server = HoldFirstRequestAsync(listener, requestStarted, serverCancellation.Token);
+        var replicaPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.db");
+
+        try
+        {
+            using var connection = new TursoConnection(
+                $"Data Source=http://127.0.0.1:{port};Replica Path={replicaPath}");
+            using var cancellation = new CancellationTokenSource();
+            var open = connection.OpenAsync(cancellation.Token);
+
+            await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await cancellation.CancelAsync();
+
+            var openReplica = async () => await open;
+            await openReplica.Should().ThrowAsync<OperationCanceledException>();
+            connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        }
+        finally
+        {
+            await serverCancellation.CancelAsync();
+            listener.Stop();
+            await server;
+
+            foreach (var file in Directory.EnumerateFiles(
+                         Path.GetDirectoryName(replicaPath)!,
+                         Path.GetFileName(replicaPath) + "*"))
+            {
+                File.Delete(file);
+            }
+        }
     }
 
     [Test]
@@ -45,6 +178,29 @@ public class TursoRemoteTests
         connection.Invoking(x => x.Open())
             .Should().Throw<InvalidOperationException>()
             .WithMessage("Tls=True conflicts with the http URL scheme.");
+    }
+
+    private static async Task HoldFirstRequestAsync(
+        TcpListener listener,
+        TaskCompletionSource requestStarted,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var client = await listener.AcceptTcpClientAsync(cancellationToken);
+            await using var stream = client.GetStream();
+            var buffer = new byte[1];
+            if (await stream.ReadAsync(buffer, cancellationToken) > 0)
+                requestStarted.TrySetResult();
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (SocketException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
     }
 
     [Test]
@@ -76,16 +232,29 @@ public class TursoRemoteTests
     }
 
     [Test]
-    public void TestCanCreateBatchIsRemoteOnly()
+    public void TestCanCreateBatchSupportsLocalAndRemoteConnections()
     {
         using var localConnection = new TursoConnection("Data Source=:memory:");
-        localConnection.CanCreateBatch.Should().BeFalse();
-        localConnection.Invoking(x => x.CreateBatch())
-            .Should().Throw<NotSupportedException>()
-            .WithMessage("Turso batch execution is currently supported only for remote connections.");
+        localConnection.CanCreateBatch.Should().BeTrue();
+        localConnection.CreateBatch().Should().BeOfType<TursoBatch>();
 
         using var remoteConnection = new TursoConnection("Data Source=https://example.com");
         remoteConnection.CanCreateBatch.Should().BeTrue();
+    }
+
+    [Test]
+    public async Task TestRemoteBatchHonorsPreCanceledTokenBeforeValidation()
+    {
+        using var connection = new TursoConnection("Data Source=http://localhost:1");
+        connection.Open();
+        using var batch = (TursoBatch)connection.CreateBatch();
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+
+        var execution = batch.ExecuteNonQueryAsync(cancellation.Token);
+
+        execution.IsCanceled.Should().BeTrue();
+        Assert.ThrowsAsync<OperationCanceledException>(async () => await execution);
     }
 
     [Test]
@@ -101,6 +270,199 @@ public class TursoRemoteTests
 
         connection.Close();
         connection.State.Should().Be(System.Data.ConnectionState.Closed);
+    }
+
+    [Test]
+    public void TestRemoteCloseUnregistersTrackedTransactionBeforeReopen()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+        const string closeTransactionResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                },
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+        const string reopenedBeginResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(
+            beginResponseJson,
+            closeTransactionResponseJson,
+            reopenedBeginResponseJson,
+            closeTransactionResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        using var first = connection.BeginTransaction();
+
+        connection.Close();
+        first.Connection.Should().BeNull();
+        connection.Open();
+
+        using var second = connection.BeginTransaction();
+        connection.Close();
+        second.Connection.Should().BeNull();
+    }
+
+    [Test]
+    public void TestRemoteRawTransactionCompletionClosesStatelessSessionAndAllowsNextTransaction()
+    {
+        const string firstBeginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [],
+                    "rows": [],
+                    "affected_row_count": 0,
+                    "last_insert_rowid": null
+                  }
+                }
+              }]
+            }
+            """;
+        const string commitResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [],
+                    "rows": [],
+                    "affected_row_count": 0,
+                    "last_insert_rowid": null
+                  }
+                }
+              }]
+            }
+            """;
+        const string closeResponseJson = """
+            {
+              "results": [{
+                "type": "ok",
+                "response": { "type": "close" }
+              }]
+            }
+            """;
+        const string secondBeginResponseJson = """
+            {
+              "baton": "stream.3",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [],
+                    "rows": [],
+                    "affected_row_count": 0,
+                    "last_insert_rowid": null
+                  }
+                }
+              }]
+            }
+            """;
+        const string rollbackAndCloseResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                },
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(
+            firstBeginResponseJson,
+            commitResponseJson,
+            closeResponseJson,
+            secondBeginResponseJson,
+            rollbackAndCloseResponseJson);
+        using var connection = new TursoConnection(
+            $"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+        using var first = connection.BeginTransaction();
+
+        using var command = connection.CreateCommand();
+        command.Transaction = first;
+        command.CommandText = "COMMIT";
+        command.ExecuteNonQuery().Should().Be(0);
+
+        first.Connection.Should().BeNull();
+        using var second = connection.BeginTransaction();
+        connection.Close();
+        second.Connection.Should().BeNull();
+
+        using var closeDocument = JsonDocument.Parse(server.RequestBodies[2]);
+        closeDocument.RootElement.GetProperty("requests")[0].GetProperty("type")
+            .GetString().Should().Be("close");
     }
 
     [Test]
@@ -1031,6 +1393,137 @@ public class TursoRemoteTests
     }
 
     [Test]
+    public void TestRemoteBatchScalarSkipsNonQueryResults()
+    {
+        const string responseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "batch",
+                    "result": {
+                      "step_results": [
+                        {
+                          "cols": [],
+                          "rows": [],
+                          "affected_row_count": 1,
+                          "last_insert_rowid": "1"
+                        },
+                        {
+                          "cols": [
+                            { "name": "n", "decltype": "INTEGER" }
+                          ],
+                          "rows": [
+                            [
+                              { "type": "integer", "value": "42" }
+                            ]
+                          ],
+                          "affected_row_count": 0,
+                          "last_insert_rowid": null
+                        }
+                      ],
+                      "step_errors": [null, null]
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        using var batch = (TursoBatch)connection.CreateBatch();
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO t VALUES (1)"));
+        batch.BatchCommands.Add(new TursoBatchCommand("SELECT 42"));
+
+        batch.ExecuteScalar().Should().Be(42L);
+    }
+
+    [Test]
+    public void TestRemoteBatchTracksSuccessfulCommitBeforeLaterStepFailure()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+        const string batchResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "batch",
+                    "result": {
+                      "step_results": [
+                        {
+                          "cols": [],
+                          "rows": [],
+                          "affected_row_count": 0,
+                          "last_insert_rowid": null
+                        },
+                        null
+                      ],
+                      "step_errors": [
+                        null,
+                        {
+                          "message": "no such table: missing",
+                          "code": "SQLITE_ERROR"
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+        const string closeResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginResponseJson, batchResponseJson, closeResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        using var batch = (TursoBatch)connection.CreateBatch();
+        batch.BatchCommands.Add(new TursoBatchCommand("COMMIT"));
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO missing VALUES (1)"));
+
+        batch.Invoking(static value => value.ExecuteNonQuery())
+            .Should().Throw<TursoException>()
+            .WithMessage("Remote SQL execution failed: no such table: missing (SQLITE_ERROR)");
+
+        transaction.Invoking(static value => value.Commit())
+            .Should().Throw<InvalidOperationException>();
+        GetPrivateField<bool>(connection, "_remoteTransactionActive").Should().BeFalse();
+        GetPrivateField<object?>(connection, "_transaction").Should().BeNull();
+    }
+
+    [Test]
     public void TestRemoteBatchNonQueryUsesNoRowsAndIgnoresTrailingCloseError()
     {
         const string responseJson = """
@@ -1254,6 +1747,15 @@ public class TursoRemoteTests
 
             server.Completion.IsCompletedSuccessfully.Should().BeTrue();
         }
+    }
+
+    private static T GetPrivateField<T>(object instance, string name)
+    {
+        var field = instance.GetType().GetField(
+            name,
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        field.Should().NotBeNull();
+        return (T)field!.GetValue(instance)!;
     }
 
     private sealed class TestRemoteServer : IDisposable

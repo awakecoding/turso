@@ -79,22 +79,6 @@ public sealed class ManagedConstraintSemanticsTests
                 ScalarInteger(connection, "SELECT COUNT(*) FROM metrics;").Should().Be(1);
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
-            {
-                sqlite.Open();
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
-                ScalarInteger(
-                    sqlite,
-                    "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'sqlite_autoindex_metrics_1' AND sql IS NULL;")
-                    .Should().Be(1);
-                var schemaSql = ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'metrics';");
-                schemaSql.Should().Contain("DOUBLE PRECISION")
-                    .And.Contain("CHARACTER VARYING(20)")
-                    .And.Contain("DEFAULT (abs(-4) + 1)")
-                    .And.Contain("CONSTRAINT \"positive\" CHECK (amount > 0)")
-                    .And.Contain("UNIQUE (\"label\", \"amount\") ON CONFLICT IGNORE");
-            }
-
             using (var reopened = EmbeddedDatabase.OpenFile(path))
             using (var connection = reopened.Connect())
             {
@@ -116,6 +100,20 @@ public sealed class ManagedConstraintSemanticsTests
                     ],
                     options => options.WithStrictOrdering());
             }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarInteger(
+                sqlite,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'sqlite_autoindex_metrics_1' AND sql IS NULL;")
+                .Should().Be(1);
+            var schemaSql = ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'metrics';");
+            schemaSql.Should().Contain("DOUBLE PRECISION")
+                .And.Contain("CHARACTER VARYING(20)")
+                .And.Contain("DEFAULT (abs(-4) + 1)")
+                .And.Contain("CONSTRAINT \"positive\" CHECK (amount > 0)")
+                .And.Contain("UNIQUE (\"label\", \"amount\") ON CONFLICT IGNORE");
         }
         finally
         {
@@ -240,16 +238,16 @@ public sealed class ManagedConstraintSemanticsTests
                     .WithMessage("default value of column is not constant: missing");
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
-                ScalarInteger(sqlite, "SELECT COUNT(*) FROM pragma_table_info('values_table');").Should().Be(1);
+                ReadRows(reopenedConnection, "PRAGMA table_info(values_table);").Should().HaveCount(1);
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            ReadRows(reopenedConnection, "PRAGMA table_info(values_table);").Should().HaveCount(1);
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM pragma_table_info('values_table');").Should().Be(1);
         }
         finally
         {
@@ -280,31 +278,30 @@ public sealed class ManagedConstraintSemanticsTests
                 ScalarInteger(connection, "SELECT COUNT(*) FROM generated_values;").Should().Be(1);
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
-                ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'generated_values';")
-                    .Should().Contain("CONSTRAINT \"generated_unique\" UNIQUE ON CONFLICT IGNORE");
-                ScalarInteger(
-                    sqlite,
-                    "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'sqlite_autoindex_generated_values_1' AND sql IS NULL;")
-                    .Should().Be(1);
-                Execute(sqlite, "INSERT INTO generated_values(value) VALUES (2), (2);");
-                ScalarInteger(sqlite, "SELECT COUNT(*) FROM generated_values;").Should().Be(2);
+                Execute(reopenedConnection, "INSERT INTO generated_values(value) VALUES (3), (3);");
+                ReadRows(reopenedConnection, "SELECT value, computed FROM generated_values ORDER BY value;")
+                    .Should().BeEquivalentTo(
+                    [
+                        new[] { SqlValue.Integer(1), SqlValue.Integer(2) },
+                        new[] { SqlValue.Integer(3), SqlValue.Integer(4) },
+                    ],
+                    options => options.WithStrictOrdering());
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            Execute(reopenedConnection, "INSERT INTO generated_values(value) VALUES (3), (3);");
-            ReadRows(reopenedConnection, "SELECT value, computed FROM generated_values ORDER BY value;")
-                .Should().BeEquivalentTo(
-                [
-                    new[] { SqlValue.Integer(1), SqlValue.Integer(2) },
-                    new[] { SqlValue.Integer(2), SqlValue.Integer(3) },
-                    new[] { SqlValue.Integer(3), SqlValue.Integer(4) },
-                ],
-                options => options.WithStrictOrdering());
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'generated_values';")
+                .Should().Contain("CONSTRAINT \"generated_unique\" UNIQUE ON CONFLICT IGNORE");
+            ScalarInteger(
+                sqlite,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'sqlite_autoindex_generated_values_1' AND sql IS NULL;")
+                .Should().Be(1);
+            Execute(sqlite, "INSERT INTO generated_values(value) VALUES (2), (2);");
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM generated_values;").Should().Be(3);
         }
         finally
         {
@@ -334,20 +331,20 @@ public sealed class ManagedConstraintSemanticsTests
                     .WithMessage("CHECK constraint failed: qualified.value > 0");
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
-                Action invalid = () => Execute(sqlite, "INSERT INTO qualified VALUES (0);");
-                invalid.Should().Throw<MsData.SqliteException>()
-                    .WithMessage("*CHECK constraint failed: qualified.value > 0*");
+                Action reopenedInvalid = () => Execute(reopenedConnection, "INSERT INTO qualified VALUES (-1);");
+                reopenedInvalid.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("CHECK constraint failed: qualified.value > 0");
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            Action reopenedInvalid = () => Execute(reopenedConnection, "INSERT INTO qualified VALUES (-1);");
-            reopenedInvalid.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("CHECK constraint failed: qualified.value > 0");
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Action sqliteInvalid = () => Execute(sqlite, "INSERT INTO qualified VALUES (0);");
+            sqliteInvalid.Should().Throw<MsData.SqliteException>()
+                .WithMessage("*CHECK constraint failed: qualified.value > 0*");
         }
         finally
         {
@@ -376,19 +373,19 @@ public sealed class ManagedConstraintSemanticsTests
                     .WithMessage("CHECK constraint failed: old_name.value > 0");
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
-                ScalarInteger(sqlite, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'old_name';").Should().Be(1);
-                ScalarInteger(sqlite, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'new_name';").Should().Be(0);
+                Action reopenedInvalid = () => Execute(reopenedConnection, "INSERT INTO old_name VALUES (-1);");
+                reopenedInvalid.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("CHECK constraint failed: old_name.value > 0");
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            Action reopenedInvalid = () => Execute(reopenedConnection, "INSERT INTO old_name VALUES (-1);");
-            reopenedInvalid.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("CHECK constraint failed: old_name.value > 0");
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'old_name';").Should().Be(1);
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'new_name';").Should().Be(0);
         }
         finally
         {
@@ -443,22 +440,22 @@ public sealed class ManagedConstraintSemanticsTests
                 Execute(connection, "INSERT INTO rowid_checks(rowid, value) VALUES (1, 1);");
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
-                Action invalid = () => Execute(sqlite, "INSERT INTO rowid_checks(rowid, value) VALUES (-1, 2);");
-                invalid.Should().Throw<MsData.SqliteException>()
-                    .WithMessage("*CHECK constraint failed: rowid > 0*");
+                Action reopenedInvalid = () => Execute(
+                    reopenedConnection,
+                    "INSERT INTO rowid_checks(rowid, value) VALUES (-2, 3);");
+                reopenedInvalid.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("CHECK constraint failed: rowid > 0");
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            Action reopenedInvalid = () => Execute(
-                reopenedConnection,
-                "INSERT INTO rowid_checks(rowid, value) VALUES (-2, 3);");
-            reopenedInvalid.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("CHECK constraint failed: rowid > 0");
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Action invalid = () => Execute(sqlite, "INSERT INTO rowid_checks(rowid, value) VALUES (-1, 2);");
+            invalid.Should().Throw<MsData.SqliteException>()
+                .WithMessage("*CHECK constraint failed: rowid > 0*");
         }
         finally
         {
@@ -488,20 +485,20 @@ public sealed class ManagedConstraintSemanticsTests
                 Execute(connection, "INSERT INTO configured VALUES (1), (2);");
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                Execute(sqlite, "UPDATE configured SET value = NULL;");
-                ScalarInteger(sqlite, "SELECT COUNT(*) FROM configured WHERE value IS NOT NULL;").Should().Be(2);
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                Execute(reopenedConnection, "UPDATE configured SET value = NULL;");
+                ReadRows(reopenedConnection, "SELECT value FROM configured ORDER BY value;")
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(1, 2);
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            Execute(reopenedConnection, "UPDATE configured SET value = NULL;");
-            ReadRows(reopenedConnection, "SELECT value FROM configured ORDER BY value;")
-                .Select(row => row[0].AsInteger())
-                .Should().Equal(1, 2);
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            Execute(sqlite, "UPDATE configured SET value = NULL;");
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM configured WHERE value IS NOT NULL;").Should().Be(2);
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
         }
         finally
         {
@@ -546,29 +543,29 @@ public sealed class ManagedConstraintSemanticsTests
                     .Should().Equal(1, 3);
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                Execute(sqlite, "UPDATE generated_not_null SET value = 0;");
-                ScalarInteger(sqlite, "SELECT COUNT(*) FROM generated_not_null WHERE value > 0;").Should().Be(2);
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                Execute(
+                    reopenedConnection,
+                    "INSERT INTO generated_not_null(id, value) VALUES (4, 4), (5, 0), (6, 6);");
+                Execute(reopenedConnection, "UPDATE generated_not_null SET value = 0 WHERE id >= 4;");
+                ReadRows(reopenedConnection, "SELECT id, value, computed FROM generated_not_null ORDER BY id;")
+                    .Should().BeEquivalentTo(
+                    [
+                        new[] { SqlValue.Integer(1), SqlValue.Integer(1), SqlValue.Integer(1) },
+                        new[] { SqlValue.Integer(3), SqlValue.Integer(3), SqlValue.Integer(3) },
+                        new[] { SqlValue.Integer(4), SqlValue.Integer(4), SqlValue.Integer(4) },
+                        new[] { SqlValue.Integer(6), SqlValue.Integer(6), SqlValue.Integer(6) },
+                    ],
+                    options => options.WithStrictOrdering());
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            Execute(
-                reopenedConnection,
-                "INSERT INTO generated_not_null(id, value) VALUES (4, 4), (5, 0), (6, 6);");
-            Execute(reopenedConnection, "UPDATE generated_not_null SET value = 0 WHERE id >= 4;");
-            ReadRows(reopenedConnection, "SELECT id, value, computed FROM generated_not_null ORDER BY id;")
-                .Should().BeEquivalentTo(
-                [
-                    new[] { SqlValue.Integer(1), SqlValue.Integer(1), SqlValue.Integer(1) },
-                    new[] { SqlValue.Integer(3), SqlValue.Integer(3), SqlValue.Integer(3) },
-                    new[] { SqlValue.Integer(4), SqlValue.Integer(4), SqlValue.Integer(4) },
-                    new[] { SqlValue.Integer(6), SqlValue.Integer(6), SqlValue.Integer(6) },
-                ],
-                options => options.WithStrictOrdering());
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            Execute(sqlite, "UPDATE generated_not_null SET value = 0;");
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM generated_not_null WHERE value > 0;").Should().Be(4);
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
         }
         finally
         {
@@ -618,19 +615,19 @@ public sealed class ManagedConstraintSemanticsTests
                 Execute(connection, """INSERT INTO dotted("dotted.value", value) VALUES (1, -1);""");
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                Action reopenedInvalid = () => Execute(
+                    reopenedConnection,
+                    """INSERT INTO dotted("dotted.value", value) VALUES (0, 1);""");
+                reopenedInvalid.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("CHECK constraint failed: \"dotted.value\" > 0");
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            Action reopenedInvalid = () => Execute(
-                reopenedConnection,
-                """INSERT INTO dotted("dotted.value", value) VALUES (0, 1);""");
-            reopenedInvalid.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("CHECK constraint failed: \"dotted.value\" > 0");
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
         }
         finally
         {
@@ -693,7 +690,7 @@ public sealed class ManagedConstraintSemanticsTests
                     options => options.WithStrictOrdering());
             }
 
-            using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
             sqlite.Open();
             ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
         }
@@ -760,7 +757,7 @@ public sealed class ManagedConstraintSemanticsTests
                 ScalarInteger(connection, "SELECT COUNT(*) FROM hidden_rowid;").Should().Be(1);
             }
 
-            using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
             sqlite.Open();
             ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
         }
@@ -790,23 +787,26 @@ public sealed class ManagedConstraintSemanticsTests
                 Execute(connection, """INSERT INTO "a.b"(rowid, value) VALUES (1, 1);""");
             }
 
-            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var reopenedConnection = reopened.Connect())
             {
-                sqlite.Open();
-                Execute(sqlite, """INSERT INTO "a.b"(rowid, value) VALUES (2, 2);""");
-                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                Execute(reopenedConnection, """INSERT INTO "a.b"(rowid, value) VALUES (3, 3);""");
+                Action invalid = () => Execute(
+                    reopenedConnection,
+                    """INSERT INTO "a.b"(rowid, value) VALUES (-1, 4);""");
+                invalid.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("""CHECK constraint failed: "a.b".rowid > 0""");
+                ReadRows(reopenedConnection, """SELECT rowid, value FROM "a.b" ORDER BY rowid;""")
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(1, 3);
             }
 
-            using var reopened = EmbeddedDatabase.OpenFile(path);
-            using var reopenedConnection = reopened.Connect();
-            Execute(reopenedConnection, """INSERT INTO "a.b"(rowid, value) VALUES (3, 3);""");
-            Action invalid = () => Execute(
-                reopenedConnection,
-                """INSERT INTO "a.b"(rowid, value) VALUES (-1, 4);""");
-            invalid.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("""CHECK constraint failed: "a.b".rowid > 0""");
-            ReadRows(reopenedConnection, """SELECT rowid, value FROM "a.b" ORDER BY rowid;""")
-                .Select(row => row[0].AsInteger())
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            Execute(sqlite, """INSERT INTO "a.b"(rowid, value) VALUES (2, 2);""");
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ReadRows(sqlite, """SELECT rowid, value FROM "a.b" ORDER BY rowid;""")
+                .Select(row => Convert.ToInt64(row[0]))
                 .Should().Equal(1, 2, 3);
         }
         finally

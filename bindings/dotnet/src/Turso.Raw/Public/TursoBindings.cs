@@ -75,6 +75,25 @@ public static class TursoBindings
         return TursoStatementHandle.FromPtr(statementPtr);
     }
 
+    public static void Interrupt(TursoDatabaseHandle db)
+    {
+        db.ThrowIfInvalid();
+        if (db.IsManaged)
+            throw new InvalidOperationException("Native interruption requires a native database.");
+
+        TursoInterop.ConnectionInterrupt(db);
+    }
+
+    public static void SetBusyTimeout(TursoDatabaseHandle db, TimeSpan timeout)
+    {
+        db.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
+        if (db.IsManaged)
+            throw new InvalidOperationException("Native busy timeout requires a native database.");
+
+        TursoInterop.ConnectionSetBusyTimeout(db, checked((long)timeout.TotalMilliseconds));
+    }
+
     public static void RegisterScalarFunction(
         TursoDatabaseHandle db,
         string name,

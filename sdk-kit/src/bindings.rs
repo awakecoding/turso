@@ -16,6 +16,26 @@ impl Default for turso_slice_ref_t {
         }
     }
 }
+pub const turso_abi_type_t_TURSO_ABI_TYPE_STATUS_CODE: turso_abi_type_t = 1;
+pub const turso_abi_type_t_TURSO_ABI_TYPE_VALUE_TYPE: turso_abi_type_t = 2;
+pub const turso_abi_type_t_TURSO_ABI_TYPE_EXTENSION_VALUE_TYPE: turso_abi_type_t = 3;
+pub const turso_abi_type_t_TURSO_ABI_TYPE_DATABASE_CONFIG: turso_abi_type_t = 4;
+pub const turso_abi_type_t_TURSO_ABI_TYPE_EXTENSION_VALUE: turso_abi_type_t = 5;
+pub const turso_abi_type_t_TURSO_ABI_TYPE_EXTENSION_VALUE_DATA: turso_abi_type_t = 6;
+pub type turso_abi_type_t = ::std::os::raw::c_uint;
+unsafe extern "C" {
+    pub fn turso_abi_version() -> u32;
+}
+unsafe extern "C" {
+    pub fn turso_abi_sizeof(type_: u32) -> usize;
+}
+unsafe extern "C" {
+    pub fn turso_abi_offsetof(type_: u32, field: u32) -> usize;
+}
+unsafe extern "C" {
+    pub fn turso_connection_interrupt(connection: *const turso_connection_t);
+}
+
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum turso_status_code_t {
