@@ -1850,6 +1850,8 @@ internal sealed class SqlParser
                 // rowid assignment, which would diverge from SQLite.
                 throw Error("AUTOINCREMENT is not supported: the managed engine does not implement sqlite_sequence semantics");
             }
+            if (ConsumeKeyword("NULL"))
+                continue;
             if (ConsumeKeyword("NOT"))
             {
                 ExpectKeyword("NULL");
@@ -1969,6 +1971,7 @@ internal sealed class SqlParser
             || keyword.Equals("FOREIGN", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("GENERATED", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("NOT", StringComparison.OrdinalIgnoreCase)
+            || keyword.Equals("NULL", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("PRIMARY", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("REFERENCES", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("UNIQUE", StringComparison.OrdinalIgnoreCase);

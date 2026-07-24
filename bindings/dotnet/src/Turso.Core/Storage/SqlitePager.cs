@@ -257,6 +257,7 @@ public sealed class SqlitePager : IDisposable
             fileSystem,
             databasePath,
             createNew: true,
+            readOnly: false,
             configuredBusyTimeout);
         SqlitePageStore? pageStore = null;
         SqliteWalFile? wal = null;
@@ -358,6 +359,7 @@ public sealed class SqlitePager : IDisposable
             fileSystem,
             databasePath,
             createNew: false,
+            readOnly,
             configuredBusyTimeout);
         try
         {

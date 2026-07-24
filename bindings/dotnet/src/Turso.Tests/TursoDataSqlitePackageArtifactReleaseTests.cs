@@ -611,10 +611,10 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 $"Data Source={path};Local Provider=Managed;Encryption Cipher=AES256GCM;Encryption Key={key}";
             try
             {
-                using (var managed = new SqliteConnection(connectionString))
+                using (var encrypted = new SqliteConnection(connectionString))
                 {
-                    managed.Open();
-                    managed.ExecuteNonQuery("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('encrypted');");
+                    encrypted.Open();
+                    encrypted.ExecuteNonQuery("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('encrypted');");
                 }
 
                 using (var reopened = new SqliteConnection(connectionString))

@@ -5,6 +5,20 @@ namespace Turso.Tests;
 
 public sealed class ManagedDdlBoundaryTests
 {
+    [Test]
+    public void ManagedEngineAcceptsExplicitNullColumnConstraints()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Execute(connection, "CREATE TABLE items(untyped NULL, typed TEXT NULL);");
+        Execute(connection, "INSERT INTO items VALUES (NULL, NULL);");
+
+        ReadCount(connection, "SELECT COUNT(*) FROM items WHERE untyped IS NULL AND typed IS NULL;")
+            .Should()
+            .Be(1);
+    }
+
     [TestCase(
         "CREATE TABLE items(value INTEGER CHECK (value > 0));",
         "*CHECK constraints are not supported*")]
