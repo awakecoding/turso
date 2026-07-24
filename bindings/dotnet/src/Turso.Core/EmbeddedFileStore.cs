@@ -654,17 +654,30 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private List<SchemaEntry> ReadSchemaEntries()
     {
-        var entries = new List<SchemaEntry>();
-        var occupiedPages = new HashSet<uint> { SchemaRootPage };
-        long? previousRowId = null;
-        _ = ReadSchemaTreeNodeEntries(
-            SchemaRootPage,
-            _pager.ReadCommittedPage(SchemaRootPage),
-            isRoot: true,
-            occupiedPages,
-            ref previousRowId,
-            entries);
-        return entries;
+        try
+        {
+            var entries = new List<SchemaEntry>();
+            var occupiedPages = new HashSet<uint> { SchemaRootPage };
+            long? previousRowId = null;
+            _ = ReadSchemaTreeNodeEntries(
+                SchemaRootPage,
+                _pager.ReadCommittedPage(SchemaRootPage),
+                isRoot: true,
+                occupiedPages,
+                ref previousRowId,
+                entries);
+            return entries;
+        }
+        catch (Exception exception) when (
+            exception is InvalidDataException
+                or ArgumentOutOfRangeException
+                or OverflowException
+                or NotSupportedException)
+        {
+            throw new EmbeddedSqlException(
+                "Managed file database has an invalid sqlite_schema b-tree.",
+                exception);
+        }
     }
 
     private SchemaTreeReadResult ReadSchemaTreeNodeEntries(
@@ -720,7 +733,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                         pageImage,
                         _usableSpace,
                         isFirstPage: isRoot);
-                    if (interior.Cells.Count == 0)
+                    if (interior.Cells.Count == 0 && !isRoot)
                         throw new EmbeddedSqlException("Managed file database sqlite_schema has an empty interior page.");
 
                     int? childHeight = null;
@@ -1363,6 +1376,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 transaction.WritePage(interiorPage.PageNumber, interiorPage.Page);
             foreach (var leafPage in schemaTree.LeafPages)
                 transaction.WritePage(leafPage.PageNumber, leafPage.Page);
+            foreach (var overflowPage in schemaTree.OverflowPages)
+                transaction.WritePage(overflowPage.PageNumber, overflowPage.Page);
             foreach (var freelistPage in freelist.PageImages)
                 transaction.WritePage(freelistPage.PageNumber, freelistPage.Page.Span);
 
@@ -7030,6 +7045,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             AddActivePage(activePages, interiorPage.PageNumber);
         foreach (var leafPage in schemaTree.LeafPages)
             AddActivePage(activePages, leafPage.PageNumber);
+        foreach (var overflowPage in schemaTree.OverflowPages)
+            AddActivePage(activePages, overflowPage.PageNumber);
         foreach (var name in tableNames)
         {
             var rootPage = tableRootPages[name];
@@ -8617,6 +8634,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         RebuildPageAllocator allocator)
     {
         var cells = new List<SqliteTableLeafCell>(entries.Count);
+        var overflowPages = new List<PageImage>();
         long rowId = 1;
         foreach (var entry in entries)
         {
@@ -8629,18 +8647,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                     entry.Sql is null ? SqlValue.Null : SqlValue.Text(entry.Sql),
                 ],
                 _textEncoding);
-            if (SqlitePayloadLayout.Calculate(
-                    SqliteBtreePageType.TableLeaf,
-                    checked((ulong)record.Length),
-                    _usableSpace).UsesOverflow)
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist the schema for '{entry.Name}' because schema overflow pages are not supported.");
-            }
-
             try
             {
-                cells.Add(SqliteTableLeafCell.Create(rowId++, record, _usableSpace));
+                cells.Add(CreateTableLeafCell(rowId++, record, allocator, overflowPages));
             }
             catch (ArgumentException exception)
             {
@@ -8651,12 +8660,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         if (TryBuildSchemaLeafPage(cells, isFirstPage: true, out var rootPage))
-            return new PreparedSchemaTree(rootPage, Array.Empty<PageImage>(), Array.Empty<PageImage>());
+        {
+            return new PreparedSchemaTree(
+                rootPage,
+                Array.Empty<PageImage>(),
+                Array.Empty<PageImage>(),
+                overflowPages);
+        }
 
         var leafGroups = PartitionSchemaLeafCells(cells);
-        if (leafGroups.Count == 1)
-            leafGroups = SplitSchemaLeafGroup(leafGroups[0]);
-
         var leafPages = new List<PageImage>(leafGroups.Count);
         var leafChildren = new TableTreeChild[leafGroups.Count];
         for (var leafIndex = 0; leafIndex < leafGroups.Count; leafIndex++)
@@ -8689,7 +8701,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             levelChildren = parentChildren;
         }
 
-        return new PreparedSchemaTree(rootPage, interiorPages, leafPages);
+        return new PreparedSchemaTree(rootPage, interiorPages, leafPages, overflowPages);
     }
 
     private List<List<SqliteTableLeafCell>> PartitionSchemaLeafCells(
@@ -8719,24 +8731,6 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         return groups;
-    }
-
-    private List<List<SqliteTableLeafCell>> SplitSchemaLeafGroup(
-        IReadOnlyList<SqliteTableLeafCell> cells)
-    {
-        for (var leftCount = 1; leftCount < cells.Count; leftCount++)
-        {
-            var left = cells.Take(leftCount).ToList();
-            var right = cells.Skip(leftCount).ToList();
-            if (TryBuildSchemaLeafPage(left, isFirstPage: false, out _)
-                && TryBuildSchemaLeafPage(right, isFirstPage: false, out _))
-            {
-                return [left, right];
-            }
-        }
-
-        throw new EmbeddedSqlException(
-            "The managed file engine cannot promote the sqlite_schema root because a single schema row requires a non-root page.");
     }
 
     private byte[] BuildSchemaLeafPage(
@@ -9403,7 +9397,8 @@ internal sealed class EmbeddedFileStore : IDisposable
     private sealed record PreparedSchemaTree(
         byte[] RootPage,
         IReadOnlyList<PageImage> InteriorPages,
-        IReadOnlyList<PageImage> LeafPages);
+        IReadOnlyList<PageImage> LeafPages,
+        IReadOnlyList<PageImage> OverflowPages);
 
     private sealed record PreparedTableTree(
         byte[] RootPage,
