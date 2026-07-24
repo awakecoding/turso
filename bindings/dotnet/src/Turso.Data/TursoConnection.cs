@@ -16,6 +16,7 @@ public class TursoConnection : DbConnection
     private TursoRemoteClient? _remoteClient;
     private TursoConnectionOptions _connectionOptions;
     private TursoReplicaOptions? _replicaOptions;
+    private HttpMessageHandler? _ownedReplicaHttpHandler;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
     private bool _disposed;
     private bool _readUncommitted;
@@ -65,12 +66,22 @@ public class TursoConnection : DbConnection
         _connectionOptions = TursoConnectionOptions.Parse(connectionString);
     }
 
-    public TursoConnection(TursoReplicaOptions replicaOptions)
+    /// <summary>
+    /// Creates a connection configured as an embedded replica.
+    /// </summary>
+    /// <param name="replicaOptions">The embedded replica configuration.</param>
+    public static TursoConnection CreateReplica(TursoReplicaOptions replicaOptions)
     {
         ArgumentNullException.ThrowIfNull(replicaOptions);
         replicaOptions.Validate();
-        _replicaOptions = replicaOptions;
-        _connectionOptions = TursoConnectionOptions.FromReplica(replicaOptions);
+        var ownedHttpHandler = replicaOptions.HttpPolicy.ClaimMessageHandlerOwnership();
+        var connectionReplicaOptions = replicaOptions.CloneForConnection();
+        return new TursoConnection
+        {
+            _replicaOptions = connectionReplicaOptions,
+            _connectionOptions = TursoConnectionOptions.FromReplica(connectionReplicaOptions),
+            _ownedReplicaHttpHandler = ownedHttpHandler,
+        };
     }
 
     public override void Open()
@@ -119,6 +130,7 @@ public class TursoConnection : DbConnection
 
     public override void Close()
     {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: true);
         if (_remoteClient is not null)
         {
             CloseRemote();
@@ -171,8 +183,13 @@ public class TursoConnection : DbConnection
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_disposed)
+        {
             Close();
+            _disposed = true;
+            _ownedReplicaHttpHandler?.Dispose();
+            _ownedReplicaHttpHandler = null;
+        }
 
         _disposed = true;
         base.Dispose(disposing);
@@ -180,6 +197,7 @@ public class TursoConnection : DbConnection
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
         if (_nativeDatabase is null && _managedDatabase is null && _remoteClient is null)
         {
             throw new InvalidOperationException("Turso database is closed.");
@@ -225,6 +243,7 @@ public class TursoConnection : DbConnection
 
     public Task SyncAsync(CancellationToken cancellationToken = default)
     {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
@@ -242,6 +261,7 @@ public class TursoConnection : DbConnection
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(options);
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled<TursoSyncResult>(cancellationToken);
@@ -280,7 +300,13 @@ public class TursoConnection : DbConnection
     }
 
     internal TursoNativeDatabase NativeDatabase
-        => _nativeDatabase ?? throw new InvalidOperationException("Turso database is closed.");
+    {
+        get
+        {
+            _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
+            return _nativeDatabase ?? throw new InvalidOperationException("Turso database is closed.");
+        }
+    }
 
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("Turso database is closed.");
@@ -510,12 +536,19 @@ public class TursoConnection : DbConnection
 
     private void SetReplicaDatabase(TursoReplicaDatabase replicaDatabase)
     {
+        if (_disposed)
+        {
+            replicaDatabase.Dispose();
+            throw new ObjectDisposedException(nameof(TursoConnection));
+        }
+
         _replicaDatabase = replicaDatabase;
         _nativeDatabase = replicaDatabase;
     }
 
     private void ValidateCanOpen()
     {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");

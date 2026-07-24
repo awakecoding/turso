@@ -767,7 +767,9 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 PushOperationsThreshold = 1000,
                 PullBytesThreshold = 1024 * 1024,
             };
-            using var replica = new TursoConnection(options);
+            using var nullConnection = new TursoConnection(null!);
+            using var defaultConnection = new TursoConnection(default!);
+            using var replica = TursoConnection.CreateReplica(options);
             try
             {
                 replica.Open();

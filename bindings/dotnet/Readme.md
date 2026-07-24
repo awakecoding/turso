@@ -90,7 +90,7 @@ var replicaOptions = new TursoReplicaOptions(
     HttpPolicy = new TursoSyncHttpPolicy(requestTimeout: TimeSpan.FromMinutes(2)),
 };
 
-using var replica = new TursoConnection(replicaOptions);
+using var replica = TursoConnection.CreateReplica(replicaOptions);
 await replica.OpenAsync(CancellationToken.None);
 var progress = new Progress<TursoSyncProgress>(value =>
     Console.WriteLine(value.Stage));
@@ -107,16 +107,21 @@ the base64 key and server cipher together so the provider can set the native
 reserved-byte requirement. Push thresholds never split a transaction. Pull
 thresholds chunk full or prefix bootstrap downloads, but are rejected with query
 bootstrap because the server selects that page set. A custom `HttpMessageHandler`
-is application-owned unless `disposeMessageHandler: true` is specified, and HTTP
-timeouts are separate from long-poll duration.
+is application-owned unless `disposeMessageHandler: true` transfers ownership to
+the connection. Owned handlers survive `Close`/reopen cycles and are disposed with
+the connection; an ownership-transferring HTTP policy cannot create a second
+connection. HTTP timeouts cover both response headers and body reads and are separate
+from long-poll duration.
 
 The options-bearing synchronization overload returns `TursoSyncResult`, including
 whether remote changes were applied and a native statistics snapshot. The
 parameterless `Sync` and cancellation-token-only `SyncAsync` methods retain their
 existing return types for binary compatibility. Progress reports the
 `Pushing`, `Pulling`, optional `Applying`, and `Completed` phases. Progress callbacks
-must not reenter or close the same replica; reentry fails explicitly. Cancellation stops
-in-flight HTTP or file I/O and does not report `Completed`.
+must not reenter or close the same replica; reentry fails explicitly. The same rule
+applies to custom HTTP handlers and response bodies while application code is
+executing under the serialized replica operation. Cancellation stops in-flight HTTP
+or file I/O and does not report `Completed`.
 
 Current boundaries are intentional: automatic `Sync Interval` remains unsupported;
 local at-rest encryption options cannot be used for replicas (remote encryption is

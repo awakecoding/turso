@@ -39,9 +39,11 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
     private readonly SyncDatabaseHandle _database;
     private SyncConnectionHandle? _connection;
     private readonly HttpClient _httpClient;
+    private readonly TimeSpan _requestTimeout;
+    private readonly TursoReplicaOptions _options;
     private readonly Uri _remoteUri;
     private readonly string? _authToken;
-    private readonly AsyncLocal<bool> _insideProgressCallback = new();
+    private readonly AsyncLocal<ApplicationCallbackScope?> _progressCallbackScope = new();
     private bool _disposeRequested;
     private bool _disposed;
     private int _operationThreadId;
@@ -52,15 +54,17 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         HttpMessageHandler? httpMessageHandler = null)
     {
         _database = database;
+        _options = options;
         _remoteUri = options.RemoteUri;
         _authToken = options.AuthToken;
+        _requestTimeout = options.HttpPolicy.RequestTimeout;
         var handler = httpMessageHandler ?? options.HttpPolicy.MessageHandler;
         _httpClient = handler is null
             ? new HttpClient()
             : new HttpClient(
                 handler,
-                disposeHandler: httpMessageHandler is null && options.HttpPolicy.DisposeMessageHandler);
-        _httpClient.Timeout = options.HttpPolicy.RequestTimeout;
+                disposeHandler: httpMessageHandler is not null);
+        _httpClient.Timeout = Timeout.InfiniteTimeSpan;
     }
 
     internal static SyncReplicaDatabase Open(
@@ -179,13 +183,13 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(options);
-        if (_insideProgressCallback.Value)
-            throw new InvalidOperationException("Embedded replica operations cannot be reentered from a sync progress callback.");
+        ThrowIfReentrantApplicationCode();
         ThrowIfUnavailable();
         using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken,
             _disposeCancellation.Token);
         await _operationGate.WaitAsync(operationCancellation.Token).ConfigureAwait(false);
+        var progressScope = options.Progress is null ? null : EnterProgressCallbackScope();
         try
         {
             ThrowIfUnavailable();
@@ -200,6 +204,7 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         }
         finally
         {
+            progressScope?.Dispose();
             _operationGate.Release();
         }
     }
@@ -240,11 +245,12 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
 
     internal override void EnsureCanClose()
     {
-        if (_insideProgressCallback.Value)
+        if (_progressCallbackScope.Value?.IsActive == true)
         {
             throw new InvalidOperationException(
                 "An embedded replica cannot be closed from a sync progress callback.");
         }
+        _options.ThrowIfApplicationHttpReentrant(closing: true);
     }
 
     internal T UseExclusiveOperation<T>(Func<T> operation)
@@ -457,6 +463,11 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
     {
         var requestStatus = SyncInterop.IoRequestHttp(item, out var nativeRequest);
         SyncNative.ThrowIfFailure(requestStatus, IntPtr.Zero);
+        using var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (_requestTimeout != Timeout.InfiniteTimeSpan)
+            requestCancellation.CancelAfter(_requestTimeout);
+        var requestToken = requestCancellation.Token;
+        using var httpScope = _options.EnterApplicationHttpScope();
 
         try
         {
@@ -480,14 +491,14 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             using var response = await _httpClient.SendAsync(
                 request,
                 HttpCompletionOption.ResponseHeadersRead,
-                cancellationToken).ConfigureAwait(false);
+                requestToken).ConfigureAwait(false);
             SyncNative.ThrowIfFailure(SyncInterop.IoStatus(item, (int)response.StatusCode), IntPtr.Zero);
 
-            await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using var responseStream = await response.Content.ReadAsStreamAsync(requestToken).ConfigureAwait(false);
             var buffer = new byte[64 * 1024];
             while (true)
             {
-                var read = await responseStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                var read = await responseStream.ReadAsync(buffer, requestToken).ConfigureAwait(false);
                 if (read == 0)
                     break;
                 PushIoBuffer(item, buffer.AsSpan(0, read));
@@ -731,8 +742,7 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
 
     private void EnterOperation()
     {
-        if (_insideProgressCallback.Value)
-            throw new InvalidOperationException("Embedded replica operations cannot be reentered from a sync progress callback.");
+        ThrowIfReentrantApplicationCode();
         if (Volatile.Read(ref _operationThreadId) == Environment.CurrentManagedThreadId)
         {
             throw new InvalidOperationException(
@@ -774,21 +784,52 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         if (progress is null)
             return;
 
-        _insideProgressCallback.Value = true;
-        try
+        progress.Report(new TursoSyncProgress(stage));
+    }
+
+    private void ThrowIfReentrantApplicationCode()
+    {
+        if (_progressCallbackScope.Value?.IsActive == true)
         {
-            progress.Report(new TursoSyncProgress(stage));
+            throw new InvalidOperationException(
+                "Embedded replica operations cannot be reentered from a sync progress callback.");
         }
-        finally
-        {
-            _insideProgressCallback.Value = false;
-        }
+        _options.ThrowIfApplicationHttpReentrant(closing: false);
+    }
+
+    private IDisposable EnterProgressCallbackScope()
+    {
+        var previousScope = _progressCallbackScope.Value;
+        var scope = new ApplicationCallbackScope();
+        _progressCallbackScope.Value = scope;
+        return new ApplicationCallbackScopeLease(_progressCallbackScope, scope, previousScope);
     }
 
     private delegate SyncStatusCode SyncOperationStarter(
         SyncDatabaseHandle database,
         out IntPtr operation,
         out IntPtr error);
+
+    private sealed class ApplicationCallbackScope
+    {
+        private int _isActive = 1;
+
+        public bool IsActive => Volatile.Read(ref _isActive) != 0;
+
+        public void Deactivate() => Interlocked.Exchange(ref _isActive, 0);
+    }
+
+    private sealed class ApplicationCallbackScopeLease(
+        AsyncLocal<ApplicationCallbackScope?> currentScope,
+        ApplicationCallbackScope scope,
+        ApplicationCallbackScope? previousScope) : IDisposable
+    {
+        public void Dispose()
+        {
+            scope.Deactivate();
+            currentScope.Value = previousScope;
+        }
+    }
 }
 
 internal sealed class SyncNativeStatement : TursoNativeStatement

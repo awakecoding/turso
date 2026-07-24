@@ -79,6 +79,8 @@ public static class TursoReplicaProvider
 /// </summary>
 public sealed class TursoReplicaOptions
 {
+    private readonly AsyncLocal<ApplicationHttpScope?> _applicationHttpScope = new();
+
     /// <summary>
     /// Initializes embedded-replica connection options.
     /// </summary>
@@ -197,6 +199,37 @@ public sealed class TursoReplicaOptions
         ArgumentNullException.ThrowIfNull(HttpPolicy);
     }
 
+    internal IDisposable EnterApplicationHttpScope()
+    {
+        var previousScope = _applicationHttpScope.Value;
+        var scope = new ApplicationHttpScope();
+        _applicationHttpScope.Value = scope;
+        return new ApplicationHttpScopeLease(_applicationHttpScope, scope, previousScope);
+    }
+
+    internal TursoReplicaOptions CloneForConnection()
+    {
+        return new TursoReplicaOptions(Path, RemoteUri, AuthToken, BootstrapIfEmpty)
+        {
+            LongPollTimeout = LongPollTimeout,
+            PartialBootstrap = PartialBootstrap,
+            RemoteEncryption = RemoteEncryption,
+            PushOperationsThreshold = PushOperationsThreshold,
+            PullBytesThreshold = PullBytesThreshold,
+            HttpPolicy = HttpPolicy,
+        };
+    }
+
+    internal void ThrowIfApplicationHttpReentrant(bool closing)
+    {
+        if (_applicationHttpScope.Value?.IsActive != true)
+            return;
+
+        throw new InvalidOperationException(closing
+            ? "An embedded replica cannot be closed from its HTTP handler or response body."
+            : "Embedded replica operations cannot be reentered from its HTTP handler or response body.");
+    }
+
     private static void ValidateNativeSize(long? value, string parameterName)
     {
         if (value is null)
@@ -205,6 +238,27 @@ public sealed class TursoReplicaOptions
             throw new ArgumentOutOfRangeException(parameterName, value, "The value must be positive.");
         if ((ulong)value > nuint.MaxValue)
             throw new ArgumentOutOfRangeException(parameterName, value, "The value exceeds the native platform size.");
+    }
+
+    private sealed class ApplicationHttpScope
+    {
+        private int _isActive = 1;
+
+        public bool IsActive => Volatile.Read(ref _isActive) != 0;
+
+        public void Deactivate() => Interlocked.Exchange(ref _isActive, 0);
+    }
+
+    private sealed class ApplicationHttpScopeLease(
+        AsyncLocal<ApplicationHttpScope?> currentScope,
+        ApplicationHttpScope scope,
+        ApplicationHttpScope? previousScope) : IDisposable
+    {
+        public void Dispose()
+        {
+            scope.Deactivate();
+            currentScope.Value = previousScope;
+        }
     }
 }
 

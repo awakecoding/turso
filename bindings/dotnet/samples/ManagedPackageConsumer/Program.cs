@@ -164,7 +164,7 @@ static void VerifySourceFreeReplicaOptions()
         PushOperationsThreshold = 1000,
         PullBytesThreshold = 1024 * 1024,
     };
-    using var replica = new TursoConnection(options);
+    using var replica = TursoConnection.CreateReplica(options);
     try
     {
         replica.Open();

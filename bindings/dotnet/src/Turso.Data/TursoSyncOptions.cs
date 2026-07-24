@@ -175,6 +175,8 @@ public sealed class TursoRemoteEncryptionOptions
 /// </summary>
 public sealed class TursoSyncHttpPolicy
 {
+    private int _handlerOwnershipClaimed;
+
     /// <summary>
     /// Initializes an HTTP policy.
     /// </summary>
@@ -187,7 +189,10 @@ public sealed class TursoSyncHttpPolicy
     /// <see cref="TursoReplicaOptions.LongPollTimeout"/>.
     /// </param>
     /// <param name="disposeMessageHandler">
-    /// Whether the embedded replica owns and disposes <paramref name="messageHandler"/>.
+    /// Whether the connection owns <paramref name="messageHandler"/>. An owned handler
+    /// remains usable across <see cref="TursoConnection.Close"/> and reopen cycles and is
+    /// disposed with the connection. An ownership-transferring policy can create only
+    /// one connection.
     /// </param>
     public TursoSyncHttpPolicy(
         HttpMessageHandler? messageHandler = null,
@@ -215,7 +220,7 @@ public sealed class TursoSyncHttpPolicy
     public HttpMessageHandler? MessageHandler { get; }
 
     /// <summary>
-    /// Gets whether the embedded replica owns and disposes <see cref="MessageHandler"/>.
+    /// Gets whether the connection owns and disposes <see cref="MessageHandler"/>.
     /// </summary>
     public bool DisposeMessageHandler { get; }
 
@@ -223,6 +228,19 @@ public sealed class TursoSyncHttpPolicy
     /// Gets the per-request HTTP timeout.
     /// </summary>
     public TimeSpan RequestTimeout { get; }
+
+    internal HttpMessageHandler? ClaimMessageHandlerOwnership()
+    {
+        if (!DisposeMessageHandler || MessageHandler is null)
+            return null;
+        if (Interlocked.CompareExchange(ref _handlerOwnershipClaimed, 1, 0) != 0)
+        {
+            throw new InvalidOperationException(
+                "This HTTP policy already transferred ownership of its message handler to another connection.");
+        }
+
+        return MessageHandler;
+    }
 }
 
 /// <summary>

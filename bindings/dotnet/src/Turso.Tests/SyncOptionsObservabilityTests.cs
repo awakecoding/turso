@@ -186,6 +186,14 @@ public sealed class SyncOptionsObservabilityTests
             .GetMethod(nameof(TursoReplicaDatabase.SyncAsync), [typeof(CancellationToken)])!;
         providerMethod.ReturnType.Should().Be(typeof(Task));
         providerMethod.IsAbstract.Should().BeTrue();
+        typeof(TursoConnection)
+            .GetConstructor([typeof(TursoReplicaOptions)])
+            .Should().BeNull();
+        typeof(TursoConnection)
+            .GetMethod(
+                nameof(TursoConnection.CreateReplica),
+                [typeof(TursoReplicaOptions)])!
+            .ReturnType.Should().Be(typeof(TursoConnection));
     }
 
     [Test]
@@ -200,19 +208,78 @@ public sealed class SyncOptionsObservabilityTests
 
     [TestCase(false)]
     [TestCase(true)]
-    public void HttpPolicyControlsMessageHandlerOwnership(bool disposeHandler)
+    public void HttpPolicyOwnershipSurvivesCloseAndReopen(bool disposeHandler)
     {
         var handler = new TrackingHandler();
         var options = CreateOptions(
             bootstrapIfEmpty: false,
             httpPolicy: new TursoSyncHttpPolicy(handler, disposeHandler));
+        var connection = TursoConnection.CreateReplica(options);
 
-        using (SyncReplicaDatabase.Open(options))
-        {
-        }
+        connection.Open();
+        connection.Close();
+        handler.IsDisposed.Should().BeFalse();
+        connection.Open();
+        connection.Close();
+        handler.IsDisposed.Should().BeFalse();
+        connection.Dispose();
 
         handler.IsDisposed.Should().Be(disposeHandler);
         handler.Dispose();
+    }
+
+    [Test]
+    public void OwnedHttpHandlerCanBeTransferredToOnlyOneConnection()
+    {
+        var handler = new TrackingHandler();
+        var options = CreateOptions(
+            bootstrapIfEmpty: false,
+            httpPolicy: new TursoSyncHttpPolicy(handler, disposeMessageHandler: true));
+        using var connection = TursoConnection.CreateReplica(options);
+
+        var createSecond = () => TursoConnection.CreateReplica(options);
+
+        createSecond.Should().Throw<InvalidOperationException>()
+            .WithMessage("This HTTP policy already transferred ownership*");
+    }
+
+    [Test]
+    public async Task ReusedOptionsDoNotCoupleHttpReentrancyAcrossConnections()
+    {
+        TursoConnection? second = null;
+        var callSecond = false;
+        var callbackResult = new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var handler = new TrackingHandler((_, _) =>
+        {
+            if (callSecond)
+            {
+                try
+                {
+                    second!.ExecuteNonQuery("SELECT 1");
+                    callbackResult.TrySetResult(null);
+                }
+                catch (Exception exception)
+                {
+                    callbackResult.TrySetResult(exception);
+                }
+            }
+
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        });
+        var options = CreateOptions(
+            bootstrapIfEmpty: false,
+            httpPolicy: new TursoSyncHttpPolicy(handler));
+        using var first = TursoConnection.CreateReplica(options);
+        using var secondConnection = TursoConnection.CreateReplica(options);
+        second = secondConnection;
+        first.Open();
+        second.Open();
+        callSecond = true;
+
+        var synchronize = async () => await first.SyncAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        await synchronize.Should().ThrowAsync<TursoException>();
+        (await callbackResult.Task.WaitAsync(TimeSpan.FromSeconds(5))).Should().BeNull();
     }
 
     [Test]
@@ -234,6 +301,30 @@ public sealed class SyncOptionsObservabilityTests
 
         var sync = replica.SyncAsync(CancellationToken.None);
         await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var synchronize = async () => await sync.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await synchronize.Should().ThrowAsync<TursoException>();
+        sync.IsCanceled.Should().BeFalse();
+    }
+
+    [Test]
+    public async Task HttpPolicyTimeoutCoversResponseBodyReads()
+    {
+        var bodyReadStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var handler = new TrackingHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new StallingReadStream(bodyReadStarted)),
+            }));
+        var options = CreateOptions(
+            bootstrapIfEmpty: false,
+            httpPolicy: new TursoSyncHttpPolicy(
+                handler,
+                requestTimeout: TimeSpan.FromMilliseconds(50)));
+        using var replica = SyncReplicaDatabase.Open(options);
+
+        var sync = replica.SyncAsync(CancellationToken.None);
+        await bodyReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var synchronize = async () => await sync.WaitAsync(TimeSpan.FromSeconds(5));
 
         await synchronize.Should().ThrowAsync<TursoException>();
@@ -374,6 +465,177 @@ public sealed class SyncOptionsObservabilityTests
         }
     }
 
+    [Test]
+    public async Task AsynchronouslyDispatchedProgressCannotReenterReplica()
+    {
+        var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var handler = new TrackingHandler(async (_, cancellationToken) =>
+        {
+            requestStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("The canceled request unexpectedly completed.");
+        });
+        var options = CreateOptions(
+            bootstrapIfEmpty: false,
+            httpPolicy: new TursoSyncHttpPolicy(handler));
+        using var replica = SyncReplicaDatabase.Open(options);
+        using var cancellation = new CancellationTokenSource();
+        var callbackResult = new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var progress = new Progress<TursoSyncProgress>(_ =>
+        {
+            try
+            {
+                using var statement = replica.PrepareStatement("SELECT 1");
+                callbackResult.TrySetResult(null);
+            }
+            catch (Exception exception)
+            {
+                callbackResult.TrySetResult(exception);
+            }
+        });
+
+        var sync = replica.SyncAsync(new TursoSyncOptions(progress), cancellation.Token);
+        await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var exception = await callbackResult.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cancellation.CancelAsync();
+
+        exception.Should().BeOfType<InvalidOperationException>()
+            .Which.Message.Should().Be("Embedded replica operations cannot be reentered from a sync progress callback.");
+        await ((Func<Task>)(async () => await sync)).Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    [TestCase(HttpReentrantOperation.Sql)]
+    [TestCase(HttpReentrantOperation.Sync)]
+    [TestCase(HttpReentrantOperation.Close)]
+    [TestCase(HttpReentrantOperation.Dispose)]
+    public async Task HttpApplicationCodeCannotReenterReplica(HttpReentrantOperation operation)
+    {
+        TursoConnection? connection = null;
+        var reenter = false;
+        using var handler = new TrackingHandler((_, _) =>
+        {
+            if (reenter)
+            {
+                switch (operation)
+                {
+                    case HttpReentrantOperation.Sql:
+                        connection!.ExecuteNonQuery("SELECT 1");
+                        break;
+                    case HttpReentrantOperation.Sync:
+                        connection!.Sync();
+                        break;
+                    case HttpReentrantOperation.Close:
+                        connection!.Close();
+                        break;
+                    case HttpReentrantOperation.Dispose:
+                        connection!.Dispose();
+                        break;
+                    default:
+                        throw new InvalidOperationException($"Unknown reentrant operation {operation}.");
+                }
+            }
+
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        });
+        connection = TursoConnection.CreateReplica(CreateOptions(
+            bootstrapIfEmpty: false,
+            httpPolicy: new TursoSyncHttpPolicy(handler)));
+        try
+        {
+            connection.Open();
+            reenter = true;
+            var synchronize = async () => await connection.SyncAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+            await synchronize.Should().ThrowAsync<TursoException>()
+                .WithMessage("*HTTP handler or response body*");
+            reenter = false;
+            connection.ExecuteNonQuery("SELECT 42").Should().Be(0);
+        }
+        finally
+        {
+            reenter = false;
+            connection.Dispose();
+        }
+    }
+
+    [Test]
+    public async Task HttpResponseBodyCannotReenterReplica()
+    {
+        TursoConnection? connection = null;
+        var reenter = false;
+        using var handler = new TrackingHandler((_, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new CallbackReadStream(() =>
+                {
+                    if (reenter)
+                        connection!.ExecuteNonQuery("SELECT 1");
+                })),
+            }));
+        connection = TursoConnection.CreateReplica(CreateOptions(
+            bootstrapIfEmpty: false,
+            httpPolicy: new TursoSyncHttpPolicy(handler)));
+        try
+        {
+            connection.Open();
+            reenter = true;
+            var synchronize = async () => await connection.SyncAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+            await synchronize.Should().ThrowAsync<TursoException>()
+                .WithMessage("*HTTP handler or response body*");
+        }
+        finally
+        {
+            reenter = false;
+            connection.Dispose();
+        }
+    }
+
+    [TestCase(HttpReentrantOperation.Sql)]
+    [TestCase(HttpReentrantOperation.Sync)]
+    [TestCase(HttpReentrantOperation.Close)]
+    [TestCase(HttpReentrantOperation.Dispose)]
+    public async Task HttpApplicationCodeCannotReenterWhileReplicaIsOpening(HttpReentrantOperation operation)
+    {
+        TursoConnection? connection = null;
+        using var handler = new TrackingHandler((_, _) =>
+        {
+            switch (operation)
+            {
+                case HttpReentrantOperation.Sql:
+                    connection!.ExecuteNonQuery("SELECT 1");
+                    break;
+                case HttpReentrantOperation.Sync:
+                    connection!.Sync();
+                    break;
+                case HttpReentrantOperation.Close:
+                    connection!.Close();
+                    break;
+                case HttpReentrantOperation.Dispose:
+                    connection!.Dispose();
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unknown reentrant operation {operation}.");
+            }
+
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+        });
+        connection = TursoConnection.CreateReplica(CreateOptions(
+            httpPolicy: new TursoSyncHttpPolicy(handler)));
+        try
+        {
+            var open = async () => await Task.Run(connection.Open).WaitAsync(TimeSpan.FromSeconds(5));
+
+            await open.Should().ThrowAsync<TursoException>()
+                .WithMessage("*HTTP handler or response body*");
+            connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        }
+        finally
+        {
+            connection.Dispose();
+        }
+    }
+
     private static TursoReplicaOptions CreateOptions(
         bool bootstrapIfEmpty = true,
         TimeSpan? longPollTimeout = null,
@@ -435,6 +697,89 @@ public sealed class SyncOptionsObservabilityTests
         }
     }
 
+    private sealed class StallingReadStream(TaskCompletionSource readStarted) : Stream
+    {
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            readStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("The stalled response body unexpectedly completed.");
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+            => throw new NotSupportedException();
+
+        public override void SetLength(long value)
+            => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count)
+            => throw new NotSupportedException();
+    }
+
+    private sealed class CallbackReadStream(Action read) : Stream
+    {
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => throw new NotSupportedException();
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            read();
+            return ValueTask.FromResult(0);
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+            => throw new NotSupportedException();
+
+        public override void SetLength(long value)
+            => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count)
+            => throw new NotSupportedException();
+    }
+
     private sealed class SequencedHandler(params HttpResponseMessage[] responses) : HttpMessageHandler
     {
         private int _index;
@@ -459,5 +804,13 @@ public sealed class SyncOptionsObservabilityTests
 
             base.Dispose(disposing);
         }
+    }
+
+    public enum HttpReentrantOperation
+    {
+        Sql,
+        Sync,
+        Close,
+        Dispose,
     }
 }
