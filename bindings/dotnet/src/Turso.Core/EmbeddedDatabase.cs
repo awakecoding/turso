@@ -4587,7 +4587,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         // ExecuteSelect validates collations before it resolves LIMIT/OFFSET. Do that before
         // any lowering work so a missing collation keeps its evaluator error precedence.
-        ValidateOrderByCollations(select.OrderBy);
+        ValidateOrderByCollations(ResolveOrderBy(select.OrderBy, select.Projections));
         if (!TryResolveLimitOffset(select, parameters, context, outerRow, out var limit, out var offset))
             return false;
 
@@ -4830,7 +4830,8 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        ValidateOrderByCollations(select.OrderBy);
+        var resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
+        ValidateOrderByCollations(resolvedOrderBy);
 
         var target = ResolveScanTarget(select.Source, context);
         if (target is null)
@@ -4856,7 +4857,6 @@ public sealed class EmbeddedDatabase : IDisposable
         // ORDER BY keys are resolved (ordinal/alias) exactly like the evaluator, then must
         // be evaluable against a single scanned row and must not read an unbacked rowid,
         // which the materialized declared-column row cannot supply.
-        var resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
         foreach (var term in resolvedOrderBy)
         {
             if ((!IsScanPredicate(term.Expression)
@@ -5635,6 +5635,8 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!sawWindow || spec is null)
             return false;
 
+        ValidateOrderByCollations(spec.OrderBy);
+
         // PARTITION BY keys must be bare, backed columns so the builder can copy them into the
         // partition-key registers and the reused group-key equality can compare them.
         var partitionColumns = new List<int>();
@@ -5689,6 +5691,7 @@ public sealed class EmbeddedDatabase : IDisposable
         else
         {
             var resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
+            ValidateOrderByCollations(resolvedOrderBy);
             if (resolvedOrderBy.Count != partitionCount + windowOrderCount)
                 return false;
 
@@ -5709,7 +5712,9 @@ public sealed class EmbeddedDatabase : IDisposable
             {
                 var top = resolvedOrderBy[partitionCount + index];
                 var windowTerm = spec.OrderBy[index];
-                if (!top.Expression.Equals(windowTerm.Expression) || top.Descending != windowTerm.Descending)
+                if (!top.Expression.Equals(windowTerm.Expression)
+                    || top.Descending != windowTerm.Descending
+                    || top.NullPlacement != windowTerm.NullPlacement)
                     return false;
             }
 
@@ -7203,7 +7208,11 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        ValidateOrderByCollations(statement.OrderBy);
+        var resolvedOrderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
+        ValidateOrderByCollations(resolvedOrderBy);
+        var windowFunctions = CollectSelectWindowFunctions(statement);
+        foreach (var function in windowFunctions)
+            ValidateOrderByCollations(function.Window!.OrderBy);
         var limit = statement.Limit is null
             ? (long?)null
             : RequireLimitInteger(Evaluate(statement.Limit, parameters, outerRow, context));
@@ -7211,7 +7220,6 @@ public sealed class EmbeddedDatabase : IDisposable
             ? 0
             : Math.Max(0, RequireLimitInteger(Evaluate(statement.Offset, parameters, outerRow, context)));
         var hasAggregate = statement.Projections.Any(projection => ContainsAggregate(projection.Expression));
-        var windowFunctions = CollectSelectWindowFunctions(statement);
         var hasWindow = windowFunctions.Count > 0;
         if (statement.Where is not null && ContainsWindowFunction(statement.Where))
             throw new EmbeddedSqlException("misuse of window function in WHERE clause");
@@ -7331,8 +7339,8 @@ public sealed class EmbeddedDatabase : IDisposable
             }
             if (statement.OrderBy.Count > 0)
             {
-                var orderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
-                groupedRows.Sort((left, right) => CompareGroupedRows(left, right, orderBy, parameters, context));
+                groupedRows.Sort((left, right) =>
+                    CompareGroupedRows(left, right, resolvedOrderBy, parameters, context));
             }
             return new ExecutionResult(
                 columnNames,
@@ -7347,8 +7355,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (statement.OrderBy.Count > 0)
         {
-            var orderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
-            selectedRows.Sort((left, right) => CompareRows(left, right, orderBy, parameters, context));
+            selectedRows.Sort((left, right) =>
+                CompareRows(left, right, resolvedOrderBy, parameters, context));
         }
 
         var resultRows = new List<SqlValue[]>();
@@ -7687,6 +7695,8 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        ValidateCompoundOrderByCollations(statement, context);
+
         // Route the supported same-operator UNION / UNION ALL subset entirely through the bytecode
         // compiler, running the sequenced program as a real execution path. Its result columns are
         // the first term's, exactly as the tree-walking fold below reports first.Columns. Everything
@@ -7722,7 +7732,7 @@ public sealed class EmbeddedDatabase : IDisposable
         }
 
         if (statement.OrderBy.Count > 0)
-            SortCompoundRows(rows, statement, first.Columns);
+            SortCompoundRows(rows, statement, first.Columns, context);
 
         var limit = statement.Limit is null
             ? (long?)null
@@ -8787,49 +8797,71 @@ public sealed class EmbeddedDatabase : IDisposable
     private void SortCompoundRows(
         List<SqlValue[]> rows,
         CompoundSelectStatement statement,
-        IReadOnlyList<string> columns)
+        IReadOnlyList<string> columns,
+        QueryContext context)
     {
+        var outputCollations = GetQueryOutputCollations(statement.Terms[0], context);
         var orderBy = statement.OrderBy.Select(term =>
         {
-            var index = ResolveCompoundOrderByIndex(term.Expression, statement.Terms, columns);
-            // Projection collations only exist on SELECT terms; a leading VALUES term
-            // has none, so fall back to the ORDER BY expression's collation.
-            var projectionCollation = statement.Terms[0] is SelectStatement select
-                ? GetCollation(select.Projections[index].Expression)
-                : null;
-            return (index, term.Descending, projectionCollation ?? GetCollation(term.Expression));
+            var index = ResolveCompoundOrderByIndex(term, statement.Terms, columns);
+            // An explicit ORDER BY collation overrides the result expression's collation.
+            // Projection collations only exist on SELECT terms; a leading VALUES term has none.
+            var projectionCollation = outputCollations.ElementAtOrDefault(index);
+            return (index, term, GetCollation(term.Expression) ?? projectionCollation);
         }).ToArray();
         rows.Sort((left, right) =>
         {
             foreach (var term in orderBy)
             {
-                var comparison = CompareForOrdering(left[term.index], right[term.index], term.Item3);
+                var comparison = CompareForOrdering(
+                    left[term.index],
+                    right[term.index],
+                    term.term,
+                    term.Item3);
                 if (comparison == 0)
                     continue;
 
-                return term.Descending
-                    ? comparison > 0 ? -1 : 1
-                    : comparison;
+                return comparison;
             }
 
             return 0;
         });
     }
 
+    private void ValidateCompoundOrderByCollations(
+        CompoundSelectStatement statement,
+        QueryContext context)
+    {
+        if (statement.OrderBy.Count == 0)
+            return;
+
+        var columns = DescribeQuery(statement.Terms[0], context);
+        var outputCollations = GetQueryOutputCollations(statement.Terms[0], context);
+        foreach (var term in statement.OrderBy)
+        {
+            var index = ResolveCompoundOrderByIndex(term, statement.Terms, columns);
+            ValidateCollation(GetCollation(term.Expression) ?? outputCollations.ElementAtOrDefault(index));
+        }
+    }
+
     private static int ResolveCompoundOrderByIndex(
-        Expression expression,
+        OrderByTerm orderBy,
         IReadOnlyList<QueryStatement> terms,
         IReadOnlyList<string> columns)
     {
-        if (expression is LiteralExpression { Value.Kind: SqlValueKind.Integer } ordinal
-            && ordinal.Value.AsInteger() is >= 1 and <= int.MaxValue
-            && ordinal.Value.AsInteger() <= columns.Count)
+        var expression = orderBy.Expression;
+        if (orderBy.Ordinal is { } ordinal)
         {
-            return (int)ordinal.Value.AsInteger() - 1;
+            if (ordinal >= 1 && ordinal <= columns.Count)
+                return (int)ordinal - 1;
+
+            throw new EmbeddedSqlException(
+                $"ORDER BY position {ordinal} is out of range for {columns.Count} result columns");
         }
 
+        var reference = UnwrapCollation(expression);
         var selectTerms = terms.OfType<SelectStatement>().ToArray();
-        if (expression is ColumnExpression column)
+        if (reference is ColumnExpression column)
         {
             for (var index = 0; index < columns.Count; index++)
             {
@@ -8851,7 +8883,8 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             for (var index = 0; index < term.Projections.Count; index++)
             {
-                if (term.Projections[index].Expression.Equals(expression))
+                if (term.Projections[index].Expression.Equals(expression)
+                    || term.Projections[index].Expression.Equals(reference))
                     return index;
             }
         }
@@ -12072,19 +12105,21 @@ public sealed class EmbeddedDatabase : IDisposable
     private void ValidateOrderByCollations(IReadOnlyList<OrderByTerm> orderBy)
     {
         foreach (var term in orderBy)
-        {
-            var collation = GetCollation(term.Expression);
-            if (collation is null
-                || collation.Equals("BINARY", StringComparison.OrdinalIgnoreCase)
-                || collation.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
-                || collation.Equals("RTRIM", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
+            ValidateCollation(GetCollation(term.Expression));
+    }
 
-            if (!_collations.ContainsKey(collation))
-                throw new EmbeddedSqlException($"no such collation sequence: {collation}");
+    private void ValidateCollation(string? collation)
+    {
+        if (collation is null
+            || collation.Equals("BINARY", StringComparison.OrdinalIgnoreCase)
+            || collation.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
+            || collation.Equals("RTRIM", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
         }
+
+        if (!_collations.ContainsKey(collation))
+            throw new EmbeddedSqlException($"no such collation sequence: {collation}");
     }
 
     private bool TryGetAggregateFunction(string name, int arity, out ManagedAggregateFunction function)
@@ -12419,11 +12454,15 @@ public sealed class EmbeddedDatabase : IDisposable
                         parameters,
                         selectedRows[right],
                         context);
-                    var comparison = CompareForOrdering(leftValue, rightValue, GetCollation(term.Expression));
+                    var comparison = CompareForOrdering(
+                        leftValue,
+                        rightValue,
+                        term,
+                        GetCollation(term.Expression));
                     if (comparison == 0)
                         continue;
 
-                    return term.Descending ? (comparison > 0 ? -1 : 1) : comparison;
+                    return comparison;
                 }
 
                 return 0;
@@ -12672,13 +12711,12 @@ public sealed class EmbeddedDatabase : IDisposable
             var comparison = CompareForOrdering(
                 Evaluate(term.Expression, parameters, left, context),
                 Evaluate(term.Expression, parameters, right, context),
+                term,
                 GetCollation(term.Expression));
             if (comparison == 0)
                 continue;
 
-            return term.Descending
-                ? comparison > 0 ? -1 : 1
-                : comparison;
+            return comparison;
         }
 
         return 0;
@@ -12700,52 +12738,92 @@ public sealed class EmbeddedDatabase : IDisposable
                 ContainsAggregate(term.Expression)
                     ? EvaluateAggregate(term.Expression, right.Rows, parameters, context)
                     : Evaluate(term.Expression, parameters, right.Representative, context),
+                term,
                 GetCollation(term.Expression));
             if (comparison == 0)
                 continue;
 
-            return term.Descending
-                ? comparison > 0 ? -1 : 1
-                : comparison;
+            return comparison;
         }
 
         return 0;
     }
 
-    private int CompareForOrdering(SqlValue left, SqlValue right, string? collation)
+    private int CompareForOrdering(
+        SqlValue left,
+        SqlValue right,
+        OrderByTerm term,
+        string? collation)
     {
-        if (left.Kind == SqlValueKind.Null)
-            return right.Kind == SqlValueKind.Null ? 0 : -1;
-        if (right.Kind == SqlValueKind.Null)
-            return 1;
+        if (left.Kind == SqlValueKind.Null || right.Kind == SqlValueKind.Null)
+        {
+            if (left.Kind == right.Kind)
+                return 0;
 
-        return Compare(left, right, collation);
+            var nullPlacement = term.NullPlacement switch
+            {
+                NullPlacement.Default => term.Descending ? NullPlacement.Last : NullPlacement.First,
+                NullPlacement.First => NullPlacement.First,
+                NullPlacement.Last => NullPlacement.Last,
+                _ => throw new InvalidOperationException($"Unsupported NULL placement {term.NullPlacement}."),
+            };
+            return left.Kind == SqlValueKind.Null
+                ? nullPlacement == NullPlacement.First ? -1 : 1
+                : nullPlacement == NullPlacement.First ? 1 : -1;
+        }
+
+        var comparison = Compare(left, right, collation);
+        return term.Descending && comparison != 0
+            ? comparison > 0 ? -1 : 1
+            : comparison;
     }
 
     private static IReadOnlyList<OrderByTerm> ResolveOrderBy(
         IReadOnlyList<OrderByTerm> orderBy,
         IReadOnlyList<Projection> projections)
     {
-        return orderBy.Select(term =>
+        return orderBy
+            .Select(term => term with
+            {
+                Expression = ResolveOrderByExpression(term.Expression, projections, term.Ordinal),
+                Ordinal = null,
+            })
+            .ToArray();
+    }
+
+    private static Expression ResolveOrderByExpression(
+        Expression expression,
+        IReadOnlyList<Projection> projections,
+        long? ordinal = null)
+    {
+        if (expression is CollationExpression collation)
         {
-            if (term.Expression is LiteralExpression { Value.Kind: SqlValueKind.Integer } ordinal
-                && ordinal.Value.AsInteger() is >= 1 and <= int.MaxValue
-                && ordinal.Value.AsInteger() <= projections.Count)
+            return collation with
             {
-                return term with { Expression = projections[(int)ordinal.Value.AsInteger() - 1].Expression };
-            }
+                Expression = ResolveOrderByExpression(collation.Expression, projections, ordinal),
+            };
+        }
 
-            if (term.Expression is ColumnExpression column)
+        if (ordinal is { } value)
+        {
+            if (value is >= 1 and <= int.MaxValue && value <= projections.Count)
+                return projections[(int)value - 1].Expression;
+
+            if (!projections.Any(projection =>
+                    projection.Expression is StarExpression or QualifiedStarExpression))
             {
-                var projection = projections.FirstOrDefault(projection =>
-                    projection.Alias is not null
-                    && string.Equals(projection.Alias, column.Name, StringComparison.OrdinalIgnoreCase));
-                if (projection is not null)
-                    return term with { Expression = projection.Expression };
+                throw new EmbeddedSqlException(
+                    $"ORDER BY position {value} is out of range for {projections.Count} result columns");
             }
+        }
 
-            return term;
-        }).ToArray();
+        if (expression is not ColumnExpression column)
+            return expression;
+
+        var projection = projections.FirstOrDefault(projection =>
+            projection.Alias is not null
+            && string.Equals(projection.Alias, column.Name, StringComparison.OrdinalIgnoreCase));
+        return projection?.Expression ?? expression;
     }
 
     private static double AsReal(SqlValue value)
@@ -17823,7 +17901,18 @@ internal enum CompoundOperator
 
 internal sealed record Projection(Expression Expression, string? Alias);
 
-internal sealed record OrderByTerm(Expression Expression, bool Descending);
+internal enum NullPlacement
+{
+    Default,
+    First,
+    Last,
+}
+
+internal sealed record OrderByTerm(
+    Expression Expression,
+    bool Descending,
+    NullPlacement NullPlacement = NullPlacement.Default,
+    long? Ordinal = null);
 
 // Aggregate window functions (func(...) OVER (...)). Only the ROWS frame type is
 // materialized; RANGE/GROUPS/EXCLUDE and dedicated ranking functions are rejected
@@ -19038,11 +19127,7 @@ internal sealed class SqlParser
             ExpectKeyword("BY");
             do
             {
-                var expression = ParseExpression();
-                var descending = ConsumeKeyword("DESC");
-                if (!descending)
-                    ConsumeKeyword("ASC");
-                orderBy.Add(new OrderByTerm(expression, descending));
+                orderBy.Add(ParseOrderByTerm());
             }
             while (Consume(TokenKind.Comma));
         }
@@ -19064,6 +19149,87 @@ internal sealed class SqlParser
         }
 
         return (orderBy, limit, offset);
+    }
+
+    private OrderByTerm ParseOrderByTerm()
+    {
+        var expressionOffset = _lexer.Current.Offset;
+        var expression = ParseExpression();
+        var ordinal = TryParseOrderByOrdinal(
+            _sql.AsSpan(expressionOffset, _lexer.Current.Offset - expressionOffset));
+        var descending = ConsumeKeyword("DESC");
+        if (!descending)
+            ConsumeKeyword("ASC");
+
+        var nullPlacement = NullPlacement.Default;
+        if (ConsumeKeyword("NULLS"))
+        {
+            if (ConsumeKeyword("FIRST"))
+                nullPlacement = NullPlacement.First;
+            else if (ConsumeKeyword("LAST"))
+                nullPlacement = NullPlacement.Last;
+            else
+                throw Error("Expected FIRST or LAST after NULLS.");
+        }
+
+        return new OrderByTerm(expression, descending, nullPlacement, ordinal);
+    }
+
+    private static long? TryParseOrderByOrdinal(ReadOnlySpan<char> expression)
+    {
+        var collation = expression.IndexOf("COLLATE", StringComparison.OrdinalIgnoreCase);
+        if (collation >= 0)
+            expression = expression[..collation];
+
+        expression = expression.Trim();
+        while (TryStripOuterParentheses(ref expression))
+            expression = expression.Trim();
+
+        var sign = '\0';
+        if (!expression.IsEmpty && expression[0] is '+' or '-')
+        {
+            sign = expression[0];
+            expression = expression[1..].Trim();
+            while (TryStripOuterParentheses(ref expression))
+                expression = expression.Trim();
+        }
+
+        if (expression.IsEmpty || expression.IndexOfAnyExceptInRange('0', '9') >= 0)
+            return null;
+
+        var text = sign == '\0'
+            ? expression.ToString()
+            : sign + expression.ToString();
+        return long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ordinal)
+            ? ordinal
+            : null;
+    }
+
+    private static bool TryStripOuterParentheses(ref ReadOnlySpan<char> expression)
+    {
+        if (expression.Length < 2 || expression[0] != '(' || expression[^1] != ')')
+            return false;
+
+        var depth = 0;
+        for (var index = 0; index < expression.Length; index++)
+        {
+            depth += expression[index] switch
+            {
+                '(' => 1,
+                ')' => -1,
+                _ => 0,
+            };
+            if (depth == 0 && index != expression.Length - 1)
+                return false;
+            if (depth < 0)
+                return false;
+        }
+
+        if (depth != 0)
+            return false;
+
+        expression = expression[1..^1];
+        return true;
     }
 
     private Projection ParseProjection()
@@ -19152,11 +19318,7 @@ internal sealed class SqlParser
             ExpectKeyword("BY");
             do
             {
-                var expression = ParseExpression();
-                var descending = ConsumeKeyword("DESC");
-                if (!descending)
-                    ConsumeKeyword("ASC");
-                orderBy.Add(new OrderByTerm(expression, descending));
+                orderBy.Add(ParseOrderByTerm());
             }
             while (Consume(TokenKind.Comma));
         }
