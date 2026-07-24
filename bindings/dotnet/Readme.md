@@ -190,10 +190,13 @@ Supported common connection string keywords include:
 
 ## SQLite-compatible facade coverage
 
-- `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, SQL-backed blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
+- `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, managed fixed-length blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
 - `PRAGMA read_uncommitted` is tracked as connection-local state for API compatibility, but Turso does not currently implement SQLite shared-cache dirty reads.
-- `SqliteBlob` preserves fixed-length blob stream behavior through SQL reads and writes. It is not yet backed by a native incremental-blob storage handle.
+- Managed `BackupDatabase` supports distinct connections and the `main` database only. The destination must be empty, and active readers, transactions, or attachments are rejected before copying.
+- `SqliteBlob` uses the managed incremental-blob adapter for fixed-length BLOB values. Explicit database names are limited to `main`; `WITHOUT ROWID` tables, resizing, and writes to tables with UPDATE triggers remain unsupported and fail without changing the stored value.
+- Managed file persistence rejects schema SQL that requires `sqlite_schema` overflow pages before publishing the catalog or WAL commit. Encryption reduces usable page space, so encrypted databases can reach this explicit bound sooner.
+- Managed `ATTACH` is limited to ten file-backed databases and does not support transactions while attached, cross-database queries, or schema-qualified CTE DML. Encrypted attachments inherit the main database key; `KEY` overrides, plaintext attachments, and attachments encrypted with another key are rejected.
 - SQLite virtual-table modules such as FTS3/FTS5 are not built in unless provided by a Turso extension/module.
 - Async methods currently use the base ADO.NET behavior rather than a dedicated async native path.
 

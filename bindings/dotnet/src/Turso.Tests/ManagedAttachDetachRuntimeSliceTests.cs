@@ -6,6 +6,9 @@ namespace Turso.Tests;
 
 public sealed class ManagedAttachDetachRuntimeSliceTests
 {
+    private const string Aes256Key = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+    private const string OtherAes256Key = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+
     [Test]
     public void DirectManagedAttachRoutesSchemaQualifiedDdlDmlAndQueriesAcrossDetach()
     {
@@ -220,6 +223,134 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
             [SqlValue.Integer(1)],
             [SqlValue.Integer(2)],
             [SqlValue.Integer(3)]);
+    }
+
+    [Test]
+    public void DirectManagedAttachEnforcesTheTenDatabaseLimitAndReusesDetachedCapacity()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var main = EmbeddedDatabase.OpenFile("attach-limit-main.db", fileSystem);
+        using var connection = main.Connect();
+
+        for (var index = 0; index < 10; index++)
+            Execute(connection, $"ATTACH DATABASE 'attach-limit-{index}.db' AS db{index};");
+
+        ReadRows(connection, "PRAGMA database_list;").Should().HaveCount(11);
+        var overLimit = () => Execute(connection, "ATTACH DATABASE 'attach-limit-overflow.db' AS overflow;");
+        overLimit.Should().Throw<EmbeddedSqlException>().WithMessage("too many attached databases - maximum 10");
+        fileSystem.FileExists("attach-limit-overflow.db").Should().BeFalse();
+
+        Execute(connection, "DETACH DATABASE db4;");
+        Execute(connection, "ATTACH DATABASE 'attach-limit-replacement.db' AS replacement;");
+        Execute(connection, "CREATE TABLE replacement.items(value TEXT);");
+        Execute(connection, "INSERT INTO replacement.items VALUES ('persisted');");
+        Execute(connection, "DETACH DATABASE replacement;");
+
+        using var reopened = EmbeddedDatabase.OpenFile("attach-limit-replacement.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadRows(reopenedConnection, "SELECT value FROM items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("persisted"));
+    }
+
+    [Test]
+    public void DirectManagedAttachRoutesPlainDmlAndRejectsSchemaQualifiedCteDmlAtomically()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var main = EmbeddedDatabase.OpenFile("attach-cte-main.db", fileSystem);
+        using var connection = main.Connect();
+        Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT);");
+        Execute(connection, "ATTACH DATABASE 'attach-cte-aux.db' AS aux;");
+        Execute(connection, "CREATE TABLE aux.items(id INTEGER PRIMARY KEY, value TEXT);");
+
+        Execute(connection, "INSERT INTO aux.items VALUES (1, 'aux');");
+        Execute(connection, "UPDATE aux.items SET value = 'updated' WHERE id = 1;");
+        Execute(connection, """
+            WITH selected(id) AS (SELECT 2)
+            INSERT INTO items SELECT id, 'main' FROM selected;
+            """);
+
+        var qualifiedTarget = () => Execute(connection, """
+            WITH selected(id) AS (SELECT 3)
+            INSERT INTO aux.items SELECT id, 'rejected' FROM selected;
+            """);
+        qualifiedTarget.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("Schema-qualified and cross-database CTE DML is not supported by managed ATTACH.");
+
+        var crossDatabaseSource = () => Execute(connection, """
+            WITH selected(id) AS (SELECT id FROM aux.items)
+            INSERT INTO items SELECT id, 'rejected' FROM selected;
+            """);
+        crossDatabaseSource.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("Schema-qualified and cross-database CTE DML is not supported by managed ATTACH.");
+
+        ReadRows(connection, "SELECT id, value FROM main.items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(2), SqlValue.Text("main"));
+        ReadRows(connection, "SELECT id, value FROM aux.items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1), SqlValue.Text("updated"));
+        Execute(connection, "DETACH DATABASE aux;");
+
+        using var reopened = EmbeddedDatabase.OpenFile("attach-cte-aux.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadRows(reopenedConnection, "SELECT id, value FROM items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1), SqlValue.Text("updated"));
+    }
+
+    [Test]
+    public void EncryptedManagedAttachInheritsTheMainKeyAndRejectsIncompatibleFilesAtomically()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        SeedPlaintextDatabase(fileSystem, "attach-encrypted-plaintext.db");
+        SeedEncryptedDatabase(fileSystem, "attach-encrypted-other-key.db", OtherAes256Key);
+
+        using (var encryption = TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes256Gcm, Aes256Key))
+        using (var encryptedFileSystem = new TursoEncryptionFileSystem(fileSystem, encryption))
+        using (var main = EmbeddedDatabase.OpenFile("attach-encrypted-main.db", encryptedFileSystem))
+        using (var connection = main.Connect())
+        {
+            Execute(connection, "CREATE TABLE durable(value TEXT);");
+            Execute(connection, "INSERT INTO durable VALUES ('main');");
+            Execute(connection, "ATTACH DATABASE 'attach-encrypted-aux.db' AS aux;");
+            Execute(connection, "CREATE TABLE aux.items(value TEXT);");
+            Execute(connection, "INSERT INTO aux.items VALUES ('encrypted');");
+            Execute(connection, "DETACH DATABASE aux;");
+
+            Assert.Throws<InvalidDataException>(
+                    () => Execute(connection, "ATTACH DATABASE 'attach-encrypted-plaintext.db' AS plaintext;"))!
+                .Message.Should().Contain("Plaintext fallback");
+            Assert.Throws<InvalidDataException>(
+                    () => Execute(connection, "ATTACH DATABASE 'attach-encrypted-other-key.db' AS other_key;"))!
+                .Message.Should().Contain("failed authentication");
+            ReadRows(connection, "PRAGMA database_list;").Should().ContainSingle();
+            ReadRows(connection, "SELECT value FROM durable;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("main"));
+        }
+
+        Assert.Throws<InvalidDataException>(
+            () => EmbeddedDatabase.OpenFile("attach-encrypted-aux.db", fileSystem))!
+            .Message.Should().Contain("encrypted");
+
+        using var reopenEncryption = TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes256Gcm, Aes256Key);
+        using var reopenedFileSystem = new TursoEncryptionFileSystem(fileSystem, reopenEncryption);
+        using var reopened = EmbeddedDatabase.OpenFile("attach-encrypted-aux.db", reopenedFileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ReadRows(reopenedConnection, "SELECT value FROM items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("encrypted"));
+    }
+
+    private static void SeedPlaintextDatabase(IFileSystem fileSystem, string path)
+    {
+        using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE items(value TEXT);");
+    }
+
+    private static void SeedEncryptedDatabase(IFileSystem fileSystem, string path, string key)
+    {
+        using var encryption = TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes256Gcm, key);
+        using var encryptedFileSystem = new TursoEncryptionFileSystem(fileSystem, encryption);
+        using var database = EmbeddedDatabase.OpenFile(path, encryptedFileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE items(value TEXT);");
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

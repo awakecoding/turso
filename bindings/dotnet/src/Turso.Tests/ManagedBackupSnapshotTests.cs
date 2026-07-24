@@ -101,6 +101,78 @@ public sealed class ManagedBackupSnapshotTests
     }
 
     [Test]
+    public void ManagedBackupRejectsActiveSourceTransactionWithoutChangingEitherDatabase()
+    {
+        using var source = OpenManagedConnection();
+        using var destination = OpenManagedConnection();
+        source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('committed');");
+
+        using var transaction = source.BeginTransaction();
+        source.ExecuteNonQuery("INSERT INTO source_data VALUES ('uncommitted');");
+
+        var exception = Assert.Throws<SqliteException>(() => source.BackupDatabase(destination));
+
+        exception!.SqliteErrorCode.Should().Be(5);
+        source.ExecuteScalar<long>("SELECT COUNT(*) FROM source_data;").Should().Be(2);
+        destination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+        transaction.Rollback();
+        source.ExecuteScalar<long>("SELECT COUNT(*) FROM source_data;").Should().Be(1);
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void ManagedBackupRejectsOpenReadersAndRemainsUsable(bool readerOnSource)
+    {
+        using var source = OpenManagedConnection();
+        using var destination = OpenManagedConnection();
+        source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
+        var readerConnection = readerOnSource ? source : destination;
+        using var reader = readerConnection.ExecuteReader("SELECT 1;");
+        reader.Read().Should().BeTrue();
+
+        var exception = Assert.Throws<SqliteException>(() => source.BackupDatabase(destination));
+
+        exception!.SqliteErrorCode.Should().Be(5);
+        source.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("source");
+        reader.Dispose();
+        source.BackupDatabase(destination);
+        destination.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("source");
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void ManagedBackupRejectsActiveAttachmentsAndSucceedsAfterDetach(bool attachmentOnSource)
+    {
+        var sourcePath = CreateManagedDatabasePath();
+        var destinationPath = CreateManagedDatabasePath();
+        var attachmentPath = CreateManagedDatabasePath();
+        try
+        {
+            using var source = OpenManagedConnection(sourcePath);
+            using var destination = OpenManagedConnection(destinationPath);
+            source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
+            var attachedConnection = attachmentOnSource ? source : destination;
+            attachedConnection.ExecuteNonQuery($"ATTACH DATABASE '{attachmentPath}' AS aux;");
+
+            var exception = Assert.Throws<SqliteException>(() => source.BackupDatabase(destination));
+
+            exception!.SqliteErrorCode.Should().Be(1);
+            exception.Message.Should().Contain("transactions are not supported while a database is attached");
+            destination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+
+            attachedConnection.ExecuteNonQuery("DETACH DATABASE aux;");
+            source.BackupDatabase(destination);
+            destination.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("source");
+        }
+        finally
+        {
+            DeleteManagedDatabase(sourcePath);
+            DeleteManagedDatabase(destinationPath);
+            DeleteManagedDatabase(attachmentPath);
+        }
+    }
+
+    [Test]
     public void ManagedBackupPersistsAFileBackedSnapshotWithoutNativeFallback()
     {
         var sourcePath = CreateManagedDatabasePath();
