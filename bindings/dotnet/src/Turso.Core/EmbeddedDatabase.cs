@@ -16965,7 +16965,8 @@ public sealed class EmbeddedConnection : IDisposable
     private StringComparer GetAttachmentPathComparer()
     {
         var fileSystem = TursoEncryptionFileSystem.Unwrap(_database.FileSystem);
-        return fileSystem is PhysicalFileSystem && OperatingSystem.IsWindows()
+        return fileSystem is PhysicalFileSystem
+            && (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
             ? StringComparer.OrdinalIgnoreCase
             : StringComparer.Ordinal;
     }

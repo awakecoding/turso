@@ -272,6 +272,38 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
     }
 
     [Test]
+    public void DirectManagedAttachRejectsCaseVariantsOnCaseInsensitivePhysicalPlatforms()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS())
+            Assert.Ignore("This regression exercises case-insensitive physical file identity.");
+
+        var directory = Path.Combine(Path.GetTempPath(), $"managed-attach-case-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var mainPath = Path.Combine(directory, "main.db");
+        var attachedPath = Path.Combine(directory, "attached.db");
+        try
+        {
+            using var main = EmbeddedDatabase.OpenFile(mainPath);
+            using var connection = main.Connect();
+
+            var duplicateMain = () => Execute(
+                connection,
+                $"ATTACH DATABASE '{Path.Combine(directory, "MAIN.DB")}' AS duplicate_main;");
+            duplicateMain.Should().Throw<EmbeddedSqlException>().WithMessage("database file is already open as main");
+
+            Execute(connection, $"ATTACH DATABASE '{attachedPath}' AS aux;");
+            var duplicateAttachment = () => Execute(
+                connection,
+                $"ATTACH DATABASE '{Path.Combine(directory, "ATTACHED.DB")}' AS duplicate_aux;");
+            duplicateAttachment.Should().Throw<EmbeddedSqlException>().WithMessage("database file is already attached");
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Test]
     public void DirectManagedAttachEnforcesAliasAndTenDatabaseBoundaries()
     {
         var fileSystem = new InMemoryFileSystem();
