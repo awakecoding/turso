@@ -68,7 +68,7 @@ public sealed class ManagedIncrementalBlobBoundaryTests
     }
 
     [Test]
-    public void ManagedBlobDatabaseNameOverloadAcceptsMainAndRejectsAttachmentsWithoutMutation()
+    public void ManagedBlobDatabaseNameOverloadSupportsMainAndAttachments()
     {
         var mainPath = CreateDatabasePath();
         var attachmentPath = CreateDatabasePath();
@@ -88,14 +88,14 @@ public sealed class ManagedIncrementalBlobBoundaryTests
                 blob.Write([3], 0, 1);
             }
 
-            var error = Assert.Throws<SqliteException>(
-                () => new SqliteBlob(connection, "aux", "data", "value", 1));
+            using (var blob = new SqliteBlob(connection, "aux", "data", "value", 1))
+            {
+                blob.Position = 1;
+                blob.Write([6], 0, 1);
+            }
 
-            error!.SqliteErrorCode.Should().Be(1);
-            error.Message.Should().Be(
-                Data.Sqlite.Properties.Resources.SqliteNativeError(1, "unknown database: aux"));
             connection.ExecuteScalar<byte[]>("SELECT value FROM main.data WHERE rowid = 1;").Should().Equal(1, 3);
-            connection.ExecuteScalar<byte[]>("SELECT value FROM aux.data WHERE rowid = 1;").Should().Equal(4, 5);
+            connection.ExecuteScalar<byte[]>("SELECT value FROM aux.data WHERE rowid = 1;").Should().Equal(4, 6);
         }
         finally
         {
