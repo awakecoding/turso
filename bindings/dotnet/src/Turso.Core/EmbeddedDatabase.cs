@@ -11118,11 +11118,8 @@ public sealed class EmbeddedDatabase : IDisposable
     private const int MaximumPrintfPrecision = 1_000;
     private const int MaximumPrintfOutputLength = 1_000_000;
 
-    // SQLite format() is an alias for printf(). This parser deliberately owns the stable subset
-    // that can be reproduced without relying on the platform formatter: static width/precision,
-    // -, +, space, and 0 flags, and SQLite's scalar conversion rules. SQLite-specific extensions
-    // whose rules are not represented here (dynamic width, #, !, comma, and length modifiers)
-    // fail explicitly rather than producing a plausible but incorrect result.
+    // SQLite format() is an alias for printf(). Keep the parser independent of the platform
+    // formatter so width, precision, rounding, quoting, and numeric coercion remain deterministic.
     private static SqlValue EvaluatePrintf(IReadOnlyList<SqlValue> arguments)
     {
         if (arguments.Count == 0 || arguments[0].Kind == SqlValueKind.Null)
@@ -11155,7 +11152,14 @@ public sealed class EmbeddedDatabase : IDisposable
                 continue;
             }
 
-            var specifier = ParsePrintfSpecifier(format, ref formatIndex);
+            var specifier = ParsePrintfSpecifier(
+                format,
+                ref formatIndex,
+                arguments,
+                ref argumentIndex);
+            if (specifier.Verb == 'n')
+                continue;
+
             var value = argumentIndex < arguments.Count ? arguments[argumentIndex] : SqlValue.Null;
             argumentIndex++;
             AppendPrintfOutput(result, FormatPrintfValue(specifier, value).Value);
@@ -11164,12 +11168,19 @@ public sealed class EmbeddedDatabase : IDisposable
         return SqlValue.Text(result.ToString());
     }
 
-    private static PrintfSpecifier ParsePrintfSpecifier(string format, ref int formatIndex)
+    private static PrintfSpecifier ParsePrintfSpecifier(
+        string format,
+        ref int formatIndex,
+        IReadOnlyList<SqlValue> arguments,
+        ref int argumentIndex)
     {
         var leftJustify = false;
         var forceSign = false;
         var spaceSign = false;
         var zeroPad = false;
+        var alternate = false;
+        var alternate2 = false;
+        var comma = false;
 
         while (formatIndex < format.Length)
         {
@@ -11192,9 +11203,17 @@ public sealed class EmbeddedDatabase : IDisposable
                     formatIndex++;
                     continue;
                 case '#':
+                    alternate = true;
+                    formatIndex++;
+                    continue;
                 case '!':
+                    alternate2 = true;
+                    formatIndex++;
+                    continue;
                 case ',':
-                    throw new EmbeddedSqlException($"unsupported printf format flag: {format[formatIndex]}");
+                    comma = true;
+                    formatIndex++;
+                    continue;
                 default:
                     break;
             }
@@ -11202,45 +11221,90 @@ public sealed class EmbeddedDatabase : IDisposable
             break;
         }
 
+        int? width;
         if (formatIndex < format.Length && format[formatIndex] == '*')
-            throw new EmbeddedSqlException("unsupported printf dynamic width or precision.");
+        {
+            formatIndex++;
+            var dynamicWidth = ReadPrintfDynamicSize(arguments, ref argumentIndex, MaximumPrintfWidth, "width");
+            if (dynamicWidth < 0)
+            {
+                leftJustify = true;
+                dynamicWidth = -dynamicWidth;
+            }
 
-        var width = ReadPrintfSize(format, ref formatIndex, MaximumPrintfWidth, "width");
+            width = dynamicWidth;
+        }
+        else
+        {
+            width = ReadPrintfSize(format, ref formatIndex, MaximumPrintfWidth, "width");
+        }
+
         int? precision = null;
         if (formatIndex < format.Length && format[formatIndex] == '.')
         {
             formatIndex++;
             if (formatIndex < format.Length && format[formatIndex] == '*')
-                throw new EmbeddedSqlException("unsupported printf dynamic width or precision.");
-
-            precision = ReadPrintfSize(format, ref formatIndex, MaximumPrintfPrecision, "precision") ?? 0;
+            {
+                formatIndex++;
+                precision = Math.Abs(ReadPrintfDynamicSize(
+                    arguments,
+                    ref argumentIndex,
+                    MaximumPrintfPrecision,
+                    "precision"));
+            }
+            else
+            {
+                precision = ReadPrintfSize(format, ref formatIndex, MaximumPrintfPrecision, "precision") ?? 0;
+            }
         }
 
         if (formatIndex == format.Length)
             throw new EmbeddedSqlException("unterminated printf format specifier.");
 
-        if (format[formatIndex] is 'h' or 'l' or 'L' or 'z' or 't' or 'j')
-            throw new EmbeddedSqlException($"unsupported printf length modifier: {format[formatIndex]}");
+        if (format[formatIndex] == 'l')
+        {
+            formatIndex++;
+            if (formatIndex < format.Length && format[formatIndex] == 'l')
+                formatIndex++;
+            if (formatIndex == format.Length)
+                throw new EmbeddedSqlException("unterminated printf format specifier.");
+        }
 
         var verb = format[formatIndex];
         if (!IsSupportedPrintfVerb(verb))
             throw new EmbeddedSqlException($"unsupported printf format conversion: %{verb}");
 
-        var numeric = verb is 'd' or 'i' or 'u' or 'x' or 'X' or 'o' or 'f' or 'e' or 'E' or 'g' or 'G';
-        var signedNumeric = verb is 'd' or 'i' or 'f' or 'e' or 'E' or 'g' or 'G';
-        if ((forceSign || spaceSign) && !signedNumeric)
-            throw new EmbeddedSqlException($"unsupported printf sign flag for %{verb}");
-        if (zeroPad && !numeric)
-            throw new EmbeddedSqlException($"unsupported printf zero-padding flag for %{verb}");
+        var numeric = verb is 'd' or 'i' or 'u' or 'x' or 'X' or 'o' or 'r' or 'p'
+            or 'f' or 'e' or 'E' or 'g' or 'G';
+        var signedNumeric = verb is 'd' or 'i' or 'r' or 'f' or 'e' or 'E' or 'g' or 'G';
 
         return new PrintfSpecifier(
             verb,
-            leftJustify,
-            forceSign,
-            spaceSign,
-            zeroPad && !leftJustify,
+            leftJustify && !(zeroPad && numeric),
+            forceSign && signedNumeric,
+            spaceSign && signedNumeric,
+            zeroPad && numeric,
+            alternate,
+            alternate2,
+            comma,
             width,
             precision);
+    }
+
+    private static int ReadPrintfDynamicSize(
+        IReadOnlyList<SqlValue> arguments,
+        ref int argumentIndex,
+        int maximum,
+        string kind)
+    {
+        var value = argumentIndex < arguments.Count
+            ? ToPrintfInteger(arguments[argumentIndex])
+            : 0;
+        argumentIndex++;
+        if (value > maximum || value < -maximum)
+            throw new EmbeddedSqlException($"printf {kind} exceeds {maximum}.");
+
+        return (int)value;
     }
 
     private static int? ReadPrintfSize(string format, ref int formatIndex, int maximum, string kind)
@@ -11264,7 +11328,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private static bool IsSupportedPrintfVerb(char verb)
         => verb is 's' or 'd' or 'i' or 'u' or 'x' or 'X' or 'o'
-            or 'f' or 'e' or 'E' or 'g' or 'G' or 'c' or 'q' or 'Q' or 'w';
+            or 'f' or 'e' or 'E' or 'g' or 'G' or 'c' or 'q' or 'Q' or 'w'
+            or 'p' or 'r' or 'z' or 'n';
 
     private static void AppendPrintfOutput(StringBuilder output, string value)
     {
@@ -11282,20 +11347,34 @@ public sealed class EmbeddedDatabase : IDisposable
                 specifier,
                 value.Kind == SqlValueKind.Null
                     ? PrintfText.Empty
-                    : LimitPrintfText(value, specifier.Precision)),
+                    : LimitPrintfText(value, specifier.Precision, specifier.Alternate2)),
+            'z' => ApplyPrintfTextWidth(
+                specifier,
+                value.Kind == SqlValueKind.Null
+                    ? PrintfText.Empty
+                    : LimitPrintfText(value, specifier.Precision, specifier.Alternate2)),
             'd' or 'i' => FormatPrintfSignedInteger(specifier, ToPrintfInteger(value)),
             'u' => FormatPrintfUnsignedInteger(
                 specifier,
-                unchecked((ulong)ToPrintfInteger(value)).ToString(CultureInfo.InvariantCulture)),
+                unchecked((ulong)ToPrintfInteger(value)).ToString(CultureInfo.InvariantCulture),
+                group: true),
             'x' => FormatPrintfUnsignedInteger(
                 specifier,
-                unchecked((ulong)ToPrintfInteger(value)).ToString("x", CultureInfo.InvariantCulture)),
+                unchecked((ulong)ToPrintfInteger(value)).ToString("x", CultureInfo.InvariantCulture),
+                specifier.Alternate && ToPrintfInteger(value) != 0 ? "0x" : string.Empty),
             'X' => FormatPrintfUnsignedInteger(
                 specifier,
-                unchecked((ulong)ToPrintfInteger(value)).ToString("X", CultureInfo.InvariantCulture)),
+                unchecked((ulong)ToPrintfInteger(value)).ToString("X", CultureInfo.InvariantCulture),
+                specifier.Alternate && ToPrintfInteger(value) != 0 ? "0X" : string.Empty),
             'o' => FormatPrintfUnsignedInteger(
                 specifier,
-                FormatPrintfOctal(unchecked((ulong)ToPrintfInteger(value)))),
+                FormatPrintfOctal(unchecked((ulong)ToPrintfInteger(value))),
+                specifier.Alternate && ToPrintfInteger(value) != 0 ? "0" : string.Empty),
+            'p' => FormatPrintfUnsignedInteger(
+                specifier,
+                unchecked((ulong)ToPrintfInteger(value)).ToString("X", CultureInfo.InvariantCulture),
+                specifier.Alternate && ToPrintfInteger(value) != 0 ? "0x" : string.Empty),
+            'r' => FormatPrintfOrdinal(specifier, ToPrintfInteger(value)),
             'f' or 'e' or 'E' or 'g' or 'G' => FormatPrintfFloatingPoint(specifier, ToPrintfReal(value)),
             'c' => FormatPrintfCharacter(specifier, value),
             'q' => FormatPrintfQuotedText(specifier, value, '\0'),
@@ -11315,14 +11394,62 @@ public sealed class EmbeddedDatabase : IDisposable
             magnitude.ToString(CultureInfo.InvariantCulture),
             specifier.Precision);
         var sign = negative ? "-" : specifier.ForceSign ? "+" : specifier.SpaceSign ? " " : string.Empty;
-        return ApplyPrintfNumericWidth(specifier, sign, digits);
+        if (specifier.Comma)
+        {
+            if (specifier.ZeroPad && specifier.Width is { } width)
+                digits = digits.PadLeft(Math.Max(digits.Length, width - sign.Length), '0');
+            digits = AddPrintfThousandsSeparators(digits);
+        }
+        return ApplyPrintfNumericWidth(
+            specifier.Comma && specifier.ZeroPad ? specifier with { Width = null } : specifier,
+            sign,
+            digits);
     }
 
-    private static PrintfText FormatPrintfUnsignedInteger(PrintfSpecifier specifier, string digits)
-        => ApplyPrintfNumericWidth(
-            specifier,
-            string.Empty,
-            ApplyPrintfIntegerPrecision(digits, specifier.Precision));
+    private static PrintfText FormatPrintfUnsignedInteger(
+        PrintfSpecifier specifier,
+        string digits,
+        string prefix = "",
+        bool group = false)
+    {
+        digits = ApplyPrintfIntegerPrecision(digits, specifier.Precision);
+        if (specifier.Comma && group)
+        {
+            if (specifier.ZeroPad && specifier.Width is { } width)
+                digits = digits.PadLeft(width, '0');
+            digits = AddPrintfThousandsSeparators(digits);
+        }
+
+        return ApplyPrintfNumericWidth(
+            specifier.Comma && group && specifier.ZeroPad
+                ? specifier with { Width = null }
+                : specifier,
+            prefix,
+            digits);
+    }
+
+    private static PrintfText FormatPrintfOrdinal(PrintfSpecifier specifier, long value)
+    {
+        var magnitude = value < 0
+            ? unchecked((ulong)(-(value + 1))) + 1
+            : (ulong)value;
+        var suffix = magnitude % 100 is 11 or 12 or 13
+            ? "th"
+            : (magnitude % 10) switch
+            {
+                1 => "st",
+                2 => "nd",
+                3 => "rd",
+                _ => "th",
+            };
+        var digits = string.Concat(
+            ApplyPrintfIntegerPrecision(
+                magnitude.ToString(CultureInfo.InvariantCulture),
+                specifier.Precision),
+            suffix);
+        var sign = value < 0 ? "-" : specifier.ForceSign ? "+" : specifier.SpaceSign ? " " : string.Empty;
+        return ApplyPrintfNumericWidth(specifier, sign, digits);
+    }
 
     private static string ApplyPrintfIntegerPrecision(string digits, int? precision)
     {
@@ -11332,11 +11459,44 @@ public sealed class EmbeddedDatabase : IDisposable
         return string.Concat(new string('0', minimumDigits - digits.Length), digits);
     }
 
+    private static string AddPrintfThousandsSeparators(string digits)
+    {
+        if (digits.Length <= 3)
+            return digits;
+
+        var firstGroupLength = digits.Length % 3;
+        if (firstGroupLength == 0)
+            firstGroupLength = 3;
+        var builder = new StringBuilder(digits.Length + (digits.Length - 1) / 3);
+        builder.Append(digits.AsSpan(0, firstGroupLength));
+        for (var index = firstGroupLength; index < digits.Length; index += 3)
+        {
+            builder.Append(',');
+            builder.Append(digits.AsSpan(index, 3));
+        }
+
+        return builder.ToString();
+    }
+
     private static PrintfText FormatPrintfFloatingPoint(PrintfSpecifier specifier, double value)
     {
         var negative = value < 0;
         var sign = negative ? "-" : specifier.ForceSign ? "+" : specifier.SpaceSign ? " " : string.Empty;
-        var digits = FormatPrintfReal(specifier.Verb, Math.Abs(value), specifier.Precision);
+        var digits = FormatPrintfReal(
+            specifier.Verb,
+            Math.Abs(value),
+            specifier.Precision,
+            specifier.Alternate,
+            specifier.Alternate2);
+        if (specifier.Comma && specifier.Verb == 'f')
+        {
+            var decimalIndex = digits.IndexOf('.');
+            var integerLength = decimalIndex < 0 ? digits.Length : decimalIndex;
+            digits = string.Concat(
+                AddPrintfThousandsSeparators(digits[..integerLength]),
+                digits.AsSpan(integerLength));
+        }
+
         return ApplyPrintfNumericWidth(specifier, sign, digits);
     }
 
@@ -11345,10 +11505,15 @@ public sealed class EmbeddedDatabase : IDisposable
         if (value.Kind == SqlValueKind.Null)
         {
             var nullText = quote == '\'' ? "NULL" : "(NULL)";
-            return ApplyPrintfTextWidth(specifier, LimitPrintfText(nullText, specifier.Precision));
+            return ApplyPrintfTextWidth(
+                specifier,
+                LimitPrintfText(nullText, specifier.Precision, specifier.Alternate2));
         }
 
-        var text = LimitPrintfText(value, specifier.Precision);
+        var text = LimitPrintfText(value, specifier.Precision, specifier.Alternate2);
+        if (specifier.Alternate && quote is '\0' or '\'')
+            return FormatPrintfEscapedControlText(specifier, text, quote == '\'');
+
         var quoteCount = text.Value.Count(character => character == quote || (quote == '\0' && character == '\''));
         var enclosingQuoteCount = quote == '\'' ? 2 : 0;
         if (text.Value.Length > MaximumPrintfOutputLength - quoteCount - enclosingQuoteCount)
@@ -11363,6 +11528,39 @@ public sealed class EmbeddedDatabase : IDisposable
         };
         var byteLength = text.ByteLength + quoteCount + enclosingQuoteCount;
         return ApplyPrintfTextWidth(specifier, new PrintfText(escaped, byteLength));
+    }
+
+    private static PrintfText FormatPrintfEscapedControlText(
+        PrintfSpecifier specifier,
+        PrintfText text,
+        bool enclose)
+    {
+        var builder = new StringBuilder(text.Value.Length);
+        var changed = false;
+        foreach (var rune in text.Value.EnumerateRunes())
+        {
+            if (Rune.IsControl(rune))
+            {
+                builder.Append(@"\u");
+                builder.Append(rune.Value.ToString("x4", CultureInfo.InvariantCulture));
+                changed = true;
+            }
+            else if (rune.Value == '\'')
+            {
+                builder.Append("''");
+            }
+            else
+            {
+                builder.Append(rune.ToString());
+            }
+        }
+
+        var escaped = builder.ToString();
+        if (enclose)
+            escaped = changed ? $"unistr('{escaped}')" : $"'{escaped}'";
+        return ApplyPrintfTextWidth(
+            specifier,
+            new PrintfText(escaped, Encoding.UTF8.GetByteCount(escaped)));
     }
 
     private static PrintfText FormatPrintfCharacter(PrintfSpecifier specifier, SqlValue value)
@@ -11387,13 +11585,34 @@ public sealed class EmbeddedDatabase : IDisposable
             new PrintfText(output, Encoding.UTF8.GetByteCount(character) * count));
     }
 
-    private static PrintfText LimitPrintfText(SqlValue value, int? precision)
+    private static PrintfText LimitPrintfText(
+        SqlValue value,
+        int? precision,
+        bool characterPrecision = false)
         => value.Kind == SqlValueKind.Text
-            ? LimitPrintfText(value.AsText(), precision)
-            : LimitPrintfText(ToPrintfText(value), precision);
+            ? LimitPrintfText(value.AsText(), precision, characterPrecision)
+            : LimitPrintfText(ToPrintfText(value), precision, characterPrecision);
 
-    private static PrintfText LimitPrintfText(string value, int? precision)
+    private static PrintfText LimitPrintfText(
+        string value,
+        int? precision,
+        bool characterPrecision = false)
     {
+        if (characterPrecision && precision is { } characterLimit)
+        {
+            var builder = new StringBuilder(Math.Min(value.Length, characterLimit));
+            var count = 0;
+            foreach (var rune in value.EnumerateRunes())
+            {
+                if (rune.Value == 0 || count++ == characterLimit)
+                    break;
+                builder.Append(rune.ToString());
+            }
+
+            var text = builder.ToString();
+            return new PrintfText(text, Encoding.UTF8.GetByteCount(text));
+        }
+
         if (precision is not { } byteLimit)
         {
             var terminatorOffset = value.IndexOf('\0');
@@ -11437,7 +11656,10 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private static PrintfText ApplyPrintfTextWidth(PrintfSpecifier specifier, PrintfText text)
     {
-        var padding = Math.Max(0, (specifier.Width ?? 0) - text.ByteLength);
+        var length = specifier.Alternate2
+            ? text.Value.EnumerateRunes().Count()
+            : text.ByteLength;
+        var padding = Math.Max(0, (specifier.Width ?? 0) - length);
         if (padding == 0)
             return text;
 
@@ -11461,8 +11683,12 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (specifier.ZeroPad)
         {
-            var zeroes = new string('0', padding);
-            return new PrintfText(string.Concat(sign, zeroes, digits), sign.Length + digits.Length + padding);
+            var prefixIsAlternateInteger = sign is "0" or "0x" or "0X";
+            var zeroes = new string(
+                '0',
+                prefixIsAlternateInteger ? padding + sign.Length : padding);
+            var formatted = string.Concat(sign, zeroes, digits);
+            return new PrintfText(formatted, formatted.Length);
         }
 
         var leadingSpaces = new string(' ', padding);
@@ -11682,22 +11908,70 @@ public sealed class EmbeddedDatabase : IDisposable
         return new string(buffer[index..]);
     }
 
-    private static string FormatPrintfReal(char verb, double value, int? requestedPrecision)
+    private static string FormatPrintfReal(
+        char verb,
+        double value,
+        int? requestedPrecision,
+        bool alternate,
+        bool alternate2)
     {
         if (double.IsNaN(value))
             return "NaN";
         if (double.IsPositiveInfinity(value))
             return "Inf";
 
+        if (alternate2 && requestedPrecision is > 26)
+            requestedPrecision = 26;
+        var forceDecimalPoint = alternate || alternate2;
         return verb switch
         {
-            'f' => FormatPrintfFixed(value, requestedPrecision ?? 6),
-            'e' => FormatPrintfExponential(value, requestedPrecision ?? 6, upperCase: false),
-            'E' => FormatPrintfExponential(value, requestedPrecision ?? 6, upperCase: true),
-            'g' => FormatPrintfGeneral(value, requestedPrecision ?? 6, upperCase: false),
-            'G' => FormatPrintfGeneral(value, requestedPrecision ?? 6, upperCase: true),
+            'f' => EnsurePrintfDecimalPoint(
+                FormatPrintfFixed(value, requestedPrecision ?? 6),
+                forceDecimalPoint,
+                alternate2),
+            'e' => EnsurePrintfDecimalPoint(
+                FormatPrintfExponential(value, requestedPrecision ?? 6, upperCase: false),
+                forceDecimalPoint,
+                alternate2),
+            'E' => EnsurePrintfDecimalPoint(
+                FormatPrintfExponential(value, requestedPrecision ?? 6, upperCase: true),
+                forceDecimalPoint,
+                alternate2),
+            'g' => EnsurePrintfDecimalPoint(
+                FormatPrintfGeneral(
+                    value,
+                    requestedPrecision ?? 6,
+                    upperCase: false,
+                    preserveTrailingZeros: alternate),
+                alternate2,
+                alternate2),
+            'G' => EnsurePrintfDecimalPoint(
+                FormatPrintfGeneral(
+                    value,
+                    requestedPrecision ?? 6,
+                    upperCase: true,
+                    preserveTrailingZeros: alternate),
+                alternate2,
+                alternate2),
             _ => throw new InvalidOperationException($"Unexpected printf real verb {verb}."),
         };
+    }
+
+    private static string EnsurePrintfDecimalPoint(
+        string value,
+        bool required,
+        bool trailingZero = false)
+    {
+        if (!required)
+            return value;
+        var exponentIndex = value.IndexOfAny(['e', 'E']);
+        var mantissa = exponentIndex < 0 ? value : value[..exponentIndex];
+        if (mantissa.Contains('.'))
+            return value;
+        var decimalSuffix = trailingZero ? ".0" : ".";
+        return exponentIndex < 0
+            ? string.Concat(value, decimalSuffix)
+            : string.Concat(mantissa, decimalSuffix, value.AsSpan(exponentIndex));
     }
 
     private static string FormatPrintfFixed(double value, int precision)
@@ -11729,11 +12003,17 @@ public sealed class EmbeddedDatabase : IDisposable
         return BuildPrintfExponential(digits, precision, exponent, upperCase);
     }
 
-    private static string FormatPrintfGeneral(double value, int requestedPrecision, bool upperCase)
+    private static string FormatPrintfGeneral(
+        double value,
+        int requestedPrecision,
+        bool upperCase,
+        bool preserveTrailingZeros = false)
     {
         var precision = requestedPrecision == 0 ? 1 : requestedPrecision;
         if (value == 0)
-            return "0";
+            return preserveTrailingZeros
+                ? precision == 1 ? "0." : string.Concat("0.", new string('0', precision - 1))
+                : "0";
 
         var exponent = GetPrintfDecimalExponent(value);
         var digits = RoundPrintfReal(value, precision - 1 - exponent);
@@ -11747,7 +12027,7 @@ public sealed class EmbeddedDatabase : IDisposable
         if (exponent < -4 || exponent >= precision)
         {
             var exponential = BuildPrintfExponential(digits, precision - 1, exponent, upperCase);
-            return TrimPrintfFractionalZeros(exponential);
+            return preserveTrailingZeros ? exponential : TrimPrintfFractionalZeros(exponential);
         }
 
         var decimalDigits = digits.ToString(CultureInfo.InvariantCulture).PadLeft(precision, '0');
@@ -11771,7 +12051,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 decimalDigits);
         }
 
-        return TrimPrintfFractionalZeros(fixedPoint);
+        return preserveTrailingZeros ? EnsurePrintfDecimalPoint(fixedPoint, required: true) : TrimPrintfFractionalZeros(fixedPoint);
     }
 
     private static string BuildPrintfExponential(BigInteger digits, int precision, int exponent, bool upperCase)
@@ -11870,6 +12150,9 @@ public sealed class EmbeddedDatabase : IDisposable
         bool ForceSign,
         bool SpaceSign,
         bool ZeroPad,
+        bool Alternate,
+        bool Alternate2,
+        bool Comma,
         int? Width,
         int? Precision);
 
