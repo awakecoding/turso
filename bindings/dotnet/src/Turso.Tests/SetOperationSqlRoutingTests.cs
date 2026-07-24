@@ -344,6 +344,52 @@ public class SetOperationSqlRoutingTests
             () => ReadRows(connection, "EXPLAIN SELECT DISTINCT a FROM t INTERSECT SELECT a FROM u;"));
     }
 
+    [TestCase("INTERSECT")]
+    [TestCase("EXCEPT")]
+    public void ErrorCapableTermsPreserveEvaluatorSourceOrder(string compoundOperator)
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE first_error(value);");
+        Execute(connection, "INSERT INTO first_error VALUES (-9223372036854775808);");
+        Execute(connection, "CREATE TABLE second_error(value);");
+        Execute(connection, "INSERT INTO second_error VALUES ('x');");
+        var query =
+            $"SELECT abs(value) FROM first_error {compoundOperator} SELECT instr(value) FROM second_error;";
+        var forcedEvaluator =
+            $"SELECT abs(value) FROM first_error {compoundOperator} SELECT instr(value) FROM second_error ORDER BY 1;";
+
+        var actual = Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query))!;
+        var expected = Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, forcedEvaluator))!;
+
+        actual.Message.Should().Be(expected.Message).And.Be("integer overflow");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query))!
+            .Message.Should().Contain("EXPLAIN is only supported");
+    }
+
+    [TestCase("INTERSECT")]
+    [TestCase("EXCEPT")]
+    public void ComputedArithmeticTermsStayEvaluatorOwned(string compoundOperator)
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE arithmetic_left(value);");
+        Execute(connection, "INSERT INTO arithmetic_left VALUES ('10');");
+        Execute(connection, "CREATE TABLE arithmetic_right(value);");
+        Execute(connection, "INSERT INTO arithmetic_right VALUES ('10');");
+        var query =
+            $"SELECT value + 1 FROM arithmetic_left {compoundOperator} SELECT value + 1 FROM arithmetic_right;";
+        var forcedEvaluator =
+            $"SELECT value + 1 FROM arithmetic_left {compoundOperator} SELECT value + 1 FROM arithmetic_right ORDER BY 1;";
+
+        var actual = ReadRows(connection, query);
+        var expected = ReadRows(connection, forcedEvaluator);
+
+        actual.Should().HaveCount(expected.Count);
+        for (var index = 0; index < actual.Count; index++)
+            actual[index].Should().Equal(expected[index]);
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query))!
+            .Message.Should().Contain("EXPLAIN is only supported");
+    }
+
     [Test]
     public void MismatchedColumnCountIntersectRaisesTheEvaluatorError()
     {

@@ -259,32 +259,29 @@ public class ScalarFunctionSqlRoutingTests
         Opcodes(ReadRows(connection, "EXPLAIN SELECT abs(x) FROM t;")).Should().Contain("Function");
     }
 
-    // ---- boundary: pure-constant calls still fold (no Function opcode) ----------------------------------
+    // ---- row-independent calls still execute at their normal row position --------------------------------
 
     [Test]
-    public void PureConstantCallFoldsToLoadConstantAndDoesNotEmitFunction()
+    public void PureConstantCallExecutesThroughFunctionOpcode()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
         ReadRows(connection, "SELECT abs(-5);")[0][0].Should().Be(SqlValue.Integer(5));
 
-        // A wholly constant argument list is folded by the constant route ahead of this one, so no Function
-        // opcode is emitted -- the value is baked directly.
         var opcodes = Opcodes(ReadRows(connection, "EXPLAIN SELECT abs(-5);")).ToList();
-        opcodes.Should().Contain("LoadConstant").And.NotContain("Function");
+        opcodes.Should().Contain("LoadConstant").And.Contain("Function");
     }
 
     [Test]
-    public void ConstantArgumentOverScanFoldsWithoutFunctionOpcode()
+    public void ConstantArgumentOverScanExecutesFunctionPerRow()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(x INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1), (2);");
 
-        // abs(5) over a scan is a folded constant projection (the scan compiler owns it), not a Function.
         ReadRows(connection, "SELECT abs(5) FROM t;").Select(row => row[0])
             .Should().Equal(SqlValue.Integer(5), SqlValue.Integer(5));
-        Opcodes(ReadRows(connection, "EXPLAIN SELECT abs(5) FROM t;")).Should().NotContain("Function");
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT abs(5) FROM t;")).Should().Contain("Function");
     }
 
     // ---- fallback boundaries: evaluator keeps ownership, EXPLAIN refuses to describe -------------------

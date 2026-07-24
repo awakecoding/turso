@@ -4397,6 +4397,12 @@ public sealed class EmbeddedDatabase : IDisposable
             terms.Add(new CompoundTerm(compiledTerm.Program, compiledTerm.CursorSources));
         }
 
+        if (compoundOperator is CompoundOperator.Intersect or CompoundOperator.Except
+            && terms.Any(term => !IsReorderSafeSetOperationTerm(term.Program)))
+        {
+            return false;
+        }
+
         CompoundTerm compound;
         if (compoundOperator == CompoundOperator.UnionAll)
         {
@@ -4413,7 +4419,8 @@ public sealed class EmbeddedDatabase : IDisposable
             // column per output, so a star-expanded first term declines rather than index a too-short
             // vector (the same range the evaluator's own RowsEqual would fault on).
             var collations = GetCompoundCollations(statement.Terms[0], columnCount);
-            if (collations.Count != columnCount)
+            if (collations.Count != columnCount
+                || collations.Any(collation => !IsStreamingSafeDistinctCollation(collation)))
                 return false;
 
             bool RowEquality(SqlValue[] left, SqlValue[] right) => RowsEqual(left, right, collations);
@@ -4430,6 +4437,26 @@ public sealed class EmbeddedDatabase : IDisposable
         compiled = new CompiledSelect(compound.Program, compound.CursorSources);
         return true;
     }
+
+    // INTERSECT/EXCEPT currently build probe terms before the primary term. Only programs whose
+    // execution cannot raise or invoke user code may be reordered this way; computed arithmetic,
+    // functions, aggregates, joins, and sorters remain on the evaluator, which evaluates terms
+    // left-to-right.
+    private static bool IsReorderSafeSetOperationTerm(VdbeProgram program)
+        => program.Instructions.All(instruction => instruction is
+            LoadConstantInstruction
+            or LoadParameterInstruction
+            or CopyInstruction
+            or OpenReadCursorInstruction
+            or CloseCursorInstruction
+            or RewindCursorInstruction
+            or ColumnInstruction
+            or RowIdInstruction
+            or FilterInstruction
+            or FilterRowIdInstruction
+            or NextInstruction
+            or ResultRowInstruction
+            or HaltInstruction);
 
     // The number of result columns a compiled term projects, read from its first result-row emission.
     // Every lowered SELECT emits one, and CompoundProgramBuilder validates the widths agree, so this
@@ -6452,51 +6479,20 @@ public sealed class EmbeddedDatabase : IDisposable
             context)));
     }
 
-    // A constant scalar expression folds to the same value regardless of the row,
-    // parameters, or catalog, so the compiler can bake it into a LoadConstant. Any
-    // column, parameter, subquery, aggregate, or star reference is rejected so the
-    // evaluator keeps ownership of those statements.
+    // Only literal numeric arithmetic is safe to evaluate while compiling: it is deterministic
+    // and cannot raise or invoke user code. Other row-independent expressions must execute at their
+    // normal row position (when lowerable) or remain on the evaluator, so volatile functions run per
+    // row and an erroring projection is not evaluated for an empty input.
     private bool IsConstantScalarExpression(Expression expression)
     {
-        switch (expression)
+        return expression switch
         {
-            case LiteralExpression:
-                return true;
-            case UnaryExpression unary:
-                return IsConstantScalarExpression(unary.Operand);
-            case BinaryExpression binary:
-                return IsConstantScalarExpression(binary.Left) && IsConstantScalarExpression(binary.Right);
-            case CastExpression cast:
-                return IsConstantScalarExpression(cast.Expression);
-            case CollationExpression collation:
-                return IsConstantScalarExpression(collation.Expression);
-            case CaseExpression @case:
-                return (@case.Operand is null || IsConstantScalarExpression(@case.Operand))
-                    && @case.Clauses.All(clause =>
-                        IsConstantScalarExpression(clause.When) && IsConstantScalarExpression(clause.Then))
-                    && (@case.Else is null || IsConstantScalarExpression(@case.Else));
-            case LikeExpression like:
-                return IsConstantScalarExpression(like.Value)
-                    && IsConstantScalarExpression(like.Pattern)
-                    && (like.Escape is null || IsConstantScalarExpression(like.Escape));
-            case GlobExpression glob:
-                return IsConstantScalarExpression(glob.Value) && IsConstantScalarExpression(glob.Pattern);
-            case BetweenExpression between:
-                return IsConstantScalarExpression(between.Value)
-                    && IsConstantScalarExpression(between.Lower)
-                    && IsConstantScalarExpression(between.Upper);
-            case InExpression @in:
-                return IsConstantScalarExpression(@in.Value) && @in.Values.All(IsConstantScalarExpression);
-            case FunctionExpression function:
-                return function.Window is null
-                    && !function.CountStar
-                    && !function.Distinct
-                    && function.Filter is null
-                    && !ContainsAggregate(function)
-                    && function.Arguments.All(IsConstantScalarExpression);
-            default:
-                return false;
-        }
+            LiteralExpression => true,
+            BinaryExpression binary when TryMapArithmeticOperator(binary.Operator, out _)
+                => IsConstantScalarExpression(binary.Left) && IsConstantScalarExpression(binary.Right),
+            CollationExpression collation => IsConstantScalarExpression(collation.Expression),
+            _ => false,
+        };
     }
 
     private ExecutionResult ExecuteExplain(

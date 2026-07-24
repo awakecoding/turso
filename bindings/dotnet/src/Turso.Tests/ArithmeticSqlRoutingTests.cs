@@ -87,14 +87,63 @@ public class ArithmeticSqlRoutingTests
     }
 
     [Test]
-    public void PureConstantExpressionsStillFold()
+    public void SafeConstantArithmeticFoldsWhileFunctionsExecuteAtRuntime()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
         Read(connection, "SELECT 1 + 2, abs(-5);")[0]
             .Should().Equal(SqlValue.Integer(3), SqlValue.Integer(5));
         Opcodes(Read(connection, "EXPLAIN SELECT 1 + 2, abs(-5);"))
-            .Should().Equal("LoadConstant", "LoadConstant", "ResultRow", "Halt");
+            .Should().Equal("LoadConstant", "LoadConstant", "Function", "ResultRow", "Halt");
+    }
+
+    [Test]
+    public void VolatileNestedExpressionsRemainEvaluatorOwnedAndRunPerRow()
+    {
+        var calls = 0L;
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "next_value",
+            0,
+            _ => SqlValue.Integer(++calls));
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE input(value);");
+        Execute(connection, "INSERT INTO input VALUES (1), (2), (3);");
+
+        var rows = Read(connection, "SELECT next_value() + 0 FROM input;");
+
+        rows.Select(row => row[0]).Should().Equal(
+            SqlValue.Integer(1),
+            SqlValue.Integer(2),
+            SqlValue.Integer(3));
+        calls.Should().Be(3);
+        ExplainRefused(connection, "EXPLAIN SELECT next_value() + 0 FROM input;");
+
+        var uuids = Read(connection, "SELECT upper(uuid4_str()) FROM input;")
+            .Select(row => row[0].AsText())
+            .ToArray();
+        uuids.Distinct(StringComparer.Ordinal).Should().HaveCount(3);
+        ExplainRefused(connection, "EXPLAIN SELECT upper(uuid4_str()) FROM input;");
+    }
+
+    [Test]
+    public void ErroringRowIndependentFunctionIsNotEvaluatedForEmptyInput()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE empty_input(value);");
+
+        var compiled = Read(
+            connection,
+            "SELECT abs(-9223372036854775808) FROM empty_input;");
+        var evaluated = Read(
+            connection,
+            "SELECT CASE WHEN 1 THEN abs(-9223372036854775808) END FROM empty_input;");
+
+        AssertRowsEqual(compiled, evaluated);
+        Opcodes(Read(
+                connection,
+                "EXPLAIN SELECT abs(-9223372036854775808) FROM empty_input;"))
+            .Should().ContainInOrder("Rewind", "LoadConstant", "Function");
     }
 
     [Test]

@@ -108,10 +108,10 @@ public class CompiledSelectExecutionTests
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
 
-        var rows = ReadRows(connection, "EXPLAIN SELECT 2 + 3 * 4, 'a' || 'b';");
+        var rows = ReadRows(connection, "EXPLAIN SELECT 2 + 3 * 4, 9 / 3;");
         Opcodes(rows).Should().Equal("LoadConstant", "LoadConstant", "ResultRow", "Halt");
         rows[0][5].Should().Be(SqlValue.Text("14"));
-        rows[1][5].Should().Be(SqlValue.Text("'ab'"));
+        rows[1][5].Should().Be(SqlValue.Text("3"));
     }
 
     [Test]
