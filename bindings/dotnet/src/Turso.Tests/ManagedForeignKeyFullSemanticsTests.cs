@@ -448,6 +448,52 @@ public sealed class ManagedForeignKeyFullSemanticsTests
     }
 
     [Test]
+    public void ForeignKeysPreserveFailPartialPublicationUnlessItLeavesAnImmediateViolation()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE items(id INTEGER PRIMARY KEY)",
+            ],
+            "INSERT OR FAIL INTO items VALUES (1), (2), (1)",
+            "SELECT id FROM items ORDER BY id");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE configured(id INTEGER PRIMARY KEY ON CONFLICT FAIL)",
+            ],
+            "INSERT INTO configured VALUES (1), (2), (1)",
+            "SELECT id FROM configured ORDER BY id");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+            ],
+            "INSERT OR FAIL INTO child VALUES (1, 999), (2, 999), (1, 999)",
+            "SELECT id, parent_id FROM child ORDER BY id");
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        using var sqlite = OpenSqlite();
+        ExecuteBoth(
+            managed,
+            sqlite,
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE transactional(id INTEGER PRIMARY KEY)",
+            "BEGIN");
+        AssertSameError(
+            managed,
+            sqlite,
+            "INSERT OR FAIL INTO transactional VALUES (1), (2), (1)");
+        AssertQueriesMatch(managed, sqlite, "SELECT id FROM transactional ORDER BY id");
+        ExecuteBoth(managed, sqlite, "COMMIT");
+        AssertQueriesMatch(managed, sqlite, "SELECT id FROM transactional ORDER BY id");
+    }
+
+    [Test]
     public void MatchClausesRemainSimpleAndMultipleInlineReferencesAreIndependent()
     {
         AssertMatchesSqlite(

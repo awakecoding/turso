@@ -3002,8 +3002,8 @@ public sealed class EmbeddedDatabase : IDisposable
     }
 
     // Re-sorts a WITHOUT ROWID table's rows into primary-key order (honoring per-column
-    // ASC/DESC) so scans observe the physical key order SQLite exposes. The parallel rowid
-    // list is reordered in lock-step to stay index-aligned with the rows.
+    // ASC/DESC) so scans observe the physical key order SQLite exposes. The parallel internal
+    // row-identity list is reordered in lock-step even though SQL cannot access those values.
     private void SortWithoutRowid(EmbeddedTable table)
     {
         if (!table.WithoutRowid)
@@ -3730,8 +3730,7 @@ public sealed class EmbeddedDatabase : IDisposable
         table.Rows.Clear();
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
-        if (table.HasRowid)
-            table.RowIds.AddRange(rowIds);
+        table.RowIds.AddRange(rowIds);
         SortWithoutRowid(table);
         ValidateForeignKeysAfterUpdate(
             context,
@@ -4102,16 +4101,14 @@ public sealed class EmbeddedDatabase : IDisposable
             else
             {
                 rows.Add(childTable.Rows[position]);
-                if (childTable.HasRowid)
-                    rowIds.Add(rowId);
+                rowIds.Add(rowId);
             }
         }
 
         childTable.Rows.Clear();
         childTable.Rows.AddRange(rows);
         childTable.RowIds.Clear();
-        if (childTable.HasRowid)
-            childTable.RowIds.AddRange(rowIds);
+        childTable.RowIds.AddRange(rowIds);
         ValidateForeignKeysAfterDelete(
             context,
             childTableName,
@@ -4726,8 +4723,7 @@ public sealed class EmbeddedDatabase : IDisposable
         table.Rows.Clear();
         table.Rows.AddRange(rows);
         table.RowIds.Clear();
-        if (table.HasRowid)
-            table.RowIds.AddRange(rowIds);
+        table.RowIds.AddRange(rowIds);
         if (rowsAffected > 0)
         {
             ValidateForeignKeysAfterDelete(
@@ -4878,9 +4874,8 @@ public sealed class EmbeddedDatabase : IDisposable
         var baseline = CollectForeignKeyViolations(context.Tables, includeImmediate: true);
         var backup = CloneTables(context.Tables);
         foreignKeyState.Depth++;
-        try
+        void ValidateRetainedState()
         {
-            var result = operation();
             var remaining = CollectForeignKeyViolations(context.Tables, includeImmediate: true);
             var introducedImmediate = remaining
                 .Except(baseline)
@@ -4888,7 +4883,26 @@ public sealed class EmbeddedDatabase : IDisposable
                     || (!context.DeferForeignKeys && !violation.DeclaredDeferred));
             if (introducedImmediate)
                 throw new EmbeddedSqlException("FOREIGN KEY constraint failed");
+        }
+
+        try
+        {
+            var result = operation();
+            ValidateRetainedState();
             return result;
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            try
+            {
+                ValidateRetainedState();
+            }
+            catch
+            {
+                RestoreTables(context.Tables, backup);
+                throw;
+            }
+            throw;
         }
         catch
         {
