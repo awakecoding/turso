@@ -137,6 +137,7 @@ public sealed class EmbeddedDatabase : IDisposable
     private PragmaHeaderMetadata _inMemoryPragmaHeader;
     private long _version;
     private int _activeTransactions;
+    private int _activeStatementReaders;
     private readonly Dictionary<BlobMutationIdentity, int> _activeBlobMutations = new();
     private readonly Dictionary<BlobMutationIdentity, long> _blobMutationGenerations = new();
     private long _nextBlobMutationGeneration;
@@ -250,6 +251,27 @@ public sealed class EmbeddedDatabase : IDisposable
 
         return ReferenceEquals(fileSystem, otherFileSystem)
                && string.Equals(_databasePath, other._databasePath, StringComparison.Ordinal);
+    }
+
+    internal bool ReferencesStoragePath(string path, IFileSystem fileSystem)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentNullException.ThrowIfNull(fileSystem);
+        if (!IsFileBacked || _fileSystem is null)
+            return false;
+
+        var ownFileSystem = TursoEncryptionFileSystem.Unwrap(_fileSystem);
+        var candidateFileSystem = TursoEncryptionFileSystem.Unwrap(fileSystem);
+        if (ownFileSystem is PhysicalFileSystem && candidateFileSystem is PhysicalFileSystem)
+        {
+            var candidate = Path.GetFullPath(path);
+            return new[] { string.Empty, "-wal", "-journal", "-shm" }.Any(suffix =>
+                PhysicalPathComparer.Equals(Path.GetFullPath(_databasePath + suffix), candidate));
+        }
+
+        return ReferenceEquals(ownFileSystem, candidateFileSystem)
+               && new[] { string.Empty, "-wal", "-journal", "-shm" }.Any(suffix =>
+                   string.Equals(_databasePath + suffix, path, StringComparison.Ordinal));
     }
 
     private sealed record ManagedAggregateFunction(
@@ -584,7 +606,7 @@ public sealed class EmbeddedDatabase : IDisposable
         CreateTableStatement or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
-        or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement;
+        or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement or VacuumStatement;
 
     internal static bool MayChangeSchema(ParsedStatement statement) => statement is
         CreateTableStatement or DropTableStatement or CreateIndexStatement or DropIndexStatement
@@ -780,6 +802,15 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
+    internal IDisposable OpenStatementReaderLease()
+    {
+        lock (_gate)
+        {
+            _activeStatementReaders = checked(_activeStatementReaders + 1);
+            return new StatementReaderLease(this);
+        }
+    }
+
     internal long GetBlobMutationGeneration(string tableName, long rowId)
     {
         lock (_gate)
@@ -833,6 +864,16 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
+    internal void ReleaseStatementReaderLease()
+    {
+        lock (_gate)
+        {
+            if (_activeStatementReaders == 0)
+                throw new InvalidOperationException("Managed statement reader count underflow.");
+            _activeStatementReaders--;
+        }
+    }
+
     internal int GetPageSize()
     {
         lock (_gate)
@@ -855,6 +896,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 throw new EmbeddedSqlException("attempt to write a readonly database");
             if (_activeTransactions != 0)
                 throw new EmbeddedSqlException("cannot change journal mode while a transaction is active");
+            if (_activeStatementReaders != 0)
+                throw new EmbeddedSqlException("cannot change journal mode while a SQL statement is in progress");
             if (_activeBlobMutations.Count != 0)
                 throw new EmbeddedSqlException("cannot change journal mode while a blob handle is active");
             if (_fileSystem is null || _fileCatalogWriteLock is null)
@@ -882,6 +925,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 throw new EmbeddedSqlException("attempt to write a readonly database");
             if (_activeTransactions != 0)
                 throw new EmbeddedSqlException("cannot VACUUM while a transaction is active");
+            if (_activeStatementReaders != 0)
+                throw new EmbeddedSqlException("cannot VACUUM - SQL statements in progress");
             if (_activeBlobMutations.Count != 0)
                 throw new EmbeddedSqlException("cannot VACUUM while a blob handle is active");
             if (_fileSystem is null || _fileCatalogWriteLock is null)
@@ -899,6 +944,72 @@ public sealed class EmbeddedDatabase : IDisposable
                 _version++;
             }
         }
+    }
+
+    internal void VacuumInto(string destinationPath, int pageSize)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        lock (_gate)
+        {
+            if (_fileStore is null)
+                throw new EmbeddedSqlException("Managed VACUUM INTO requires a file-backed source database.");
+            if (_readOnly)
+                throw new EmbeddedSqlException("attempt to write a readonly database");
+            if (_activeTransactions != 0)
+                throw new EmbeddedSqlException("cannot VACUUM while a transaction is active");
+            if (_activeStatementReaders != 0)
+                throw new EmbeddedSqlException("cannot VACUUM - SQL statements in progress");
+            if (_activeBlobMutations.Count != 0)
+                throw new EmbeddedSqlException("cannot VACUUM while a blob handle is active");
+            if (_fileSystem is null || _fileCatalogWriteLock is null)
+                throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+
+            var destinationWriteLock = GetFileCatalogWriteLock(_fileSystem, destinationPath);
+            var sourceLockPath = GetFileCatalogLockPath(_fileSystem, _databasePath);
+            var destinationLockPath = GetFileCatalogLockPath(_fileSystem, destinationPath);
+            if (string.Equals(sourceLockPath, destinationLockPath, StringComparison.Ordinal))
+                throw new EmbeddedSqlException("output file already exists");
+
+            if (string.CompareOrdinal(sourceLockPath, destinationLockPath) < 0)
+            {
+                lock (_fileCatalogWriteLock)
+                {
+                    using var sourceWriteLease =
+                        EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
+                    lock (destinationWriteLock)
+                    {
+                        using var destinationWriteLease =
+                            EnterPhysicalFileCatalogWriteLock(_fileSystem, destinationPath);
+                        VacuumIntoCore(destinationPath, pageSize);
+                    }
+                }
+            }
+            else
+            {
+                lock (destinationWriteLock)
+                {
+                    using var destinationWriteLease =
+                        EnterPhysicalFileCatalogWriteLock(_fileSystem, destinationPath);
+                    lock (_fileCatalogWriteLock)
+                    {
+                        using var sourceWriteLease =
+                            EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
+                        VacuumIntoCore(destinationPath, pageSize);
+                    }
+                }
+            }
+        }
+    }
+
+    private void VacuumIntoCore(string destinationPath, int pageSize)
+    {
+        EnsureFileCatalogVersionCurrent();
+        _fileStore!.VacuumInto(
+            destinationPath,
+            pageSize,
+            _tables,
+            _views,
+            _triggers);
     }
 
     internal void SetInMemoryPragmaHeaderMetadata(PragmaHeaderMetadata metadata)
@@ -1042,12 +1153,18 @@ public sealed class EmbeddedDatabase : IDisposable
     private static object GetFileCatalogWriteLock(IFileSystem fileSystem, string path)
     {
         var unwrappedFileSystem = TursoEncryptionFileSystem.Unwrap(fileSystem);
+        return FileCatalogWriteLocks
+            .GetValue(unwrappedFileSystem, static _ => new FileCatalogWriteLockScope())
+            .Get(GetFileCatalogLockPath(fileSystem, path));
+    }
+
+    private static string GetFileCatalogLockPath(IFileSystem fileSystem, string path)
+    {
+        var unwrappedFileSystem = TursoEncryptionFileSystem.Unwrap(fileSystem);
         var lockPath = unwrappedFileSystem is PhysicalFileSystem
             ? Path.GetFullPath(path)
             : path;
-        return FileCatalogWriteLocks
-            .GetValue(unwrappedFileSystem, static _ => new FileCatalogWriteLockScope())
-            .Get(lockPath);
+        return OperatingSystem.IsWindows() ? lockPath.ToUpperInvariant() : lockPath;
     }
 
     private static IDisposable? EnterPhysicalFileCatalogWriteLock(IFileSystem fileSystem, string path)
@@ -17207,6 +17324,8 @@ public sealed class EmbeddedConnection : IDisposable
     private const char UnqualifiedSchemaMarker = '\0';
     private readonly EmbeddedDatabase _database;
     private readonly Dictionary<string, AttachedDatabase> _attachedDatabases = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _statementReaderGate = new();
+    private readonly HashSet<ConnectionStatementReaderLease> _statementReaders = [];
     private Dictionary<EmbeddedDatabase, TransactionDatabaseState>? _transactionDatabases;
     private EmbeddedDatabase? _transactionWriteDatabase;
     private EmbeddedDatabase? _transactionMutationDatabase;
@@ -17255,6 +17374,29 @@ public sealed class EmbeddedConnection : IDisposable
         }
     }
 
+    private sealed class ConnectionStatementReaderLease(
+        EmbeddedConnection owner,
+        IDisposable[] databaseLeases) : IDisposable
+    {
+        private EmbeddedConnection? _owner = owner;
+        private IDisposable[]? _databaseLeases = databaseLeases;
+
+        public void Dispose()
+        {
+            var currentOwner = Interlocked.Exchange(ref _owner, null);
+            var leases = Interlocked.Exchange(ref _databaseLeases, null);
+            if (currentOwner is not null && leases is not null)
+                currentOwner.ReleaseStatementReader(this, leases);
+        }
+
+        internal void ReleaseFromOwner()
+        {
+            _ = Interlocked.Exchange(ref _owner, null);
+            var leases = Interlocked.Exchange(ref _databaseLeases, null);
+            DisposeDatabaseLeases(leases);
+        }
+    }
+
     private sealed class TransactionDatabaseState(
         EmbeddedDatabase.SchemaCatalog catalog,
         long version,
@@ -17279,6 +17421,36 @@ public sealed class EmbeddedConnection : IDisposable
     }
 
     internal bool HasActiveTransaction => _transactionDatabases is not null;
+
+    internal IDisposable OpenStatementReaderLease()
+    {
+        ThrowIfDisposed();
+        var databases = new[] { _database }
+            .Concat(_attachedDatabases.Values.Select(attachment => attachment.Database))
+            .Distinct()
+            .ToArray();
+        var databaseLeases = new List<IDisposable>(databases.Length);
+        try
+        {
+            foreach (var database in databases)
+                databaseLeases.Add(database.OpenStatementReaderLease());
+
+            var lease = new ConnectionStatementReaderLease(this, databaseLeases.ToArray());
+            lock (_statementReaderGate)
+            {
+                ThrowIfDisposed();
+                if (!_statementReaders.Add(lease))
+                    throw new InvalidOperationException("Managed statement reader lease is already registered.");
+            }
+
+            return lease;
+        }
+        catch
+        {
+            DisposeDatabaseLeases(databaseLeases);
+            throw;
+        }
+    }
 
     internal EmbeddedConnection OpenDatabaseConnection(string databaseName)
         => ResolveDatabase(databaseName).Connect();
@@ -17363,6 +17535,7 @@ public sealed class EmbeddedConnection : IDisposable
     public void ResetForPooling()
     {
         ThrowIfDisposed();
+        ReleaseAllStatementReaders();
         ResetTransactionState();
         _lastInsertRowId = 0;
         _queryOnly = false;
@@ -17473,11 +17646,42 @@ public sealed class EmbeddedConnection : IDisposable
 
     public void Dispose()
     {
+        ReleaseAllStatementReaders();
         ResetTransactionState();
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
         _disposed = true;
+    }
+
+    private void ReleaseStatementReader(
+        ConnectionStatementReaderLease lease,
+        IDisposable[] databaseLeases)
+    {
+        lock (_statementReaderGate)
+            _statementReaders.Remove(lease);
+        DisposeDatabaseLeases(databaseLeases);
+    }
+
+    private void ReleaseAllStatementReaders()
+    {
+        ConnectionStatementReaderLease[] readers;
+        lock (_statementReaderGate)
+        {
+            readers = _statementReaders.ToArray();
+            _statementReaders.Clear();
+        }
+
+        foreach (var reader in readers)
+            reader.ReleaseFromOwner();
+    }
+
+    private static void DisposeDatabaseLeases(IEnumerable<IDisposable>? leases)
+    {
+        if (leases is null)
+            return;
+        foreach (var lease in leases.Reverse())
+            lease.Dispose();
     }
 
     internal ExecutionResult Execute(
@@ -17551,8 +17755,8 @@ public sealed class EmbeddedConnection : IDisposable
                 return ExecutePragmaJournalMode(journalMode);
             case PragmaPageSizeStatement pageSize:
                 return ExecutePragmaPageSize(pageSize);
-            case VacuumStatement:
-                return ExecuteVacuum();
+            case VacuumStatement vacuum:
+                return ExecuteVacuum(vacuum, parameters);
             default:
                 if (_queryOnly && EmbeddedDatabase.MayMutate(statement))
                     throw new EmbeddedSqlException("attempt to write a readonly database");
@@ -19216,22 +19420,65 @@ public sealed class EmbeddedConnection : IDisposable
         return ExecutionResult.Empty;
     }
 
-    private ExecutionResult ExecuteVacuum()
+    private ExecutionResult ExecuteVacuum(VacuumStatement statement, SqlValue[] parameters)
     {
-        if (_queryOnly || _database.IsReadOnly)
+        if (_queryOnly)
             throw new EmbeddedSqlException("attempt to write a readonly database");
         if (_transactionDatabases is not null)
             throw new EmbeddedSqlException("cannot VACUUM from within a transaction");
-        if (_attachedDatabases.Count != 0)
-            throw new EmbeddedSqlException("Managed VACUUM requires all attached databases to be detached.");
-        if (!_database.IsFileBacked)
+
+        var databaseName = statement.Schema ?? "main";
+        var database = ResolveDatabase(databaseName);
+        if (database.IsReadOnly)
+            throw new EmbeddedSqlException("attempt to write a readonly database");
+        if (!database.IsFileBacked && statement.Into is null)
             return ExecutionResult.Empty;
 
-        var targetPageSize = _database.GetJournalMode() == SqliteJournalMode.Wal
-            ? _database.GetPageSize()
-            : _pendingPageSize ?? _database.GetPageSize();
-        _database.MigratePageSize(targetPageSize);
-        _pendingPageSize = null;
+        var isMain = ReferenceEquals(database, _database);
+        var pendingPageSize = isMain ? _pendingPageSize : null;
+        var currentPageSize = database.GetPageSize();
+        var targetPageSize = statement.Into is not null
+            ? pendingPageSize ?? currentPageSize
+            : database.GetJournalMode() == SqliteJournalMode.Wal
+                ? currentPageSize
+                : pendingPageSize ?? currentPageSize;
+        if (statement.Into is null)
+        {
+            database.MigratePageSize(targetPageSize);
+        }
+        else
+        {
+            var destinationValue = database.EvaluateConstant(
+                statement.Into,
+                parameters,
+                _lastInsertRowId);
+            if (destinationValue.Kind != SqlValueKind.Text)
+                throw new EmbeddedSqlException("non-text filename");
+
+            var destinationPath = destinationValue.AsText();
+            if (string.IsNullOrWhiteSpace(destinationPath)
+                || destinationPath.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
+                || destinationPath.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new EmbeddedSqlException(
+                    "Managed VACUUM INTO supports only non-empty ordinary file paths.");
+            }
+            if (!database.IsFileBacked)
+                throw new EmbeddedSqlException("Managed VACUUM INTO requires a file-backed source database.");
+
+            var openDatabases = new[] { _database }
+                .Concat(_attachedDatabases.Values.Select(attachment => attachment.Database));
+            if (openDatabases.Any(openDatabase =>
+                    openDatabase.ReferencesStoragePath(destinationPath, database.FileSystem)))
+            {
+                throw new EmbeddedSqlException("output file already exists");
+            }
+
+            database.VacuumInto(destinationPath, targetPageSize);
+        }
+
+        if (isMain)
+            _pendingPageSize = null;
         return ExecutionResult.Empty;
     }
 
@@ -19434,6 +19681,7 @@ public sealed class EmbeddedStatement : IDisposable
     private readonly bool[] _isBound;
     private string[]? _columnNames;
     private ExecutionResult? _result;
+    private IDisposable? _readerLease;
     private int _rowIndex = -1;
     private bool _disposed;
 
@@ -19538,6 +19786,7 @@ public sealed class EmbeddedStatement : IDisposable
         if (++_rowIndex < _result!.Rows.Count)
             return StatementStepResult.Row;
 
+        ReleaseReaderLease();
         return StatementStepResult.Done;
     }
 
@@ -19565,6 +19814,7 @@ public sealed class EmbeddedStatement : IDisposable
     public void Reset()
     {
         ThrowIfDisposed();
+        ReleaseReaderLease();
         _result = null;
         _rowIndex = -1;
     }
@@ -19587,6 +19837,7 @@ public sealed class EmbeddedStatement : IDisposable
 
     public void Dispose()
     {
+        ReleaseReaderLease();
         _disposed = true;
         _result = null;
 
@@ -19623,12 +19874,26 @@ public sealed class EmbeddedStatement : IDisposable
         {
             _result = valuesResult;
             cancellationToken.ThrowIfCancellationRequested();
+            OpenReaderLeaseIfNeeded();
             return;
         }
 
         _result = _connection.Execute(_statement, _boundValues, cancellationToken);
         if (!EmbeddedDatabase.MayMutate(_statement))
             cancellationToken.ThrowIfCancellationRequested();
+        OpenReaderLeaseIfNeeded();
+    }
+
+    private void OpenReaderLeaseIfNeeded()
+    {
+        if (_result!.Rows.Count != 0 && _readerLease is null)
+            _readerLease = _connection.OpenStatementReaderLease();
+    }
+
+    private void ReleaseReaderLease()
+    {
+        var lease = Interlocked.Exchange(ref _readerLease, null);
+        lease?.Dispose();
     }
 
     // Routes an eligible top-level VALUES through its per-statement cached lowering. The lowering is
@@ -20941,6 +21206,17 @@ internal sealed class BlobMutationLease(EmbeddedDatabase database, BlobMutationI
     {
         var database = System.Threading.Interlocked.Exchange(ref _database, null);
         database?.ReleaseBlobMutationLease(identity);
+    }
+}
+
+internal sealed class StatementReaderLease(EmbeddedDatabase database) : IDisposable
+{
+    private EmbeddedDatabase? _database = database;
+
+    public void Dispose()
+    {
+        var owner = Interlocked.Exchange(ref _database, null);
+        owner?.ReleaseStatementReaderLease();
     }
 }
 

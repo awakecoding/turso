@@ -25,6 +25,7 @@ public enum FileSystemOperation
     Write,
     SetLength,
     FlushToDisk,
+    AtomicReplace,
 }
 
 /// <summary>
@@ -47,6 +48,18 @@ public interface IFileSystem
 
     /// <summary>Deletes the file at <paramref name="path"/> if it exists.</summary>
     void DeleteFile(string path);
+}
+
+/// <summary>
+/// Publishes a fully written sibling file at its final path without exposing a
+/// partial destination image.
+/// </summary>
+internal interface IAtomicFileSystem
+{
+    void ReplaceFileAtomically(
+        string sourcePath,
+        string destinationPath,
+        bool replaceEmptyDestination);
 }
 
 /// <summary>
