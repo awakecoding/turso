@@ -197,6 +197,7 @@ public class TursoCommand : DbCommand
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText must be set before preparing a command.");
         ValidateTransaction();
+        _connection.ValidateCommandCapabilities(CommandText);
         if (_connection.IsManagedReadOnly)
             ManagedReadOnlySqlGuard.ThrowIfQueryOnlyIsDisabled(CommandText);
         if (_connection.IsRemote)
@@ -480,6 +481,7 @@ public class TursoCommand : DbCommand
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText must be set before executing a command.");
         ValidateTransaction();
+        _connection.ValidateCommandCapabilities(CommandText);
 
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -499,6 +501,7 @@ public class TursoCommand : DbCommand
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText must be set before executing a command.");
         ValidateTransaction();
+        _connection.ValidateCommandCapabilities(CommandText);
 
         cancellationToken.ThrowIfCancellationRequested();
 

@@ -11,6 +11,15 @@ public class SqliteTransaction : DbTransaction
     private bool _externalRollback;
 
     internal SqliteTransaction(SqliteConnection connection, IsolationLevel isolationLevel, bool deferred)
+        : this(connection, isolationLevel, deferred, beginTransaction: true)
+    {
+    }
+
+    private SqliteTransaction(
+        SqliteConnection connection,
+        IsolationLevel isolationLevel,
+        bool deferred,
+        bool beginTransaction)
     {
         _connection = connection;
         _isolationLevel = NormalizeIsolationLevel(connection, isolationLevel, deferred);
@@ -18,7 +27,33 @@ public class SqliteTransaction : DbTransaction
         if (_isolationLevel == IsolationLevel.ReadUncommitted)
             connection.ReadUncommitted = true;
 
-        Execute(_isolationLevel == IsolationLevel.Serializable && !deferred ? "BEGIN IMMEDIATE;" : "BEGIN;");
+        if (beginTransaction)
+            Execute(GetBeginSql(_isolationLevel, deferred));
+    }
+
+    internal static async ValueTask<SqliteTransaction> CreateAsync(
+        SqliteConnection connection,
+        IsolationLevel isolationLevel,
+        bool deferred,
+        CancellationToken cancellationToken)
+    {
+        var transaction = new SqliteTransaction(
+            connection,
+            isolationLevel,
+            deferred,
+            beginTransaction: false);
+        try
+        {
+            await transaction
+                .ExecuteAsync(GetBeginSql(transaction._isolationLevel, deferred), cancellationToken)
+                .ConfigureAwait(false);
+            return transaction;
+        }
+        catch
+        {
+            transaction.Complete();
+            throw;
+        }
     }
 
     public override IsolationLevel IsolationLevel => _isolationLevel;
@@ -43,11 +78,15 @@ public class SqliteTransaction : DbTransaction
         Complete();
     }
 
-    public override Task CommitAsync(CancellationToken cancellationToken = default)
+    public override async Task CommitAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        Commit();
-        return Task.CompletedTask;
+        ThrowIfCompleted();
+        if (_externalRollback)
+            throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
+
+        await ExecuteAsync("COMMIT;", cancellationToken).ConfigureAwait(false);
+        Complete();
     }
 
     public override void Rollback()
@@ -64,11 +103,19 @@ public class SqliteTransaction : DbTransaction
         }
     }
 
-    public override Task RollbackAsync(CancellationToken cancellationToken = default)
+    public override async Task RollbackAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        Rollback();
-        return Task.CompletedTask;
+        ThrowIfCompleted();
+        try
+        {
+            if (!_externalRollback)
+                await ExecuteAsync("ROLLBACK;", cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Complete();
+        }
     }
 
     public override void Save(string savepointName)
@@ -78,11 +125,15 @@ public class SqliteTransaction : DbTransaction
         Execute("SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
     }
 
-    public override Task SaveAsync(string savepointName, CancellationToken cancellationToken = default)
+    public override async Task SaveAsync(string savepointName, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        Save(savepointName);
-        return Task.CompletedTask;
+        ArgumentNullException.ThrowIfNull(savepointName);
+        ThrowIfCompleted();
+        await ExecuteAsync(
+                "SAVEPOINT " + QuoteIdentifier(savepointName) + ";",
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public override void Rollback(string savepointName)
@@ -92,11 +143,15 @@ public class SqliteTransaction : DbTransaction
         Execute("ROLLBACK TO SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
     }
 
-    public override Task RollbackAsync(string savepointName, CancellationToken cancellationToken = default)
+    public override async Task RollbackAsync(string savepointName, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        Rollback(savepointName);
-        return Task.CompletedTask;
+        ArgumentNullException.ThrowIfNull(savepointName);
+        ThrowIfCompleted();
+        await ExecuteAsync(
+                "ROLLBACK TO SAVEPOINT " + QuoteIdentifier(savepointName) + ";",
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public override void Release(string savepointName)
@@ -106,11 +161,15 @@ public class SqliteTransaction : DbTransaction
         Execute("RELEASE SAVEPOINT " + QuoteIdentifier(savepointName) + ";");
     }
 
-    public override Task ReleaseAsync(string savepointName, CancellationToken cancellationToken = default)
+    public override async Task ReleaseAsync(string savepointName, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        Release(savepointName);
-        return Task.CompletedTask;
+        ArgumentNullException.ThrowIfNull(savepointName);
+        ThrowIfCompleted();
+        await ExecuteAsync(
+                "RELEASE SAVEPOINT " + QuoteIdentifier(savepointName) + ";",
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     protected override void Dispose(bool disposing)
@@ -176,6 +235,11 @@ public class SqliteTransaction : DbTransaction
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 
+    private static string GetBeginSql(IsolationLevel isolationLevel, bool deferred)
+        => isolationLevel == IsolationLevel.Serializable && !deferred
+            ? "BEGIN IMMEDIATE;"
+            : "BEGIN;";
+
     private void Execute(string sql)
     {
         var connection = _connection;
@@ -186,6 +250,18 @@ public class SqliteTransaction : DbTransaction
         command.CommandText = sql;
         command.Transaction = this;
         command.ExecuteNonQuery();
+    }
+
+    private async Task ExecuteAsync(string sql, CancellationToken cancellationToken)
+    {
+        var connection = _connection;
+        if (connection is null)
+            throw new InvalidOperationException(Properties.Resources.TransactionCompleted);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Transaction = this;
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
 }
