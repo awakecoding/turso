@@ -2473,6 +2473,11 @@ public sealed class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         QueryContext context)
     {
+        if (IsSqliteSequenceTable(statement.TableName)
+            && catalog.Tables.ContainsKey(statement.TableName))
+        {
+            throw new EmbeddedSqlException($"table {SqliteSequenceTableName} may not be altered");
+        }
         if (!catalog.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 

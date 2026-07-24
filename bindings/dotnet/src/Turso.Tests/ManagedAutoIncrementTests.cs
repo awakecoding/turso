@@ -291,6 +291,9 @@ public sealed class ManagedAutoIncrementTests
                 () => Execute(connection, "ALTER TABLE sqlite_sequence ADD COLUMN extra"))!
             .Message.Should().Be("table sqlite_sequence may not be altered");
         Assert.Throws<EmbeddedSqlException>(
+                () => Execute(connection, "ALTER TABLE sqlite_sequence DROP COLUMN seq"))!
+            .Message.Should().Be("table sqlite_sequence may not be altered");
+        Assert.Throws<EmbeddedSqlException>(
                 () => Execute(connection, "CREATE INDEX sequence_name ON sqlite_sequence(name)"))!
             .Message.Should().Be("table sqlite_sequence may not be indexed");
     }
