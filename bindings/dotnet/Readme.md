@@ -276,6 +276,40 @@ await using var reader = await batch.ExecuteReaderAsync();
 
 Local batches execute each batch command in order on one connection and expose command boundaries through `DbDataReader.NextResult()`. Each command has its own parameters and affected-row count. Local batches do not create an implicit transaction: completed commands remain committed if a later command fails unless the batch is associated with an explicit transaction. Transaction association is refreshed between commands, so commands after an explicit `COMMIT` or full `ROLLBACK` run outside the completed transaction. Closing or disposing a reader drains the remaining commands; `Cancel()` or cancellation stops before the next command. Remote batches preserve the existing single Hrana batch request.
 
+## Facade capability matrix
+
+`TursoConnection.Capabilities` and `SqliteConnection.Capabilities` expose the same
+executable contract used by provider feature gates. `CanCreateBatch` is sourced from
+that contract, so generic ADO.NET callers and the provider cannot drift.
+
+| Capability | `TursoConnection` managed local | `TursoConnection` native local | `TursoConnection` remote Hrana | `TursoConnection` embedded replica | `SqliteConnection` managed local | `SqliteConnection` native local |
+| --- | --- | --- | --- | --- | --- | --- |
+| `DbBatch` / `CanCreateBatch` | Yes, sequential | Yes, sequential | Yes, one Hrana batch | No | Yes, sequential | Yes, sequential |
+| Async open, command, reader, transaction, batch | Yes, worker-backed local I/O | Yes, worker-backed local I/O | Yes, HTTP I/O | Yes, replica/native I/O | Yes, worker-backed local I/O | Yes, worker-backed local I/O |
+| Transactions | Yes | Yes | Yes | Yes | Yes | Yes |
+| Savepoints | Yes | Yes | Yes | Yes | Yes | Yes |
+| `BackupDatabase` | No facade API | No facade API | No | No | Yes | Yes |
+| `SqliteBlob` fixed-length incremental I/O | No facade API | No facade API | No | No | Yes, managed handle | Yes, SQL-backed compatibility |
+| Scalar UDFs / aggregates / collations | No facade API | No facade API | No | No | Yes | Yes |
+| Loadable extensions | No facade API | No facade API | No | No | No | Yes, disabled by default |
+| `ATTACH` / `DETACH` | Yes, with managed limits | Yes | No | No | Yes, with managed limits | Yes |
+| Managed connection pooling | Eligible unencrypted files when `Pooling=True` | No | No | No | Eligible unencrypted files | No |
+| Explicit `Sync` | No | No | No | Yes | No | No |
+
+`Turso.Data.Sqlite` is a local-only migration facade; remote URLs fail before they
+can be interpreted as file paths. Use `TursoConnection` for Hrana and embedded
+replicas. `TursoConnection` also rejects `Pooling=True` before provider or network
+access unless the target is an eligible unencrypted managed file. The SQLite facade
+continues to accept its default `Pooling=True` keyword for native compatibility, but
+native handles are not pooled. Memory, shared-memory, encrypted, callback-bearing,
+remote, and replica connections are never pooled.
+
+Remote Hrana and embedded replicas reject `ATTACH` and `DETACH` before network or
+native execution; syncing or routing an attached database is not implied. Native
+SQLite compatibility remains explicit: the SQLite facade keeps its native UDF,
+aggregate, collation, extension, backup, blob, and attachment behavior, while
+`Turso.Raw` and native handles are unchanged and no fake SQLite handle is exposed.
+
 Provider factories are available through `TursoFactory.Instance`:
 
 ```C#
@@ -347,7 +381,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 - `TursoConnection` uses the same contract when `Pooling=True` is explicitly selected and exposes corresponding `TursoConnection.ClearPool(connection)` and `TursoConnection.ClearAllPools()` methods.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
 - Managed physical databases are not concurrently interoperable with ordinary SQLite clients. All managed connections in one process share exclusive ownership of SQLite's main-file lock-byte range until the last connection is disposed; other managed processes and SQLite clients receive a busy/ownership failure. Windows uses its native byte-range locks and 64-bit Linux uses open-file-description locks so closing a secondary database descriptor cannot silently release ownership. Do not mix a native SQLite client into the owning process. A handoff to SQLite is one-way: dispose every managed connection after a successful managed checkpoint, then let SQLite own the database and companion-file lifecycle; SQLite may delete or replace the managed `-wal`/`-shm` files, so the managed provider deliberately refuses to reopen that altered pair. After an interrupted managed writer, reopen it with the managed provider first so managed WAL recovery and checkpointing complete. Even a managed read-only open requires write access to the main file solely to acquire this fail-safe ownership lock.
-- Managed named shared-memory databases use `Data Source=NAME;Mode=Memory;Cache=Shared`. Connections with the same case-sensitive name share one managed catalog and page/cache owner until the last logical connection closes. Reopening while another connection remains open preserves the database; reopening after the last close creates an empty database. These connections are never pooled, even when `Pooling=True`, so an idle pool cannot extend their lifetime. `ClearPool` and `ClearAllPools` affect file pools only.
+- Managed named shared-memory databases use `Data Source=NAME;Mode=Memory;Cache=Shared`. Connections with the same case-sensitive name share one managed catalog and page/cache owner until the last logical connection closes. Reopening while another connection remains open preserves the database; reopening after the last close creates an empty database. The SQLite facade accepts `Pooling=True` for connection-string compatibility but never pools shared memory; `TursoConnection` requires `Pooling=False` and rejects `Pooling=True` before opening. `ClearPool` and `ClearAllPools` affect file pools only.
 - Managed `Cache=Shared` is rejected for file databases, empty or `:memory:` data sources, and modes other than `Memory`, because those configurations cannot provide a true shared managed page/cache owner. `Cache=Private` and the default cache remain connection-private for memory databases. Managed shared-memory connections also reject connection-local functions, aggregates, and collations because the current managed function registry belongs to the shared database rather than an individual connection.
 - `PRAGMA read_uncommitted` remains connection-local compatibility state for native and managed private-cache connections. Managed shared-memory databases preserve transaction isolation and reject enabling `PRAGMA read_uncommitted` or beginning an `IsolationLevel.ReadUncommitted` transaction rather than claiming unsupported dirty-read behavior.
 - Managed `BackupDatabase` atomically replaces existing managed destinations, including schema, rows, `schema_version`, `user_version`, and `application_id`, and accepts `main` or attached database names. Active source transactions are copied from their current snapshot without being completed, and active source readers remain usable. Non-transactional file sources are reopened before snapshot acquisition so commits from other connections are included. Memory and physical-file endpoints are supported, including encrypted file-to-file re-encryption; failures before publication leave the destination unchanged.

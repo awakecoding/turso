@@ -48,7 +48,7 @@ public sealed class ManagedDefaultValuesTests
         Action missingRequiredValue = () => Execute(connection, "INSERT INTO required_items DEFAULT VALUES;");
         missingRequiredValue.Should()
             .Throw<EmbeddedSqlException>()
-            .WithMessage("*NOT NULL constraint failed: value*");
+            .WithMessage("*NOT NULL constraint failed: required_items.value*");
         ReadRows(connection, "SELECT * FROM required_items;").Should().BeEmpty();
 
         Execute(connection, "CREATE TABLE optional_items(value TEXT DEFAULT 'default');");

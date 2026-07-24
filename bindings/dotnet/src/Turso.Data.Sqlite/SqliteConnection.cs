@@ -100,7 +100,10 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         ? ConnectionState.Closed
         : ConnectionState.Open;
 
-    public override bool CanCreateBatch => true;
+    public TursoConnectionCapabilities Capabilities
+        => TursoConnectionCapabilities.ForSqlite(_connectionOptions.EffectiveLocalProvider);
+
+    public override bool CanCreateBatch => Capabilities.CanCreateBatch;
 
     protected override DbProviderFactory DbProviderFactory => SqliteFactory.Instance;
 
@@ -109,6 +112,11 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_database is not null || _managedDatabase is not null)
             throw new InvalidOperationException("The connection is already open.");
+        if (TursoConnectionCapabilities.IsRemoteDataSource(_connectionOptions.DataSource))
+        {
+            throw new NotSupportedException(
+                "Turso.Data.Sqlite supports only local database connections. Use TursoConnection for remote Hrana or embedded replica connections.");
+        }
         ValidateManagedSharedCacheOptions();
         if (!string.IsNullOrEmpty(_connectionOptions.Password))
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
@@ -440,7 +448,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     public virtual void EnableExtensions(bool enable = true)
     {
-        if (enable && IsManagedProvider)
+        if (enable && !Capabilities.SupportsExtensions)
             throw new NotSupportedException(Properties.Resources.ManagedExtensionsNotSupported);
 
         _extensionsEnabled = enable;
@@ -451,7 +459,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     public virtual void LoadExtension(string file, string? proc = null)
     {
         ArgumentNullException.ThrowIfNull(file);
-        if (IsManagedProvider)
+        if (!Capabilities.SupportsExtensions)
             throw new NotSupportedException(Properties.Resources.ManagedExtensionsNotSupported);
         if (proc is not null)
             throw new NotSupportedException("Custom extension entry points are not yet supported by the Turso SQLite-compatible provider.");
@@ -502,6 +510,25 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
         => BeginTransaction(isolationLevel);
+
+    protected override async ValueTask<DbTransaction> BeginDbTransactionAsync(
+        IsolationLevel isolationLevel,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (State != ConnectionState.Open)
+            throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection(nameof(BeginTransaction)));
+        if (Transaction is not null)
+            throw new InvalidOperationException(Properties.Resources.ParallelTransactionsNotSupported);
+
+        return Transaction = await SqliteTransaction
+            .CreateAsync(
+                this,
+                isolationLevel,
+                deferred: isolationLevel == IsolationLevel.ReadUncommitted,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     protected override void Dispose(bool disposing)
     {
