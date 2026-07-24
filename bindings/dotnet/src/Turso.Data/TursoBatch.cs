@@ -241,6 +241,7 @@ public sealed class TursoBatch : DbBatch
                 throw new InvalidOperationException("Batch command text must be set before executing a batch.");
             if (command.CommandType != CommandType.Text)
                 throw new NotSupportedException("TursoBatchCommand only supports CommandType.Text.");
+            connection.ValidateCommandCapabilities(command.CommandText);
         }
 
         return connection;

@@ -36,6 +36,8 @@ public class SqliteBlob : Stream
         ArgumentNullException.ThrowIfNull(columnName);
         if (connection.State != ConnectionState.Open)
             throw new InvalidOperationException(Properties.Resources.SqlBlobRequiresOpenConnection);
+        if (!connection.Capabilities.SupportsIncrementalBlob)
+            throw new NotSupportedException("Incremental blob I/O is not supported by this connection.");
 
         _connection = connection;
         _databaseName = databaseName;

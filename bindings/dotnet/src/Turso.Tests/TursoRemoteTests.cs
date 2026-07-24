@@ -849,6 +849,88 @@ public class TursoRemoteTests
     }
 
     [Test]
+    public async Task TestRemoteAsyncTransactionsAndSavepointsUseBaton()
+    {
+        const string closeResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(
+            ExecuteResponse("stream.1"),
+            ExecuteResponse("stream.2"),
+            ExecuteResponse("stream.3"),
+            ExecuteResponse("stream.4"),
+            ExecuteResponse("stream.5"),
+            closeResponseJson);
+        using var connection = new TursoConnection(
+            $"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        await using var transaction = await connection.BeginTransactionAsync();
+        transaction.SupportsSavepoints.Should().BeTrue();
+        await transaction.SaveAsync("checkpoint");
+        await transaction.RollbackAsync("checkpoint");
+        await transaction.ReleaseAsync("checkpoint");
+        await transaction.CommitAsync();
+
+        server.RequestBodies.Should().HaveCount(6);
+        var expectedSql = new[]
+        {
+            "BEGIN",
+            "SAVEPOINT \"checkpoint\";",
+            "ROLLBACK TO SAVEPOINT \"checkpoint\";",
+            "RELEASE SAVEPOINT \"checkpoint\";",
+            "COMMIT",
+        };
+        for (var i = 0; i < expectedSql.Length; i++)
+        {
+            using var document = JsonDocument.Parse(server.RequestBodies[i]);
+            document.RootElement.GetProperty("requests")[0]
+                .GetProperty("stmt")
+                .GetProperty("sql")
+                .GetString()
+                .Should().Be(expectedSql[i]);
+            if (i > 0)
+                document.RootElement.GetProperty("baton").GetString().Should().Be($"stream.{i}");
+        }
+
+        using var closeDocument = JsonDocument.Parse(server.RequestBodies[5]);
+        closeDocument.RootElement.GetProperty("baton").GetString().Should().Be("stream.5");
+        closeDocument.RootElement.GetProperty("requests")[0]
+            .GetProperty("type")
+            .GetString()
+            .Should().Be("close");
+
+        static string ExecuteResponse(string baton)
+            => $$"""
+                {
+                  "baton": "{{baton}}",
+                  "results": [
+                    {
+                      "type": "ok",
+                      "response": {
+                        "type": "execute",
+                        "result": {
+                          "cols": [],
+                          "rows": [],
+                          "affected_row_count": 0,
+                          "last_insert_rowid": null
+                        }
+                      }
+                    }
+                  ]
+                }
+                """;
+    }
+
+    [Test]
     public void TestRemoteCommandAndBatchRejectTransactionFromDifferentConnection()
     {
         const string beginResponseJson = """

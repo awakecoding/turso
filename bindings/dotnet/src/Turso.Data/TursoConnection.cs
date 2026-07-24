@@ -53,7 +53,10 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
         ? ConnectionState.Open
         : ConnectionState.Closed;
 
-    public override bool CanCreateBatch => !_connectionOptions.IsReplica;
+    public TursoConnectionCapabilities Capabilities
+        => TursoConnectionCapabilities.ForTurso(_connectionOptions);
+
+    public override bool CanCreateBatch => Capabilities.CanCreateBatch;
 
     protected override DbProviderFactory DbProviderFactory => TursoFactory.Instance;
 
@@ -206,15 +209,20 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
-        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
-        if (_nativeDatabase is null && _managedDatabase is null && _remoteClient is null)
-        {
-            throw new InvalidOperationException("Turso database is closed.");
-        }
-        if (_transaction is not null)
-            throw new InvalidOperationException("Parallel transactions are not supported.");
+        ValidateCanBeginTransaction();
 
         return _transaction = new TursoTransaction(this, isolationLevel);
+    }
+
+    protected override async ValueTask<DbTransaction> BeginDbTransactionAsync(
+        IsolationLevel isolationLevel,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ValidateCanBeginTransaction();
+        return _transaction = await TursoTransaction
+            .CreateAsync(this, isolationLevel, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     protected override DbCommand CreateDbCommand()
@@ -257,7 +265,7 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
             return Task.FromCanceled(cancellationToken);
         if (State != ConnectionState.Open)
             throw new InvalidOperationException("Turso database is closed.");
-        if (!_connectionOptions.IsReplica)
+        if (!Capabilities.SupportsSync)
             throw new NotSupportedException("Sync requires an embedded replica connection.");
 
         return (_replicaDatabase ?? throw new InvalidOperationException("Turso database is closed."))
@@ -275,7 +283,7 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
             return Task.FromCanceled<TursoSyncResult>(cancellationToken);
         if (State != ConnectionState.Open)
             throw new InvalidOperationException("Turso database is closed.");
-        if (!_connectionOptions.IsReplica)
+        if (!Capabilities.SupportsSync)
             throw new NotSupportedException("Sync requires an embedded replica connection.");
 
         return (_replicaDatabase ?? throw new InvalidOperationException("Turso database is closed."))
@@ -351,6 +359,18 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
         _remoteTransactionActive = false;
         _transaction?.MarkCompletedExternally();
         CloseRemoteSessionIfStateless();
+    }
+
+    internal void ValidateCommandCapabilities(string sql)
+    {
+        var keyword = SqlTransactionControl.GetFirstKeyword(sql);
+        if (!Capabilities.SupportsAttach
+            && (keyword?.Equals("ATTACH", StringComparison.OrdinalIgnoreCase) == true
+                || keyword?.Equals("DETACH", StringComparison.OrdinalIgnoreCase) == true))
+        {
+            throw new NotSupportedException(
+                "ATTACH and DETACH are supported only for local database connections.");
+        }
     }
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
@@ -436,6 +456,40 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
         }
     }
 
+    internal async Task BeginRemoteTransactionAsync(
+        IsolationLevel isolationLevel,
+        CancellationToken cancellationToken)
+    {
+        _ = isolationLevel;
+        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        if (_remoteTransactionActive)
+            throw new InvalidOperationException("A transaction is already active on this connection.");
+
+        _remoteTransactionActive = true;
+        try
+        {
+            await remoteClient
+                .ExecuteAsync(
+                    "BEGIN",
+                    new TursoParameterCollection(),
+                    wantRows: false,
+                    DefaultTimeout,
+                    closeAfter: false,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TursoRemoteSqlException)
+        {
+            _remoteTransactionActive = false;
+            throw;
+        }
+        catch
+        {
+            InvalidateRemoteSession();
+            throw;
+        }
+    }
+
     internal void CommitRemoteTransaction()
     {
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
@@ -462,6 +516,37 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
         _remoteTransactionActive = false;
     }
 
+    internal async Task CommitRemoteTransactionAsync(CancellationToken cancellationToken)
+    {
+        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        if (!_remoteTransactionActive)
+            throw new InvalidOperationException("No remote transaction is active on this connection.");
+
+        try
+        {
+            await remoteClient
+                .ExecuteAsync(
+                    "COMMIT",
+                    new TursoParameterCollection(),
+                    wantRows: false,
+                    DefaultTimeout,
+                    closeAfter: false,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TursoRemoteSqlException)
+        {
+            throw;
+        }
+        catch
+        {
+            InvalidateRemoteSession();
+            throw;
+        }
+
+        _remoteTransactionActive = false;
+    }
+
     internal void RollbackRemoteTransaction()
     {
         var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
@@ -474,6 +559,32 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
                 .ExecuteAsync("ROLLBACK", new TursoParameterCollection(), wantRows: false, DefaultTimeout, closeAfter: false, CancellationToken.None)
                 .GetAwaiter()
                 .GetResult();
+            _remoteTransactionActive = false;
+        }
+        catch
+        {
+            InvalidateRemoteSession();
+            throw;
+        }
+    }
+
+    internal async Task RollbackRemoteTransactionAsync(CancellationToken cancellationToken)
+    {
+        var remoteClient = _remoteClient ?? throw new InvalidOperationException("Turso database is closed.");
+        if (!_remoteTransactionActive)
+            throw new InvalidOperationException("No remote transaction is active on this connection.");
+
+        try
+        {
+            await remoteClient
+                .ExecuteAsync(
+                    "ROLLBACK",
+                    new TursoParameterCollection(),
+                    wantRows: false,
+                    DefaultTimeout,
+                    closeAfter: false,
+                    cancellationToken)
+                .ConfigureAwait(false);
             _remoteTransactionActive = false;
         }
         catch
@@ -582,6 +693,37 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
 
             throw new NotSupportedException(
                 "Password is not supported. Use Encryption Cipher and Encryption Key for local encrypted databases.");
+        }
+
+        ValidatePoolingOptions();
+    }
+
+    private void ValidateCanBeginTransaction()
+    {
+        _replicaOptions?.ThrowIfApplicationHttpReentrant(closing: false);
+        if (_nativeDatabase is null && _managedDatabase is null && _remoteClient is null)
+            throw new InvalidOperationException("Turso database is closed.");
+        if (_transaction is not null)
+            throw new InvalidOperationException("Parallel transactions are not supported.");
+    }
+
+    private void ValidatePoolingOptions()
+    {
+        if (!_connectionOptions.Pooling)
+            return;
+
+        var dataSource = _connectionOptions.DataSource;
+        var mode = _connectionOptions.Mode;
+        var eligibleManagedFile = Capabilities.SupportsPooling
+            && !string.IsNullOrWhiteSpace(dataSource)
+            && !dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
+            && !mode.Equals("Memory", StringComparison.OrdinalIgnoreCase)
+            && !_connectionOptions.GetEncryptionCipher().HasValue
+            && string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]);
+        if (!eligibleManagedFile)
+        {
+            throw new NotSupportedException(
+                "Pooling=True is supported only for unencrypted managed local file databases.");
         }
     }
 
