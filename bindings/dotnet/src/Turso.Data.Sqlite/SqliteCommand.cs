@@ -232,7 +232,7 @@ public class SqliteCommand : DbCommand
             return new SqliteDataReader(this, -1, behavior, CloseReader);
         }
 
-        if (Connection?.HasOpenReader == true && IsWriteCommand(CommandText))
+        if (Connection?.HasOpenReader == true && IsReaderBlockingCommand(CommandText))
         {
             Thread.Sleep(TimeSpan.FromSeconds(CommandTimeout));
             throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
@@ -514,9 +514,15 @@ public class SqliteCommand : DbCommand
     private static bool IsWriteCommand(string commandText)
         => SplitStatements(commandText).Any(IsWriteStatement);
 
+    private static bool IsReaderBlockingCommand(string commandText)
+        => SplitStatements(commandText).Any(statement =>
+            IsWriteStatement(statement)
+            || TrimLeadingSqlTrivia(statement).StartsWith("ATTACH", StringComparison.OrdinalIgnoreCase)
+            || TrimLeadingSqlTrivia(statement).StartsWith("DETACH", StringComparison.OrdinalIgnoreCase));
+
     private static bool IsWriteStatement(string statement)
     {
-        var trimmed = statement.TrimStart();
+        var trimmed = TrimLeadingSqlTrivia(statement);
         return trimmed.StartsWith("CREATE", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("DROP", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("ALTER", StringComparison.OrdinalIgnoreCase)
@@ -526,6 +532,39 @@ public class SqliteCommand : DbCommand
                || trimmed.StartsWith("REPLACE", StringComparison.OrdinalIgnoreCase)
                || trimmed.StartsWith("VACUUM", StringComparison.OrdinalIgnoreCase)
                || IsWithDmlStatement(trimmed);
+    }
+
+    private static string TrimLeadingSqlTrivia(string statement)
+    {
+        var offset = 0;
+        while (offset < statement.Length)
+        {
+            while (offset < statement.Length && char.IsWhiteSpace(statement[offset]))
+                offset++;
+            if (offset + 1 >= statement.Length)
+                break;
+
+            if (statement[offset] == '-' && statement[offset + 1] == '-')
+            {
+                offset += 2;
+                while (offset < statement.Length && statement[offset] is not ('\r' or '\n'))
+                    offset++;
+                continue;
+            }
+
+            if (statement[offset] == '/' && statement[offset + 1] == '*')
+            {
+                var end = statement.IndexOf("*/", offset + 2, StringComparison.Ordinal);
+                if (end < 0)
+                    return string.Empty;
+                offset = end + 2;
+                continue;
+            }
+
+            break;
+        }
+
+        return statement[offset..];
     }
 
     internal bool TryHandleFacadeStatement(string sql, out string rewrittenSql)

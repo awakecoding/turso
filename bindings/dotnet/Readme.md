@@ -191,6 +191,7 @@ Supported common connection string keywords include:
 ## SQLite-compatible facade coverage
 
 - `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, SQL-backed blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
+- Managed `ATTACH` supports file-backed aliases, filename expressions and parameters, `file:` URIs with `mode=ro|rw|rwc`, inherited page encryption, same-cipher hexadecimal `KEY` overrides, same-database SELECT/DML/CTE/subquery routing, and transactions/savepoints that modify at most one database. Statements spanning databases and transactions that attempt to write a second database are rejected before that second write because independent WAL files cannot be committed atomically. The managed engine does not implement `temp`, attached in-memory databases, URI options other than `mode`, cross-database views/triggers, or plaintext-to-encrypted `KEY` attachment without a primary cipher.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
 - `PRAGMA read_uncommitted` is tracked as connection-local state for API compatibility, but Turso does not currently implement SQLite shared-cache dirty reads.
 - `SqliteBlob` preserves fixed-length blob stream behavior through SQL reads and writes. It is not yet backed by a native incremental-blob storage handle.
