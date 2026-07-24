@@ -510,6 +510,200 @@ public sealed class ManagedConstraintSemanticsTests
         }
     }
 
+    [Test]
+    public void GeneratedNotNullIgnoreSkipsInvalidInsertAndUpdateRows()
+    {
+        const string create =
+            """
+            CREATE TABLE generated_not_null(
+                id INTEGER,
+                value INTEGER,
+                computed INTEGER GENERATED ALWAYS AS (
+                    CASE WHEN value > 0 THEN value END
+                ) STORED NOT NULL ON CONFLICT IGNORE
+            );
+            """;
+        AssertQueryMatchesSqlite(
+            [
+                create,
+                "INSERT INTO generated_not_null(id, value) VALUES (1, 1), (2, 0), (3, 3);",
+                "UPDATE generated_not_null SET value = 0;",
+            ],
+            "SELECT id, value, computed FROM generated_not_null ORDER BY id;");
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, create);
+                Execute(
+                    connection,
+                    "INSERT INTO generated_not_null(id, value) VALUES (1, 1), (2, 0), (3, 3);");
+                ReadRows(connection, "SELECT id FROM generated_not_null ORDER BY id;")
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(1, 3);
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                Execute(sqlite, "UPDATE generated_not_null SET value = 0;");
+                ScalarInteger(sqlite, "SELECT COUNT(*) FROM generated_not_null WHERE value > 0;").Should().Be(2);
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Execute(
+                reopenedConnection,
+                "INSERT INTO generated_not_null(id, value) VALUES (4, 4), (5, 0), (6, 6);");
+            Execute(reopenedConnection, "UPDATE generated_not_null SET value = 0 WHERE id >= 4;");
+            ReadRows(reopenedConnection, "SELECT id, value, computed FROM generated_not_null ORDER BY id;")
+                .Should().BeEquivalentTo(
+                [
+                    new[] { SqlValue.Integer(1), SqlValue.Integer(1), SqlValue.Integer(1) },
+                    new[] { SqlValue.Integer(3), SqlValue.Integer(3), SqlValue.Integer(3) },
+                    new[] { SqlValue.Integer(4), SqlValue.Integer(4), SqlValue.Integer(4) },
+                    new[] { SqlValue.Integer(6), SqlValue.Integer(6), SqlValue.Integer(6) },
+                ],
+                options => options.WithStrictOrdering());
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void QuotedDottedCheckIdentifierIsNotTreatedAsQualification()
+    {
+        const string create =
+            """CREATE TABLE dotted("dotted.value" INTEGER, value INTEGER, CHECK("dotted.value" > 0));""";
+        AssertQueryMatchesSqlite(
+            [create, """INSERT INTO dotted("dotted.value", value) VALUES (1, -1);"""],
+            "SELECT COUNT(*) FROM dotted;");
+
+        using (var managedDatabase = new EmbeddedDatabase())
+        using (var managed = managedDatabase.Connect())
+        {
+            Execute(managed, create);
+            Action invalid = () => Execute(
+                managed,
+                """INSERT INTO dotted("dotted.value", value) VALUES (-1, 1);""");
+            invalid.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("CHECK constraint failed: \"dotted.value\" > 0");
+        }
+
+        using (var sqlite = new MsData.SqliteConnection("Data Source=:memory:"))
+        {
+            sqlite.Open();
+            Execute(sqlite, create);
+            Action invalid = () => Execute(
+                sqlite,
+                """INSERT INTO dotted("dotted.value", value) VALUES (-1, 1);""");
+            invalid.Should().Throw<MsData.SqliteException>()
+                .WithMessage("*CHECK constraint failed: dotted.value*");
+        }
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, create);
+                Execute(connection, """INSERT INTO dotted("dotted.value", value) VALUES (1, -1);""");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Action reopenedInvalid = () => Execute(
+                reopenedConnection,
+                """INSERT INTO dotted("dotted.value", value) VALUES (0, 1);""");
+            reopenedInvalid.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("CHECK constraint failed: \"dotted.value\" > 0");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void UniqueIgnoreUpdateScansRowidOrderAfterOutOfOrderInsertion()
+    {
+        const string create =
+            "CREATE TABLE ordered(id INTEGER PRIMARY KEY, value INTEGER UNIQUE ON CONFLICT IGNORE);";
+        AssertQueryMatchesSqlite(
+            [
+                create,
+                "INSERT INTO ordered VALUES (2, 2), (1, 1);",
+                "UPDATE ordered SET value = 0;",
+            ],
+            "SELECT id, value FROM ordered ORDER BY id;");
+
+        using (var database = new EmbeddedDatabase())
+        using (var connection = database.Connect())
+        {
+            Execute(connection, create);
+            Execute(connection, "INSERT INTO ordered VALUES (2, 2), (1, 1);");
+            Execute(connection, "UPDATE ordered SET value = 0;");
+            ReadRows(connection, "SELECT id, value FROM ordered ORDER BY id;")
+                .Should().BeEquivalentTo(
+                [
+                    new[] { SqlValue.Integer(1), SqlValue.Integer(0) },
+                    new[] { SqlValue.Integer(2), SqlValue.Integer(2) },
+                ],
+                options => options.WithStrictOrdering());
+        }
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, create);
+                Execute(connection, "INSERT INTO ordered VALUES (2, 2), (1, 1);");
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Execute(connection, "INSERT INTO ordered VALUES (4, 4), (3, 3);");
+                Execute(connection, "UPDATE ordered SET value = 10 WHERE id >= 3;");
+                ReadRows(connection, "SELECT id, value FROM ordered ORDER BY id;")
+                    .Should().BeEquivalentTo(
+                    [
+                        new[] { SqlValue.Integer(1), SqlValue.Integer(1) },
+                        new[] { SqlValue.Integer(2), SqlValue.Integer(2) },
+                        new[] { SqlValue.Integer(3), SqlValue.Integer(10) },
+                        new[] { SqlValue.Integer(4), SqlValue.Integer(4) },
+                    ],
+                    options => options.WithStrictOrdering());
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     private static void AssertQueryMatchesSqlite(IReadOnlyList<string> setup, string query)
     {
         var managed = RunManaged(setup, query);

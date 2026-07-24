@@ -1454,35 +1454,36 @@ public sealed class EmbeddedDatabase : IDisposable
         void InsertExpressions(Expression[] values)
         {
             var plan = PrepareInsert(statement, table);
-            var (row, rowId) = BuildInsertRow(
+            BuildAndCommitCandidate(() => BuildInsertRow(
                 statement,
                 table,
                 plan,
                 values,
                 parameters,
                 context,
-                allowExistingRowid: true);
-            CommitCandidate(row, rowId);
+                allowExistingRowid: true));
         }
 
         void InsertValues(IReadOnlyList<SqlValue> values)
         {
             var plan = PrepareInsert(statement, table);
-            var (row, rowId) = BuildInsertRow(
+            BuildAndCommitCandidate(() => BuildInsertRow(
                 statement,
                 table,
                 plan,
                 values,
                 parameters,
                 context,
-                allowExistingRowid: true);
-            CommitCandidate(row, rowId);
+                allowExistingRowid: true));
         }
 
-        void CommitCandidate(SqlValue[] row, long rowId)
+        void BuildAndCommitCandidate(Func<(SqlValue[] Row, long RowId)> build)
         {
+            SqlValue[]? row = null;
+            var rowId = 0L;
             try
             {
+                (row, rowId) = build();
                 CommitInserts(context, statement.TableName, table, [row], [rowId]);
                 insertedRows.Add(row);
                 insertedRowIds.Add(rowId);
@@ -1500,7 +1501,8 @@ public sealed class EmbeddedDatabase : IDisposable
                     case InsertConflictAlgorithm.Rollback:
                         throw new EmbeddedConflictRollbackException(exception);
                     case InsertConflictAlgorithm.Replace
-                        when exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal):
+                        when row is not null
+                            && exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal):
                         if (HasForeignKeyParticipation(context, statement.TableName, table))
                         {
                             throw new EmbeddedSqlException(
@@ -2908,7 +2910,10 @@ public sealed class EmbeddedDatabase : IDisposable
         var updatedRowIds = statement.Returning is null ? null : new List<long>();
         var updatedPositions = new List<int>();
         var rowsAffected = 0;
-        for (var position = 0; position < table.Rows.Count; position++)
+        var updateOrder = table.HasRowid
+            ? Enumerable.Range(0, table.Rows.Count).OrderBy(position => rowIds[position]).ToArray()
+            : Enumerable.Range(0, table.Rows.Count).ToArray();
+        foreach (var position in updateOrder)
         {
             var row = table.Rows[position];
             var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
@@ -2923,11 +2928,20 @@ public sealed class EmbeddedDatabase : IDisposable
                     continue;
             }
 
-            var (updated, newRowid) = BuildUpdatedRow(statement, table, plan, row, rowid, parameters, context);
-            rows[position] = updated;
-            rowIds[position] = newRowid;
+            SqlValue[]? updated = null;
+            var newRowid = rowid;
             try
             {
+                (updated, newRowid) = BuildUpdatedRow(
+                    statement,
+                    table,
+                    plan,
+                    row,
+                    rowid,
+                    parameters,
+                    context);
+                rows[position] = updated;
+                rowIds[position] = newRowid;
                 ValidateRowIdsUnique(statement.TableName, table, rowIds, plan.AliasIndex);
                 table.ValidateRows(statement.TableName, rows);
                 ValidateColumnUniqueConstraints(table, rows);
@@ -2951,7 +2965,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 }
                 throw;
             }
-            updatedRows?.Add(updated);
+            updatedRows?.Add(updated!);
             updatedRowIds?.Add(newRowid);
             updatedPositions.Add(position);
             rowsAffected++;
@@ -7898,7 +7912,7 @@ public sealed class EmbeddedDatabase : IDisposable
         switch (expression)
         {
             case ColumnExpression column:
-                row.GetValue(column.Name);
+                row.GetValue(column);
                 return;
             case FunctionExpression function:
                 foreach (var argument in function.Arguments)
@@ -10137,7 +10151,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 _ => throw new InvalidOperationException($"Unknown current-time kind {current.Kind}."),
             },
             ParameterExpression parameter => ReadParameter(parameters, parameter.Index),
-            ColumnExpression column => row?.GetValue(column.Name)
+            ColumnExpression column => row?.GetValue(column)
                 ?? throw new EmbeddedSqlException($"no such column: {column.Name}"),
             FunctionExpression function => EvaluateScalarFunction(function, parameters, row, context),
             ScalarSubqueryExpression subquery => EvaluateScalarSubquery(subquery, parameters, row, context),
@@ -17206,7 +17220,7 @@ internal sealed class EmbeddedTable
             case ColumnExpression column:
                 if (!allowColumns)
                     throw new EmbeddedSqlException($"default value of column is not constant: {column.Name}");
-                if (!IsConstraintColumn(column.Name))
+                if (!IsConstraintColumn(column))
                     throw new EmbeddedSqlException($"no such column: {column.Name}");
                 return;
             case ParameterExpression:
@@ -17272,16 +17286,15 @@ internal sealed class EmbeddedTable
         }
     }
 
-    private bool IsConstraintColumn(string name)
+    private bool IsConstraintColumn(ColumnExpression column)
     {
-        var separator = name.IndexOf('.');
-        var bare = separator < 0 ? name : name[(separator + 1)..];
-        if (separator >= 0
-            && !string.Equals(name[..separator], Name, StringComparison.OrdinalIgnoreCase))
+        if (column.Qualifier is not null
+            && !string.Equals(column.Qualifier, Name, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
+        var bare = column.UnqualifiedName ?? column.Name;
         return _columnIndices.ContainsKey(bare)
             || (HasRowid && IsRowidAliasName(bare));
     }
@@ -17291,8 +17304,7 @@ internal sealed class EmbeddedTable
         foreach (var check in ColumnDefinitions.SelectMany(column => column.CheckConstraints).Concat(CheckConstraints))
         {
             var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            CollectColumnReferences(check.Expression, references);
-            if (references.Any(reference => reference.Contains('.')))
+            if (CollectColumnReferences(check.Expression, references))
                 return true;
         }
 
@@ -17685,65 +17697,61 @@ internal sealed class EmbeddedTable
                 or "PRINTF" or "FORMAT" or "STRFTIME" or "TIME" or "UNIXEPOCH";
     }
 
-    private static void CollectColumnReferences(Expression expression, HashSet<string> names)
+    private static bool CollectColumnReferences(Expression expression, HashSet<string> names)
     {
         switch (expression)
         {
             case ColumnExpression column:
                 names.Add(column.Name);
-                return;
+                return column.Qualifier is not null;
             case FunctionExpression function:
+                var functionQualified = false;
                 foreach (var argument in function.Arguments)
-                    CollectColumnReferences(argument, names);
+                    functionQualified |= CollectColumnReferences(argument, names);
                 if (function.Filter is not null)
-                    CollectColumnReferences(function.Filter, names);
-                return;
+                    functionQualified |= CollectColumnReferences(function.Filter, names);
+                return functionQualified;
             case CollationExpression collation:
-                CollectColumnReferences(collation.Expression, names);
-                return;
+                return CollectColumnReferences(collation.Expression, names);
             case CastExpression cast:
-                CollectColumnReferences(cast.Expression, names);
-                return;
+                return CollectColumnReferences(cast.Expression, names);
             case CaseExpression @case:
+                var caseQualified = false;
                 if (@case.Operand is not null)
-                    CollectColumnReferences(@case.Operand, names);
+                    caseQualified |= CollectColumnReferences(@case.Operand, names);
                 foreach (var clause in @case.Clauses)
                 {
-                    CollectColumnReferences(clause.When, names);
-                    CollectColumnReferences(clause.Then, names);
+                    caseQualified |= CollectColumnReferences(clause.When, names);
+                    caseQualified |= CollectColumnReferences(clause.Then, names);
                 }
                 if (@case.Else is not null)
-                    CollectColumnReferences(@case.Else, names);
-                return;
+                    caseQualified |= CollectColumnReferences(@case.Else, names);
+                return caseQualified;
             case LikeExpression like:
-                CollectColumnReferences(like.Value, names);
-                CollectColumnReferences(like.Pattern, names);
+                var likeQualified = CollectColumnReferences(like.Value, names)
+                    | CollectColumnReferences(like.Pattern, names);
                 if (like.Escape is not null)
-                    CollectColumnReferences(like.Escape, names);
-                return;
+                    likeQualified |= CollectColumnReferences(like.Escape, names);
+                return likeQualified;
             case GlobExpression glob:
-                CollectColumnReferences(glob.Value, names);
-                CollectColumnReferences(glob.Pattern, names);
-                return;
+                return CollectColumnReferences(glob.Value, names)
+                    | CollectColumnReferences(glob.Pattern, names);
             case InExpression @in:
-                CollectColumnReferences(@in.Value, names);
+                var inQualified = CollectColumnReferences(@in.Value, names);
                 foreach (var value in @in.Values)
-                    CollectColumnReferences(value, names);
-                return;
+                    inQualified |= CollectColumnReferences(value, names);
+                return inQualified;
             case BetweenExpression between:
-                CollectColumnReferences(between.Value, names);
-                CollectColumnReferences(between.Lower, names);
-                CollectColumnReferences(between.Upper, names);
-                return;
+                return CollectColumnReferences(between.Value, names)
+                    | CollectColumnReferences(between.Lower, names)
+                    | CollectColumnReferences(between.Upper, names);
             case UnaryExpression unary:
-                CollectColumnReferences(unary.Operand, names);
-                return;
+                return CollectColumnReferences(unary.Operand, names);
             case BinaryExpression binary:
-                CollectColumnReferences(binary.Left, names);
-                CollectColumnReferences(binary.Right, names);
-                return;
+                return CollectColumnReferences(binary.Left, names)
+                    | CollectColumnReferences(binary.Right, names);
             default:
-                return;
+                return false;
         }
     }
 
@@ -18117,9 +18125,19 @@ internal sealed record SourceRow(
     string? RowIdQualifier = null)
 {
     public SqlValue GetValue(string name)
+        => GetValue(name, allowQualifiedLookup: true);
+
+    public SqlValue GetValue(ColumnExpression column)
+        => GetValue(column.Name, allowQualifiedLookup: column.Qualifier is not null);
+
+    private SqlValue GetValue(string name, bool allowQualifiedLookup)
     {
-        if (QualifiedColumns is not null && QualifiedColumns.TryGetValue(name, out var qualifiedIndex))
+        if (allowQualifiedLookup
+            && QualifiedColumns is not null
+            && QualifiedColumns.TryGetValue(name, out var qualifiedIndex))
+        {
             return Values[qualifiedIndex];
+        }
 
         // Columns joined with USING/NATURAL are coalesced: an unqualified reference to
         // such a column must resolve to COALESCE(left, right) so RIGHT/FULL joins report
@@ -18150,7 +18168,7 @@ internal sealed record SourceRow(
             return SqlValue.Integer(rowid);
 
         if (Parent is not null)
-            return Parent.GetValue(name);
+            return Parent.GetValue(name, allowQualifiedLookup);
 
         throw new EmbeddedSqlException($"no such column: {name}");
     }
@@ -18545,7 +18563,10 @@ internal sealed record CurrentTimeExpression(CurrentTimeKind Kind) : Expression;
 
 internal sealed record ParameterExpression(int Index) : Expression;
 
-internal sealed record ColumnExpression(string Name) : Expression;
+internal sealed record ColumnExpression(
+    string Name,
+    string? Qualifier = null,
+    string? UnqualifiedName = null) : Expression;
 
 internal sealed record FunctionExpression(
     string Name,
@@ -20282,7 +20303,13 @@ internal sealed class SqlParser
 
                 _lexer.Next();
                 if (Consume(TokenKind.Dot))
-                    return new ColumnExpression(token.Text + "." + ExpectIdentifier());
+                {
+                    var columnName = ExpectIdentifier();
+                    return new ColumnExpression(
+                        token.Text + "." + columnName,
+                        token.Text,
+                        columnName);
+                }
                 if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
                     return new LiteralExpression(SqlValue.Null);
                 if (string.Equals(token.Text, "CURRENT_DATE", StringComparison.OrdinalIgnoreCase))
