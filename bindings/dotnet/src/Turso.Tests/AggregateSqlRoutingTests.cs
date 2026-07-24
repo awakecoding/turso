@@ -1087,6 +1087,31 @@ public class AggregateSqlRoutingTests
     }
 
     [Test]
+    public void NoCaseHashMatchesEmbeddedNullEquality()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(value TEXT COLLATE NOCASE);");
+        using (var insert = connection.Prepare("INSERT INTO t VALUES (?1), (?2);"))
+        {
+            insert.Bind(1, SqlValue.Text("A\0x"));
+            insert.Bind(2, SqlValue.Text("a\0y"));
+            insert.Step().Should().Be(StatementStepResult.Done);
+        }
+
+        var grouped = ReadRows(connection, "SELECT count(*) FROM t GROUP BY value;");
+        grouped.Should().ContainSingle();
+        grouped[0][0].Should().Be(SqlValue.Integer(2));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT count(*) FROM t GROUP BY value;"))
+            .Should().Contain("GroupKey");
+
+        ReadRows(
+                connection,
+                "SELECT count(*) OVER (PARTITION BY value) FROM t ORDER BY value;")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(2, 2);
+    }
+
+    [Test]
     public void ExplainDoesNotExecuteAggregateLimitCallbacks()
     {
         var calls = 0;

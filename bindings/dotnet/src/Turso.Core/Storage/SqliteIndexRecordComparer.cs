@@ -3,11 +3,11 @@ using System.Text;
 namespace Turso.Core.Storage;
 
 /// <summary>
-/// Compares SQLite index records using BINARY collation and retained term directions.
+/// Compares SQLite index records using retained term collations and directions.
 /// </summary>
 /// <remarks>
-/// NOCASE, RTRIM, and application-defined collations need their own comparator
-/// before their index pages can be built or validated.
+/// Fields after the retained terms use ascending BINARY order. For an ordinary
+/// SQLite index this is the appended rowid field.
 /// </remarks>
 public sealed class SqliteIndexRecordComparer
 {
@@ -15,11 +15,11 @@ public sealed class SqliteIndexRecordComparer
     private static readonly UnicodeEncoding StrictUtf16LittleEndian = new(false, false, true);
     private static readonly UnicodeEncoding StrictUtf16BigEndian = new(true, false, true);
 
-    private readonly bool[] _descendingFields;
+    private readonly SqliteIndexComparisonTerm[] _terms;
 
     /// <summary>Creates a comparer for records encoded using <paramref name="textEncoding"/>.</summary>
     public SqliteIndexRecordComparer(SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8)
-        : this(textEncoding, [])
+        : this(textEncoding, Array.Empty<SqliteIndexComparisonTerm>())
     {
     }
 
@@ -30,13 +30,47 @@ public sealed class SqliteIndexRecordComparer
     public SqliteIndexRecordComparer(
         SqliteTextEncoding textEncoding,
         IReadOnlyList<bool> descendingFields)
+        : this(
+            textEncoding,
+            descendingFields,
+            Enumerable.Repeat<string?>("BINARY", descendingFields?.Count ?? 0).ToArray())
     {
-        ArgumentNullException.ThrowIfNull(descendingFields);
+    }
+
+    /// <summary>
+    /// Creates a comparer whose listed leading fields use the supplied sort
+    /// directions and built-in SQLite collations.
+    /// </summary>
+    public SqliteIndexRecordComparer(
+        SqliteTextEncoding textEncoding,
+        IReadOnlyList<bool> descendingFields,
+        IReadOnlyList<string?> collations)
+        : this(textEncoding, CreateTerms(descendingFields, collations))
+    {
+    }
+
+    /// <summary>Creates a comparer for schema-aware leading index terms.</summary>
+    public SqliteIndexRecordComparer(
+        SqliteTextEncoding textEncoding,
+        IReadOnlyList<SqliteIndexComparisonTerm> terms)
+    {
+        ArgumentNullException.ThrowIfNull(terms);
         TextEncoding = textEncoding is SqliteTextEncoding.Unset
             ? SqliteTextEncoding.Utf8
             : textEncoding;
         _ = GetTextEncoding(TextEncoding);
-        _descendingFields = descendingFields.ToArray();
+        _terms = terms.ToArray();
+        foreach (var term in _terms)
+        {
+            ArgumentNullException.ThrowIfNull(term.Collation);
+            if (!term.Collation.IsAvailable)
+                throw new NotSupportedException("SQLite index comparison requires concrete collation metadata.");
+            if (!term.Collation.IsSupportedByManagedIndexWriter)
+            {
+                throw new NotSupportedException(
+                    $"SQLite index comparison does not support application-defined collation {term.Collation.Name}.");
+            }
+        }
     }
 
     /// <summary>The database text encoding used to interpret text record fields.</summary>
@@ -55,9 +89,12 @@ public sealed class SqliteIndexRecordComparer
         var count = Math.Min(left.Count, right.Count);
         for (var index = 0; index < count; index++)
         {
-            var result = CompareValue(left[index], right[index]);
+            var term = index < _terms.Length
+                ? _terms[index]
+                : SqliteIndexComparisonTerm.BinaryAscending;
+            var result = CompareValue(left[index], right[index], term.Collation);
             if (result != 0)
-                return index < _descendingFields.Length && _descendingFields[index]
+                return term.SortOrder == SqliteKeySortOrder.Descending
                     ? -Math.Sign(result)
                     : result;
         }
@@ -76,7 +113,17 @@ public sealed class SqliteIndexRecordComparer
         }
     }
 
-    private int CompareValue(SqlValue left, SqlValue right)
+    /// <summary>
+    /// Returns whether a collation name is one of SQLite's built-in persisted
+    /// index collations. A missing name means BINARY.
+    /// </summary>
+    public static bool IsSupportedCollation(string? collation)
+        => collation is null
+            || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase);
+
+    private int CompareValue(SqlValue left, SqlValue right, SqliteKeyCollation collation)
     {
         var leftClass = GetStorageClass(left.Kind);
         var rightClass = GetStorageClass(right.Kind);
@@ -87,13 +134,63 @@ public sealed class SqliteIndexRecordComparer
         {
             StorageClass.Null => 0,
             StorageClass.Numeric => CompareNumeric(left, right),
-            StorageClass.Text => CompareBinary(
-                GetTextEncoding(TextEncoding).GetBytes(left.AsText()),
-                GetTextEncoding(TextEncoding).GetBytes(right.AsText())),
+            StorageClass.Text => CompareText(left.AsText(), right.AsText(), collation),
             StorageClass.Blob => CompareBinary(left.AsBlob().Span, right.AsBlob().Span),
             _ => throw new InvalidOperationException("SQLite index record has an unknown storage class."),
         };
     }
+
+    private int CompareText(string left, string right, SqliteKeyCollation collation)
+    {
+        if (collation.IsNoCase)
+            return CompareNoCaseText(left, right);
+
+        if (collation.IsRTrim)
+            return CompareRTrimText(left, right);
+
+        if (collation.IsBinary)
+        {
+            var encoding = GetTextEncoding(TextEncoding);
+            return CompareBinary(encoding.GetBytes(left), encoding.GetBytes(right));
+        }
+
+        throw new NotSupportedException(
+            $"SQLite index comparison does not support collation {collation.Name}.");
+    }
+
+    internal static int CompareNoCaseText(string left, string right)
+    {
+        var leftBytes = StrictUtf8.GetBytes(left);
+        var rightBytes = StrictUtf8.GetBytes(right);
+        var count = Math.Min(leftBytes.Length, rightBytes.Length);
+        for (var index = 0; index < count; index++)
+        {
+            var leftByte = FoldAscii(leftBytes[index]);
+            var rightByte = FoldAscii(rightBytes[index]);
+            if (leftByte == 0 || rightByte == 0)
+            {
+                return leftByte == rightByte
+                    ? leftBytes.Length.CompareTo(rightBytes.Length)
+                    : leftByte.CompareTo(rightByte);
+            }
+
+            var comparison = leftByte.CompareTo(rightByte);
+            if (comparison != 0)
+                return comparison;
+        }
+
+        return leftBytes.Length.CompareTo(rightBytes.Length);
+    }
+
+    internal static int CompareRTrimText(string left, string right)
+        => CompareBinary(
+            StrictUtf8.GetBytes(left.TrimEnd(' ')),
+            StrictUtf8.GetBytes(right.TrimEnd(' ')));
+
+    private static byte FoldAscii(byte value)
+        => value is >= (byte)'A' and <= (byte)'Z'
+            ? (byte)(value + ((byte)'a' - (byte)'A'))
+            : value;
 
     private static StorageClass GetStorageClass(SqlValueKind kind)
     {
@@ -181,6 +278,32 @@ public sealed class SqliteIndexRecordComparer
         };
     }
 
+    private static SqliteIndexComparisonTerm[] CreateTerms(
+        IReadOnlyList<bool> descendingFields,
+        IReadOnlyList<string?> collations)
+    {
+        ArgumentNullException.ThrowIfNull(descendingFields);
+        ArgumentNullException.ThrowIfNull(collations);
+        if (descendingFields.Count != collations.Count)
+        {
+            throw new ArgumentException(
+                "SQLite index sort-direction and collation metadata must describe the same number of fields.",
+                nameof(collations));
+        }
+
+        var terms = new SqliteIndexComparisonTerm[descendingFields.Count];
+        for (var index = 0; index < terms.Length; index++)
+        {
+            terms[index] = new SqliteIndexComparisonTerm(
+                descendingFields[index] ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
+                collations[index] is null
+                    ? SqliteKeyCollation.Binary
+                    : SqliteKeyCollation.FromName(collations[index]!));
+        }
+
+        return terms;
+    }
+
     private enum StorageClass
     {
         Null,
@@ -188,4 +311,13 @@ public sealed class SqliteIndexRecordComparer
         Text,
         Blob,
     }
+}
+
+/// <summary>Comparison metadata for one leading SQLite index-record field.</summary>
+public sealed record SqliteIndexComparisonTerm(
+    SqliteKeySortOrder SortOrder,
+    SqliteKeyCollation Collation)
+{
+    internal static SqliteIndexComparisonTerm BinaryAscending { get; } =
+        new(SqliteKeySortOrder.Ascending, SqliteKeyCollation.Binary);
 }

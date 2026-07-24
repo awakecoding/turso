@@ -15,7 +15,9 @@ internal sealed record CreateTableStatement(
     IReadOnlyList<TableUniqueConstraint>? UniqueConstraints = null,
     IReadOnlyList<CheckConstraint>? CheckConstraints = null,
     InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm = null,
-    string? PrimaryKeyConstraintName = null) : ParsedStatement;
+    string? PrimaryKeyConstraintName = null,
+    int? PrimaryKeyDeclarationOrder = null,
+    IReadOnlyList<ForeignKeyDefinition>? TableForeignKeys = null) : ParsedStatement;
 
 internal sealed record DropTableStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -165,6 +167,10 @@ internal sealed record PragmaIndexListStatement(string TableName) : ParsedStatem
 
 internal sealed record PragmaIndexInfoStatement(string IndexName) : ParsedStatement;
 
+internal sealed record PragmaForeignKeyListStatement(string TableName) : ParsedStatement;
+
+internal sealed record PragmaForeignKeyCheckStatement(string? TableName) : ParsedStatement;
+
 internal sealed record PragmaTableListStatement : ParsedStatement;
 
 internal sealed record PragmaDatabaseListStatement : ParsedStatement;
@@ -174,6 +180,8 @@ internal sealed record PragmaEncodingStatement : ParsedStatement;
 internal sealed record PragmaQueryOnlyStatement(bool? Enabled) : ParsedStatement;
 
 internal sealed record PragmaForeignKeysStatement(bool? Enabled) : ParsedStatement;
+
+internal sealed record PragmaDeferForeignKeysStatement(bool? Enabled) : ParsedStatement;
 
 internal sealed record PragmaRecursiveTriggersStatement(bool? Enabled) : ParsedStatement;
 
@@ -350,10 +358,10 @@ internal sealed record EmbeddedColumn(
     string? DefaultConstraintName = null,
     string? CollationConstraintName = null,
     string? GenerationConstraintName = null,
-    string? ForeignKeyConstraintName = null,
     string? NullConstraintName = null,
     bool ExplicitNull = false,
-    bool GenerationAlways = false)
+    bool GenerationAlways = false,
+    IReadOnlyList<ForeignKeyDefinition>? AdditionalForeignKeys = null)
 {
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether
@@ -362,6 +370,13 @@ internal sealed record EmbeddedColumn(
 
     public IReadOnlyList<CheckConstraint> CheckConstraints { get; } =
         Array.AsReadOnly((Checks ?? []).ToArray());
+
+    public IReadOnlyList<ForeignKeyDefinition> ForeignKeyConstraints { get; } =
+        Array.AsReadOnly(
+            (ForeignKey is null
+                ? AdditionalForeignKeys ?? []
+                : new[] { ForeignKey }.Concat(AdditionalForeignKeys ?? []))
+            .ToArray());
 
     public bool HasDefault => DefaultValue.HasValue || DefaultExpression is not null;
 }
@@ -374,7 +389,8 @@ internal sealed record TablePrimaryKeyColumn(string Name, bool Descending, strin
 internal sealed record TableUniqueConstraint(
     string? Name,
     IReadOnlyList<TablePrimaryKeyColumn> Columns,
-    InsertConflictAlgorithm? ConflictAlgorithm = null);
+    InsertConflictAlgorithm? ConflictAlgorithm = null,
+    int DeclarationOrder = int.MaxValue);
 
 internal sealed record CheckConstraint(
     string? Name,
@@ -382,7 +398,31 @@ internal sealed record CheckConstraint(
     string Sql,
     InsertConflictAlgorithm? ConflictAlgorithm = null);
 
-internal sealed record ForeignKeyDefinition(string ChildColumn, string ParentTable, string ParentColumn);
+internal enum ForeignKeyAction
+{
+    NoAction,
+    Restrict,
+    SetNull,
+    SetDefault,
+    Cascade,
+}
+
+internal enum ForeignKeyDeferral
+{
+    NotDeferrable,
+    InitiallyImmediate,
+    InitiallyDeferred,
+}
+
+internal sealed record ForeignKeyDefinition(
+    IReadOnlyList<string> ChildColumns,
+    string ParentTable,
+    IReadOnlyList<string> ParentColumns,
+    ForeignKeyAction OnDelete = ForeignKeyAction.NoAction,
+    ForeignKeyAction OnUpdate = ForeignKeyAction.NoAction,
+    string? Match = null,
+    ForeignKeyDeferral Deferral = ForeignKeyDeferral.NotDeferrable,
+    string? ConstraintName = null);
 
 internal sealed record EmbeddedIndexColumn(string Name, int ColumnIndex, string? Collation, bool Descending);
 

@@ -151,6 +151,10 @@ internal sealed class SqlParser
             return new PragmaIndexListStatement(ParsePragmaObjectName());
         if (name.Equals("index_info", StringComparison.OrdinalIgnoreCase))
             return new PragmaIndexInfoStatement(ParsePragmaObjectName());
+        if (name.Equals("foreign_key_list", StringComparison.OrdinalIgnoreCase))
+            return new PragmaForeignKeyListStatement(ParsePragmaObjectName());
+        if (name.Equals("foreign_key_check", StringComparison.OrdinalIgnoreCase))
+            return new PragmaForeignKeyCheckStatement(ParseOptionalPragmaObjectName(name));
         if (name.Equals("table_list", StringComparison.OrdinalIgnoreCase))
         {
             RequireReadOnlyPragma(name);
@@ -170,6 +174,8 @@ internal sealed class SqlParser
             return new PragmaQueryOnlyStatement(ParseOptionalPragmaBoolean(name));
         if (name.Equals("foreign_keys", StringComparison.OrdinalIgnoreCase))
             return new PragmaForeignKeysStatement(ParseOptionalPragmaBoolean(name));
+        if (name.Equals("defer_foreign_keys", StringComparison.OrdinalIgnoreCase))
+            return new PragmaDeferForeignKeysStatement(ParseOptionalPragmaBoolean(name));
         if (name.Equals("recursive_triggers", StringComparison.OrdinalIgnoreCase))
             return new PragmaRecursiveTriggersStatement(ParseOptionalPragmaBoolean(name));
         if (name.Equals("schema_version", StringComparison.OrdinalIgnoreCase))
@@ -204,6 +210,15 @@ internal sealed class SqlParser
         var objectName = ExpectIdentifier();
         Expect(TokenKind.RightParen);
         return objectName;
+    }
+
+    private string? ParseOptionalPragmaObjectName(string name)
+    {
+        if (_lexer.Current.Kind is TokenKind.Semicolon or TokenKind.End)
+            return null;
+        if (_lexer.Current.Kind != TokenKind.LeftParen)
+            throw Error($"PRAGMA {name} requires a parenthesized table name.");
+        return ParsePragmaObjectName();
     }
 
     private void RequireReadOnlyPragma(string name)
@@ -380,13 +395,17 @@ internal sealed class SqlParser
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null;
         InsertConflictAlgorithm? tablePrimaryKeyConflictAlgorithm = null;
         string? tablePrimaryKeyConstraintName = null;
+        int? tablePrimaryKeyDeclarationOrder = null;
         var uniqueConstraints = new List<TableUniqueConstraint>();
         var checkConstraints = new List<CheckConstraint>();
+        var tableConstraintOrder = 0;
+        var tableForeignKeys = new List<ForeignKeyDefinition>();
         do
         {
             if (IsTableConstraintStart())
             {
                 var parsed = ParseTableConstraint();
+                var declarationOrder = tableConstraintOrder++;
                 switch (parsed)
                 {
                     case PrimaryKeyTableConstraint primaryKey:
@@ -396,15 +415,17 @@ internal sealed class SqlParser
                         tablePrimaryKey = primaryKey.Columns;
                         tablePrimaryKeyConflictAlgorithm = primaryKey.ConflictAlgorithm;
                         tablePrimaryKeyConstraintName = primaryKey.Name;
+                        tablePrimaryKeyDeclarationOrder = declarationOrder;
                         break;
                     case ForeignKeyTableConstraint foreignKey:
-                        AttachTableForeignKey(columns, foreignKey.Definition);
+                        tableForeignKeys.Add(foreignKey.Definition);
                         break;
                     case UniqueTableConstraint unique:
                         uniqueConstraints.Add(new TableUniqueConstraint(
                             unique.Name,
                             unique.Columns,
-                            unique.ConflictAlgorithm));
+                            unique.ConflictAlgorithm,
+                            declarationOrder));
                         break;
                     case CheckTableConstraint check:
                         checkConstraints.Add(new CheckConstraint(
@@ -443,7 +464,9 @@ internal sealed class SqlParser
             uniqueConstraints,
             checkConstraints,
             tablePrimaryKeyConflictAlgorithm,
-            tablePrimaryKeyConstraintName);
+            tablePrimaryKeyConstraintName,
+            tablePrimaryKeyDeclarationOrder,
+            tableForeignKeys);
     }
 
     private abstract record TableConstraint;
@@ -488,13 +511,9 @@ internal sealed class SqlParser
         if (ConsumeKeyword("FOREIGN"))
         {
             ExpectKeyword("KEY");
-            Expect(TokenKind.LeftParen);
-            var childColumn = ExpectIdentifier();
-            if (Consume(TokenKind.Comma))
-                throw Error("Composite foreign key constraints are not supported.");
-            Expect(TokenKind.RightParen);
+            var childColumns = ParseForeignKeyColumns();
             ExpectKeyword("REFERENCES");
-            return new ForeignKeyTableConstraint(ParseForeignKeyReference(childColumn));
+            return new ForeignKeyTableConstraint(ParseForeignKeyReference(childColumns, constraintName));
         }
 
         if (ConsumeKeyword("CHECK"))
@@ -528,40 +547,114 @@ internal sealed class SqlParser
         return columns;
     }
 
-    private static void AttachTableForeignKey(List<EmbeddedColumn> columns, ForeignKeyDefinition foreignKey)
+    private IReadOnlyList<string> ParseForeignKeyColumns()
     {
-        var index = columns.FindIndex(column =>
-            string.Equals(column.Name, foreignKey.ChildColumn, StringComparison.OrdinalIgnoreCase));
-        if (index < 0)
-            throw new EmbeddedSqlException($"foreign key constraint references unknown column: {foreignKey.ChildColumn}");
-        if (columns[index].ForeignKey is not null)
-            throw new EmbeddedSqlException($"multiple foreign key constraints on column {foreignKey.ChildColumn} are not supported");
-
-        columns[index] = columns[index] with { ForeignKey = foreignKey };
+        Expect(TokenKind.LeftParen);
+        var columns = new List<string>();
+        do
+        {
+            columns.Add(ExpectIdentifier());
+        }
+        while (Consume(TokenKind.Comma));
+        Expect(TokenKind.RightParen);
+        return columns;
     }
 
-    private ForeignKeyDefinition ParseForeignKeyReference(string childColumn)
+    private ForeignKeyDefinition ParseForeignKeyReference(
+        IReadOnlyList<string> childColumns,
+        string? constraintName = null)
     {
         var parentTable = ExpectIdentifier();
         if (Consume(TokenKind.Dot))
             throw Error("Schema-qualified foreign keys are not supported.");
-        if (!Consume(TokenKind.LeftParen))
-            throw Error("Foreign key references must name exactly one parent column.");
 
-        var parentColumn = ExpectIdentifier();
-        if (Consume(TokenKind.Comma))
-            throw Error("Composite foreign key constraints are not supported.");
-        Expect(TokenKind.RightParen);
+        IReadOnlyList<string> parentColumns = [];
+        if (_lexer.Current.Kind == TokenKind.LeftParen)
+            parentColumns = ParseForeignKeyColumns();
 
-        if (CurrentIsKeyword("ON")
-            || CurrentIsKeyword("MATCH")
-            || CurrentIsKeyword("DEFERRABLE")
-            || CurrentIsKeyword("NOT"))
+        var onDelete = ForeignKeyAction.NoAction;
+        var onUpdate = ForeignKeyAction.NoAction;
+        string? match = null;
+        var deferral = ForeignKeyDeferral.NotDeferrable;
+        while (true)
         {
-            throw Error("Foreign key actions, MATCH, and deferral are not supported.");
+            if (ConsumeKeyword("ON"))
+            {
+                var isDelete = ConsumeKeyword("DELETE");
+                if (!isDelete)
+                    ExpectKeyword("UPDATE");
+
+                var action = ParseForeignKeyAction();
+                if (isDelete)
+                    onDelete = action;
+                else
+                    onUpdate = action;
+                continue;
+            }
+
+            if (ConsumeKeyword("MATCH"))
+            {
+                match = ExpectIdentifier();
+                continue;
+            }
+
+            var notDeferrable = ConsumeKeyword("NOT");
+            if (notDeferrable || ConsumeKeyword("DEFERRABLE"))
+            {
+                if (notDeferrable)
+                    ExpectKeyword("DEFERRABLE");
+
+                var initiallyDeferred = false;
+                if (ConsumeKeyword("INITIALLY"))
+                {
+                    if (ConsumeKeyword("DEFERRED"))
+                        initiallyDeferred = true;
+                    else
+                        ExpectKeyword("IMMEDIATE");
+                }
+
+                deferral = notDeferrable
+                    ? ForeignKeyDeferral.NotDeferrable
+                    : initiallyDeferred
+                        ? ForeignKeyDeferral.InitiallyDeferred
+                        : ForeignKeyDeferral.InitiallyImmediate;
+                continue;
+            }
+
+            break;
         }
 
-        return new ForeignKeyDefinition(childColumn, parentTable, parentColumn);
+        return new ForeignKeyDefinition(
+            childColumns,
+            parentTable,
+            parentColumns,
+            onDelete,
+            onUpdate,
+            match,
+            deferral,
+            constraintName);
+    }
+
+    private ForeignKeyAction ParseForeignKeyAction()
+    {
+        if (ConsumeKeyword("CASCADE"))
+            return ForeignKeyAction.Cascade;
+        if (ConsumeKeyword("RESTRICT"))
+            return ForeignKeyAction.Restrict;
+        if (ConsumeKeyword("SET"))
+        {
+            if (ConsumeKeyword("NULL"))
+                return ForeignKeyAction.SetNull;
+            ExpectKeyword("DEFAULT");
+            return ForeignKeyAction.SetDefault;
+        }
+        if (ConsumeKeyword("NO"))
+        {
+            ExpectKeyword("ACTION");
+            return ForeignKeyAction.NoAction;
+        }
+
+        throw Error("Expected CASCADE, RESTRICT, SET NULL, SET DEFAULT, or NO ACTION.");
     }
 
     private ParsedStatement ParseCreateIndex(bool unique)
@@ -2007,7 +2100,7 @@ internal sealed class SqlParser
         Expression? generationExpression = null;
         var generatedStored = false;
         string? generationSql = null;
-        ForeignKeyDefinition? foreignKey = null;
+        var foreignKeys = new List<ForeignKeyDefinition>();
         var checks = new List<CheckConstraint>();
         InsertConflictAlgorithm? primaryKeyConflictAlgorithm = null;
         InsertConflictAlgorithm? notNullConflictAlgorithm = null;
@@ -2018,7 +2111,6 @@ internal sealed class SqlParser
         string? defaultConstraintName = null;
         string? collationConstraintName = null;
         string? generationConstraintName = null;
-        string? foreignKeyConstraintName = null;
         string? nullConstraintName = null;
         var explicitNull = false;
         var generationAlways = false;
@@ -2122,11 +2214,7 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("REFERENCES"))
             {
-                if (foreignKey is not null)
-                    throw Error($"multiple foreign key constraints on column {name} are not supported");
-
-                foreignKey = ParseForeignKeyReference(name);
-                foreignKeyConstraintName = pendingConstraintName;
+                foreignKeys.Add(ParseForeignKeyReference([name], pendingConstraintName));
                 pendingConstraintName = null;
                 continue;
             }
@@ -2158,7 +2246,7 @@ internal sealed class SqlParser
             generatedStored,
             generationSql,
             collation,
-            foreignKey,
+            foreignKeys.FirstOrDefault(),
             checks,
             defaultExpression,
             defaultSql,
@@ -2171,10 +2259,10 @@ internal sealed class SqlParser
             defaultConstraintName,
             collationConstraintName,
             generationConstraintName,
-            foreignKeyConstraintName,
             nullConstraintName,
             explicitNull,
-            generationAlways);
+            generationAlways,
+            foreignKeys.Skip(1).ToArray());
     }
 
     private string? ParseDeclaredType()

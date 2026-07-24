@@ -51,6 +51,50 @@ public class SqliteIndexLeafStorageTests
     }
 
     [Test]
+    public void IndexRecordComparerAppliesBuiltInCollationsAndDirectionsPerTerm()
+    {
+        var comparer = new SqliteIndexRecordComparer(
+            SqliteTextEncoding.Utf8,
+            [true, false, false],
+            ["NOCASE", "RTRIM", "BINARY"]);
+
+        comparer.Compare(
+            Record(SqlValue.Text("a"), SqlValue.Text("x "), SqlValue.Integer(1), SqlValue.Integer(5)),
+            Record(SqlValue.Text("B"), SqlValue.Text("x"), SqlValue.Integer(1), SqlValue.Integer(2)))
+            .Should().BeGreaterThan(0);
+        comparer.Compare(
+            Record(SqlValue.Text("A"), SqlValue.Text("x "), SqlValue.Integer(1), SqlValue.Integer(1)),
+            Record(SqlValue.Text("a"), SqlValue.Text("x"), SqlValue.Integer(1), SqlValue.Integer(2)))
+            .Should().BeLessThan(0);
+        comparer.Compare(
+            Record(SqlValue.Text("a\0c"), SqlValue.Text("x"), SqlValue.Integer(1), SqlValue.Integer(1)),
+            Record(SqlValue.Text("A\0b"), SqlValue.Text("x"), SqlValue.Integer(1), SqlValue.Integer(2)))
+            .Should().BeLessThan(0);
+        comparer.Compare(
+            Record(SqlValue.Text("Ä"), SqlValue.Text("x"), SqlValue.Integer(1)),
+            Record(SqlValue.Text("ä"), SqlValue.Text("x"), SqlValue.Integer(1)))
+            .Should().NotBe(0);
+
+        var utf16RTrim = new SqliteIndexRecordComparer(
+            SqliteTextEncoding.Utf16LittleEndian,
+            [false],
+            ["RTRIM"]);
+        utf16RTrim.Compare(
+            SqliteRecordCodec.Encode(
+                [SqlValue.Text("ÿ")],
+                SqliteTextEncoding.Utf16LittleEndian),
+            SqliteRecordCodec.Encode(
+                [SqlValue.Text("Ā")],
+                SqliteTextEncoding.Utf16LittleEndian))
+            .Should().BeLessThan(0);
+
+        Assert.Throws<NotSupportedException>(() => new SqliteIndexRecordComparer(
+            SqliteTextEncoding.Utf8,
+            [false],
+            ["custom"]));
+    }
+
+    [Test]
     public void IndexLeafPageBuilderPacksOrderedCellsAndPreservesReservedBytes()
     {
         const int pageSize = SqlitePageSize.Minimum;

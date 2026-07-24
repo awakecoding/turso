@@ -119,7 +119,7 @@ public sealed class ManagedSchemaDefinitionRecoverySafetyTests
     }
 
     [Test]
-    public void OversizedEncryptedSchemaSqlIsRejectedWithoutPublishingCatalogOrPages()
+    public void OversizedEncryptedSchemaSqlPersistsThroughOverflowPages()
     {
         var fileSystem = new InMemoryFileSystem();
         const string path = "oversized-encrypted-schema.db";
@@ -132,13 +132,11 @@ public sealed class ManagedSchemaDefinitionRecoverySafetyTests
         {
             Execute(connection, "CREATE TABLE durable(id INTEGER PRIMARY KEY, value TEXT);");
             Execute(connection, "INSERT INTO durable VALUES (1, 'before');");
+            Execute(connection, $"CREATE TABLE oversized(value TEXT DEFAULT '{oversizedDefault}');");
+            Execute(connection, "INSERT INTO oversized DEFAULT VALUES;");
 
-            Assert.Throws<EmbeddedSqlException>(() => Execute(
-                connection,
-                $"CREATE TABLE oversized(value TEXT DEFAULT '{oversizedDefault}');"))!
-                .Message.Should().Contain("schema overflow pages are not supported");
-
-            ScalarInteger(connection, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'oversized';").Should().Be(0);
+            ScalarInteger(connection, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'oversized';").Should().Be(1);
+            ScalarInteger(connection, "SELECT length(value) FROM oversized;").Should().Be(oversizedDefault.Length);
             Scalar(connection, "SELECT value FROM durable WHERE id = 1;").Should().Be("before");
         }
 
@@ -146,7 +144,8 @@ public sealed class ManagedSchemaDefinitionRecoverySafetyTests
         using var reopenedFileSystem = new TursoEncryptionFileSystem(fileSystem, reopenEncryption);
         using var reopened = EmbeddedDatabase.OpenFile(path, reopenedFileSystem);
         using var reopenedConnection = reopened.Connect();
-        ScalarInteger(reopenedConnection, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'oversized';").Should().Be(0);
+        ScalarInteger(reopenedConnection, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'oversized';").Should().Be(1);
+        ScalarInteger(reopenedConnection, "SELECT length(value) FROM oversized;").Should().Be(oversizedDefault.Length);
         Scalar(reopenedConnection, "SELECT value FROM durable WHERE id = 1;").Should().Be("before");
     }
 
