@@ -1345,9 +1345,17 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"table {statement.NewName} already exists");
         if (TryFindIndex(tables, statement.NewName, out _, out _))
             throw new EmbeddedSqlException($"there is already an index named {statement.NewName}");
-        if (!tables.Remove(statement.TableName, out var table))
+        if (!tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+        if (table.HasQualifiedCheckReferences())
+        {
+            throw new EmbeddedSqlException(
+                "ALTER TABLE RENAME cannot rewrite table-qualified CHECK expressions until "
+                + "managed schema token rewriting is implemented.");
+        }
 
+        if (!tables.Remove(statement.TableName))
+            throw new InvalidOperationException($"Table '{statement.TableName}' disappeared during rename.");
         table.Rename(statement.NewName);
         tables.Add(statement.NewName, table);
         return new ExecutionResult([], [], 0, true);
@@ -2872,7 +2880,9 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         var requiresRowwiseConstraintValidation =
             context.Tables.TryGetValue(statement.TableName, out var table)
-            && (table.PrimaryKeyColumns.Count > 0 || table.Indexes.Any(index => index.Unique));
+            && (table.PrimaryKeyColumns.Count > 0
+                || table.Indexes.Any(index => index.Unique)
+                || table.HasNonDefaultConflictAlgorithms);
         if (!requiresRowwiseConstraintValidation
             && CanCompileDml(context)
             && TryCompileUpdate(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
@@ -17265,11 +17275,28 @@ internal sealed class EmbeddedTable
     private bool IsConstraintColumn(string name)
     {
         var separator = name.IndexOf('.');
-        if (separator < 0)
-            return _columnIndices.ContainsKey(name);
+        var bare = separator < 0 ? name : name[(separator + 1)..];
+        if (separator >= 0
+            && !string.Equals(name[..separator], Name, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
 
-        return string.Equals(name[..separator], Name, StringComparison.OrdinalIgnoreCase)
-            && _columnIndices.ContainsKey(name[(separator + 1)..]);
+        return _columnIndices.ContainsKey(bare)
+            || (HasRowid && IsRowidAliasName(bare));
+    }
+
+    public bool HasQualifiedCheckReferences()
+    {
+        foreach (var check in ColumnDefinitions.SelectMany(column => column.CheckConstraints).Concat(CheckConstraints))
+        {
+            var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            CollectColumnReferences(check.Expression, references);
+            if (references.Any(reference => reference.Contains('.')))
+                return true;
+        }
+
+        return false;
     }
 
     public string Name { get; private set; }

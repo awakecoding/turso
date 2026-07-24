@@ -356,6 +356,160 @@ public sealed class ManagedConstraintSemanticsTests
         }
     }
 
+    [Test]
+    public void TableRenameRejectsQualifiedChecksBeforeMutation()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE TABLE old_name(value INTEGER, CHECK(old_name.value > 0));");
+                Action rename = () => Execute(connection, "ALTER TABLE old_name RENAME TO new_name;");
+                rename.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*table-qualified CHECK expressions*");
+
+                Execute(connection, "INSERT INTO old_name VALUES (1);");
+                Action invalid = () => Execute(connection, "INSERT INTO old_name VALUES (0);");
+                invalid.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("CHECK constraint failed: old_name.value > 0");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                ScalarInteger(sqlite, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'old_name';").Should().Be(1);
+                ScalarInteger(sqlite, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'new_name';").Should().Be(0);
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Action reopenedInvalid = () => Execute(reopenedConnection, "INSERT INTO old_name VALUES (-1);");
+            reopenedInvalid.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("CHECK constraint failed: old_name.value > 0");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void CheckRowidAliasesMatchSqliteShadowingAndSurviveReopen()
+    {
+        const string create =
+            "CREATE TABLE rowid_checks(value INTEGER, CHECK(rowid > 0), CHECK(rowid_checks._rowid_ > 0), CHECK(oid > 0));";
+        AssertQueryMatchesSqlite(
+            [create, "INSERT INTO rowid_checks(value) VALUES (1);"],
+            "SELECT value FROM rowid_checks;");
+
+        using (var managedDatabase = new EmbeddedDatabase())
+        using (var managed = managedDatabase.Connect())
+        {
+            Action invalidWithoutRowid = () => Execute(
+                managed,
+                "CREATE TABLE invalid(value INTEGER PRIMARY KEY, CHECK(rowid > 0)) WITHOUT ROWID;");
+            invalidWithoutRowid.Should().Throw<EmbeddedSqlException>().WithMessage("no such column: rowid");
+            Execute(
+                managed,
+                "CREATE TABLE shadowed(rowid INTEGER, value INTEGER, CHECK(rowid > 0), CHECK(shadowed._rowid_ > 0));");
+            Execute(managed, "INSERT INTO shadowed(rowid, value) VALUES (1, 1);");
+            Action hiddenRowidViolation = () => Execute(
+                managed,
+                "INSERT INTO shadowed(_rowid_, rowid, value) VALUES (-1, 1, 2);");
+            hiddenRowidViolation.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("CHECK constraint failed: shadowed._rowid_ > 0");
+        }
+
+        using (var sqlite = new MsData.SqliteConnection("Data Source=:memory:"))
+        {
+            sqlite.Open();
+            Action invalidWithoutRowid = () => Execute(
+                sqlite,
+                "CREATE TABLE invalid(value INTEGER PRIMARY KEY, CHECK(rowid > 0)) WITHOUT ROWID;");
+            invalidWithoutRowid.Should().Throw<MsData.SqliteException>().WithMessage("*no such column: rowid*");
+        }
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, create);
+                Execute(connection, "INSERT INTO rowid_checks(rowid, value) VALUES (1, 1);");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                Action invalid = () => Execute(sqlite, "INSERT INTO rowid_checks(rowid, value) VALUES (-1, 2);");
+                invalid.Should().Throw<MsData.SqliteException>()
+                    .WithMessage("*CHECK constraint failed: rowid > 0*");
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Action reopenedInvalid = () => Execute(
+                reopenedConnection,
+                "INSERT INTO rowid_checks(rowid, value) VALUES (-2, 3);");
+            reopenedInvalid.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("CHECK constraint failed: rowid > 0");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void NotNullIgnoreUpdateUsesRowwiseConflictPolicyAfterReopen()
+    {
+        AssertQueryMatchesSqlite(
+            [
+                "CREATE TABLE configured(value INTEGER NOT NULL ON CONFLICT IGNORE);",
+                "INSERT INTO configured VALUES (1), (2);",
+                "UPDATE configured SET value = NULL;",
+            ],
+            "SELECT value FROM configured ORDER BY value;");
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE TABLE configured(value INTEGER NOT NULL ON CONFLICT IGNORE);");
+                Execute(connection, "INSERT INTO configured VALUES (1), (2);");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                Execute(sqlite, "UPDATE configured SET value = NULL;");
+                ScalarInteger(sqlite, "SELECT COUNT(*) FROM configured WHERE value IS NOT NULL;").Should().Be(2);
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Execute(reopenedConnection, "UPDATE configured SET value = NULL;");
+            ReadRows(reopenedConnection, "SELECT value FROM configured ORDER BY value;")
+                .Select(row => row[0].AsInteger())
+                .Should().Equal(1, 2);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     private static void AssertQueryMatchesSqlite(IReadOnlyList<string> setup, string query)
     {
         var managed = RunManaged(setup, query);
