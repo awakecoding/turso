@@ -101,14 +101,17 @@ build-rust-iosarm64:
 build-rust-iossimulatorarm64:
 	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target aarch64-apple-ios-sim $(RUST_RELEASE_OPT)
 
-build-rust-ios: build-rust-iosarm64 build-rust-iossimulatorarm64
+build-rust-iossimulator64:
+	cargo build -p turso_sdk_kit -p turso_sync_sdk_kit --target-dir ./rs_compiled --target x86_64-apple-ios $(RUST_RELEASE_OPT)
+
+build-rust-ios: build-rust-iosarm64 build-rust-iossimulatorarm64 build-rust-iossimulator64
 
 package-rust-iosframework:
 	rm -rf "$(IOS_FRAMEWORK_BUILD_DIR)" "$(IOS_XCFRAMEWORK_DIR)"
 	mkdir -p "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework" "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework" ./rs_compiled/ios-universal/native
 	cp ./rs_compiled/aarch64-apple-ios/$(RUST_PROFILE_DIR)/$(IOS_DYLIB_FILE) "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
 	install_name_tool -id @rpath/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME) "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
-	cp ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/$(IOS_DYLIB_FILE) "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
+	lipo -create ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/$(IOS_DYLIB_FILE) ./rs_compiled/x86_64-apple-ios/$(RUST_PROFILE_DIR)/$(IOS_DYLIB_FILE) -output "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
 	install_name_tool -id @rpath/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME) "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
 	printf '%s\n' \
 	'<?xml version="1.0" encoding="UTF-8"?>' \
@@ -136,6 +139,8 @@ package-rust-iosframework:
 	'</dict>' \
 	'</plist>' > "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/Info.plist"
 	cp "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/Info.plist" "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/Info.plist"
+	codesign --force --sign - "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
+	codesign --force --sign - "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework/$(IOS_FRAMEWORK_NAME)"
 	xcodebuild -create-xcframework -framework "$(IOS_FRAMEWORK_BUILD_DIR)/device/$(IOS_FRAMEWORK_NAME).framework" -framework "$(IOS_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_FRAMEWORK_NAME).framework" -output "$(IOS_XCFRAMEWORK_DIR)"
 
 package-rust-ios-syncframework:
@@ -143,7 +148,7 @@ package-rust-ios-syncframework:
 	mkdir -p "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework" "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework" ./rs_compiled/ios-sync-universal/native
 	cp ./rs_compiled/aarch64-apple-ios/$(RUST_PROFILE_DIR)/$(IOS_SYNC_DYLIB_FILE) "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
 	install_name_tool -id @rpath/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME) "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
-	cp ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/$(IOS_SYNC_DYLIB_FILE) "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
+	lipo -create ./rs_compiled/aarch64-apple-ios-sim/$(RUST_PROFILE_DIR)/$(IOS_SYNC_DYLIB_FILE) ./rs_compiled/x86_64-apple-ios/$(RUST_PROFILE_DIR)/$(IOS_SYNC_DYLIB_FILE) -output "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
 	install_name_tool -id @rpath/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME) "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
 	printf '%s\n' \
 		'<?xml version="1.0" encoding="UTF-8"?>' \
@@ -171,6 +176,8 @@ package-rust-ios-syncframework:
 		'</dict>' \
 		'</plist>' > "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/Info.plist"
 	cp "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/Info.plist" "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework/Info.plist"
+	codesign --force --sign - "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
+	codesign --force --sign - "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework/$(IOS_SYNC_FRAMEWORK_NAME)"
 	xcodebuild -create-xcframework -framework "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/device/$(IOS_SYNC_FRAMEWORK_NAME).framework" -framework "$(IOS_SYNC_FRAMEWORK_BUILD_DIR)/simulator/$(IOS_SYNC_FRAMEWORK_NAME).framework" -output "$(IOS_SYNC_XCFRAMEWORK_DIR)"
 
 build-rust: 

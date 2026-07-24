@@ -140,19 +140,19 @@
       <Pack>true</Pack>
       <PackagePath>runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64/libturso_sync_sdk_kit.framework/</PackagePath>
     </None>
-    <None Include="..\..\rs_compiled\ios-sync-universal\native\libturso_sync_sdk_kit.xcframework\ios-arm64-simulator\libturso_sync_sdk_kit.framework\Info.plist"
+    <None Include="..\..\rs_compiled\ios-sync-universal\native\libturso_sync_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sync_sdk_kit.framework\Info.plist"
           Visible="false"
-          Condition="Exists('..\..\rs_compiled\ios-sync-universal\native\libturso_sync_sdk_kit.xcframework\ios-arm64-simulator\libturso_sync_sdk_kit.framework\Info.plist')">
+          Condition="Exists('..\..\rs_compiled\ios-sync-universal\native\libturso_sync_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sync_sdk_kit.framework\Info.plist')">
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>
       <Pack>true</Pack>
-      <PackagePath>runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64-simulator/libturso_sync_sdk_kit.framework/</PackagePath>
+      <PackagePath>runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sync_sdk_kit.framework/</PackagePath>
     </None>
-    <None Include="..\..\rs_compiled\ios-sync-universal\native\libturso_sync_sdk_kit.xcframework\ios-arm64-simulator\libturso_sync_sdk_kit.framework\libturso_sync_sdk_kit"
+    <None Include="..\..\rs_compiled\ios-sync-universal\native\libturso_sync_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sync_sdk_kit.framework\libturso_sync_sdk_kit"
           Visible="false"
-          Condition="Exists('..\..\rs_compiled\ios-sync-universal\native\libturso_sync_sdk_kit.xcframework\ios-arm64-simulator\libturso_sync_sdk_kit.framework\libturso_sync_sdk_kit')">
+          Condition="Exists('..\..\rs_compiled\ios-sync-universal\native\libturso_sync_sdk_kit.xcframework\ios-arm64_x86_64-simulator\libturso_sync_sdk_kit.framework\libturso_sync_sdk_kit')">
       <CopyToOutputDirectory>Never</CopyToOutputDirectory>
       <Pack>true</Pack>
-      <PackagePath>runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64-simulator/libturso_sync_sdk_kit.framework/</PackagePath>
+      <PackagePath>runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sync_sdk_kit.framework/</PackagePath>
     </None>
   </ItemGroup>
 

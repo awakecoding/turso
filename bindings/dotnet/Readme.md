@@ -25,7 +25,7 @@ Applications that intentionally select `Local Provider=Native` can reference the
 </ItemGroup>
 ```
 
-`Turso.Data.Sqlite.Native` activates the native provider and resolves its `Turso.Raw` runtime companion for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices. These are optional companion packages with their own native-asset validation; they are not restored or packed by the managed release path. Remote Turso/libSQL connections use the managed HTTP client and do not require either native package.
+`Turso.Data.Sqlite.Native` activates the native provider and resolves its `Turso.Raw` runtime companion for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with an arm64 device slice and a universal arm64+x64 simulator slice. These are optional companion packages with their own native-asset validation; they are not restored or packed by the managed release path. Remote Turso/libSQL connections use the managed HTTP client and do not require either native package.
 
 Calls on one native connection are serialized because its connection and
 statement handles require exclusive access; use separate connections for
@@ -51,7 +51,22 @@ the replica on first open, and `Sync()` or `SyncAsync(CancellationToken)` explic
 pushes local changes then pulls and applies remote changes. Automatic `Sync Interval`
 is intentionally unsupported. The companion resolves its native runtime assets on
 Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and
-`android-x86`), and iOS as an XCFramework with device and simulator slices.
+`android-x86`), and iOS as an XCFramework with an arm64 device slice and a
+universal arm64+x64 simulator slice.
+
+## Native platform matrix
+
+| Distribution | Target frameworks | Runtime identifiers / slices | Release validation |
+| --- | --- | --- | --- |
+| Managed `Turso.Data.Sqlite` | `net8.0`, `net9.0`, `net10.0` | Runtime-independent | Pack, restore, run, publish, and NativeAOT managed-engine smoke without Rust |
+| Dynamic native and Sync companions | `net8.0`, `net9.0`, `net10.0` | `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64` | Package restore and ABI/runtime smoke on every TFM/RID combination |
+| Dynamic mobile companions | Mobile workload TFMs compatible with the `net8.0`, `net9.0`, or `net10.0` package assets | Android arm64, arm, x64, and x86; iOS arm64 device and arm64+x64 simulator XCFramework slices | Binary architecture, direct system dependencies, XCFramework structure, and package target selection; no device/emulator runtime claim |
+| Static native NativeAOT companions | Generic `net8.0`, `net9.0`, `net10.0` only | `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64` | Restore, static publish, final executable architecture/dependencies, and runtime smoke on every TFM/RID combination |
+
+The `Turso.Data.Sqlite.NativeAot.*` packages intentionally reject mobile and
+OS-qualified TFMs. Android and iOS use the dynamic mobile package assets and
+their workload-specific app build; they are not covered by the desktop static
+NativeAOT package gates.
 
 ## NativeAOT static linking
 
@@ -80,9 +95,25 @@ Publish with a supported runtime identifier, for example:
 dotnet publish -c Release -r win-x64
 ```
 
-Static native packages are published for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`. See `samples/NativeAot` for a complete executable sample.
+Static native packages are published for generic `net8.0`, `net9.0`, and
+`net10.0` applications on `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`,
+`osx-x64`, and `osx-arm64`. Mobile and OS-qualified TFMs are explicitly
+excluded from this package contract. See `samples/NativeAot` for a complete
+executable sample.
 
 The RID-specific package carries the matching `Turso.Data.Native` provider assembly required by `Local Provider=Native` and resolves `Turso.Raw` for its bindings; do not add the dynamic companion separately. The static build target removes the dynamic runtime sidecar before publishing.
+
+Release gates inspect every native binary's architecture and direct native
+dependencies before packaging. Windows DLLs published to NuGet must have valid
+timestamped Authenticode signatures; unsigned Windows artifacts are accepted
+only for pull requests and dry runs. Apple libraries may be unsigned or
+ad-hoc-signed in the NuGet XCFramework because the consuming macOS/iOS app is
+responsible for final bundle code signing; any signature already present must
+verify successfully. Linux and Android packages have no code-signing
+expectation.
+Static `.lib` and `.a` archives are not code-signing units; applications that
+consume a NativeAOT static package must sign the final executable or app bundle
+according to their distribution channel.
 
 ## Maintainer packaging
 
