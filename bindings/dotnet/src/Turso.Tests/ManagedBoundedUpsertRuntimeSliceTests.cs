@@ -170,6 +170,92 @@ public sealed class ManagedBoundedUpsertRuntimeSliceTests
     }
 
     [Test]
+    public void MultiRowUpsertProcessesMixedActionsInOrderAndFiresEachStatementTriggerOnce()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER, doubled AS (value * 2));");
+        Execute(connection, "CREATE TABLE audit(event TEXT);");
+        Execute(
+            connection,
+            "CREATE TRIGGER item_insert AFTER INSERT ON items BEGIN INSERT INTO audit VALUES ('insert'); END;");
+        Execute(
+            connection,
+            "CREATE TRIGGER item_update AFTER UPDATE ON items BEGIN INSERT INTO audit VALUES ('update'); END;");
+        Execute(connection, "INSERT INTO items VALUES (1, 10);");
+        Execute(connection, "DELETE FROM audit;");
+
+        using var statement = connection.Prepare(
+            """
+            INSERT INTO items(id, value) VALUES (1, 11), (2, 20), (1, 8)
+            ON CONFLICT(id) DO UPDATE SET value = excluded.value
+            WHERE excluded.value > items.value
+            RETURNING id, value, doubled;
+            """);
+        var rows = new List<SqlValue[]>();
+        while (statement.Step() == StatementStepResult.Row)
+        {
+            rows.Add(
+            [
+                statement.GetValue(0),
+                statement.GetValue(1),
+                statement.GetValue(2),
+            ]);
+        }
+
+        AssertRows(
+            rows,
+            [SqlValue.Integer(1), SqlValue.Integer(11), SqlValue.Integer(22)],
+            [SqlValue.Integer(2), SqlValue.Integer(20), SqlValue.Integer(40)]);
+        statement.RowsAffected.Should().Be(2);
+        connection.LastInsertRowId.Should().Be(2);
+        AssertRows(
+            ReadRows(connection, "SELECT id, value, doubled FROM items ORDER BY id;"),
+            [SqlValue.Integer(1), SqlValue.Integer(11), SqlValue.Integer(22)],
+            [SqlValue.Integer(2), SqlValue.Integer(20), SqlValue.Integer(40)]);
+        AssertRows(
+            ReadRows(connection, "SELECT event FROM audit;"),
+            [SqlValue.Text("update")],
+            [SqlValue.Text("insert")]);
+    }
+
+    [Test]
+    public void MultiRowUpsertDoNothingSkipsConflictsAndRollsBackTheWholeStatementOnLaterFailure()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, code TEXT UNIQUE, value INTEGER);");
+        Execute(connection, "INSERT INTO items VALUES (1, 'one', 1);");
+
+        ReadRows(
+                connection,
+                """
+                INSERT INTO items VALUES (1, 'ignored', 10), (2, 'two', 2)
+                ON CONFLICT(id) DO NOTHING
+                RETURNING id, code, value;
+                """)
+            .Should()
+            .ContainSingle()
+            .Which
+            .Should()
+            .Equal(SqlValue.Integer(2), SqlValue.Text("two"), SqlValue.Integer(2));
+
+        Action conflict = () => Execute(
+            connection,
+            """
+            INSERT INTO items VALUES (3, 'three', 3), (4, 'one', 4)
+            ON CONFLICT(id) DO UPDATE SET value = excluded.value;
+            """);
+        conflict.Should().Throw<EmbeddedSqlException>().WithMessage("UNIQUE constraint failed: code");
+        AssertRows(
+            ReadRows(connection, "SELECT id, code, value FROM items ORDER BY id;"),
+            [SqlValue.Integer(1), SqlValue.Text("one"), SqlValue.Integer(1)],
+            [SqlValue.Integer(2), SqlValue.Text("two"), SqlValue.Integer(2)]);
+    }
+
+    [Test]
     public void UpsertConstraintFailureRollsBackTheWholeStatement()
     {
         using var database = new EmbeddedDatabase();

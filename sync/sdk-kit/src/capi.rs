@@ -25,6 +25,96 @@ pub mod c {
 }
 
 type TursoDatabaseSync = rsapi::TursoDatabaseSync<Vec<u8>>;
+const TURSO_SYNC_ABI_VERSION: u32 = 1;
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_sync_abi_version() -> u32 {
+    TURSO_SYNC_ABI_VERSION
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_sync_abi_sizeof(type_: u32) -> usize {
+    match type_ {
+        1 => std::mem::size_of::<c::turso_sync_io_request_type_t>(),
+        2 => std::mem::size_of::<c::turso_sync_operation_result_type_t>(),
+        3 => std::mem::size_of::<turso_slice_ref_t>(),
+        4 => std::mem::size_of::<capi::c::turso_database_config_t>(),
+        5 => std::mem::size_of::<c::turso_sync_database_config_t>(),
+        6 => std::mem::size_of::<c::turso_sync_io_http_request_t>(),
+        7 => std::mem::size_of::<c::turso_sync_io_http_header_t>(),
+        8 => std::mem::size_of::<c::turso_sync_io_full_read_request_t>(),
+        9 => std::mem::size_of::<c::turso_sync_io_full_write_request_t>(),
+        _ => usize::MAX,
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_sync_abi_offsetof(type_: u32, field: u32) -> usize {
+    match (type_, field) {
+        (3, 0) => std::mem::offset_of!(turso_slice_ref_t, ptr),
+        (3, 1) => std::mem::offset_of!(turso_slice_ref_t, len),
+        (4, 0) => std::mem::offset_of!(capi::c::turso_database_config_t, async_io),
+        (4, 1) => std::mem::offset_of!(capi::c::turso_database_config_t, path),
+        (4, 2) => std::mem::offset_of!(capi::c::turso_database_config_t, experimental_features),
+        (4, 3) => std::mem::offset_of!(capi::c::turso_database_config_t, vfs),
+        (4, 4) => std::mem::offset_of!(capi::c::turso_database_config_t, encryption_cipher),
+        (4, 5) => std::mem::offset_of!(capi::c::turso_database_config_t, encryption_hexkey),
+        (5, 0) => std::mem::offset_of!(c::turso_sync_database_config_t, path),
+        (5, 1) => std::mem::offset_of!(c::turso_sync_database_config_t, remote_url),
+        (5, 2) => std::mem::offset_of!(c::turso_sync_database_config_t, client_name),
+        (5, 3) => std::mem::offset_of!(c::turso_sync_database_config_t, long_poll_timeout_ms),
+        (5, 4) => std::mem::offset_of!(c::turso_sync_database_config_t, bootstrap_if_empty),
+        (5, 5) => std::mem::offset_of!(c::turso_sync_database_config_t, reserved_bytes),
+        (5, 6) => {
+            std::mem::offset_of!(
+                c::turso_sync_database_config_t,
+                partial_bootstrap_strategy_prefix
+            )
+        }
+        (5, 7) => {
+            std::mem::offset_of!(
+                c::turso_sync_database_config_t,
+                partial_bootstrap_strategy_query
+            )
+        }
+        (5, 8) => {
+            std::mem::offset_of!(
+                c::turso_sync_database_config_t,
+                partial_bootstrap_segment_size
+            )
+        }
+        (5, 9) => {
+            std::mem::offset_of!(c::turso_sync_database_config_t, partial_bootstrap_prefetch)
+        }
+        (5, 10) => {
+            std::mem::offset_of!(c::turso_sync_database_config_t, remote_encryption_key)
+        }
+        (5, 11) => {
+            std::mem::offset_of!(c::turso_sync_database_config_t, remote_encryption_cipher)
+        }
+        (5, 12) => {
+            std::mem::offset_of!(c::turso_sync_database_config_t, push_operations_threshold)
+        }
+        (5, 13) => {
+            std::mem::offset_of!(c::turso_sync_database_config_t, pull_bytes_threshold)
+        }
+        (5, 14) => std::mem::offset_of!(c::turso_sync_database_config_t, logical_mvcc_pull),
+        (6, 0) => std::mem::offset_of!(c::turso_sync_io_http_request_t, url),
+        (6, 1) => std::mem::offset_of!(c::turso_sync_io_http_request_t, method),
+        (6, 2) => std::mem::offset_of!(c::turso_sync_io_http_request_t, path),
+        (6, 3) => std::mem::offset_of!(c::turso_sync_io_http_request_t, body),
+        (6, 4) => std::mem::offset_of!(c::turso_sync_io_http_request_t, headers),
+        (7, 0) => std::mem::offset_of!(c::turso_sync_io_http_header_t, key),
+        (7, 1) => std::mem::offset_of!(c::turso_sync_io_http_header_t, value),
+        (8, 0) => std::mem::offset_of!(c::turso_sync_io_full_read_request_t, path),
+        (9, 0) => std::mem::offset_of!(c::turso_sync_io_full_write_request_t, path),
+        (9, 1) => std::mem::offset_of!(c::turso_sync_io_full_write_request_t, content),
+        _ => usize::MAX,
+    }
+}
 
 #[no_mangle]
 #[signature(c)]
@@ -503,6 +593,21 @@ mod tests {
         turso_sync_operation_result_extract_connection, turso_sync_operation_result_kind,
         turso_sync_operation_result_type_t, turso_sync_operation_resume,
     };
+
+    #[test]
+    fn abi_contract_reports_native_layout() {
+        assert_eq!(super::turso_sync_abi_version(), 1);
+        assert_eq!(
+            super::turso_sync_abi_sizeof(5),
+            std::mem::size_of::<turso_sync_database_config_t>()
+        );
+        assert_eq!(
+            super::turso_sync_abi_offsetof(6, 4),
+            std::mem::offset_of!(turso_sync_io_http_request_t, headers)
+        );
+        assert_eq!(super::turso_sync_abi_sizeof(u32::MAX), usize::MAX);
+        assert_eq!(super::turso_sync_abi_offsetof(5, u32::MAX), usize::MAX);
+    }
 
     #[test]
     pub fn database_sync_create() {

@@ -87,7 +87,6 @@ public class SqliteFacadeTests
 
         Task<object?>? faulted = null;
         Assert.DoesNotThrow(() => faulted = command.ExecuteScalarAsync());
-        faulted!.IsFaulted.Should().BeTrue();
         Assert.ThrowsAsync<SqliteException>(async () => await faulted);
     }
 
@@ -849,19 +848,23 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    public void OpenReaderBlocksWriteCommandUntilTimeout()
+    public async Task ZeroCommandTimeoutWaitsUntilOpenReaderCloses()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
         connection.ExecuteNonQuery("CREATE TABLE t(value INTEGER); INSERT INTO t VALUES (1);");
 
-        using var reader = connection.ExecuteReader("SELECT value FROM t;");
+        var reader = connection.ExecuteReader("SELECT value FROM t;");
         using var command = connection.CreateCommand();
         command.CommandText = "DROP TABLE t;";
         command.CommandTimeout = 0;
 
-        var exception = Assert.Throws<SqliteException>(() => command.ExecuteNonQuery());
-        exception.SqliteErrorCode.Should().Be(5);
+        var execution = Task.Run(command.ExecuteNonQuery);
+        await Task.Delay(100);
+        execution.IsCompleted.Should().BeFalse();
+
+        reader.Dispose();
+        (await execution.WaitAsync(TimeSpan.FromSeconds(5))).Should().Be(0);
     }
 
     [Test]

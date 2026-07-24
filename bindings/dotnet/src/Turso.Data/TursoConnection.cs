@@ -19,6 +19,7 @@ public class TursoConnection : DbConnection
     private bool _remoteTransactionActive;
     private bool _managedReadOnly;
     private readonly HashSet<TursoDataReader> _openReaders = [];
+    private readonly object _readerLock = new();
 
     [AllowNull]
     public override string ConnectionString
@@ -74,8 +75,18 @@ public class TursoConnection : DbConnection
             return OpenRemoteReplicaAsync(GetReplicaOptions(), cancellationToken);
         }
 
-        Open();
-        return Task.CompletedTask;
+        return Task.Run(
+            () =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Open();
+                if (!cancellationToken.IsCancellationRequested)
+                    return;
+
+                Close();
+                cancellationToken.ThrowIfCancellationRequested();
+            },
+            CancellationToken.None);
     }
 
     public override void Close()
@@ -203,9 +214,17 @@ public class TursoConnection : DbConnection
     internal IManagedConnectionAdapter ManagedConnection
         => _managedDatabase?.Connection ?? throw new InvalidOperationException("Turso database is closed.");
 
-    internal void ReaderOpened(TursoDataReader reader) => _openReaders.Add(reader);
+    internal void ReaderOpened(TursoDataReader reader)
+    {
+        lock (_readerLock)
+            _openReaders.Add(reader);
+    }
 
-    internal void ReaderClosed(TursoDataReader reader) => _openReaders.Remove(reader);
+    internal void ReaderClosed(TursoDataReader reader)
+    {
+        lock (_readerLock)
+            _openReaders.Remove(reader);
+    }
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
         string sql,
@@ -595,7 +614,10 @@ public class TursoConnection : DbConnection
 
     private void CloseOpenReaders()
     {
-        foreach (var reader in _openReaders.ToArray())
+        TursoDataReader[] readers;
+        lock (_readerLock)
+            readers = _openReaders.ToArray();
+        foreach (var reader in readers)
             reader.CloseFromConnection();
     }
 }

@@ -14,6 +14,7 @@ public class TursoCommand : DbCommand
     private TursoNativeStatement? _nativeStatement;
     private IManagedStatementAdapter? _managedStatement;
     private int _commandTimeout = 30;
+    private readonly CommandCancellationController _cancellation = new();
 
     public TursoCommand()
     {
@@ -99,21 +100,29 @@ public class TursoCommand : DbCommand
 
     protected override void Dispose(bool disposing)
     {
+        if (disposing)
+        {
+            _cancellation.Cancel();
+            _nativeStatement?.Dispose();
+            _managedStatement?.Dispose();
+        }
+
         base.Dispose(disposing);
-        _nativeStatement?.Dispose();
-        _managedStatement?.Dispose();
     }
 
-    public override void Cancel()
-    {
-    }
+    public override void Cancel() => _cancellation.Cancel();
 
     public override int ExecuteNonQuery()
     {
         if (_connection?.IsRemote == true)
-            return ExecuteRemoteNonQueryAsync(CancellationToken.None).GetAwaiter().GetResult();
+        {
+            return _cancellation
+                .RunAsync(ExecuteRemoteNonQueryAsync, CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+        }
 
-        using var reader = Execute();
+        using var reader = _cancellation.Run(token => Execute(CommandBehavior.Default, token));
         while (reader.Read())
         {
         }
@@ -124,7 +133,11 @@ public class TursoCommand : DbCommand
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
         if (_connection?.IsRemote == true)
-            return await ExecuteRemoteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        {
+            return await _cancellation
+                .RunAsync(ExecuteRemoteNonQueryAsync, cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -136,7 +149,7 @@ public class TursoCommand : DbCommand
 
     public override object? ExecuteScalar()
     {
-        using var reader = Execute();
+        using var reader = _cancellation.Run(token => Execute(CommandBehavior.Default, token));
         return reader.Read()
             ? reader.GetValue(0)
             : null;
@@ -193,6 +206,10 @@ public class TursoCommand : DbCommand
         try
         {
             var sql = RewriteFacadePragmas(CommandText, _connection);
+            _connection.NativeDatabase.SetBusyTimeout(
+                CommandTimeout == 0
+                    ? TimeSpan.MaxValue
+                    : TimeSpan.FromSeconds(CommandTimeout));
             preparedStatement = _connection.NativeDatabase.PrepareStatement(sql);
             var parameterCount = preparedStatement.ParameterCount;
             var boundParameters = new bool[parameterCount + 1];
@@ -254,18 +271,21 @@ public class TursoCommand : DbCommand
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
-        return Execute(behavior);
+        return _cancellation.Run(token => Execute(behavior, token));
     }
 
     protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
     {
-        if (cancellationToken.IsCancellationRequested)
-            return Task.FromCanceled<DbDataReader>(cancellationToken);
-
         if (_connection?.IsRemote == true)
-            return ExecuteRemoteAsync(behavior, cancellationToken);
+        {
+            return _cancellation.RunAsync(
+                token => ExecuteRemoteAsync(behavior, token),
+                cancellationToken);
+        }
 
-        return Task.FromResult(Execute(behavior));
+        return _cancellation.RunAsync<DbDataReader>(
+            token => Execute(behavior, token),
+            cancellationToken);
     }
 
     private static string RewriteFacadePragmas(string sql, TursoConnection connection)
@@ -297,15 +317,19 @@ public class TursoCommand : DbCommand
               || value.Equals("YES", StringComparison.OrdinalIgnoreCase);
     }
 
-    private DbDataReader Execute(CommandBehavior behavior = CommandBehavior.Default)
+    private DbDataReader Execute(
+        CommandBehavior behavior = CommandBehavior.Default,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (_connection is null)
             throw new InvalidOperationException("Connection must be set before executing a command.");
 
         if (_connection.IsRemote)
-            return ExecuteRemoteAsync(behavior, CancellationToken.None).GetAwaiter().GetResult();
+            return ExecuteRemoteAsync(behavior, cancellationToken).GetAwaiter().GetResult();
 
         Prepare();
+        cancellationToken.ThrowIfCancellationRequested();
 
         var nativeStatement = _nativeStatement;
         var managedStatement = _managedStatement;
@@ -316,6 +340,16 @@ public class TursoCommand : DbCommand
         var reader = new TursoDataReader(this, nativeStatement, managedStatement, behavior);
         return reader;
     }
+
+    internal T RunOperation<T>(
+        Func<CancellationToken, T> operation,
+        CancellationToken cancellationToken = default)
+        => _cancellation.Run(operation, cancellationToken);
+
+    internal Task<T> RunOperationAsync<T>(
+        Func<CancellationToken, T> operation,
+        CancellationToken cancellationToken = default)
+        => _cancellation.RunAsync(operation, cancellationToken);
 
     private void BindManagedParameters(IManagedStatementAdapter statement)
     {

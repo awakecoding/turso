@@ -34,6 +34,8 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
     private const string ClientName = "turso-dotnet";
     private readonly object _lifecycleLock = new();
     private readonly SemaphoreSlim _operationGate = new(1, 1);
+    private readonly CancellationTokenSource _disposeCancellation = new();
+    private readonly HashSet<SyncNativeStatement> _statements = [];
     private readonly SyncDatabaseHandle _database;
     private SyncConnectionHandle? _connection;
     private readonly HttpClient _httpClient;
@@ -41,19 +43,43 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
     private readonly string? _authToken;
     private bool _disposeRequested;
     private bool _disposed;
+    private int _operationThreadId;
 
     private SyncReplicaDatabase(
         SyncDatabaseHandle database,
         Uri remoteUri,
-        string? authToken)
+        string? authToken,
+        HttpMessageHandler? httpMessageHandler = null)
     {
         _database = database;
         _remoteUri = remoteUri;
         _authToken = authToken;
-        _httpClient = new HttpClient
+        _httpClient = httpMessageHandler is null
+            ? new HttpClient()
+            : new HttpClient(httpMessageHandler);
+        _httpClient.Timeout = Timeout.InfiniteTimeSpan;
+    }
+
+    internal static SyncReplicaDatabase Open(
+        TursoReplicaOptions options,
+        HttpMessageHandler httpMessageHandler)
+    {
+        ArgumentNullException.ThrowIfNull(httpMessageHandler);
+        var database = CreateDatabase(options);
+        SyncReplicaDatabase? replica = null;
+        try
         {
-            Timeout = Timeout.InfiniteTimeSpan,
-        };
+            replica = new SyncReplicaDatabase(database, options.RemoteUri, options.AuthToken, httpMessageHandler);
+            replica.InitializeAsync(CancellationToken.None).GetAwaiter().GetResult();
+            return replica;
+        }
+        catch
+        {
+            replica?.Dispose();
+            if (replica is null)
+                database.Dispose();
+            throw;
+        }
     }
 
     public override bool IsInvalid => _disposed || _connection is null || _connection.IsInvalid;
@@ -107,19 +133,51 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             var connection = _connection ?? throw new InvalidOperationException("The embedded replica SQL connection is unavailable.");
             var status = SyncInterop.ConnectionPrepareSingle(connection, sql, out var statement, out var error);
             SyncNative.ThrowIfFailure(status, error);
-            return new SyncNativeStatement(SyncStatementHandle.FromRaw(statement), this);
+            var nativeStatement = new SyncNativeStatement(SyncStatementHandle.FromRaw(statement), this);
+            _statements.Add(nativeStatement);
+            return nativeStatement;
         });
+    }
+
+    public override void SetBusyTimeout(TimeSpan timeout)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
+        UseExclusiveOperation(() =>
+        {
+            var connection = _connection
+                ?? throw new InvalidOperationException("The embedded replica SQL connection is unavailable.");
+            SyncInterop.ConnectionSetBusyTimeout(connection, checked((long)timeout.TotalMilliseconds));
+        });
+    }
+
+    internal void Interrupt()
+    {
+        try
+        {
+            lock (_lifecycleLock)
+            {
+                if (_disposed || _connection is null)
+                    return;
+                SyncInterop.ConnectionInterrupt(_connection);
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     public override async Task SyncAsync(CancellationToken cancellationToken)
     {
         ThrowIfUnavailable();
-        await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _disposeCancellation.Token);
+        await _operationGate.WaitAsync(operationCancellation.Token).ConfigureAwait(false);
         try
         {
             ThrowIfUnavailable();
-            await PushChangesAsync(cancellationToken).ConfigureAwait(false);
-            await PullChangesAsync(cancellationToken).ConfigureAwait(false);
+            await PushChangesAsync(operationCancellation.Token).ConfigureAwait(false);
+            await PullChangesAsync(operationCancellation.Token).ConfigureAwait(false);
         }
         finally
         {
@@ -137,13 +195,18 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             _disposeRequested = true;
         }
 
+        _disposeCancellation.Cancel();
         _operationGate.Wait();
         try
         {
+            foreach (var statement in _statements)
+                statement.DisposeFromDatabase();
+            _statements.Clear();
             _connection?.Dispose();
             _connection = null;
             _database.Dispose();
             _httpClient.Dispose();
+            _disposeCancellation.Dispose();
             lock (_lifecycleLock)
             {
                 _disposed = true;
@@ -165,7 +228,7 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
         }
         finally
         {
-            _operationGate.Release();
+            ExitOperation();
         }
     }
 
@@ -177,6 +240,21 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             operation();
             return true;
         });
+    }
+
+    internal void DisposeStatement(SyncNativeStatement statement, SyncStatementHandle handle)
+    {
+        try
+        {
+            UseExclusiveOperation(() =>
+            {
+                if (_statements.Remove(statement))
+                    handle.Dispose();
+            });
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     internal void RunStatementIoWhileExclusive()
@@ -391,6 +469,11 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             CompleteIoFailure(item, "The embedded replica synchronization operation was canceled.");
             return true;
         }
+        catch (OperationCanceledException exception)
+        {
+            CompleteIoFailure(item, exception.Message);
+            return false;
+        }
         catch (HttpRequestException exception)
         {
             CompleteIoFailure(item, exception.Message);
@@ -407,6 +490,16 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             return false;
         }
         catch (UriFormatException exception)
+        {
+            CompleteIoFailure(item, exception.Message);
+            return false;
+        }
+        catch (ArgumentException exception)
+        {
+            CompleteIoFailure(item, exception.Message);
+            return false;
+        }
+        catch (NotSupportedException exception)
         {
             CompleteIoFailure(item, exception.Message);
             return false;
@@ -569,7 +662,10 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             throw new InvalidOperationException($"The native sync SDK returned an invalid HTTP header: {name}.");
     }
 
-    private static async Task WriteFileAtomicallyAsync(string path, byte[] content, CancellationToken cancellationToken)
+    internal static async Task WriteFileAtomicallyAsync(
+        string path,
+        byte[] content,
+        CancellationToken cancellationToken)
     {
         var directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(directory))
@@ -603,17 +699,30 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
 
     private void EnterOperation()
     {
+        if (Volatile.Read(ref _operationThreadId) == Environment.CurrentManagedThreadId)
+        {
+            throw new InvalidOperationException(
+                "The native Sync connection does not support reentrant operations from callbacks.");
+        }
+
         ThrowIfUnavailable();
         _operationGate.Wait();
         try
         {
             ThrowIfUnavailable();
+            Volatile.Write(ref _operationThreadId, Environment.CurrentManagedThreadId);
         }
         catch
         {
             _operationGate.Release();
             throw;
         }
+    }
+
+    private void ExitOperation()
+    {
+        Volatile.Write(ref _operationThreadId, 0);
+        _operationGate.Release();
     }
 
     private void ThrowIfUnavailable()
@@ -716,6 +825,8 @@ internal sealed class SyncNativeStatement : TursoNativeStatement
         });
     }
 
+    public override void Interrupt() => _database.Interrupt();
+
     public override TursoValue GetValue(int ordinal)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
@@ -763,7 +874,9 @@ internal sealed class SyncNativeStatement : TursoNativeStatement
             () => SyncInterop.StatementColumnCount(_statement) > 0
                 && SyncInterop.StatementRowValueKind(_statement, 0) != SyncValueType.Unknown);
 
-    public override void Dispose() => _database.UseExclusiveOperation(_statement.Dispose);
+    public override void Dispose() => _database.DisposeStatement(this, _statement);
+
+    internal void DisposeFromDatabase() => _statement.Dispose();
 
     private void Bind(nuint index, TursoValue value)
     {

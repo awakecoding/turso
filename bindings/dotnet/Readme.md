@@ -27,6 +27,14 @@ Applications that intentionally select `Local Provider=Native` can reference the
 
 `Turso.Data.Sqlite.Native` activates the native provider and resolves its `Turso.Raw` runtime companion for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices. These are optional companion packages with their own native-asset validation; they are not restored or packed by the managed release path. Remote Turso/libSQL connections use the managed HTTP client and do not require either native package.
 
+Calls on one native connection are serialized because its connection and
+statement handles require exclusive access; use separate connections for
+parallel execution. Managed callbacks cannot reenter the same native
+connection and fail explicitly instead of deadlocking. Cancellation tokens,
+`DbCommand.Cancel()`, reader disposal, and connection closure interrupt an
+active native statement and wait for its handle to become idle before release.
+`CommandTimeout` controls native busy-lock waits, not total query duration.
+
 ## Embedded replicas
 
 Embedded replicas require the matching-version `Turso.Data.Sqlite.Sync` companion package:
@@ -41,7 +49,9 @@ Embedded replicas require the matching-version `Turso.Data.Sqlite.Sync` companio
 Specify a remote `Data Source` and a local `Replica Path`. The companion bootstraps
 the replica on first open, and `Sync()` or `SyncAsync(CancellationToken)` explicitly
 pushes local changes then pulls and applies remote changes. Automatic `Sync Interval`
-is intentionally unsupported.
+is intentionally unsupported. The companion resolves its native runtime assets on
+Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and
+`android-x86`), and iOS as an XCFramework with device and simulator slices.
 
 ## NativeAOT static linking
 
@@ -76,9 +86,9 @@ The RID-specific package carries the matching `Turso.Data.Native` provider assem
 
 ## Maintainer packaging
 
-`make restore`, `make build`, `make test`, and `make pack` use the isolated managed-only release path. They neither build Rust nor consume `rs_compiled` native assets. `Turso.slnx` likewise contains only the managed package projects; compatibility-package tests and benchmarks stay on their explicit native paths. `make test` validates the packed provider by restoring, building, running, and publishing the source-free `ManagedPackageConsumer` sample. The consumer rejects restored native companion packages, and the validation rejects native companion assets in its publish output. `make validate-managed-project-closure` rejects native package, asset, P/Invoke, Rust-tool, and shared-solution references from the managed package and NativeAOT sample configurations. `scripts/Validate-ManagedPackageClosure.ps1` also opens every managed `.nupkg`, rejects native entries and native/PInvoke/Rust build configuration, and checks the restored closure and publish output; this cross-platform PowerShell gate is used by both package and NativeAOT validation. `make validate-managed-nativeaot` restores that same packed provider before publishing its smoke executable, so NativeAOT validates the shipping package rather than a project reference. The managed CI gates replace `cargo` and `rustc` with failing shims while this path runs. Use the explicitly opt-in `make test-native` for the full source test suite, including dynamic native-companion coverage. `make validate-managed-package` runs the same packaged-provider validation directly.
+`make restore`, `make build`, `make test`, and `make pack` use the isolated managed-only release path. They neither build Rust nor consume `rs_compiled` native assets. `Turso.slnx` likewise contains only the managed package projects; compatibility-package tests and benchmarks stay on their explicit native paths. `make test` validates the packed provider and EF Core facade by restoring, building, running, and publishing the source-free `ManagedPackageConsumer` sample. The consumer rejects restored native companion packages, and the validation rejects native companion assets in its publish output. `make validate-managed-project-closure` rejects native package, asset, P/Invoke, Rust-tool, and shared-solution references from the managed package and NativeAOT sample configurations. `scripts/Validate-ManagedPackageClosure.ps1` also opens every managed `.nupkg`, rejects native entries and native/PInvoke/Rust build configuration, and checks the restored closure and publish output; this cross-platform PowerShell gate is used by both package and NativeAOT validation. `make validate-managed-nativeaot` restores that same packed provider before publishing its smoke executable, so NativeAOT validates the shipping package rather than a project reference. The managed CI gates replace `cargo` and `rustc` with failing shims while this path runs. Use the explicitly opt-in `make test-native` for the full source test suite, including dynamic native-companion coverage. `make validate-managed-package` runs the same packaged-provider validation directly.
 
-Native distribution is intentionally explicit: `make pack-native` creates the dynamic native companion packages after their runtime assets have been built. `Turso.Raw` carries its managed `Turso.Core` and `Turso.Data` closure for `net8.0`, `net9.0`, and `net10.0` alongside the runtime assets. `make pack-nativeaot-static` creates the RID-specific static-linking companions. `make pack-release` deliberately combines those optional companion steps with the managed packages for a full distribution cut; it is not the primary managed release path.
+Native distribution is intentionally explicit: `make pack-native` creates the dynamic native companion packages after their runtime assets have been built. `Turso.Raw` carries its managed `Turso.Core` and `Turso.Data` closure for `net8.0`, `net9.0`, and `net10.0` alongside the runtime assets. Release validation restores only the packed artifacts and executes the dynamic Raw, Native, and Sync companions on `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`. That smoke verifies the versioned native ABI, every imported symbol, enum widths, managed/native structure sizes and offsets, UTF-8 values and errors, and owned handle cleanup before companion publication. `make pack-nativeaot-static` creates the RID-specific static-linking companions. `make pack-release` deliberately combines those optional companion steps with the managed packages for a full distribution cut; it is not the primary managed release path.
 
 ## Getting started
 
@@ -210,7 +220,10 @@ Supported common connection string keywords include:
 - `SqliteBlob` preserves fixed-length blob stream behavior through the managed incremental-blob storage adapter. It is not backed by a native SQLitePCL blob handle.
 - SQLite virtual-table modules such as FTS3/FTS5 are not built in unless provided by a Turso extension/module.
 - The managed engine does not implement experimental MVCC or vector-search functions. `PRAGMA journal_mode = mvcc` and functions such as `vector32()` fail rather than enabling partial behavior.
-- Async methods currently use the base ADO.NET behavior rather than a dedicated async native path.
+- Local managed `OpenAsync` and command/reader async methods run blocking work
+  off the caller thread and cooperatively observe cancellation tokens and
+  `DbCommand.Cancel()` during execution. `CommandTimeout` applies to busy reader
+  waits; it is not a general query-execution deadline.
 
 ## Entity Framework Core
 

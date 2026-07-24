@@ -20,6 +20,43 @@ pub mod c {
 }
 
 pub static PKG_VERSION_C: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+const TURSO_ABI_VERSION: u32 = 1;
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_abi_version() -> u32 {
+    TURSO_ABI_VERSION
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_abi_sizeof(type_: u32) -> usize {
+    match type_ {
+        1 => std::mem::size_of::<c::turso_status_code_t>(),
+        2 => std::mem::size_of::<c::turso_type_t>(),
+        3 => std::mem::size_of::<c::turso_extension_value_type_t>(),
+        4 => std::mem::size_of::<c::turso_database_config_t>(),
+        5 => std::mem::size_of::<c::turso_value_t>(),
+        6 => std::mem::size_of::<c::turso_extension_value_data_t>(),
+        _ => usize::MAX,
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_abi_offsetof(type_: u32, field: u32) -> usize {
+    match (type_, field) {
+        (4, 0) => std::mem::offset_of!(c::turso_database_config_t, async_io),
+        (4, 1) => std::mem::offset_of!(c::turso_database_config_t, path),
+        (4, 2) => std::mem::offset_of!(c::turso_database_config_t, experimental_features),
+        (4, 3) => std::mem::offset_of!(c::turso_database_config_t, vfs),
+        (4, 4) => std::mem::offset_of!(c::turso_database_config_t, encryption_cipher),
+        (4, 5) => std::mem::offset_of!(c::turso_database_config_t, encryption_hexkey),
+        (5, 0) => std::mem::offset_of!(c::turso_value_t, value_type),
+        (5, 1) => std::mem::offset_of!(c::turso_value_t, value),
+        _ => usize::MAX,
+    }
+}
 
 type CScalarFunction = unsafe extern "C" fn(
     usize,
@@ -109,6 +146,14 @@ pub extern "C" fn turso_database_connect(
             c::turso_status_code_t::TURSO_OK
         }
         Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_interrupt(connection: *const c::turso_connection_t) {
+    if let Ok(connection) = unsafe { TursoConnection::ref_from_capi(connection) } {
+        connection.interrupt();
     }
 }
 
@@ -1059,6 +1104,21 @@ mod tests {
         },
         value_from_c_value,
     };
+
+    #[test]
+    fn abi_contract_reports_native_layout() {
+        assert_eq!(super::turso_abi_version(), 1);
+        assert_eq!(
+            super::turso_abi_sizeof(4),
+            std::mem::size_of::<c::turso_database_config_t>()
+        );
+        assert_eq!(
+            super::turso_abi_offsetof(5, 1),
+            std::mem::offset_of!(c::turso_value_t, value)
+        );
+        assert_eq!(super::turso_abi_sizeof(u32::MAX), usize::MAX);
+        assert_eq!(super::turso_abi_offsetof(4, u32::MAX), usize::MAX);
+    }
 
     extern "C" fn logger(log: *const c::turso_log_t) {
         println!("log: {:?}", unsafe {

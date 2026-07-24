@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
@@ -32,7 +33,7 @@ internal enum SyncValueType : uint
     Null = 5,
 }
 
-internal enum SyncIoRequestType : int
+internal enum SyncIoRequestType : uint
 {
     None = 0,
     Http = 1,
@@ -40,7 +41,7 @@ internal enum SyncIoRequestType : int
     FullWrite = 3,
 }
 
-internal enum SyncOperationResultType : int
+internal enum SyncOperationResultType : uint
 {
     None = 0,
     Connection = 1,
@@ -256,6 +257,31 @@ internal static class SyncInterop
 {
     private const string DllName = "turso_sync_sdk_kit";
 
+    static SyncInterop()
+    {
+        if (OperatingSystem.IsIOS())
+            NativeLibrary.SetDllImportResolver(typeof(SyncInterop).Assembly, ResolveDllImport);
+    }
+
+    private static IntPtr ResolveDllImport(
+        string libraryName,
+        Assembly assembly,
+        DllImportSearchPath? searchPath)
+    {
+        return libraryName == DllName
+            ? NativeLibrary.Load($"Frameworks/lib{libraryName}.framework/lib{libraryName}", assembly, searchPath)
+            : IntPtr.Zero;
+    }
+
+    [DllImport(DllName, EntryPoint = "turso_sync_abi_version", CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint AbiVersion();
+
+    [DllImport(DllName, EntryPoint = "turso_sync_abi_sizeof", CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint AbiSizeOf(uint type);
+
+    [DllImport(DllName, EntryPoint = "turso_sync_abi_offsetof", CallingConvention = CallingConvention.Cdecl)]
+    public static extern nuint AbiOffsetOf(uint type, uint field);
+
     [DllImport(DllName, EntryPoint = "turso_sync_database_new", CallingConvention = CallingConvention.Cdecl)]
     public static extern SyncStatusCode DatabaseNew(
         ref SyncDatabaseConfig databaseConfig,
@@ -359,6 +385,12 @@ internal static class SyncInterop
 
     [DllImport(DllName, EntryPoint = "turso_connection_close", CallingConvention = CallingConvention.Cdecl)]
     public static extern SyncStatusCode ConnectionClose(IntPtr connection, out IntPtr error);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_interrupt", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void ConnectionInterrupt(SyncConnectionHandle connection);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_set_busy_timeout_ms", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void ConnectionSetBusyTimeout(SyncConnectionHandle connection, long timeoutMilliseconds);
 
     [DllImport(DllName, EntryPoint = "turso_connection_deinit", CallingConvention = CallingConvention.Cdecl)]
     public static extern void ConnectionDeinit(IntPtr connection);

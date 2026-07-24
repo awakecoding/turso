@@ -21,6 +21,8 @@ public partial class SqliteConnection : DbConnection
     private bool _disposed;
     private int? _defaultTimeout;
     private readonly HashSet<SqliteDataReader> _openReaders = [];
+    private readonly object _readerGate = new();
+    private readonly ManualResetEventSlim _noOpenReaders = new(initialState: true);
     private readonly HashSet<SqliteBlob> _openManagedBlobs = [];
     private string? _dataSource;
     private bool _readOnly;
@@ -177,8 +179,18 @@ public partial class SqliteConnection : DbConnection
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled(cancellationToken);
 
-        Open();
-        return Task.CompletedTask;
+        return Task.Run(
+            () =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Open();
+                if (!cancellationToken.IsCancellationRequested)
+                    return;
+
+                Close();
+                cancellationToken.ThrowIfCancellationRequested();
+            },
+            CancellationToken.None);
     }
 
     public override void Close()
@@ -457,8 +469,11 @@ public partial class SqliteConnection : DbConnection
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_disposed)
+        {
             Close();
+            _noOpenReaders.Dispose();
+        }
 
         _disposed = true;
         base.Dispose(disposing);
@@ -473,7 +488,14 @@ public partial class SqliteConnection : DbConnection
 
     internal bool UsesManagedDatabase => IsManagedConnection;
 
-    internal bool HasOpenReader => _openReaders.Count != 0;
+    internal bool HasOpenReader
+    {
+        get
+        {
+            lock (_readerGate)
+                return _openReaders.Count != 0;
+        }
+    }
 
     internal bool IsReadOnly => _readOnly;
 
@@ -484,15 +506,26 @@ public partial class SqliteConnection : DbConnection
     internal void ReaderOpened(SqliteDataReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
-        if (!_openReaders.Add(reader))
-            throw new InvalidOperationException("The data reader is already registered with this connection.");
+        lock (_readerGate)
+        {
+            if (!_openReaders.Add(reader))
+                throw new InvalidOperationException("The data reader is already registered with this connection.");
+            _noOpenReaders.Reset();
+        }
     }
 
     internal void ReaderClosed(SqliteDataReader reader)
     {
         ArgumentNullException.ThrowIfNull(reader);
-        _openReaders.Remove(reader);
+        lock (_readerGate)
+        {
+            if (_openReaders.Remove(reader) && _openReaders.Count == 0)
+                _noOpenReaders.Set();
+        }
     }
+
+    internal bool WaitForNoOpenReader(TimeSpan timeout, CancellationToken cancellationToken)
+        => _noOpenReaders.Wait(timeout, cancellationToken);
 
     internal void ManagedBlobOpened(SqliteBlob blob)
     {
@@ -777,7 +810,10 @@ public partial class SqliteConnection : DbConnection
 
     private void CloseOpenReaders()
     {
-        foreach (var reader in _openReaders.ToArray())
+        SqliteDataReader[] readers;
+        lock (_readerGate)
+            readers = _openReaders.ToArray();
+        foreach (var reader in readers)
             reader.CloseFromConnection();
     }
 

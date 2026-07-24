@@ -7,6 +7,26 @@
 
 #include <turso.h>
 
+#define TURSO_SYNC_ABI_VERSION 1u
+
+typedef enum
+{
+    TURSO_SYNC_ABI_TYPE_IO_REQUEST = 1,
+    TURSO_SYNC_ABI_TYPE_OPERATION_RESULT = 2,
+    TURSO_SYNC_ABI_TYPE_SLICE = 3,
+    TURSO_SYNC_ABI_TYPE_DATABASE_CONFIG = 4,
+    TURSO_SYNC_ABI_TYPE_REPLICA_CONFIG = 5,
+    TURSO_SYNC_ABI_TYPE_HTTP_REQUEST = 6,
+    TURSO_SYNC_ABI_TYPE_HTTP_HEADER = 7,
+    TURSO_SYNC_ABI_TYPE_FULL_READ_REQUEST = 8,
+    TURSO_SYNC_ABI_TYPE_FULL_WRITE_REQUEST = 9,
+} turso_sync_abi_type_t;
+
+uint32_t turso_sync_abi_version(void);
+size_t turso_sync_abi_sizeof(uint32_t type);
+/** Fields are numbered in declaration order starting at zero. */
+size_t turso_sync_abi_offsetof(uint32_t type, uint32_t field);
+
 /******** TURSO_DATABASE_SYNC_IO_REQUEST ********/
 
 // sync engine IO request type

@@ -419,11 +419,11 @@ jobs:
               fi
             done
 
-            if unzip -Z1 "$package" | grep -Eq '(^runtimes/|^buildTransitive/|turso_sdk_kit|Turso\.(Raw|Data\.Native)\.|\.(cs|fs|vb)$)'; then
+            if unzip -Z1 "$package" | grep -Eq '(^runtimes/|^buildTransitive/|turso(_sync)?_sdk_kit|Turso\.(Raw|Data\.(Native|Sync))\.|\.(cs|fs|vb)$)'; then
               echo "$package must remain source-free and managed-only"
               exit 1
             fi
-            if unzip -p "$package" '*.nuspec' | grep -Eq 'id="Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native)"'; then
+            if unzip -p "$package" '*.nuspec' | grep -Eq 'id="Turso\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native|Sync))"'; then
               echo "$package must not declare an optional-native package dependency"
               exit 1
             fi
@@ -538,11 +538,27 @@ jobs:
             "runtimes/android-x86/native/libturso_sync_sdk_kit.so"
             "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/Info.plist"
             "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64/libturso_sync_sdk_kit.framework/libturso_sync_sdk_kit"
+            "buildTransitive/Turso.Data.Sqlite.Sync.targets"
             "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64-simulator/libturso_sync_sdk_kit.framework/libturso_sync_sdk_kit"
           )
           for required_file in "${sync_required_files[@]}"; do
             if ! grep -Fxq "$required_file" sync-package-files.txt; then
               echo "Missing $required_file in $sync_package"
+              exit 1
+            fi
+          done
+
+          sync_mobile_targets=$(unzip -p "$sync_package" buildTransitive/Turso.Data.Sqlite.Sync.targets)
+          for required_target_value in \
+            "AndroidNativeLibrary" \
+            "runtimes\\android-arm\\native\\libturso_sync_sdk_kit.so" \
+            "runtimes\\android-arm64\\native\\libturso_sync_sdk_kit.so" \
+            "runtimes\\android-x86\\native\\libturso_sync_sdk_kit.so" \
+            "runtimes\\android-x64\\native\\libturso_sync_sdk_kit.so" \
+            "NativeReference" \
+            "runtimes\\ios-universal\\native\\libturso_sync_sdk_kit.xcframework"; do
+            if ! grep -Fq "$required_target_value" <<< "$sync_mobile_targets"; then
+              echo "Sync mobile build target does not select $required_target_value"
               exit 1
             fi
           done
@@ -672,6 +688,105 @@ jobs:
           name: native-companion-nuget-packages
           path: ${{ env.working-directory }}/artifacts/native-nuget-packages/*.nupkg
           retention-days: 7
+
+  validate-dynamic-native-packages:
+    needs: [package-managed, package-native-companions]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: blacksmith-4vcpu-windows-2025
+          rid: win-x64
+
+        - os: windows-11-arm
+          rid: win-arm64
+
+        - os: ubuntu-latest
+          rid: linux-x64
+
+        - os: ubuntu-24.04-arm
+          rid: linux-arm64
+
+        - os: macos-26-intel
+          rid: osx-x64
+
+        - os: macos-26
+          rid: osx-arm64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Download managed NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: managed-nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Download native companion NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: native-companion-nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Run dynamic native package smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sampleDirectory = "${{ env.working-directory }}/samples/DynamicNativePackageSmoke"
+          $sampleProject = Join-Path $sampleDirectory "DynamicNativePackageSmoke.csproj"
+          $packageSource = Resolve-Path "${{ env.working-directory }}/artifacts/nuget-packages"
+          $nugetConfig = Join-Path $sampleDirectory "NuGet.config"
+
+          @"
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$packageSource" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local">
+                <package pattern="Turso.*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          "@ | Set-Content -Path $nugetConfig -Encoding UTF8
+
+          dotnet restore $sampleProject -r "${{ matrix.rid }}" --configfile $nugetConfig
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $assets = Get-Content (Join-Path $sampleDirectory "obj/project.assets.json") -Raw | ConvertFrom-Json
+          $libraries = $assets.libraries.PSObject.Properties.Name
+          foreach ($package in @(
+            "Turso.Data.Sqlite/",
+            "Turso.Raw/",
+            "Turso.Data.Sqlite.Native/",
+            "Turso.Data.Sqlite.Sync/"
+          )) {
+            if (-not ($libraries | Where-Object { $_.StartsWith($package, [StringComparison]::OrdinalIgnoreCase) })) {
+              throw "The dynamic package closure did not restore $package"
+            }
+          }
+
+          $output = dotnet run --project $sampleProject -c Release -r "${{ matrix.rid }}" --no-restore
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($output -notcontains "Dynamic native package smoke passed.") {
+            throw "Unexpected dynamic package smoke output: $output"
+          }
 
   validate-nativeaot-static-package:
     needs: [package-managed, package-native-companions]
@@ -831,8 +946,8 @@ jobs:
           done
 
   publish-native-companions-to-nuget:
-    needs: [publish-managed-to-nuget, validate-nativeaot-static-package]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run && needs.publish-managed-to-nuget.result == 'success' && needs.validate-nativeaot-static-package.result == 'success' }}
+    needs: [publish-managed-to-nuget, validate-dynamic-native-packages, validate-nativeaot-static-package]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run && needs.publish-managed-to-nuget.result == 'success' && needs.validate-dynamic-native-packages.result == 'success' && needs.validate-nativeaot-static-package.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

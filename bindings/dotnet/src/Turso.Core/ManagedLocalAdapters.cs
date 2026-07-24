@@ -161,6 +161,14 @@ public interface IManagedStatementAdapter : IDisposable
 
     StatementStepResult Step();
 
+    StatementStepResult Step(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = Step();
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
+
     bool HasRows();
 
     void Reset();
@@ -465,10 +473,13 @@ public sealed class ManagedStatementAdapter : IManagedStatementAdapter
     }
 
     public StatementStepResult Step()
+        => Step(CancellationToken.None);
+
+    public StatementStepResult Step(CancellationToken cancellationToken)
     {
         try
         {
-            var result = GetStatement().Step();
+            var result = GetStatement().Step(cancellationToken);
             lock (_gate)
                 _hasCurrentRow = result == StatementStepResult.Row;
             return result;

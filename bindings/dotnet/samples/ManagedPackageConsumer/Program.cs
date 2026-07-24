@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using Turso.Data.Sqlite;
 
 using var connection = new SqliteConnection("Data Source=:memory:");
@@ -17,8 +18,25 @@ if (AppDomain.CurrentDomain.GetAssemblies().Any(assembly =>
 }
 
 EnsureNoNativeCompanionWasRestored();
+await VerifyEntityFrameworkIntegrationAsync(connection);
 
 Console.WriteLine("Managed package consumer succeeded.");
+
+static async Task VerifyEntityFrameworkIntegrationAsync(SqliteConnection connection)
+{
+    var options = new DbContextOptionsBuilder<ManagedPackageContext>()
+        .UseTurso(connection)
+        .Options;
+
+    await using var context = new ManagedPackageContext(options);
+    await context.Database.EnsureCreatedAsync();
+    context.Records.Add(new ManagedPackageRecord { Value = "entity-framework" });
+    await context.SaveChangesAsync();
+
+    var value = await context.Records.SingleAsync();
+    if (value.Value != "entity-framework")
+        throw new InvalidOperationException("The managed Entity Framework package consumer returned an unexpected result.");
+}
 
 static void EnsureNoNativeCompanionWasRestored()
 {
@@ -50,5 +68,19 @@ static void EnsureNoNativeCompanionWasRestored()
 static bool IsNativeCompanionPackage(string packageIdentity)
     => packageIdentity.StartsWith("Turso.Raw/", StringComparison.OrdinalIgnoreCase) ||
        packageIdentity.StartsWith("Turso.Data.Native/", StringComparison.OrdinalIgnoreCase) ||
+       packageIdentity.StartsWith("Turso.Data.Sync/", StringComparison.OrdinalIgnoreCase) ||
        packageIdentity.StartsWith("Turso.Data.Sqlite.Native/", StringComparison.OrdinalIgnoreCase) ||
-       packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot", StringComparison.OrdinalIgnoreCase);
+       packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot", StringComparison.OrdinalIgnoreCase) ||
+       packageIdentity.StartsWith("Turso.Data.Sqlite.Sync/", StringComparison.OrdinalIgnoreCase);
+
+sealed class ManagedPackageContext(DbContextOptions<ManagedPackageContext> options) : DbContext(options)
+{
+    public DbSet<ManagedPackageRecord> Records => Set<ManagedPackageRecord>();
+}
+
+sealed class ManagedPackageRecord
+{
+    public int Id { get; init; }
+
+    public required string Value { get; init; }
+}

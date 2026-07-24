@@ -204,7 +204,8 @@ public sealed class EmbeddedDatabase : IDisposable
         bool ForeignKeysEnabled = false,
         bool RecursiveTriggersEnabled = false,
         IReadOnlySet<string>? ActiveTriggers = null,
-        int TriggerDepth = 0);
+        int TriggerDepth = 0,
+        CancellationToken CancellationToken = default);
 
     // Bundles the mutable schema (tables, views, triggers) so a transaction can
     // snapshot and atomically publish all managed catalog state together.
@@ -360,10 +361,60 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         long lastInsertRowId = 0,
         bool foreignKeysEnabled = false,
-        bool recursiveTriggersEnabled = false)
+        bool recursiveTriggersEnabled = false,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
+            if (cancellationToken.CanBeCanceled && MayMutate(statement))
+            {
+                var cancellableWorking = new SchemaCatalog(_tables, _views, _triggers).Clone();
+                ExecutionResult cancellableResult;
+                try
+                {
+                    cancellableResult = Execute(
+                        statement,
+                        parameters,
+                        cancellableWorking,
+                        lastInsertRowId,
+                        foreignKeysEnabled,
+                        recursiveTriggersEnabled,
+                        cancellationToken);
+                }
+                catch (EmbeddedConflictFailException)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (_fileStore is null)
+                        PublishCatalog(cancellableWorking);
+                    else
+                        PersistFileCatalog(cancellableWorking);
+                    throw;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!cancellableResult.Changed)
+                    return cancellableResult;
+
+                if (_fileStore is null)
+                {
+                    if (MayChangeSchema(statement))
+                    {
+                        _inMemoryPragmaHeader = _inMemoryPragmaHeader with
+                        {
+                            SchemaVersion = unchecked(_inMemoryPragmaHeader.SchemaVersion + 1),
+                        };
+                    }
+                    PublishCatalog(cancellableWorking);
+                }
+                else
+                {
+                    PersistFileCatalog(cancellableWorking);
+                }
+
+                return cancellableResult;
+            }
+
             if (_fileStore is null)
             {
                 ExecutionResult inMemoryResult;
@@ -375,7 +426,8 @@ public sealed class EmbeddedDatabase : IDisposable
                         new SchemaCatalog(_tables, _views, _triggers),
                         lastInsertRowId,
                         foreignKeysEnabled,
-                        recursiveTriggersEnabled);
+                        recursiveTriggersEnabled,
+                        cancellationToken);
                 }
                 catch (EmbeddedConflictFailException)
                 {
@@ -406,7 +458,8 @@ public sealed class EmbeddedDatabase : IDisposable
                     new SchemaCatalog(_tables, _views, _triggers),
                     lastInsertRowId,
                     foreignKeysEnabled,
-                    recursiveTriggersEnabled);
+                    recursiveTriggersEnabled,
+                    cancellationToken);
 
             var working = new SchemaCatalog(_tables, _views, _triggers).Clone();
             ExecutionResult result;
@@ -418,7 +471,8 @@ public sealed class EmbeddedDatabase : IDisposable
                     working,
                     lastInsertRowId,
                     foreignKeysEnabled,
-                    recursiveTriggersEnabled);
+                    recursiveTriggersEnabled,
+                    cancellationToken);
             }
             catch (EmbeddedConflictFailException)
             {
@@ -809,8 +863,10 @@ public sealed class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         long lastInsertRowId = 0,
         bool foreignKeysEnabled = false,
-        bool recursiveTriggersEnabled = false)
+        bool recursiveTriggersEnabled = false,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (_readOnly && MayMutate(statement))
             throw new EmbeddedSqlException("attempt to write a readonly database");
 
@@ -822,7 +878,8 @@ public sealed class EmbeddedDatabase : IDisposable
             catalog.Triggers,
             LastInsertRowId: lastInsertRowId,
             ForeignKeysEnabled: foreignKeysEnabled,
-            RecursiveTriggersEnabled: recursiveTriggersEnabled);
+            RecursiveTriggersEnabled: recursiveTriggersEnabled,
+            CancellationToken: cancellationToken);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog),
@@ -1783,28 +1840,27 @@ public sealed class EmbeddedDatabase : IDisposable
                 string.Equals(foreignKey.ParentTable, tableName, StringComparison.OrdinalIgnoreCase)));
     }
 
-    // The upsert evaluator stages its one-row image before publishing it, but trigger bodies
-    // can still fail after that publication. Keep the whole statement under one backup so an
-    // INSERT branch, a DO UPDATE branch, and their statement-level triggers are equally atomic.
+    // Trigger bodies can fail after their row mutations are published. Keep the complete
+    // statement under one backup so every VALUES row and statement-level trigger is atomic.
     private ExecutionResult ExecuteUpsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
         var backup = CloneTables(context.Tables);
         try
         {
-            var (result, mutationEvent) = PerformUpsertEvaluated(statement, parameters, context);
-            if (mutationEvent is { } triggerEvent)
+            var (result, mutationEvents) = PerformUpsertEvaluated(statement, parameters, context);
+            foreach (var triggerEvent in mutationEvents)
             {
                 var triggers = GetMatchingTriggers(context, statement.TableName, triggerEvent);
-                if (triggers.Count > 0)
-                {
-                    if (context.InsideTrigger)
-                    {
-                        throw new EmbeddedSqlException(
-                            $"cannot modify {statement.TableName} within a trigger body: recursive triggers are not supported");
-                    }
+                if (triggers.Count == 0)
+                    continue;
 
-                    FireTriggers(triggers, context);
+                if (context.InsideTrigger)
+                {
+                    throw new EmbeddedSqlException(
+                        $"cannot modify {statement.TableName} within a trigger body: recursive triggers are not supported");
                 }
+
+                FireTriggers(triggers, context);
             }
 
             return result;
@@ -1816,161 +1872,146 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    private (ExecutionResult Result, TriggerEvent? MutationEvent) PerformUpsertEvaluated(
+    private (ExecutionResult Result, IReadOnlyList<TriggerEvent> MutationEvents) PerformUpsertEvaluated(
         InsertStatement statement,
         SqlValue[] parameters,
         QueryContext context)
     {
         if (statement.Upsert is null)
             throw new InvalidOperationException("UPSERT execution requires an UPSERT clause.");
-        if (statement.Source is not null || context.CommonTableExpressions.Count != 0 || statement.Rows.Count != 1)
+        if (statement.Source is not null || context.CommonTableExpressions.Count != 0)
         {
             throw new EmbeddedSqlException(
-                "Managed UPSERT supports exactly one VALUES row and does not support INSERT ... SELECT or CTE sources.");
+                "Managed UPSERT supports VALUES rows only and does not support INSERT ... SELECT or CTE sources.");
         }
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         var conflictTarget = ResolveUpsertConflictTarget(statement.TableName, table, statement.Upsert.Target);
         var insertPlan = PrepareInsert(statement, table);
-        var (candidate, candidateRowId) = BuildInsertRow(
-            statement,
-            table,
-            insertPlan,
-            statement.Rows[0],
-            parameters,
-            context,
-            allowExistingRowid: true);
-        var conflictPosition = FindUpsertConflictPosition(
-            conflictTarget,
-            candidate,
-            table.Rows);
-
-        if (conflictPosition < 0)
-        {
-            var rows = new List<SqlValue[]>(table.Rows.Count + 1);
-            rows.AddRange(table.Rows);
-            rows.Add(candidate);
-            var rowIds = new List<long>(table.RowIds.Count + 1);
-            rowIds.AddRange(table.RowIds);
-            rowIds.Add(candidateRowId);
-
-            ValidateRowIdsUnique(statement.TableName, table, rowIds, table.RowidAliasColumnIndex);
-            table.ValidateRows(rows);
-            ValidateColumnUniqueConstraints(table, rows);
-            ValidatePrimaryKey(statement.TableName, table, rows);
-            ValidateUniqueIndexes(statement.TableName, table, rows);
-            ValidateForeignKeysAfterInsert(context, statement.TableName, table, [candidate], rows);
-            ApplyUpsertRows(table, rows, rowIds);
-
-            return (
-                BuildUpsertReturningResult(
-                    statement,
-                    table,
-                    [candidate],
-                    [candidateRowId],
-                    parameters,
-                    context,
-                    rowsAffected: 1,
-                    changed: true,
-                    lastInsertRowId: candidateRowId),
-                TriggerEvent.Insert);
-        }
-
-        if (statement.Upsert.Action is DoNothingUpsertAction)
-        {
-            return (
-                BuildUpsertReturningResult(
-                    statement,
-                    table,
-                    [],
-                    [],
-                    parameters,
-                    context,
-                    rowsAffected: 0,
-                    changed: false,
-                    lastInsertRowId: null),
-                null);
-        }
-
-        if (statement.Upsert.Action is not DoUpdateUpsertAction updateAction)
+        var updateAction = statement.Upsert.Action as DoUpdateUpsertAction;
+        UpdatePlan? updatePlan = null;
+        if (updateAction is null && statement.Upsert.Action is not DoNothingUpsertAction)
             throw new InvalidOperationException("Unknown UPSERT action.");
 
-        var updateStatement = new UpdateStatement(statement.TableName, updateAction.Assignments, Where: null);
-        var updatePlan = PrepareUpdate(updateStatement, table);
-        if (updatePlan.RowidAssignment is not null || updatePlan.ColumnAssignments.Any(
-                assignment => assignment.Index == table.RowidAliasColumnIndex))
+        if (updateAction is not null)
         {
-            throw new EmbeddedSqlException(
-                "Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.");
+            var updateStatement = new UpdateStatement(statement.TableName, updateAction.Assignments, Where: null);
+            updatePlan = PrepareUpdate(updateStatement, table);
+            if (updatePlan.RowidAssignment is not null || updatePlan.ColumnAssignments.Any(
+                    assignment => assignment.Index == table.RowidAliasColumnIndex))
+            {
+                throw new EmbeddedSqlException(
+                    "Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.");
+            }
+
+            ValidateUpsertUpdateExpressions(statement.TableName, updateAction.Assignments, updateAction.Where);
         }
 
-        ValidateUpsertUpdateExpressions(statement.TableName, updateAction.Assignments, updateAction.Where);
-        var original = table.Rows[conflictPosition];
-        var originalRowId = table.RowIds[conflictPosition];
-        var source = CreateUpsertSourceRow(
-            statement.TableName,
-            table,
-            original,
-            originalRowId,
-            candidate);
-        if (updateAction.Where is not null
-            && !IsTrue(Evaluate(updateAction.Where, parameters, source, context)))
+        var affectedRows = new List<SqlValue[]>();
+        var affectedRowIds = new List<long>();
+        var mutationEvents = new List<TriggerEvent>();
+        long? lastInsertRowId = null;
+        foreach (var values in statement.Rows)
         {
-            return (
-                BuildUpsertReturningResult(
-                    statement,
-                    table,
-                    [],
-                    [],
-                    parameters,
-                    context,
-                    rowsAffected: 0,
-                    changed: false,
-                    lastInsertRowId: null),
-                null);
+            var (candidate, candidateRowId) = BuildInsertRow(
+                statement,
+                table,
+                insertPlan,
+                values,
+                parameters,
+                context,
+                allowExistingRowid: true);
+            var conflictPosition = FindUpsertConflictPosition(conflictTarget, candidate, table.Rows);
+
+            if (conflictPosition < 0)
+            {
+                var rows = new List<SqlValue[]>(table.Rows.Count + 1);
+                rows.AddRange(table.Rows);
+                rows.Add(candidate);
+                var rowIds = new List<long>(table.RowIds.Count + 1);
+                rowIds.AddRange(table.RowIds);
+                rowIds.Add(candidateRowId);
+
+                ValidateRowIdsUnique(statement.TableName, table, rowIds, table.RowidAliasColumnIndex);
+                table.ValidateRows(rows);
+                ValidateColumnUniqueConstraints(table, rows);
+                ValidatePrimaryKey(statement.TableName, table, rows);
+                ValidateUniqueIndexes(statement.TableName, table, rows);
+                ValidateForeignKeysAfterInsert(context, statement.TableName, table, [candidate], rows);
+                ApplyUpsertRows(table, rows, rowIds);
+
+                affectedRows.Add(candidate);
+                affectedRowIds.Add(candidateRowId);
+                lastInsertRowId = candidateRowId;
+                if (!mutationEvents.Contains(TriggerEvent.Insert))
+                    mutationEvents.Add(TriggerEvent.Insert);
+                continue;
+            }
+
+            if (updateAction is null)
+                continue;
+
+            var original = table.Rows[conflictPosition];
+            var originalRowId = table.RowIds[conflictPosition];
+            var source = CreateUpsertSourceRow(
+                statement.TableName,
+                table,
+                original,
+                originalRowId,
+                candidate);
+            if (updateAction.Where is not null
+                && !IsTrue(Evaluate(updateAction.Where, parameters, source, context)))
+            {
+                continue;
+            }
+
+            var updated = BuildUpsertUpdatedRow(
+                statement.TableName,
+                table,
+                updatePlan!,
+                original,
+                originalRowId,
+                source,
+                parameters,
+                context);
+            var updatedRows = new List<SqlValue[]>(table.Rows);
+            updatedRows[conflictPosition] = updated;
+            var updatedRowIds = new List<long>(table.RowIds);
+
+            ValidateRowIdsUnique(statement.TableName, table, updatedRowIds, updatePlan!.AliasIndex);
+            table.ValidateRows(updatedRows);
+            ValidateColumnUniqueConstraints(table, updatedRows);
+            ValidatePrimaryKey(statement.TableName, table, updatedRows);
+            ValidateUniqueIndexes(statement.TableName, table, updatedRows);
+            ValidateForeignKeysAfterUpdate(
+                context,
+                statement.TableName,
+                table,
+                table.Rows,
+                updatedRows,
+                updatePlan!,
+                [conflictPosition]);
+            ApplyUpsertRows(table, updatedRows, updatedRowIds);
+
+            affectedRows.Add(updated);
+            affectedRowIds.Add(originalRowId);
+            if (!mutationEvents.Contains(TriggerEvent.Update))
+                mutationEvents.Add(TriggerEvent.Update);
         }
-
-        var updated = BuildUpsertUpdatedRow(
-            statement.TableName,
-            table,
-            updatePlan,
-            original,
-            originalRowId,
-            source,
-            parameters,
-            context);
-        var updatedRows = new List<SqlValue[]>(table.Rows);
-        updatedRows[conflictPosition] = updated;
-        var updatedRowIds = new List<long>(table.RowIds);
-
-        ValidateRowIdsUnique(statement.TableName, table, updatedRowIds, updatePlan.AliasIndex);
-        table.ValidateRows(updatedRows);
-        ValidateColumnUniqueConstraints(table, updatedRows);
-        ValidatePrimaryKey(statement.TableName, table, updatedRows);
-        ValidateUniqueIndexes(statement.TableName, table, updatedRows);
-        ValidateForeignKeysAfterUpdate(
-            context,
-            statement.TableName,
-            table,
-            table.Rows,
-            updatedRows,
-            updatePlan,
-            [conflictPosition]);
-        ApplyUpsertRows(table, updatedRows, updatedRowIds);
 
         return (
             BuildUpsertReturningResult(
                 statement,
                 table,
-                [updated],
-                [originalRowId],
+                affectedRows,
+                affectedRowIds,
                 parameters,
                 context,
-                rowsAffected: 1,
-                changed: true,
-                lastInsertRowId: null),
-            TriggerEvent.Update);
+                rowsAffected: affectedRows.Count,
+                changed: affectedRows.Count > 0,
+                lastInsertRowId: lastInsertRowId),
+            mutationEvents);
     }
 
     private void ApplyUpsertRows(EmbeddedTable table, List<SqlValue[]> rows, List<long> rowIds)
@@ -3535,6 +3576,7 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        context.CancellationToken.ThrowIfCancellationRequested();
         return statement switch
         {
             SelectStatement select => ExecuteSelectStatement(select, parameters, context, outerRow),
@@ -3578,7 +3620,9 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        if (TryCompileSelect(select, parameters, context, outerRow, out var compiled))
+        context.CancellationToken.ThrowIfCancellationRequested();
+        if (!context.CancellationToken.CanBeCanceled
+            && TryCompileSelect(select, parameters, context, outerRow, out var compiled))
         {
             var columns = GetColumnNames(
                 select.Projections,
@@ -9805,7 +9849,8 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? row,
         QueryContext context)
     {
-        return expression switch
+        context.CancellationToken.ThrowIfCancellationRequested();
+        var result = expression switch
         {
             LiteralExpression literal => literal.Value,
             ParameterExpression parameter => ReadParameter(parameters, parameter.Index),
@@ -9827,6 +9872,8 @@ public sealed class EmbeddedDatabase : IDisposable
             QualifiedStarExpression => throw new EmbeddedSqlException("row value misused"),
             _ => throw new EmbeddedSqlException($"Unsupported expression type {expression.GetType().Name}."),
         };
+        context.CancellationToken.ThrowIfCancellationRequested();
+        return result;
     }
 
     private SqlValue EvaluateScalarSubquery(
@@ -15681,9 +15728,13 @@ public sealed class EmbeddedConnection : IDisposable
         _disposed = true;
     }
 
-    internal ExecutionResult Execute(ParsedStatement statement, SqlValue[] parameters)
+    internal ExecutionResult Execute(
+        ParsedStatement statement,
+        SqlValue[] parameters,
+        CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
 
         switch (statement)
         {
@@ -15764,17 +15815,30 @@ public sealed class EmbeddedConnection : IDisposable
                             parameters,
                             _lastInsertRowId,
                             _foreignKeys,
-                            _recursiveTriggers);
+                            _recursiveTriggers,
+                            cancellationToken);
                     }
                     else
                     {
+                        var transactionCatalog = _transactionCatalog;
+                        var cancellableMutation = cancellationToken.CanBeCanceled
+                            && EmbeddedDatabase.MayMutate(routed.Statement);
+                        var executionCatalog = cancellableMutation
+                            ? transactionCatalog.Clone()
+                            : transactionCatalog;
                         result = _database.Execute(
                             routed.Statement,
                             parameters,
-                            _transactionCatalog,
+                            executionCatalog,
                             _lastInsertRowId,
                             _foreignKeys,
-                            _recursiveTriggers);
+                            _recursiveTriggers,
+                            cancellationToken);
+                        if (cancellableMutation)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            _transactionCatalog = executionCatalog;
+                        }
                         if (result.Changed)
                         {
                             _transactionHasChanges = true;
@@ -16661,10 +16725,11 @@ public sealed class EmbeddedStatement : IDisposable
         return _parameters.TryGetIndex(name, out var index) && BindResolved(index, value);
     }
 
-    public StatementStepResult Step()
+    public StatementStepResult Step(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ExecuteIfNeeded();
+        cancellationToken.ThrowIfCancellationRequested();
+        ExecuteIfNeeded(cancellationToken);
 
         if (++_rowIndex < _result!.Rows.Count)
             return StatementStepResult.Row;
@@ -16732,11 +16797,12 @@ public sealed class EmbeddedStatement : IDisposable
         return true;
     }
 
-    private void ExecuteIfNeeded()
+    private void ExecuteIfNeeded(CancellationToken cancellationToken = default)
     {
         if (_result is not null)
             return;
 
+        cancellationToken.ThrowIfCancellationRequested();
         for (var index = 1; index <= ParameterCount; index++)
         {
             if (!_isBound[index])
@@ -16752,10 +16818,13 @@ public sealed class EmbeddedStatement : IDisposable
             && TryExecuteCachedValuesLowering(values, out var valuesResult))
         {
             _result = valuesResult;
+            cancellationToken.ThrowIfCancellationRequested();
             return;
         }
 
-        _result = _connection.Execute(_statement, _boundValues);
+        _result = _connection.Execute(_statement, _boundValues, cancellationToken);
+        if (!EmbeddedDatabase.MayMutate(_statement))
+            cancellationToken.ThrowIfCancellationRequested();
     }
 
     // Routes an eligible top-level VALUES through its per-statement cached lowering. The lowering is

@@ -9,5 +9,6 @@
 
   <ItemGroup>
     <PackageReference Include="Turso.Data.Sqlite" Version="$(TursoPackageVersion)" />
+    <PackageReference Include="Turso.EntityFrameworkCore.Sqlite" Version="$(TursoPackageVersion)" />
   </ItemGroup>
 </Project>

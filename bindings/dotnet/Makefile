@@ -32,6 +32,7 @@ MANAGED_PACKAGE_CONSUMER_OUTPUT ?= ./artifacts/managed-package-consumer
 MANAGED_PACKAGE_OUTPUT_ARG = $(if $(MANAGED_PACKAGE_OUTPUT),--output "$(MANAGED_PACKAGE_OUTPUT)")
 MANAGED_PACKAGE_VERSION_ARG = $(if $(MANAGED_PACKAGE_VERSION),-p:PackageVersion=$(MANAGED_PACKAGE_VERSION))
 MANAGED_PACKAGE_OUTPUT_ABSOLUTE = $(abspath $(MANAGED_PACKAGE_OUTPUT))
+MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG = ./samples/ManagedPackageConsumer/obj/managed-package-consumer.nuget.config
 MANAGED_NATIVEAOT_OUTPUT ?= ./artifacts/managed-nativeaot-smoke
 MANAGED_NATIVEAOT_PACKAGES ?= $(MANAGED_PACKAGE_OUTPUT)/.nuget-packages
 MANAGED_NATIVEAOT_NUGET_CONFIG = ./samples/ManagedNativeAot/obj/managed-nativeaot.nuget.config
@@ -213,7 +214,7 @@ pack-managed: restore-managed validate-managed-project-closure
 	$(MAKE) validate-managed-packed-closure
 
 validate-managed-project-closure:
-	@if grep -E -i '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./Directory.Build.props ./Directory.Build.targets ./Turso.slnx || grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(Turso\.(Raw|Data\.Native|Data\.Sqlite\.Native[^"]*)|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./src/Turso.Core ./src/Turso.Data ./src/Turso.Data.Sqlite ./src/Turso.EntityFrameworkCore.Sqlite ./src/Turso.Platform.Client ./src/Turso.Serverless.Client ./samples/ManagedPackageConsumer ./samples/ManagedNativeAot; then \
+	@if grep -E -i '(Turso\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./Directory.Build.props ./Directory.Build.targets ./Turso.slnx || grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(Turso\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./src/Turso.Core ./src/Turso.Data ./src/Turso.Data.Sqlite ./src/Turso.EntityFrameworkCore.Sqlite ./src/Turso.Platform.Client ./src/Turso.Serverless.Client ./samples/ManagedPackageConsumer ./samples/ManagedNativeAot; then \
 		echo "Managed package, solution, and NativeAOT build configurations must not reference native Turso packages, P/Invoke assets, or Rust tooling"; \
 		exit 1; \
 	fi
@@ -225,7 +226,9 @@ validate-managed-package: validate-managed-project-closure
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
 	$(MAKE) validate-managed-packed-closure
 	rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)"
-	dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --source "$(MANAGED_PACKAGE_OUTPUT)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local
+	mkdir -p ./samples/ManagedPackageConsumer/obj
+	printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration>' '  <packageSources>' '    <clear />' '    <add key="managed-package" value="$(MANAGED_PACKAGE_OUTPUT_ABSOLUTE)" />' '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />' '  </packageSources>' '</configuration>' > "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)"
+	dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --configfile "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local
 	dotnet build --no-restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
 	dotnet run --no-build --no-restore --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
 	dotnet publish --configuration Debug --no-build --no-restore --output "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)" ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local

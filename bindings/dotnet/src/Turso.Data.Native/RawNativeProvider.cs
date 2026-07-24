@@ -66,20 +66,34 @@ internal sealed class RawNativeProviderFactory : TursoNativeProviderFactory
     }
 }
 
-internal sealed class RawNativeDatabase(TursoDatabaseHandle database) : TursoNativeDatabase
+internal sealed class RawNativeDatabase : TursoNativeDatabase
 {
-    private readonly TursoDatabaseHandle _database = database;
+    private readonly object _gate = new();
+    private readonly TursoDatabaseHandle _database;
     private readonly List<GCHandle> _nativeContexts = [];
+    private readonly HashSet<RawNativeStatement> _statements = [];
+    private int _operationThreadId;
+    private bool _disposed;
 
     internal TursoDatabaseHandle Handle => _database;
 
-    public override bool IsInvalid => _database.IsInvalid;
+    public RawNativeDatabase(TursoDatabaseHandle database)
+    {
+        _database = database;
+    }
+
+    public override bool IsInvalid => _disposed || _database.IsInvalid;
 
     public override TursoNativeStatement PrepareStatement(string sql)
     {
         try
         {
-            return new RawNativeStatement(TursoBindings.PrepareStatement(_database, sql));
+            return ExecuteExclusive(() =>
+            {
+                var statement = new RawNativeStatement(TursoBindings.PrepareStatement(_database, sql), this);
+                _statements.Add(statement);
+                return statement;
+            });
         }
         catch (RawException exception)
         {
@@ -87,77 +101,164 @@ internal sealed class RawNativeDatabase(TursoDatabaseHandle database) : TursoNat
         }
     }
 
-    public override void Dispose()
+    public override void SetBusyTimeout(TimeSpan timeout)
+        => ExecuteExclusive(() => TursoBindings.SetBusyTimeout(_database, timeout));
+
+    internal void Interrupt()
     {
         try
         {
-            _database.Dispose();
+            TursoBindings.Interrupt(_database);
         }
-        finally
+        catch (ObjectDisposedException)
         {
-            foreach (var context in _nativeContexts)
-            {
-                if (context.Target is INativeContext nativeContext)
-                    nativeContext.Release();
-                if (context.IsAllocated)
-                    context.Free();
-            }
-
-            _nativeContexts.Clear();
         }
     }
 
-    internal void AddNativeContext(GCHandle context) => _nativeContexts.Add(context);
+    public override void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed)
+                return;
+            ThrowIfReentrant();
+            _operationThreadId = Environment.CurrentManagedThreadId;
+            try
+            {
+                foreach (var statement in _statements)
+                    statement.DisposeFromDatabase();
+                _statements.Clear();
+                _database.Dispose();
+
+                foreach (var context in _nativeContexts)
+                {
+                    if (context.Target is INativeContext nativeContext)
+                        nativeContext.Release();
+                    if (context.IsAllocated)
+                        context.Free();
+                }
+
+                _nativeContexts.Clear();
+                _disposed = true;
+            }
+            finally
+            {
+                _operationThreadId = 0;
+            }
+        }
+    }
+
+    internal T ExecuteExclusive<T>(Func<T> operation)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowIfReentrant();
+            _operationThreadId = Environment.CurrentManagedThreadId;
+            try
+            {
+                return operation();
+            }
+            finally
+            {
+                _operationThreadId = 0;
+            }
+        }
+    }
+
+    internal void ExecuteExclusive(Action operation)
+        => ExecuteExclusive(() =>
+        {
+            operation();
+            return true;
+        });
+
+    internal void AddNativeContext(GCHandle context)
+    {
+        if (_operationThreadId != Environment.CurrentManagedThreadId)
+            throw new InvalidOperationException("Native contexts must be registered within an exclusive operation.");
+        _nativeContexts.Add(context);
+    }
+
+    internal void DisposeStatement(RawNativeStatement statement, TursoStatementHandle handle)
+    {
+        lock (_gate)
+        {
+            if (_statements.Remove(statement))
+                handle.Dispose();
+        }
+    }
+
+    private void ThrowIfReentrant()
+    {
+        if (_operationThreadId == Environment.CurrentManagedThreadId)
+        {
+            throw new InvalidOperationException(
+                "The native Turso connection does not support reentrant operations from callbacks.");
+        }
+    }
 }
 
-internal sealed class RawNativeStatement(TursoStatementHandle statement) : TursoNativeStatement
+internal sealed class RawNativeStatement : TursoNativeStatement
 {
-    private readonly TursoStatementHandle _statement = statement;
+    private readonly TursoStatementHandle _statement;
+    private readonly RawNativeDatabase _database;
 
-    public override bool IsInvalid => _statement.IsInvalid;
+    public RawNativeStatement(TursoStatementHandle statement, RawNativeDatabase database)
+    {
+        _statement = statement;
+        _database = database;
+    }
 
-    public override int ParameterCount => Execute(() => TursoBindings.GetParameterCount(_statement));
+    public override bool IsInvalid => _statement.IsInvalid || _database.IsInvalid;
+
+    public override int ParameterCount
+        => ExecuteExclusive(() => TursoBindings.GetParameterCount(_statement));
 
     public override void BindParameter(int index, TursoValue value)
     {
-        Execute(() => TursoBindings.BindParameter(_statement, index, ToRawValue(value)));
+        ExecuteExclusive(() => TursoBindings.BindParameter(_statement, index, ToRawValue(value)));
     }
 
     public override int BindNamedParameter(string name, TursoValue value)
     {
-        return Execute(() => TursoBindings.BindNamedParameter(_statement, name, ToRawValue(value)));
+        return ExecuteExclusive(() => TursoBindings.BindNamedParameter(_statement, name, ToRawValue(value)));
     }
 
     public override string? GetParameterName(int index)
     {
-        return Execute(() => TursoBindings.GetParameterName(_statement, index));
+        return ExecuteExclusive(() => TursoBindings.GetParameterName(_statement, index));
     }
 
     public override bool Read()
     {
-        return Execute(() => TursoBindings.Read(_statement));
+        return ExecuteExclusive(() => TursoBindings.Read(_statement));
     }
+
+    public override void Interrupt() => _database.Interrupt();
 
     public override TursoValue GetValue(int ordinal)
     {
-        return ToTursoValue(Execute(() => TursoBindings.GetValue(_statement, ordinal)));
+        return ToTursoValue(ExecuteExclusive(() => TursoBindings.GetValue(_statement, ordinal)));
     }
 
     public override string GetName(int ordinal)
     {
-        return Execute(() => TursoBindings.GetName(_statement, ordinal));
+        return ExecuteExclusive(() => TursoBindings.GetName(_statement, ordinal));
     }
 
-    public override int FieldCount => Execute(() => TursoBindings.GetFieldCount(_statement));
+    public override int FieldCount
+        => ExecuteExclusive(() => TursoBindings.GetFieldCount(_statement));
 
-    public override int RowsAffected => Execute(() => TursoBindings.RowsAffected(_statement));
+    public override int RowsAffected
+        => ExecuteExclusive(() => TursoBindings.RowsAffected(_statement));
 
-    public override bool HasRows => Execute(() => TursoBindings.HasRows(_statement));
+    public override bool HasRows
+        => ExecuteExclusive(() => TursoBindings.HasRows(_statement));
 
-    public override void Dispose()
-    {
-        _statement.Dispose();
-    }
+    public override void Dispose() => _database.DisposeStatement(this, _statement);
+
+    internal void DisposeFromDatabase() => _statement.Dispose();
 
     private static RawValue ToRawValue(TursoValue value)
     {
@@ -187,11 +288,11 @@ internal sealed class RawNativeStatement(TursoStatementHandle statement) : Turso
         };
     }
 
-    private static void Execute(Action operation)
+    private void ExecuteExclusive(Action operation)
     {
         try
         {
-            operation();
+            _database.ExecuteExclusive(operation);
         }
         catch (RawException exception)
         {
@@ -199,11 +300,11 @@ internal sealed class RawNativeStatement(TursoStatementHandle statement) : Turso
         }
     }
 
-    private static T Execute<T>(Func<T> operation)
+    private T ExecuteExclusive<T>(Func<T> operation)
     {
         try
         {
-            return operation();
+            return _database.ExecuteExclusive(operation);
         }
         catch (RawException exception)
         {

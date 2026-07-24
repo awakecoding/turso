@@ -370,7 +370,6 @@ internal sealed class SqlParser
         Expect(TokenKind.LeftParen);
         var columns = new List<EmbeddedColumn>();
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null;
-        var hasCheckConstraint = false;
         do
         {
             if (IsTableConstraintStart())
@@ -386,9 +385,6 @@ internal sealed class SqlParser
                         break;
                     case ForeignKeyTableConstraint foreignKey:
                         AttachTableForeignKey(columns, foreignKey.Definition);
-                        break;
-                    case CheckTableConstraint:
-                        hasCheckConstraint = true;
                         break;
                 }
 
@@ -411,9 +407,6 @@ internal sealed class SqlParser
             withoutRowid = true;
         }
 
-        if (hasCheckConstraint && columns.Count > 0)
-            columns[0] = columns[0] with { HasCheckConstraint = true };
-
         return new CreateTableStatement(name, columns, ifNotExists, withoutRowid, tablePrimaryKey);
     }
 
@@ -423,11 +416,8 @@ internal sealed class SqlParser
 
     private sealed record ForeignKeyTableConstraint(ForeignKeyDefinition Definition) : TableConstraint;
 
-    private sealed record CheckTableConstraint : TableConstraint;
-
-    // Parses the single-column table constraints the managed FK slice can preserve. Other
-    // pre-existing unsupported table constraints retain the parser's skip behavior.
-    private TableConstraint? ParseTableConstraint()
+    // Parses the single-column table constraints the managed FK slice can preserve.
+    private TableConstraint ParseTableConstraint()
     {
         if (ConsumeKeyword("CONSTRAINT"))
             ExpectIdentifier();
@@ -468,13 +458,12 @@ internal sealed class SqlParser
         }
 
         if (ConsumeKeyword("CHECK"))
-        {
-            SkipParenthesized();
-            return new CheckTableConstraint();
-        }
+            throw Error("CHECK constraints are not supported by the managed engine.");
 
-        SkipColumnDefinitionRemainder();
-        return null;
+        if (ConsumeKeyword("UNIQUE"))
+            throw Error("Table-level UNIQUE constraints are not supported by the managed engine.");
+
+        throw Error($"Unsupported table constraint: {_lexer.Current.Text}.");
     }
 
     private static void AttachTableForeignKey(List<EmbeddedColumn> columns, ForeignKeyDefinition foreignKey)
@@ -786,13 +775,22 @@ internal sealed class SqlParser
             }
             while (Consume(TokenKind.Comma));
         }
+        else if (ConsumeKeyword("DEFAULT"))
+        {
+            if (columns is not null)
+                throw Error("DEFAULT VALUES cannot be used with a column list.");
+
+            ExpectKeyword("VALUES");
+            columns = [];
+            rows.Add([]);
+        }
         else if (IsQueryStart())
         {
             source = ParseQuery();
         }
         else
         {
-            throw Error("Expected VALUES or a SELECT query after the INSERT target.");
+            throw Error("Expected VALUES, DEFAULT VALUES, or a SELECT query after the INSERT target.");
         }
 
         var upsert = ParseUpsert();
@@ -1830,7 +1828,6 @@ internal sealed class SqlParser
         var generatedStored = false;
         string? generationSql = null;
         ForeignKeyDefinition? foreignKey = null;
-        var hasCheckConstraint = false;
         while (_lexer.Current.Kind == TokenKind.Identifier)
         {
             if (ConsumeKeyword("PRIMARY"))
@@ -1904,19 +1901,20 @@ internal sealed class SqlParser
             if (ConsumeKeyword("FOREIGN"))
                 throw Error("FOREIGN KEY constraints must be table-level.");
             if (ConsumeKeyword("CHECK"))
-            {
-                SkipParenthesized();
-                hasCheckConstraint = true;
-                continue;
-            }
+                throw Error("CHECK constraints are not supported by the managed engine.");
             if (ConsumeKeyword("CONSTRAINT"))
             {
                 ExpectIdentifier();
                 continue;
             }
 
-            SkipColumnDefinitionRemainder();
-            break;
+            if (CurrentIsKeyword("ON"))
+            {
+                throw Error(
+                    "Column constraint ON CONFLICT clauses are not supported by the managed engine.");
+            }
+
+            throw Error($"Unsupported column constraint clause: {_lexer.Current.Text}.");
         }
 
         return new EmbeddedColumn(
@@ -1931,8 +1929,7 @@ internal sealed class SqlParser
             generatedStored,
             generationSql,
             collation,
-            foreignKey,
-            hasCheckConstraint);
+            foreignKey);
     }
 
     // Parses the "(expr) [STORED|VIRTUAL]" body shared by GENERATED ALWAYS AS and the bare
@@ -1975,25 +1972,6 @@ internal sealed class SqlParser
             || keyword.Equals("PRIMARY", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("REFERENCES", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("UNIQUE", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private void SkipColumnDefinitionRemainder()
-    {
-        var depth = 0;
-        while (_lexer.Current.Kind is not TokenKind.Comma and not TokenKind.RightParen and not TokenKind.End)
-        {
-            if (_lexer.Current.Kind == TokenKind.LeftParen)
-                depth++;
-            else if (_lexer.Current.Kind == TokenKind.RightParen)
-            {
-                if (depth == 0)
-                    return;
-
-                depth--;
-            }
-
-            _lexer.Next();
-        }
     }
 
     private void SkipParenthesized()
