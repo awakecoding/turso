@@ -274,7 +274,7 @@ public class SqliteCommand : DbCommand
             return new SqliteDataReader(this, -1, behavior, CloseReader);
         }
 
-        if (Connection?.HasOpenReader == true && IsWriteCommand(CommandText))
+        if (Connection?.HasOpenReader == true && IsReaderBlockingCommand(CommandText))
         {
             var timeout = CommandTimeout == 0
                 ? Timeout.InfiniteTimeSpan
@@ -566,6 +566,15 @@ public class SqliteCommand : DbCommand
 
     private static bool IsWriteCommand(string commandText)
         => SplitStatements(commandText).Any(IsWriteStatement);
+
+    private static bool IsReaderBlockingCommand(string commandText)
+        => SplitStatements(commandText).Any(statement =>
+        {
+            var firstKeyword = SqlTransactionControl.GetFirstKeyword(statement);
+            return IsWriteStatement(statement)
+                   || firstKeyword?.Equals("ATTACH", StringComparison.OrdinalIgnoreCase) == true
+                   || firstKeyword?.Equals("DETACH", StringComparison.OrdinalIgnoreCase) == true;
+        });
 
     private static bool IsWriteStatement(string statement)
     {

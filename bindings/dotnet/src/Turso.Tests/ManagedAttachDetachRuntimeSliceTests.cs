@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using Turso.Core;
 using Turso.Core.Storage;
+using Turso.Data.Sqlite;
 
 namespace Turso.Tests;
 
@@ -18,6 +19,8 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
         using (var connection = main.Connect())
         {
             Execute(connection, "ATTACH DATABASE 'attach-secondary.db' AS aux;");
+            Execute(connection, "CREATE TABLE main.items(id INTEGER PRIMARY KEY, value TEXT);");
+            Execute(connection, "INSERT INTO main.items VALUES (1, 'main');");
             var databases = ReadRows(connection, "PRAGMA database_list;");
             databases.Should().HaveCount(2);
             databases[0].Should().Equal(
@@ -31,8 +34,23 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
 
             Execute(connection, "CREATE TABLE aux.items(id INTEGER PRIMARY KEY, value TEXT);");
             Execute(connection, "INSERT INTO aux.items VALUES (1, 'persisted');");
+            Execute(connection, "CREATE TABLE aux.only_aux(value TEXT);");
+            Execute(connection, "INSERT INTO aux.only_aux VALUES ('fallback');");
+            Execute(connection, "INSERT INTO aux.items SELECT 2, value || '-copy' FROM aux.items WHERE id = 1;");
+            Execute(
+                connection,
+                "UPDATE aux.items SET value = (SELECT value || '-updated' FROM aux.items WHERE id = 1) WHERE id = 2;");
             ReadRows(connection, "SELECT value FROM aux.items WHERE id = 1;")
                 .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("persisted"));
+            ReadRows(connection, "SELECT value FROM items WHERE id = 1;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("main"));
+            ReadRows(connection, "SELECT value FROM only_aux;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("fallback"));
+            ReadRows(
+                    connection,
+                    "WITH selected AS (SELECT id, value FROM aux.items WHERE id > 0) "
+                    + "SELECT value FROM selected WHERE id IN (SELECT id FROM aux.items WHERE id = 2);")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("persisted-updated"));
 
             fileSystem.FileExists("attach-secondary.db").Should().BeTrue();
             fileSystem.FileExists("attach-secondary.db-wal").Should().BeTrue();
@@ -47,6 +65,7 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
             detached.Should().Throw<EmbeddedSqlException>().WithMessage("no such database: aux");
 
             Execute(connection, "ATTACH DATABASE 'attach-secondary.db' AS aux;");
+            ReadRows(connection, "PRAGMA database_list;")[1][0].Should().Be(SqlValue.Integer(2));
             ReadRows(connection, "SELECT value FROM aux.items WHERE id = 1;")
                 .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("persisted"));
             Execute(connection, "DETACH aux;");
@@ -75,8 +94,8 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
         var memory = () => Execute(connection, "ATTACH DATABASE ':memory:' AS aux;");
         memory.Should().Throw<EmbeddedSqlException>().WithMessage("*memory databases*not supported*");
 
-        var key = () => connection.Prepare("ATTACH DATABASE 'attach-errors-secondary.db' AS aux KEY 'key';");
-        key.Should().Throw<EmbeddedSqlException>().WithMessage("*does not support KEY*");
+        var key = () => Execute(connection, "ATTACH DATABASE 'attach-errors-key.db' AS encrypted KEY '00';");
+        key.Should().Throw<EmbeddedSqlException>().WithMessage("*encrypted primary database*");
 
         Execute(connection, "ATTACH DATABASE 'attach-errors-secondary.db' AS aux;");
         var duplicateAlias = () => Execute(connection, "ATTACH DATABASE 'unused-secondary.db' AS aux;");
@@ -98,11 +117,14 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
             connection,
             "SELECT * FROM main.main_items JOIN aux.items ON 1 = 1;");
         crossDatabase.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Cross-database queries are not supported by managed ATTACH.");
+            .WithMessage("Cross-database statements are not supported by managed ATTACH;*");
+
+        var temporary = () => ReadRows(connection, "SELECT * FROM temp.items;");
+        temporary.Should().Throw<EmbeddedSqlException>().WithMessage("*temporary database*");
     }
 
     [Test]
-    public void DirectManagedAttachRejectsTransactionsAndKeepsReadOnlyAttachmentsReadOnly()
+    public void DirectManagedAttachTransactionsCommitOneDatabaseAndRejectASecondWriteBeforeExecution()
     {
         var fileSystem = new InMemoryFileSystem();
         using (var seed = EmbeddedDatabase.OpenFile("attach-readonly-main.db", fileSystem))
@@ -111,27 +133,289 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
             Execute(connection, "ATTACH DATABASE 'attach-readonly-secondary.db' AS aux;");
             Execute(connection, "CREATE TABLE aux.items(id INTEGER PRIMARY KEY);");
             Execute(connection, "INSERT INTO aux.items VALUES (1);");
+            Execute(connection, "CREATE TABLE main.items(id INTEGER PRIMARY KEY);");
 
-            var begin = () => Execute(connection, "BEGIN;");
-            begin.Should().Throw<EmbeddedSqlException>().WithMessage("*transactions are not supported*attached*");
-
-            Execute(connection, "DETACH aux;");
             Execute(connection, "BEGIN;");
+            Execute(connection, "INSERT INTO aux.items VALUES (2);");
+            Execute(connection, "SAVEPOINT nested;");
+            Execute(connection, "INSERT INTO aux.items VALUES (3);");
+            Execute(connection, "ROLLBACK TO nested;");
+            Execute(connection, "RELEASE nested;");
+            Execute(connection, "COMMIT;");
+            ReadRows(connection, "SELECT id FROM aux.items ORDER BY id;").Should().HaveCount(2);
+
+            Execute(connection, "BEGIN;");
+            var failedStatement = () => Execute(
+                connection,
+                "INSERT INTO aux.items VALUES (30) RETURNING missing_column;");
+            failedStatement.Should().Throw<EmbeddedSqlException>().WithMessage("no such column: missing_column");
+            Execute(connection, "INSERT INTO aux.items VALUES (31);");
+            Execute(connection, "COMMIT;");
+            ReadRows(connection, "SELECT COUNT(*) FROM aux.items WHERE id = 30;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+            ReadRows(connection, "SELECT COUNT(*) FROM aux.items WHERE id = 31;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1));
+            Execute(connection, "DELETE FROM aux.items WHERE id = 31;");
+
+            Execute(connection, "BEGIN;");
+            Execute(connection, "INSERT INTO main.items VALUES (1);");
+            var secondDatabaseWrite = () => Execute(connection, "INSERT INTO aux.items VALUES (4);");
+            secondDatabaseWrite.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*cannot modify more than one database*atomically*");
+            ReadRows(connection, "SELECT COUNT(*) FROM aux.items;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(2));
+            Execute(connection, "ROLLBACK;");
+            ReadRows(connection, "SELECT COUNT(*) FROM main.items;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+
+            connection.RegisterScalarFunction(
+                "reentrant_main_write",
+                0,
+                _ =>
+                {
+                    Execute(connection, "INSERT INTO main.items VALUES (20);");
+                    return SqlValue.Integer(20);
+                });
+            Execute(connection, "BEGIN;");
+            var reentrantWrite = () => Execute(connection, "INSERT INTO aux.items VALUES (reentrant_main_write());");
+            reentrantWrite.Should().Throw<EmbeddedSqlException>().WithMessage("*reentrant writes*");
+            Execute(connection, "ROLLBACK;");
+            ReadRows(connection, "SELECT COUNT(*) FROM main.items;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+            var autocommitReentrantWrite = () => Execute(
+                connection,
+                "INSERT INTO aux.items VALUES (reentrant_main_write());");
+            autocommitReentrantWrite.Should().Throw<EmbeddedSqlException>().WithMessage("*reentrant writes*");
+            ReadRows(connection, "SELECT COUNT(*) FROM main.items;")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+
+            connection.RegisterScalarFunction(
+                "reentrant_commit",
+                0,
+                _ =>
+                {
+                    Execute(connection, "COMMIT;");
+                    return SqlValue.Integer(21);
+                });
+            Execute(connection, "BEGIN;");
+            var reentrantCommit = () => Execute(connection, "INSERT INTO aux.items VALUES (reentrant_commit());");
+            reentrantCommit.Should().Throw<EmbeddedSqlException>().WithMessage("*cannot change transaction*");
+            Execute(connection, "ROLLBACK;");
+
+            using (var sibling = seed.Connect())
+            {
+                Execute(connection, "BEGIN;");
+                Execute(connection, "INSERT INTO main.items VALUES (5);");
+                Execute(sibling, "INSERT INTO main.items VALUES (9);");
+                var staleCommit = () => Execute(connection, "COMMIT;");
+                staleCommit.Should().Throw<EmbeddedSqlException>().WithMessage("database is locked");
+                Execute(connection, "ROLLBACK;");
+            }
+            AssertRows(
+                ReadRows(connection, "SELECT id FROM main.items ORDER BY id;"),
+                [SqlValue.Integer(9)]);
+
+            Execute(connection, "BEGIN;");
+            var detachInTransaction = () => Execute(connection, "DETACH aux;");
+            detachInTransaction.Should().Throw<EmbeddedSqlException>().WithMessage("*not supported inside a transaction*");
             var attachInTransaction = () => Execute(
                 connection,
-                "ATTACH DATABASE 'attach-readonly-secondary.db' AS aux;");
+                "ATTACH DATABASE 'attach-other-secondary.db' AS other;");
             attachInTransaction.Should().Throw<EmbeddedSqlException>().WithMessage("*not supported inside a transaction*");
             Execute(connection, "ROLLBACK;");
+            Execute(connection, "DETACH aux;");
         }
 
         using var readOnlyMain = EmbeddedDatabase.OpenFile("attach-readonly-main.db", fileSystem, readOnly: true);
         using var readOnlyConnection = readOnlyMain.Connect();
         Execute(readOnlyConnection, "ATTACH DATABASE 'attach-readonly-secondary.db' AS aux;");
-        ReadRows(readOnlyConnection, "SELECT id FROM aux.items;").Should()
-            .ContainSingle().Which.Should().Equal(SqlValue.Integer(1));
+        AssertRows(
+            ReadRows(readOnlyConnection, "SELECT id FROM aux.items ORDER BY id;"),
+            [SqlValue.Integer(1)],
+            [SqlValue.Integer(2)]);
 
         var writeAttached = () => Execute(readOnlyConnection, "INSERT INTO aux.items VALUES (2);");
         writeAttached.Should().Throw<EmbeddedSqlException>().WithMessage("attempt to write a readonly database");
+    }
+
+    [Test]
+    public void DirectManagedAttachEvaluatesFilenameExpressionsAndHonorsUriReadOnlyMode()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var main = EmbeddedDatabase.OpenFile("attach-expression-main.db", fileSystem);
+        using var connection = main.Connect();
+
+        using (var attach = connection.Prepare("ATTACH DATABASE ?1 || '.db' AS aux;"))
+        {
+            attach.Bind(1, SqlValue.Text("attach-expression-secondary"));
+            attach.Step().Should().Be(StatementStepResult.Done);
+        }
+        Execute(connection, "CREATE TABLE aux.items(id INTEGER PRIMARY KEY);");
+        Execute(connection, "INSERT INTO aux.items VALUES (1);");
+        Execute(connection, "DETACH aux;");
+
+        Execute(connection, "ATTACH DATABASE 'file:attach-expression-secondary.db?mode=ro' AS aux;");
+        ReadRows(connection, "SELECT id FROM aux.items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1));
+        var write = () => Execute(connection, "INSERT INTO aux.items VALUES (2);");
+        write.Should().Throw<EmbeddedSqlException>().WithMessage("attempt to write a readonly database");
+        Execute(connection, "DETACH aux;");
+
+        var unsupportedOption = () => Execute(
+            connection,
+            "ATTACH DATABASE 'file:attach-expression-secondary.db?cache=shared' AS aux;");
+        unsupportedOption.Should().Throw<EmbeddedSqlException>().WithMessage("*URI option 'cache'*not supported*");
+
+        Execute(connection, "ATTACH DATABASE 'attach-case.db' AS lower_case;");
+        Execute(connection, "ATTACH DATABASE 'ATTACH-CASE.db' AS upper_case;");
+        ReadRows(connection, "PRAGMA database_list;").Should().HaveCount(3);
+    }
+
+    [Test]
+    public void DirectManagedAttachRejectsCaseVariantsOnCaseInsensitivePhysicalPlatforms()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS())
+            Assert.Ignore("This regression exercises case-insensitive physical file identity.");
+
+        var directory = Path.Combine(Path.GetTempPath(), $"managed-attach-case-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var mainPath = Path.Combine(directory, "main.db");
+        var attachedPath = Path.Combine(directory, "attached.db");
+        try
+        {
+            using var main = EmbeddedDatabase.OpenFile(mainPath);
+            using var connection = main.Connect();
+
+            var duplicateMain = () => Execute(
+                connection,
+                $"ATTACH DATABASE '{Path.Combine(directory, "MAIN.DB")}' AS duplicate_main;");
+            duplicateMain.Should().Throw<EmbeddedSqlException>().WithMessage("database file is already open as main");
+
+            Execute(connection, $"ATTACH DATABASE '{attachedPath}' AS aux;");
+            var duplicateAttachment = () => Execute(
+                connection,
+                $"ATTACH DATABASE '{Path.Combine(directory, "ATTACHED.DB")}' AS duplicate_aux;");
+            duplicateAttachment.Should().Throw<EmbeddedSqlException>().WithMessage("database file is already attached");
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DirectManagedAttachEnforcesAliasAndTenDatabaseBoundaries()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var main = EmbeddedDatabase.OpenFile("attach-limit-main.db", fileSystem);
+        using var connection = main.Connect();
+
+        for (var index = 0; index < 10; index++)
+            Execute(connection, $"ATTACH DATABASE 'attach-limit-{index}.db' AS db{index};");
+
+        ReadRows(connection, "PRAGMA database_list;").Should().HaveCount(11);
+        var tooMany = () => Execute(connection, "ATTACH DATABASE 'attach-limit-overflow.db' AS overflow;");
+        tooMany.Should().Throw<EmbeddedSqlException>().WithMessage("too many attached databases - maximum 10");
+        fileSystem.FileExists("attach-limit-overflow.db").Should().BeFalse();
+
+        var mainAlias = () => Execute(connection, "ATTACH DATABASE 'unused-main.db' AS main;");
+        mainAlias.Should().Throw<EmbeddedSqlException>().WithMessage("cannot attach database as main");
+        var tempAlias = () => Execute(connection, "ATTACH DATABASE 'unused-temp.db' AS temp;");
+        tempAlias.Should().Throw<EmbeddedSqlException>().WithMessage("cannot attach database as temp");
+
+        Execute(connection, "CREATE TABLE db0.only_attached(value INTEGER);");
+        Execute(connection, "CREATE TABLE main.index_owner(value INTEGER);");
+        Execute(connection, "CREATE INDEX only_attached ON index_owner(value);");
+        Execute(connection, "DROP TABLE only_attached;");
+        var dropped = () => ReadRows(connection, "SELECT * FROM db0.only_attached;");
+        dropped.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: only_attached");
+
+        Execute(connection, "CREATE TABLE db0.indexed(value INTEGER);");
+        Execute(connection, "CREATE INDEX db0.indexed_value ON indexed(value);");
+        Execute(connection, "DROP INDEX indexed_value;");
+    }
+
+    [Test]
+    public void DirectManagedAttachInheritsEncryptionAndSupportsSameCipherKeyOverride()
+    {
+        var inner = new InMemoryFileSystem();
+        using var mainEncryption = TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes256Gcm, Aes256Key);
+        using var encryptedFileSystem = new TursoEncryptionFileSystem(inner, mainEncryption);
+        using var main = EmbeddedDatabase.OpenFile("attach-encrypted-main.db", encryptedFileSystem);
+        using var connection = main.Connect();
+
+        Execute(connection, "ATTACH DATABASE 'attach-encrypted-inherited.db' AS inherited;");
+        Execute(connection, "CREATE TABLE inherited.items(value TEXT);");
+        Execute(connection, "INSERT INTO inherited.items VALUES ('inherited');");
+        Execute(connection, "DETACH inherited;");
+        Execute(
+            connection,
+            $"ATTACH DATABASE 'attach-encrypted-override.db' AS overridden KEY '{OtherAes256Key}';");
+        Execute(connection, "CREATE TABLE overridden.items(value TEXT);");
+        Execute(connection, "INSERT INTO overridden.items VALUES ('overridden');");
+        Execute(connection, "DETACH overridden;");
+
+        var wrongInheritedKey = () => Execute(
+            connection,
+            $"ATTACH DATABASE 'attach-encrypted-inherited.db' AS wrong KEY '{OtherAes256Key}';");
+        wrongInheritedKey.Should().Throw<InvalidDataException>().WithMessage("*failed authentication*");
+
+        Execute(
+            connection,
+            $"ATTACH DATABASE 'attach-encrypted-override.db' AS overridden KEY '{OtherAes256Key}';");
+        ReadRows(connection, "SELECT value FROM overridden.items;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Text("overridden"));
+    }
+
+    [Test]
+    public void ManagedProviderBlocksAttachAndDetachWhileAReaderIsActive()
+    {
+        var directory = Path.Combine(AppContext.BaseDirectory, "managed-attach-reader-tests");
+        Directory.CreateDirectory(directory);
+        var mainPath = Path.Combine(directory, $"main-{Guid.NewGuid():N}.db");
+        var attachedPath = Path.Combine(directory, $"attached-{Guid.NewGuid():N}.db");
+        try
+        {
+            using var connection = new Turso.Data.Sqlite.SqliteConnection(
+                $"Data Source={mainPath};Local Provider=Managed;Default Timeout=1");
+            connection.Open();
+            connection.ExecuteNonQuery($"ATTACH DATABASE '{attachedPath}' AS aux;");
+
+            using (var reader = connection.ExecuteReader("SELECT 1;"))
+            {
+                reader.Read().Should().BeTrue();
+                var detach = () => connection.ExecuteNonQuery("-- attachment lifecycle\nDETACH aux;");
+                detach.Should().Throw<Turso.Data.Sqlite.SqliteException>().Which.SqliteErrorCode.Should().Be(5);
+            }
+
+            connection.ExecuteNonQuery("DETACH aux;");
+            using (var reader = connection.ExecuteReader("SELECT 1;"))
+            {
+                reader.Read().Should().BeTrue();
+                var attach = () => connection.ExecuteNonQuery($"ATTACH DATABASE '{attachedPath}' AS aux;");
+                attach.Should().Throw<Turso.Data.Sqlite.SqliteException>().Which.SqliteErrorCode.Should().Be(5);
+            }
+
+            connection.Close();
+            using var readOnly = new Turso.Data.Sqlite.SqliteConnection(
+                $"Data Source={mainPath};Local Provider=Managed;Mode=ReadOnly");
+            readOnly.Open();
+            var attachedUri = new Uri(attachedPath).AbsoluteUri + "?mode=ro";
+            readOnly.ExecuteNonQuery($"ATTACH DATABASE '{attachedUri}' AS aux;");
+            readOnly.ExecuteScalar<long>("SELECT COUNT(*) FROM aux.sqlite_schema;").Should().Be(0);
+        }
+        finally
+        {
+            foreach (var path in new[] { mainPath, attachedPath })
+            {
+                foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+                {
+                    var candidate = path + suffix;
+                    if (File.Exists(candidate))
+                        File.Delete(candidate);
+                }
+            }
+        }
     }
 
     [Test]
@@ -253,7 +537,7 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
     }
 
     [Test]
-    public void DirectManagedAttachRoutesPlainDmlAndRejectsSchemaQualifiedCteDmlAtomically()
+    public void DirectManagedAttachRoutesSchemaQualifiedCteDmlAndRejectsCrossDatabaseCteDmlAtomically()
     {
         var fileSystem = new InMemoryFileSystem();
         using var main = EmbeddedDatabase.OpenFile("attach-cte-main.db", fileSystem);
@@ -269,30 +553,32 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
             INSERT INTO items SELECT id, 'main' FROM selected;
             """);
 
-        var qualifiedTarget = () => Execute(connection, """
+        Execute(connection, """
             WITH selected(id) AS (SELECT 3)
-            INSERT INTO aux.items SELECT id, 'rejected' FROM selected;
+            INSERT INTO aux.items SELECT id, 'attached' FROM selected;
             """);
-        qualifiedTarget.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Schema-qualified and cross-database CTE DML is not supported by managed ATTACH.");
 
         var crossDatabaseSource = () => Execute(connection, """
             WITH selected(id) AS (SELECT id FROM aux.items)
             INSERT INTO items SELECT id, 'rejected' FROM selected;
             """);
         crossDatabaseSource.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Schema-qualified and cross-database CTE DML is not supported by managed ATTACH.");
+            .WithMessage("Cross-database statements are not supported by managed ATTACH;*");
 
         ReadRows(connection, "SELECT id, value FROM main.items;")
             .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(2), SqlValue.Text("main"));
-        ReadRows(connection, "SELECT id, value FROM aux.items;")
-            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1), SqlValue.Text("updated"));
+        AssertRows(
+            ReadRows(connection, "SELECT id, value FROM aux.items ORDER BY id;"),
+            [SqlValue.Integer(1), SqlValue.Text("updated")],
+            [SqlValue.Integer(3), SqlValue.Text("attached")]);
         Execute(connection, "DETACH DATABASE aux;");
 
         using var reopened = EmbeddedDatabase.OpenFile("attach-cte-aux.db", fileSystem);
         using var reopenedConnection = reopened.Connect();
-        ReadRows(reopenedConnection, "SELECT id, value FROM items;")
-            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1), SqlValue.Text("updated"));
+        AssertRows(
+            ReadRows(reopenedConnection, "SELECT id, value FROM items ORDER BY id;"),
+            [SqlValue.Integer(1), SqlValue.Text("updated")],
+            [SqlValue.Integer(3), SqlValue.Text("attached")]);
     }
 
     [Test]

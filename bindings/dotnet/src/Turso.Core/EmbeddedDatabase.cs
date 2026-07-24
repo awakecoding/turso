@@ -47,6 +47,14 @@ internal readonly record struct PragmaHeaderMetadata(
     int UserVersion,
     int ApplicationId);
 
+internal enum ManagedSchemaObjectKind
+{
+    Table,
+    View,
+    Trigger,
+    Index,
+}
+
 internal sealed class EmbeddedConflictRollbackException : EmbeddedSqlException
 {
     public EmbeddedConflictRollbackException(EmbeddedSqlException conflict)
@@ -513,6 +521,23 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
+    internal SqlValue EvaluateConstant(Expression expression, SqlValue[] parameters, long lastInsertRowId)
+    {
+        lock (_gate)
+        {
+            return Evaluate(
+                expression,
+                parameters,
+                row: null,
+                new QueryContext(
+                    _tables,
+                    new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
+                    _views,
+                    _triggers,
+                    LastInsertRowId: lastInsertRowId));
+        }
+    }
+
     internal string[] DescribeColumns(QueryStatement statement)
     {
         lock (_gate)
@@ -522,6 +547,29 @@ public sealed class EmbeddedDatabase : IDisposable
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
                 _views,
                 _triggers));
+        }
+    }
+
+    internal bool ContainsTableOrView(string name)
+    {
+        lock (_gate)
+            return _tables.ContainsKey(name) || _views.ContainsKey(name);
+    }
+
+    internal bool ContainsSchemaObject(string name, ManagedSchemaObjectKind kind)
+    {
+        lock (_gate)
+        {
+            return kind switch
+            {
+                ManagedSchemaObjectKind.Table => _tables.ContainsKey(name),
+                ManagedSchemaObjectKind.View => _views.ContainsKey(name),
+                ManagedSchemaObjectKind.Trigger => _triggers.ContainsKey(name),
+                ManagedSchemaObjectKind.Index => _tables.Values.Any(table =>
+                    table.Indexes.Any(index =>
+                        string.Equals(index.Name, name, StringComparison.OrdinalIgnoreCase))),
+                _ => throw new InvalidOperationException($"Unknown managed schema object kind {kind}."),
+            };
         }
     }
 
@@ -12510,7 +12558,7 @@ public sealed class EmbeddedDatabase : IDisposable
         return SqlValue.Text(ToSqlText(left) + ToSqlText(right));
     }
 
-    private static string ToSqlText(SqlValue value)
+    internal static string ToSqlText(SqlValue value)
     {
         return value.Kind switch
         {
@@ -15978,12 +16026,12 @@ public sealed class EmbeddedDatabase : IDisposable
 public sealed class EmbeddedConnection : IDisposable
 {
     private const int MaximumAttachedDatabases = 10;
+    private const char UnqualifiedSchemaMarker = '\0';
     private readonly EmbeddedDatabase _database;
     private readonly Dictionary<string, AttachedDatabase> _attachedDatabases = new(StringComparer.OrdinalIgnoreCase);
-    private EmbeddedDatabase.SchemaCatalog? _transactionCatalog;
-    private long _transactionVersion;
-    private PragmaHeaderMetadata? _transactionPragmaHeader;
-    private bool _transactionHasChanges;
+    private Dictionary<EmbeddedDatabase, TransactionDatabaseState>? _transactionDatabases;
+    private EmbeddedDatabase? _transactionWriteDatabase;
+    private EmbeddedDatabase? _transactionMutationDatabase;
     private bool _transactionOpenedBySavepoint;
     private readonly List<SavepointEntry> _savepoints = [];
     private long _lastInsertRowId;
@@ -15991,13 +16039,52 @@ public sealed class EmbeddedConnection : IDisposable
     private bool _foreignKeys;
     private bool _recursiveTriggers;
     private bool _disposed;
-    private int _nextAttachedDatabaseSequence = 2;
 
-    private sealed record AttachedDatabase(
-        string Path,
-        string PathIdentity,
-        EmbeddedDatabase Database,
-        int Sequence);
+    private sealed class AttachedDatabase : IDisposable
+    {
+        public AttachedDatabase(
+            string path,
+            string pathIdentity,
+            EmbeddedDatabase database,
+            int sequence,
+            IDisposable? ownedFileSystem)
+        {
+            Path = path;
+            PathIdentity = pathIdentity;
+            Database = database;
+            Sequence = sequence;
+            OwnedFileSystem = ownedFileSystem;
+        }
+
+        public string Path { get; }
+        public string PathIdentity { get; }
+        public EmbeddedDatabase Database { get; }
+        public int Sequence { get; }
+        private IDisposable? OwnedFileSystem { get; }
+
+        public void Dispose()
+        {
+            try
+            {
+                Database.Dispose();
+            }
+            finally
+            {
+                OwnedFileSystem?.Dispose();
+            }
+        }
+    }
+
+    private sealed class TransactionDatabaseState(
+        EmbeddedDatabase.SchemaCatalog catalog,
+        long version,
+        PragmaHeaderMetadata pragmaHeader)
+    {
+        public EmbeddedDatabase.SchemaCatalog Catalog { get; set; } = catalog;
+        public long Version { get; } = version;
+        public PragmaHeaderMetadata PragmaHeader { get; set; } = pragmaHeader;
+        public bool HasChanges { get; set; }
+    }
 
     private readonly record struct RoutedStatement(
         EmbeddedDatabase Database,
@@ -16031,9 +16118,8 @@ public sealed class EmbeddedConnection : IDisposable
         _foreignKeys = false;
         _recursiveTriggers = false;
         foreach (var attachment in _attachedDatabases.Values)
-            attachment.Database.Dispose();
+            attachment.Dispose();
         _attachedDatabases.Clear();
-        _nextAttachedDatabaseSequence = 2;
         _database.RefreshFileCatalogForPooling();
     }
 
@@ -16122,23 +16208,25 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         var database = ResolveBlobDatabase(databaseName);
-        var catalog = _transactionCatalog;
-        return catalog is null || !ReferenceEquals(database, _database)
+        var catalog = GetTransactionState(database)?.Catalog;
+        return catalog is null
             ? database.HasUpdateTrigger(tableName)
             : catalog.Triggers.Values.Any(trigger =>
                 trigger.Event == TriggerEvent.Update
                 && string.Equals(trigger.TableName, tableName, StringComparison.OrdinalIgnoreCase));
     }
 
+    internal bool HasAttachedDatabases => _attachedDatabases.Count != 0;
+
     public void Dispose()
     {
-        _transactionCatalog = null;
-        _transactionPragmaHeader = null;
-        _transactionHasChanges = false;
+        _transactionDatabases = null;
+        _transactionWriteDatabase = null;
+        _transactionMutationDatabase = null;
         _transactionOpenedBySavepoint = false;
         _savepoints.Clear();
         foreach (var attachment in _attachedDatabases.Values)
-            attachment.Database.Dispose();
+            attachment.Dispose();
         _attachedDatabases.Clear();
         _disposed = true;
     }
@@ -16150,34 +16238,35 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         cancellationToken.ThrowIfCancellationRequested();
+        if (_transactionMutationDatabase is not null
+            && statement is BeginStatement
+                or CommitStatement
+                or RollbackStatement
+                or SavepointStatement
+                or ReleaseSavepointStatement
+                or RollbackToSavepointStatement
+                or AttachDatabaseStatement
+                or DetachDatabaseStatement)
+        {
+            throw new EmbeddedSqlException(
+                "Managed SQL callbacks cannot change transaction or attachment state during a write.");
+        }
 
         switch (statement)
         {
             case BeginStatement:
-                if (_transactionCatalog is not null)
+                if (_transactionDatabases is not null)
                     throw new EmbeddedSqlException("cannot start a transaction within a transaction");
-                EnsureNoAttachedDatabasesForTransaction();
-
-                (_transactionCatalog, _transactionVersion) = _database.CreateTransactionSnapshot();
-                _transactionPragmaHeader = _database.GetPragmaHeaderMetadata();
-                _transactionHasChanges = false;
-                _transactionOpenedBySavepoint = false;
-                _savepoints.Clear();
+                BeginTransaction(openedBySavepoint: false);
                 return ExecutionResult.Empty;
             case CommitStatement:
-                if (_transactionCatalog is null)
+                if (_transactionDatabases is null)
                     throw new EmbeddedSqlException("cannot commit - no transaction is active");
 
-                if (_transactionHasChanges)
-                    _database.CommitTransaction(
-                        _transactionCatalog,
-                        _transactionVersion,
-                        _database.IsFileBacked ? null : _transactionPragmaHeader);
-
-                ResetTransactionState();
+                CommitTransaction();
                 return ExecutionResult.Empty;
             case RollbackStatement:
-                if (_transactionCatalog is null)
+                if (_transactionDatabases is null)
                     throw new EmbeddedSqlException("cannot rollback - no transaction is active");
 
                 ResetTransactionState();
@@ -16192,7 +16281,9 @@ public sealed class EmbeddedConnection : IDisposable
                 RollbackToSavepoint(rollbackTo.Name);
                 return ExecutionResult.Empty;
             case AttachDatabaseStatement attach:
-                return ExecuteAttach(attach);
+                return ExecuteWithMutationReservation(
+                    _database,
+                    () => ExecuteAttach(attach, parameters));
             case DetachDatabaseStatement detach:
                 return ExecuteDetach(detach);
             case PragmaDatabaseListStatement:
@@ -16214,55 +16305,60 @@ public sealed class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException("attempt to write a readonly database");
 
                 var routed = RouteStatement(statement);
-                if (routed.IsAttached && _transactionCatalog is not null)
-                {
-                    throw new EmbeddedSqlException(
-                        "Managed ATTACH does not support statements against attached databases inside a transaction.");
-                }
-
+                TransactionDatabaseState? transactionState = null;
+                EmbeddedDatabase.SchemaCatalog? statementCatalog = null;
                 try
                 {
                     ExecutionResult result;
-                    if (routed.IsAttached || _transactionCatalog is null)
+                    transactionState = GetTransactionState(routed.Database);
+                    var mutationReserved = ReserveTransactionMutation(routed.Database, routed.Statement);
+                    try
                     {
-                        result = routed.Database.Execute(
-                            routed.Statement,
-                            parameters,
-                            _lastInsertRowId,
-                            _foreignKeys,
-                            _recursiveTriggers,
-                            cancellationToken);
-                    }
-                    else
-                    {
-                        var transactionCatalog = _transactionCatalog;
-                        var cancellableMutation = cancellationToken.CanBeCanceled
-                            && EmbeddedDatabase.MayMutate(routed.Statement);
-                        var executionCatalog = cancellableMutation
-                            ? transactionCatalog.Clone()
-                            : transactionCatalog;
-                        result = _database.Execute(
-                            routed.Statement,
-                            parameters,
-                            executionCatalog,
-                            _lastInsertRowId,
-                            _foreignKeys,
-                            _recursiveTriggers,
-                            cancellationToken);
-                        if (cancellableMutation)
+                        if (transactionState is null)
                         {
-                            cancellationToken.ThrowIfCancellationRequested();
-                            _transactionCatalog = executionCatalog;
+                            result = routed.Database.Execute(
+                                routed.Statement,
+                                parameters,
+                                _lastInsertRowId,
+                                _foreignKeys,
+                                _recursiveTriggers,
+                                cancellationToken);
                         }
+                        else
+                        {
+                            statementCatalog = EmbeddedDatabase.MayMutate(routed.Statement)
+                                ? transactionState.Catalog.Clone()
+                                : transactionState.Catalog;
+                            result = routed.Database.Execute(
+                                routed.Statement,
+                                parameters,
+                                statementCatalog,
+                                _lastInsertRowId,
+                                _foreignKeys,
+                                _recursiveTriggers,
+                                cancellationToken);
+                            if (EmbeddedDatabase.MayMutate(routed.Statement))
+                                cancellationToken.ThrowIfCancellationRequested();
+                        }
+                    }
+                    finally
+                    {
+                        if (mutationReserved)
+                            ReleaseTransactionMutation(routed.Database);
+                    }
+                    if (transactionState is not null)
+                    {
                         if (result.Changed)
                         {
-                            _transactionHasChanges = true;
+                            transactionState.Catalog = statementCatalog
+                                ?? throw new InvalidOperationException("A transactional mutation lost its statement catalog.");
+                            transactionState.HasChanges = true;
+                            _transactionWriteDatabase = routed.Database;
                             if (EmbeddedDatabase.MayChangeSchema(routed.Statement))
                             {
-                                var metadata = _transactionPragmaHeader ?? _database.GetPragmaHeaderMetadata();
-                                _transactionPragmaHeader = metadata with
+                                transactionState.PragmaHeader = transactionState.PragmaHeader with
                                 {
-                                    SchemaVersion = unchecked(metadata.SchemaVersion + 1),
+                                    SchemaVersion = unchecked(transactionState.PragmaHeader.SchemaVersion + 1),
                                 };
                             }
                         }
@@ -16277,7 +16373,7 @@ public sealed class EmbeddedConnection : IDisposable
                 }
                 catch (EmbeddedConflictRollbackException exception)
                 {
-                    if (_transactionCatalog is not null)
+                    if (_transactionDatabases is not null)
                         ResetTransactionState();
 
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
@@ -16285,15 +16381,20 @@ public sealed class EmbeddedConnection : IDisposable
                 catch (EmbeddedConflictFailException exception)
                 {
                     _lastInsertRowId = exception.LastInsertRowId;
-                    if (_transactionCatalog is not null)
-                        _transactionHasChanges = true;
+                    if (transactionState is not null)
+                    {
+                        transactionState.Catalog = statementCatalog
+                            ?? throw new InvalidOperationException("A partial transactional mutation lost its statement catalog.");
+                        transactionState.HasChanges = true;
+                        _transactionWriteDatabase = routed.Database;
+                    }
 
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
         }
     }
 
-    private ExecutionResult ExecuteAttach(AttachDatabaseStatement statement)
+    private ExecutionResult ExecuteAttach(AttachDatabaseStatement statement, SqlValue[] parameters)
     {
         EnsureAutocommitAttachmentLifecycle();
         if (!_database.IsFileBacked)
@@ -16302,12 +16403,14 @@ public sealed class EmbeddedConnection : IDisposable
                 "Managed ATTACH requires a file-backed managed primary database so attachments share its file system.");
         }
 
-        if (string.IsNullOrWhiteSpace(statement.Path)
-            || statement.Path.Equals(":memory:", StringComparison.OrdinalIgnoreCase)
-            || statement.Path.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        var pathValue = _database.EvaluateConstant(statement.Path, parameters, _lastInsertRowId);
+        var requestedPath = EmbeddedDatabase.ToSqlText(pathValue);
+        var (path, uriReadOnly) = ResolveAttachmentPath(requestedPath);
+        if (string.IsNullOrWhiteSpace(path)
+            || path.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
         {
             throw new EmbeddedSqlException(
-                "Managed ATTACH supports only non-empty file paths; memory databases and URI filenames are not supported.");
+                "Managed ATTACH supports only non-empty file paths; memory databases are not supported.");
         }
 
         if (statement.Alias.Equals("main", StringComparison.OrdinalIgnoreCase)
@@ -16321,27 +16424,62 @@ public sealed class EmbeddedConnection : IDisposable
         if (_attachedDatabases.Count >= MaximumAttachedDatabases)
             throw new EmbeddedSqlException($"too many attached databases - maximum {MaximumAttachedDatabases}");
 
-        var pathIdentity = GetAttachmentPathIdentity(statement.Path);
-        if (string.Equals(pathIdentity, GetAttachmentPathIdentity(_database.DatabasePath), StringComparison.OrdinalIgnoreCase))
+        var pathIdentity = GetAttachmentPathIdentity(path);
+        var pathComparer = GetAttachmentPathComparer();
+        if (pathComparer.Equals(pathIdentity, GetAttachmentPathIdentity(_database.DatabasePath)))
             throw new EmbeddedSqlException("database file is already open as main");
         if (_attachedDatabases.Values.Any(attachment =>
-                string.Equals(attachment.PathIdentity, pathIdentity, StringComparison.OrdinalIgnoreCase)))
+                pathComparer.Equals(attachment.PathIdentity, pathIdentity)))
         {
             throw new EmbeddedSqlException("database file is already attached");
         }
 
-        var readOnly = _database.IsReadOnly;
-        var attached = EmbeddedDatabase.OpenFile(statement.Path, _database.FileSystem, readOnly);
+        var readOnly = _database.IsReadOnly || uriReadOnly;
+        IFileSystem attachmentFileSystem = _database.FileSystem;
+        TursoEncryptionFileSystem? ownedFileSystem = null;
+        if (statement.Key is not null)
+        {
+            if (_database.FileSystem is not TursoEncryptionFileSystem encryptedFileSystem)
+            {
+                throw new EmbeddedSqlException(
+                    "Managed ATTACH KEY overrides require an encrypted primary database to select the attachment cipher.");
+            }
+
+            var keyValue = _database.EvaluateConstant(statement.Key, parameters, _lastInsertRowId);
+            var key = EmbeddedDatabase.ToSqlText(keyValue);
+            TursoEncryptionOptions encryption;
+            try
+            {
+                encryption = TursoEncryptionOptions.FromHex(encryptedFileSystem.Encryption.Cipher, key);
+            }
+            catch (ArgumentException exception)
+            {
+                throw new EmbeddedSqlException(
+                    "Managed ATTACH KEY must be a hexadecimal key for the primary database cipher.",
+                    exception);
+            }
+            using (encryption)
+            {
+                ownedFileSystem = new TursoEncryptionFileSystem(
+                    TursoEncryptionFileSystem.Unwrap(_database.FileSystem),
+                    encryption);
+            }
+            attachmentFileSystem = ownedFileSystem;
+        }
+
+        EmbeddedDatabase? attached = null;
         try
         {
+            attached = EmbeddedDatabase.OpenFile(path, attachmentFileSystem, readOnly);
             _database.CopyFunctionAndCollationRegistriesTo(attached);
             _attachedDatabases.Add(
                 statement.Alias,
-                new AttachedDatabase(statement.Path, pathIdentity, attached, _nextAttachedDatabaseSequence++));
+                new AttachedDatabase(path, pathIdentity, attached, GetNextAttachedDatabaseSequence(), ownedFileSystem));
         }
         catch
         {
-            attached.Dispose();
+            attached?.Dispose();
+            ownedFileSystem?.Dispose();
             throw;
         }
 
@@ -16357,8 +16495,20 @@ public sealed class EmbeddedConnection : IDisposable
             throw new EmbeddedSqlException("database is locked");
 
         _attachedDatabases.Remove(statement.Alias);
-        attachment.Database.Dispose();
+        attachment.Dispose();
         return ExecutionResult.Empty;
+    }
+
+    private int GetNextAttachedDatabaseSequence()
+    {
+        var used = _attachedDatabases.Values.Select(attachment => attachment.Sequence).ToHashSet();
+        for (var sequence = 2; sequence < MaximumAttachedDatabases + 2; sequence++)
+        {
+            if (!used.Contains(sequence))
+                return sequence;
+        }
+
+        throw new InvalidOperationException("No managed ATTACH sequence is available below the enforced limit.");
     }
 
     private ExecutionResult ExecutePragmaDatabaseList()
@@ -16389,42 +16539,39 @@ public sealed class EmbeddedConnection : IDisposable
         return statement switch
         {
             CreateTableStatement create => RouteNamedStatement(create.Name, name => create with { Name = name }),
-            DropTableStatement drop => RouteNamedStatement(drop.Name, name => drop with { Name = name }),
+            DropTableStatement drop => RouteExistingNamedStatement(
+                drop.Name,
+                ManagedSchemaObjectKind.Table,
+                name => drop with { Name = name }),
             CreateIndexStatement createIndex => RouteCreateIndex(createIndex),
-            DropIndexStatement dropIndex => RouteNamedStatement(dropIndex.Name, name => dropIndex with { Name = name }),
-            AlterTableAddColumnStatement addColumn => RouteNamedStatement(addColumn.TableName, name => addColumn with { TableName = name }),
-            AlterTableRenameStatement rename => RouteNamedStatement(rename.TableName, name => rename with { TableName = name }),
-            AlterTableRenameColumnStatement renameColumn => RouteNamedStatement(renameColumn.TableName, name => renameColumn with { TableName = name }),
-            WithDmlStatement with when ContainsSchemaQualification(with)
-                => throw new EmbeddedSqlException(
-                    "Schema-qualified and cross-database CTE DML is not supported by managed ATTACH."),
-            WithDmlStatement with => new RoutedStatement(_database, with, IsAttached: false),
-            InsertStatement insert when insert.Source is not null => RouteInsertFromQuery(insert),
-            InsertStatement insert => RouteAttachedDml(
-                insert.TableName,
-                insert.Rows.SelectMany(row => row)
-                    .Concat(insert.Upsert is { Action: DoUpdateUpsertAction update }
-                        ? update.Assignments.Select(assignment => assignment.Value)
-                        : Enumerable.Empty<Expression>())
-                    .Concat(insert.Upsert is { Action: DoUpdateUpsertAction conditionalUpdate }
-                            && conditionalUpdate.Where is { } where
-                        ? [where]
-                        : Enumerable.Empty<Expression>())
-                    .Concat(insert.Returning?.Select(projection => projection.Expression)
-                        ?? Enumerable.Empty<Expression>()),
-                name => insert with { TableName = name }),
-            UpdateStatement update => RouteAttachedDml(
-                update.TableName,
-                update.Assignments.Select(assignment => assignment.Value)
-                    .Concat(update.Where is null ? Enumerable.Empty<Expression>() : [update.Where])
-                    .Concat(update.Returning?.Select(projection => projection.Expression) ?? Enumerable.Empty<Expression>()),
-                name => update with { TableName = name }),
-            DeleteStatement delete => RouteAttachedDml(
-                delete.TableName,
-                Enumerable.Empty<Expression>()
-                    .Concat(delete.Where is null ? Enumerable.Empty<Expression>() : [delete.Where])
-                    .Concat(delete.Returning?.Select(projection => projection.Expression) ?? Enumerable.Empty<Expression>()),
-                name => delete with { TableName = name }),
+            DropIndexStatement dropIndex => RouteExistingNamedStatement(
+                dropIndex.Name,
+                ManagedSchemaObjectKind.Index,
+                name => dropIndex with { Name = name }),
+            DropViewStatement dropView => RouteExistingNamedStatement(
+                dropView.Name,
+                ManagedSchemaObjectKind.View,
+                name => dropView with { Name = name }),
+            DropTriggerStatement dropTrigger => RouteExistingNamedStatement(
+                dropTrigger.Name,
+                ManagedSchemaObjectKind.Trigger,
+                name => dropTrigger with { Name = name }),
+            AlterTableAddColumnStatement addColumn => RouteExistingNamedStatement(
+                addColumn.TableName,
+                ManagedSchemaObjectKind.Table,
+                name => addColumn with { TableName = name }),
+            AlterTableRenameStatement rename => RouteExistingNamedStatement(
+                rename.TableName,
+                ManagedSchemaObjectKind.Table,
+                name => rename with { TableName = name }),
+            AlterTableRenameColumnStatement renameColumn => RouteExistingNamedStatement(
+                renameColumn.TableName,
+                ManagedSchemaObjectKind.Table,
+                name => renameColumn with { TableName = name }),
+            WithDmlStatement with => RouteDataStatement(with),
+            InsertStatement insert => RouteDataStatement(insert),
+            UpdateStatement update => RouteDataStatement(update),
+            DeleteStatement delete => RouteDataStatement(delete),
             QueryStatement query => RouteQuery(query),
             ExplainStatement { Inner: var inner } when ContainsSchemaQualification(inner)
                 => throw new EmbeddedSqlException("EXPLAIN for schema-qualified managed ATTACH statements is not supported."),
@@ -16432,21 +16579,6 @@ public sealed class EmbeddedConnection : IDisposable
                 => throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH."),
             _ => new RoutedStatement(_database, statement, IsAttached: false),
         };
-    }
-
-    private RoutedStatement RouteInsertFromQuery(InsertStatement statement)
-    {
-        if (QueryContainsSchemaQualification(statement.Source!))
-            throw new EmbeddedSqlException("Cross-database INSERT query sources are not supported by managed ATTACH.");
-
-        var routed = RouteNamedStatement(statement.TableName, name => statement with { TableName = name });
-        if (routed.IsAttached)
-        {
-            throw new EmbeddedSqlException(
-                "Managed ATTACH does not support INSERT query sources against attached databases.");
-        }
-
-        return routed;
     }
 
     private RoutedStatement RouteNamedStatement(string objectName, Func<string, ParsedStatement> rewrite)
@@ -16457,22 +16589,55 @@ public sealed class EmbeddedConnection : IDisposable
         return RouteSchema(schema, localName, rewrite);
     }
 
-    private RoutedStatement RouteAttachedDml(
-        string tableName,
-        IEnumerable<Expression> expressions,
+    private RoutedStatement RouteExistingNamedStatement(
+        string objectName,
+        ManagedSchemaObjectKind kind,
         Func<string, ParsedStatement> rewrite)
     {
-        var routed = RouteNamedStatement(tableName, rewrite);
-        if (routed.IsAttached && expressions.Any(ContainsSubquery))
-        {
-            throw new EmbeddedSqlException(
-                "Managed ATTACH does not support DML subqueries against attached databases.");
-        }
-        if (!routed.IsAttached && expressions.Any(ExpressionContainsSchemaQualification))
-            throw new EmbeddedSqlException("Cross-database DML subqueries are not supported by managed ATTACH.");
+        if (ManagedSchemaName.TrySplit(objectName, out var schema, out var localName))
+            return RouteSchema(schema, localName, rewrite);
 
-        return routed;
+        schema = ResolveExistingObjectSchema(objectName, kind);
+        return RouteSchema(schema, objectName, rewrite);
     }
+
+    private string ResolveExistingObjectSchema(string objectName, ManagedSchemaObjectKind kind)
+    {
+        if (GetTransactionState(_database) is { } mainState
+            ? CatalogContainsSchemaObject(mainState.Catalog, objectName, kind)
+            : _database.ContainsSchemaObject(objectName, kind))
+        {
+            return "main";
+        }
+
+        foreach (var pair in _attachedDatabases.OrderBy(pair => pair.Value.Sequence))
+        {
+            var database = pair.Value.Database;
+            if (GetTransactionState(database) is { } state
+                ? CatalogContainsSchemaObject(state.Catalog, objectName, kind)
+                : database.ContainsSchemaObject(objectName, kind))
+            {
+                return pair.Key;
+            }
+        }
+
+        return "main";
+    }
+
+    private static bool CatalogContainsSchemaObject(
+        EmbeddedDatabase.SchemaCatalog catalog,
+        string objectName,
+        ManagedSchemaObjectKind kind)
+        => kind switch
+        {
+            ManagedSchemaObjectKind.Table => catalog.Tables.ContainsKey(objectName),
+            ManagedSchemaObjectKind.View => catalog.Views.ContainsKey(objectName),
+            ManagedSchemaObjectKind.Trigger => catalog.Triggers.ContainsKey(objectName),
+            ManagedSchemaObjectKind.Index => catalog.Tables.Values.Any(table =>
+                table.Indexes.Any(index =>
+                    string.Equals(index.Name, objectName, StringComparison.OrdinalIgnoreCase))),
+            _ => throw new InvalidOperationException($"Unknown managed schema object kind {kind}."),
+        };
 
     private RoutedStatement RouteCreateIndex(CreateIndexStatement statement)
     {
@@ -16480,17 +16645,25 @@ public sealed class EmbeddedConnection : IDisposable
         var hasTableSchema = ManagedSchemaName.TrySplit(statement.TableName, out var tableSchema, out var tableName);
         if (!hasIndexSchema && !hasTableSchema)
             return new RoutedStatement(_database, statement, IsAttached: false);
-        if (!hasTableSchema)
+        if (hasIndexSchema)
         {
-            throw new EmbeddedSqlException(
-                "Managed ATTACH requires CREATE INDEX to qualify the target table with the attached schema.");
+            if (hasTableSchema && !string.Equals(indexSchema, tableSchema, StringComparison.OrdinalIgnoreCase))
+                throw new EmbeddedSqlException("CREATE INDEX cannot span managed database schemas.");
+
+            return RouteSchema(
+                indexSchema,
+                hasTableSchema ? tableName : statement.TableName,
+                localTableName => statement with
+                {
+                    Name = indexName,
+                    TableName = localTableName,
+                });
         }
-        if (hasIndexSchema && !string.Equals(indexSchema, tableSchema, StringComparison.OrdinalIgnoreCase))
-            throw new EmbeddedSqlException("CREATE INDEX cannot span managed database schemas.");
-        if (!hasIndexSchema && !tableSchema.Equals("main", StringComparison.OrdinalIgnoreCase))
+
+        if (!tableSchema.Equals("main", StringComparison.OrdinalIgnoreCase))
         {
             throw new EmbeddedSqlException(
-                "Managed ATTACH requires CREATE INDEX to qualify the index name with the attached schema.");
+                "CREATE INDEX on an attached table must qualify the index name with the attached schema.");
         }
 
         return RouteSchema(
@@ -16498,32 +16671,633 @@ public sealed class EmbeddedConnection : IDisposable
             tableName,
             localTableName => statement with
             {
-                Name = hasIndexSchema ? indexName : statement.Name,
+                Name = statement.Name,
                 TableName = localTableName,
             });
     }
 
     private RoutedStatement RouteQuery(QueryStatement query)
     {
-        if (query is not SelectStatement { Source: NamedTableSource source } select
-            || !ManagedSchemaName.TrySplit(source.Name, out var schema, out var tableName))
-        {
-            if (QueryContainsSchemaQualification(query))
-                throw new EmbeddedSqlException("Cross-database queries are not supported by managed ATTACH.");
+        var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CollectQuerySchemas(query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        return RouteForSchemas(query, schemas);
+    }
 
-            return new RoutedStatement(_database, query, IsAttached: false);
-        }
+    private RoutedStatement RouteDataStatement(ParsedStatement statement)
+    {
+        var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CollectStatementSchemas(statement, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        return RouteForSchemas(statement, schemas);
+    }
 
-        if (SelectContainsSubquery(select))
+    private RoutedStatement RouteForSchemas(ParsedStatement statement, HashSet<string> schemas)
+    {
+        var resolvedSchemas = schemas
+            .Select(ResolveCollectedSchema)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (resolvedSchemas.Count == 0)
+            return new RoutedStatement(_database, statement, IsAttached: false);
+        if (resolvedSchemas.Count != 1)
         {
             throw new EmbeddedSqlException(
-                "Managed ATTACH supports only single-table queries without subqueries.");
+                "Cross-database statements are not supported by managed ATTACH; every persistent table reference must resolve to one database.");
         }
 
-        return RouteSchema(
+        var schema = resolvedSchemas.Single();
+        var rewritten = RewriteStatementSchema(statement, schema);
+        if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
+            return new RoutedStatement(_database, rewritten, IsAttached: false);
+        if (schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+            throw new EmbeddedSqlException("Managed ATTACH does not implement the temporary database.");
+        if (!_attachedDatabases.TryGetValue(schema, out var attachment))
+            throw new EmbeddedSqlException($"no such database: {schema}");
+
+        return new RoutedStatement(attachment.Database, rewritten, IsAttached: true);
+    }
+
+    private string ResolveCollectedSchema(string schema)
+    {
+        if (schema.Length == 0 || schema[0] != UnqualifiedSchemaMarker)
+            return schema;
+
+        var objectName = schema[1..];
+        if (GetTransactionState(_database) is { } mainState
+            ? mainState.Catalog.Tables.ContainsKey(objectName) || mainState.Catalog.Views.ContainsKey(objectName)
+            : _database.ContainsTableOrView(objectName))
+        {
+            return "main";
+        }
+
+        foreach (var pair in _attachedDatabases.OrderBy(pair => pair.Value.Sequence))
+        {
+            var attachment = pair.Value;
+            if (GetTransactionState(attachment.Database) is { } state
+                ? state.Catalog.Tables.ContainsKey(objectName) || state.Catalog.Views.ContainsKey(objectName)
+                : attachment.Database.ContainsTableOrView(objectName))
+            {
+                return pair.Key;
+            }
+        }
+
+        return "main";
+    }
+
+    private static void CollectStatementSchemas(
+        ParsedStatement statement,
+        ISet<string> schemas,
+        HashSet<string> commonTableExpressions)
+    {
+        switch (statement)
+        {
+            case InsertStatement insert:
+                AddPersistentObjectSchema(insert.TableName, schemas);
+                foreach (var expression in insert.Rows.SelectMany(row => row))
+                    CollectExpressionSchemas(expression, schemas, commonTableExpressions);
+                if (insert.Source is not null)
+                    CollectQuerySchemas(insert.Source, schemas, commonTableExpressions);
+                if (insert.Upsert is { Action: DoUpdateUpsertAction upsertUpdate })
+                {
+                    foreach (var assignment in upsertUpdate.Assignments)
+                        CollectExpressionSchemas(assignment.Value, schemas, commonTableExpressions);
+                }
+                CollectProjectionSchemas(insert.Returning, schemas, commonTableExpressions);
+                break;
+            case UpdateStatement update:
+                AddPersistentObjectSchema(update.TableName, schemas);
+                foreach (var assignment in update.Assignments)
+                    CollectExpressionSchemas(assignment.Value, schemas, commonTableExpressions);
+                CollectExpressionSchemas(update.Where, schemas, commonTableExpressions);
+                CollectProjectionSchemas(update.Returning, schemas, commonTableExpressions);
+                break;
+            case DeleteStatement delete:
+                AddPersistentObjectSchema(delete.TableName, schemas);
+                CollectExpressionSchemas(delete.Where, schemas, commonTableExpressions);
+                CollectProjectionSchemas(delete.Returning, schemas, commonTableExpressions);
+                break;
+            case WithDmlStatement with:
+                var names = new HashSet<string>(commonTableExpressions, StringComparer.OrdinalIgnoreCase);
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                {
+                    names.Add(commonTableExpression.Name);
+                    CollectQuerySchemas(commonTableExpression.Query, schemas, names);
+                }
+                CollectStatementSchemas(with.Dml, schemas, names);
+                break;
+            default:
+                throw new InvalidOperationException($"Cannot route data statement {statement.GetType().Name}.");
+        }
+    }
+
+    private static void CollectQuerySchemas(
+        QueryStatement query,
+        ISet<string> schemas,
+        HashSet<string> commonTableExpressions)
+    {
+        switch (query)
+        {
+            case SelectStatement select:
+                CollectSourceSchemas(select.Source, schemas, commonTableExpressions);
+                CollectProjectionSchemas(select.Projections, schemas, commonTableExpressions);
+                CollectExpressionSchemas(select.Where, schemas, commonTableExpressions);
+                foreach (var expression in select.GroupBy)
+                    CollectExpressionSchemas(expression, schemas, commonTableExpressions);
+                CollectExpressionSchemas(select.Having, schemas, commonTableExpressions);
+                foreach (var orderBy in select.OrderBy)
+                    CollectExpressionSchemas(orderBy.Expression, schemas, commonTableExpressions);
+                CollectExpressionSchemas(select.Limit, schemas, commonTableExpressions);
+                CollectExpressionSchemas(select.Offset, schemas, commonTableExpressions);
+                break;
+            case ValuesClause values:
+                foreach (var expression in values.Rows.SelectMany(row => row))
+                    CollectExpressionSchemas(expression, schemas, commonTableExpressions);
+                break;
+            case CompoundSelectStatement compound:
+                foreach (var term in compound.Terms)
+                    CollectQuerySchemas(term, schemas, commonTableExpressions);
+                foreach (var orderBy in compound.OrderBy)
+                    CollectExpressionSchemas(orderBy.Expression, schemas, commonTableExpressions);
+                CollectExpressionSchemas(compound.Limit, schemas, commonTableExpressions);
+                CollectExpressionSchemas(compound.Offset, schemas, commonTableExpressions);
+                break;
+            case WithSelectStatement with:
+                var names = new HashSet<string>(commonTableExpressions, StringComparer.OrdinalIgnoreCase);
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                {
+                    names.Add(commonTableExpression.Name);
+                    CollectQuerySchemas(commonTableExpression.Query, schemas, names);
+                }
+                CollectQuerySchemas(with.Query, schemas, names);
+                break;
+            default:
+                throw new InvalidOperationException($"Cannot route query {query.GetType().Name}.");
+        }
+    }
+
+    private static void CollectSourceSchemas(
+        TableSource? source,
+        ISet<string> schemas,
+        HashSet<string> commonTableExpressions)
+    {
+        switch (source)
+        {
+            case null:
+                break;
+            case NamedTableSource named:
+                if (ManagedSchemaName.TrySplit(named.Name, out var schema, out _))
+                    schemas.Add(schema);
+                else if (!commonTableExpressions.Contains(named.Name))
+                    schemas.Add(UnqualifiedSchemaMarker + named.Name);
+                break;
+            case DerivedTableSource derived:
+                CollectQuerySchemas(derived.Query, schemas, commonTableExpressions);
+                break;
+            case JoinTableSource join:
+                CollectSourceSchemas(join.Left, schemas, commonTableExpressions);
+                CollectSourceSchemas(join.Right, schemas, commonTableExpressions);
+                CollectExpressionSchemas(join.Condition, schemas, commonTableExpressions);
+                break;
+            case GenerateSeriesSource generateSeries:
+                CollectExpressionSchemas(generateSeries.Start, schemas, commonTableExpressions);
+                CollectExpressionSchemas(generateSeries.Stop, schemas, commonTableExpressions);
+                CollectExpressionSchemas(generateSeries.Step, schemas, commonTableExpressions);
+                break;
+        }
+    }
+
+    private static void CollectProjectionSchemas(
+        IReadOnlyList<Projection>? projections,
+        ISet<string> schemas,
+        HashSet<string> commonTableExpressions)
+    {
+        if (projections is null)
+            return;
+        foreach (var projection in projections)
+            CollectExpressionSchemas(projection.Expression, schemas, commonTableExpressions);
+    }
+
+    private static void CollectExpressionSchemas(
+        Expression? expression,
+        ISet<string> schemas,
+        HashSet<string> commonTableExpressions)
+    {
+        switch (expression)
+        {
+            case null:
+            case LiteralExpression:
+            case ParameterExpression:
+            case ColumnExpression:
+            case StarExpression:
+            case QualifiedStarExpression:
+                return;
+            case ScalarSubqueryExpression scalarSubquery:
+                CollectQuerySchemas(scalarSubquery.Query, schemas, commonTableExpressions);
+                return;
+            case ExistsExpression exists:
+                CollectQuerySchemas(exists.Query, schemas, commonTableExpressions);
+                return;
+            case InSubqueryExpression inSubquery:
+                CollectExpressionSchemas(inSubquery.Value, schemas, commonTableExpressions);
+                CollectQuerySchemas(inSubquery.Query, schemas, commonTableExpressions);
+                return;
+            case FunctionExpression function:
+                foreach (var argument in function.Arguments)
+                    CollectExpressionSchemas(argument, schemas, commonTableExpressions);
+                CollectExpressionSchemas(function.Filter, schemas, commonTableExpressions);
+                CollectWindowSchemas(function.Window, schemas, commonTableExpressions);
+                return;
+            case CollationExpression collation:
+                CollectExpressionSchemas(collation.Expression, schemas, commonTableExpressions);
+                return;
+            case CastExpression cast:
+                CollectExpressionSchemas(cast.Expression, schemas, commonTableExpressions);
+                return;
+            case CaseExpression @case:
+                CollectExpressionSchemas(@case.Operand, schemas, commonTableExpressions);
+                foreach (var clause in @case.Clauses)
+                {
+                    CollectExpressionSchemas(clause.When, schemas, commonTableExpressions);
+                    CollectExpressionSchemas(clause.Then, schemas, commonTableExpressions);
+                }
+                CollectExpressionSchemas(@case.Else, schemas, commonTableExpressions);
+                return;
+            case LikeExpression like:
+                CollectExpressionSchemas(like.Value, schemas, commonTableExpressions);
+                CollectExpressionSchemas(like.Pattern, schemas, commonTableExpressions);
+                CollectExpressionSchemas(like.Escape, schemas, commonTableExpressions);
+                return;
+            case GlobExpression glob:
+                CollectExpressionSchemas(glob.Value, schemas, commonTableExpressions);
+                CollectExpressionSchemas(glob.Pattern, schemas, commonTableExpressions);
+                return;
+            case InExpression @in:
+                CollectExpressionSchemas(@in.Value, schemas, commonTableExpressions);
+                foreach (var value in @in.Values)
+                    CollectExpressionSchemas(value, schemas, commonTableExpressions);
+                return;
+            case BetweenExpression between:
+                CollectExpressionSchemas(between.Value, schemas, commonTableExpressions);
+                CollectExpressionSchemas(between.Lower, schemas, commonTableExpressions);
+                CollectExpressionSchemas(between.Upper, schemas, commonTableExpressions);
+                return;
+            case UnaryExpression unary:
+                CollectExpressionSchemas(unary.Operand, schemas, commonTableExpressions);
+                return;
+            case BinaryExpression binary:
+                CollectExpressionSchemas(binary.Left, schemas, commonTableExpressions);
+                CollectExpressionSchemas(binary.Right, schemas, commonTableExpressions);
+                return;
+            default:
+                throw new InvalidOperationException($"Cannot route expression {expression.GetType().Name}.");
+        }
+    }
+
+    private static void CollectWindowSchemas(
+        WindowSpecification? window,
+        ISet<string> schemas,
+        HashSet<string> commonTableExpressions)
+    {
+        if (window is null)
+            return;
+        foreach (var expression in window.PartitionBy)
+            CollectExpressionSchemas(expression, schemas, commonTableExpressions);
+        foreach (var orderBy in window.OrderBy)
+            CollectExpressionSchemas(orderBy.Expression, schemas, commonTableExpressions);
+        CollectExpressionSchemas(window.Frame?.Start.Offset, schemas, commonTableExpressions);
+        CollectExpressionSchemas(window.Frame?.End.Offset, schemas, commonTableExpressions);
+    }
+
+    private static void AddPersistentObjectSchema(string name, ISet<string> schemas)
+    {
+        schemas.Add(
+            ManagedSchemaName.TrySplit(name, out var schema, out _)
+                ? schema
+                : UnqualifiedSchemaMarker + name);
+    }
+
+    private static ParsedStatement RewriteStatementSchema(ParsedStatement statement, string schema)
+    {
+        return RewriteStatementSchema(
+            statement,
             schema,
-            tableName,
-            localTableName => select with { Source = source with { Name = localTableName } });
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+    }
+
+    private static ParsedStatement RewriteStatementSchema(
+        ParsedStatement statement,
+        string schema,
+        HashSet<string> commonTableExpressions)
+    {
+        return statement switch
+        {
+            InsertStatement insert => insert with
+            {
+                TableName = RewritePersistentObjectName(insert.TableName, schema),
+                Rows = insert.Rows.Select(row => row.Select(expression =>
+                    RewriteExpressionSchema(expression, schema, commonTableExpressions)).ToArray()).ToArray(),
+                Source = insert.Source is null
+                    ? null
+                    : RewriteQuerySchema(insert.Source, schema, commonTableExpressions),
+                Returning = RewriteProjections(insert.Returning, schema, commonTableExpressions),
+                Upsert = insert.Upsert is { Action: DoUpdateUpsertAction update } upsert
+                    ? upsert with
+                    {
+                        Action = update with
+                        {
+                            Assignments = update.Assignments.Select(assignment => assignment with
+                            {
+                                Value = RewriteExpressionSchema(
+                                    assignment.Value,
+                                    schema,
+                                    commonTableExpressions),
+                            }).ToArray(),
+                        },
+                    }
+                    : insert.Upsert,
+            },
+            UpdateStatement update => update with
+            {
+                TableName = RewritePersistentObjectName(update.TableName, schema),
+                Assignments = update.Assignments.Select(assignment => assignment with
+                {
+                    Value = RewriteExpressionSchema(assignment.Value, schema, commonTableExpressions),
+                }).ToArray(),
+                Where = RewriteNullableExpression(update.Where, schema, commonTableExpressions),
+                Returning = RewriteProjections(update.Returning, schema, commonTableExpressions),
+            },
+            DeleteStatement delete => delete with
+            {
+                TableName = RewritePersistentObjectName(delete.TableName, schema),
+                Where = RewriteNullableExpression(delete.Where, schema, commonTableExpressions),
+                Returning = RewriteProjections(delete.Returning, schema, commonTableExpressions),
+            },
+            WithDmlStatement with => RewriteWithDmlSchema(with, schema, commonTableExpressions),
+            QueryStatement query => RewriteQuerySchema(query, schema, commonTableExpressions),
+            _ => statement,
+        };
+    }
+
+    private static WithDmlStatement RewriteWithDmlSchema(
+        WithDmlStatement statement,
+        string schema,
+        HashSet<string> commonTableExpressions)
+    {
+        var names = new HashSet<string>(commonTableExpressions, StringComparer.OrdinalIgnoreCase);
+        var rewritten = new List<CommonTableExpression>();
+        foreach (var commonTableExpression in statement.CommonTableExpressions)
+        {
+            names.Add(commonTableExpression.Name);
+            rewritten.Add(commonTableExpression with
+            {
+                Query = RewriteQuerySchema(commonTableExpression.Query, schema, names),
+            });
+        }
+
+        return statement with
+        {
+            CommonTableExpressions = rewritten,
+            Dml = RewriteStatementSchema(statement.Dml, schema, names),
+        };
+    }
+
+    private static QueryStatement RewriteQuerySchema(
+        QueryStatement query,
+        string schema,
+        HashSet<string> commonTableExpressions)
+    {
+        return query switch
+        {
+            SelectStatement select => select with
+            {
+                Projections = RewriteProjections(select.Projections, schema, commonTableExpressions)!,
+                Source = RewriteSourceSchema(select.Source, schema, commonTableExpressions),
+                Where = RewriteNullableExpression(select.Where, schema, commonTableExpressions),
+                GroupBy = select.GroupBy.Select(expression =>
+                    RewriteExpressionSchema(expression, schema, commonTableExpressions)).ToArray(),
+                Having = RewriteNullableExpression(select.Having, schema, commonTableExpressions),
+                OrderBy = RewriteOrderBy(select.OrderBy, schema, commonTableExpressions),
+                Limit = RewriteNullableExpression(select.Limit, schema, commonTableExpressions),
+                Offset = RewriteNullableExpression(select.Offset, schema, commonTableExpressions),
+            },
+            ValuesClause values => values with
+            {
+                Rows = values.Rows.Select(row => row.Select(expression =>
+                    RewriteExpressionSchema(expression, schema, commonTableExpressions)).ToArray()).ToArray(),
+            },
+            CompoundSelectStatement compound => compound with
+            {
+                Terms = compound.Terms.Select(term =>
+                    RewriteQuerySchema(term, schema, commonTableExpressions)).ToArray(),
+                OrderBy = RewriteOrderBy(compound.OrderBy, schema, commonTableExpressions),
+                Limit = RewriteNullableExpression(compound.Limit, schema, commonTableExpressions),
+                Offset = RewriteNullableExpression(compound.Offset, schema, commonTableExpressions),
+            },
+            WithSelectStatement with => RewriteWithSelectSchema(with, schema, commonTableExpressions),
+            _ => throw new InvalidOperationException($"Cannot rewrite query {query.GetType().Name}."),
+        };
+    }
+
+    private static WithSelectStatement RewriteWithSelectSchema(
+        WithSelectStatement statement,
+        string schema,
+        HashSet<string> commonTableExpressions)
+    {
+        var names = new HashSet<string>(commonTableExpressions, StringComparer.OrdinalIgnoreCase);
+        var rewritten = new List<CommonTableExpression>();
+        foreach (var commonTableExpression in statement.CommonTableExpressions)
+        {
+            names.Add(commonTableExpression.Name);
+            rewritten.Add(commonTableExpression with
+            {
+                Query = RewriteQuerySchema(commonTableExpression.Query, schema, names),
+            });
+        }
+
+        return statement with
+        {
+            CommonTableExpressions = rewritten,
+            Query = RewriteQuerySchema(statement.Query, schema, names),
+        };
+    }
+
+    private static TableSource? RewriteSourceSchema(
+        TableSource? source,
+        string schema,
+        HashSet<string> commonTableExpressions)
+    {
+        return source switch
+        {
+            null => null,
+            NamedTableSource named => commonTableExpressions.Contains(named.Name)
+                ? named
+                : named with { Name = RewritePersistentObjectName(named.Name, schema) },
+            DerivedTableSource derived => derived with
+            {
+                Query = RewriteQuerySchema(derived.Query, schema, commonTableExpressions),
+            },
+            JoinTableSource join => join with
+            {
+                Left = RewriteSourceSchema(join.Left, schema, commonTableExpressions)!,
+                Right = RewriteSourceSchema(join.Right, schema, commonTableExpressions)!,
+                Condition = RewriteNullableExpression(join.Condition, schema, commonTableExpressions),
+            },
+            GenerateSeriesSource generateSeries => generateSeries with
+            {
+                Start = RewriteExpressionSchema(generateSeries.Start, schema, commonTableExpressions),
+                Stop = RewriteExpressionSchema(generateSeries.Stop, schema, commonTableExpressions),
+                Step = RewriteExpressionSchema(generateSeries.Step, schema, commonTableExpressions),
+            },
+            _ => throw new InvalidOperationException($"Cannot rewrite source {source.GetType().Name}."),
+        };
+    }
+
+    private static IReadOnlyList<Projection>? RewriteProjections(
+        IReadOnlyList<Projection>? projections,
+        string schema,
+        HashSet<string> commonTableExpressions)
+        => projections?.Select(projection => projection with
+        {
+            Expression = RewriteExpressionSchema(projection.Expression, schema, commonTableExpressions),
+        }).ToArray();
+
+    private static IReadOnlyList<OrderByTerm> RewriteOrderBy(
+        IReadOnlyList<OrderByTerm> orderBy,
+        string schema,
+        HashSet<string> commonTableExpressions)
+        => orderBy.Select(term => term with
+        {
+            Expression = RewriteExpressionSchema(term.Expression, schema, commonTableExpressions),
+        }).ToArray();
+
+    private static Expression? RewriteNullableExpression(
+        Expression? expression,
+        string schema,
+        HashSet<string> commonTableExpressions)
+        => expression is null ? null : RewriteExpressionSchema(expression, schema, commonTableExpressions);
+
+    private static Expression RewriteExpressionSchema(
+        Expression expression,
+        string schema,
+        HashSet<string> commonTableExpressions)
+    {
+        return expression switch
+        {
+            ScalarSubqueryExpression scalarSubquery => scalarSubquery with
+            {
+                Query = RewriteQuerySchema(scalarSubquery.Query, schema, commonTableExpressions),
+            },
+            ExistsExpression exists => exists with
+            {
+                Query = RewriteQuerySchema(exists.Query, schema, commonTableExpressions),
+            },
+            InSubqueryExpression inSubquery => inSubquery with
+            {
+                Value = RewriteExpressionSchema(inSubquery.Value, schema, commonTableExpressions),
+                Query = RewriteQuerySchema(inSubquery.Query, schema, commonTableExpressions),
+            },
+            FunctionExpression function => function with
+            {
+                Arguments = function.Arguments.Select(argument =>
+                    RewriteExpressionSchema(argument, schema, commonTableExpressions)).ToArray(),
+                Filter = RewriteNullableExpression(function.Filter, schema, commonTableExpressions),
+                Window = RewriteWindowSchema(function.Window, schema, commonTableExpressions),
+            },
+            CollationExpression collation => collation with
+            {
+                Expression = RewriteExpressionSchema(collation.Expression, schema, commonTableExpressions),
+            },
+            CastExpression cast => cast with
+            {
+                Expression = RewriteExpressionSchema(cast.Expression, schema, commonTableExpressions),
+            },
+            CaseExpression @case => @case with
+            {
+                Operand = RewriteNullableExpression(@case.Operand, schema, commonTableExpressions),
+                Clauses = @case.Clauses.Select(clause => clause with
+                {
+                    When = RewriteExpressionSchema(clause.When, schema, commonTableExpressions),
+                    Then = RewriteExpressionSchema(clause.Then, schema, commonTableExpressions),
+                }).ToArray(),
+                Else = RewriteNullableExpression(@case.Else, schema, commonTableExpressions),
+            },
+            LikeExpression like => like with
+            {
+                Value = RewriteExpressionSchema(like.Value, schema, commonTableExpressions),
+                Pattern = RewriteExpressionSchema(like.Pattern, schema, commonTableExpressions),
+                Escape = RewriteNullableExpression(like.Escape, schema, commonTableExpressions),
+            },
+            GlobExpression glob => glob with
+            {
+                Value = RewriteExpressionSchema(glob.Value, schema, commonTableExpressions),
+                Pattern = RewriteExpressionSchema(glob.Pattern, schema, commonTableExpressions),
+            },
+            InExpression @in => @in with
+            {
+                Value = RewriteExpressionSchema(@in.Value, schema, commonTableExpressions),
+                Values = @in.Values.Select(value =>
+                    RewriteExpressionSchema(value, schema, commonTableExpressions)).ToArray(),
+            },
+            BetweenExpression between => between with
+            {
+                Value = RewriteExpressionSchema(between.Value, schema, commonTableExpressions),
+                Lower = RewriteExpressionSchema(between.Lower, schema, commonTableExpressions),
+                Upper = RewriteExpressionSchema(between.Upper, schema, commonTableExpressions),
+            },
+            UnaryExpression unary => unary with
+            {
+                Operand = RewriteExpressionSchema(unary.Operand, schema, commonTableExpressions),
+            },
+            BinaryExpression binary => binary with
+            {
+                Left = RewriteExpressionSchema(binary.Left, schema, commonTableExpressions),
+                Right = RewriteExpressionSchema(binary.Right, schema, commonTableExpressions),
+            },
+            _ => expression,
+        };
+    }
+
+    private static WindowSpecification? RewriteWindowSchema(
+        WindowSpecification? window,
+        string schema,
+        HashSet<string> commonTableExpressions)
+    {
+        if (window is null)
+            return null;
+
+        return window with
+        {
+            PartitionBy = window.PartitionBy.Select(expression =>
+                RewriteExpressionSchema(expression, schema, commonTableExpressions)).ToArray(),
+            OrderBy = RewriteOrderBy(window.OrderBy, schema, commonTableExpressions),
+            Frame = window.Frame is null
+                ? null
+                : window.Frame with
+                {
+                    Start = window.Frame.Start with
+                    {
+                        Offset = RewriteNullableExpression(
+                            window.Frame.Start.Offset,
+                            schema,
+                            commonTableExpressions),
+                    },
+                    End = window.Frame.End with
+                    {
+                        Offset = RewriteNullableExpression(
+                            window.Frame.End.Offset,
+                            schema,
+                            commonTableExpressions),
+                    },
+                },
+        };
+    }
+
+    private static string RewritePersistentObjectName(string name, string schema)
+    {
+        if (!ManagedSchemaName.TrySplit(name, out var objectSchema, out var localName))
+            return name;
+        if (!objectSchema.Equals(schema, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("A cross-database object escaped managed ATTACH routing.");
+
+        return localName;
     }
 
     private RoutedStatement RouteSchema(string schema, string localName, Func<string, ParsedStatement> rewrite)
@@ -16676,53 +17450,59 @@ public sealed class EmbeddedConnection : IDisposable
             || ExpressionContainsSchemaQualification(window.Frame?.End.Offset);
     }
 
-    private static bool ContainsSubquery(Expression expression)
+    private (string Path, bool ReadOnly) ResolveAttachmentPath(string requestedPath)
     {
-        return expression switch
+        if (!requestedPath.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+            return (requestedPath, false);
+
+        var queryStart = requestedPath.IndexOf('?', StringComparison.Ordinal);
+        var escapedPath = queryStart < 0 ? requestedPath[5..] : requestedPath[5..queryStart];
+        string path;
+        try
         {
-            ScalarSubqueryExpression or ExistsExpression or InSubqueryExpression => true,
-            FunctionExpression function => function.Arguments.Any(ContainsSubquery)
-                || (function.Filter is not null && ContainsSubquery(function.Filter))
-                || WindowContainsSubquery(function.Window),
-            CollationExpression collation => ContainsSubquery(collation.Expression),
-            CastExpression cast => ContainsSubquery(cast.Expression),
-            CaseExpression @case => (@case.Operand is not null && ContainsSubquery(@case.Operand))
-                || @case.Clauses.Any(clause => ContainsSubquery(clause.When) || ContainsSubquery(clause.Then))
-                || (@case.Else is not null && ContainsSubquery(@case.Else)),
-            LikeExpression like => ContainsSubquery(like.Value)
-                || ContainsSubquery(like.Pattern)
-                || (like.Escape is not null && ContainsSubquery(like.Escape)),
-            InExpression @in => ContainsSubquery(@in.Value) || @in.Values.Any(ContainsSubquery),
-            BetweenExpression between => ContainsSubquery(between.Value)
-                || ContainsSubquery(between.Lower)
-                || ContainsSubquery(between.Upper),
-            UnaryExpression unary => ContainsSubquery(unary.Operand),
-            GlobExpression glob => ContainsSubquery(glob.Value) || ContainsSubquery(glob.Pattern),
-            BinaryExpression binary => ContainsSubquery(binary.Left) || ContainsSubquery(binary.Right),
-            _ => false,
-        };
-    }
+            if (escapedPath.StartsWith("//", StringComparison.Ordinal)
+                && Uri.TryCreate(requestedPath, UriKind.Absolute, out var absoluteUri)
+                && absoluteUri.IsFile)
+            {
+                path = absoluteUri.LocalPath;
+            }
+            else
+            {
+                path = Uri.UnescapeDataString(escapedPath);
+            }
+        }
+        catch (UriFormatException exception)
+        {
+            throw new EmbeddedSqlException($"Invalid managed ATTACH URI path '{requestedPath}'.", exception);
+        }
 
-    private static bool SelectContainsSubquery(SelectStatement statement)
-    {
-        return statement.Projections.Any(projection => ContainsSubquery(projection.Expression))
-            || (statement.Where is not null && ContainsSubquery(statement.Where))
-            || statement.GroupBy.Any(ContainsSubquery)
-            || (statement.Having is not null && ContainsSubquery(statement.Having))
-            || statement.OrderBy.Any(orderBy => ContainsSubquery(orderBy.Expression))
-            || (statement.Limit is not null && ContainsSubquery(statement.Limit))
-            || (statement.Offset is not null && ContainsSubquery(statement.Offset));
-    }
+        var mode = "rwc";
+        var query = queryStart < 0 ? string.Empty : requestedPath[(queryStart + 1)..];
+        foreach (var part in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var pieces = part.Split('=', 2);
+            var name = Uri.UnescapeDataString(pieces[0]);
+            if (!name.Equals("mode", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new EmbeddedSqlException(
+                    $"Managed ATTACH URI option '{name}' is not supported.");
+            }
 
-    private static bool WindowContainsSubquery(WindowSpecification? window)
-    {
-        if (window is null)
-            return false;
+            mode = pieces.Length == 2 ? Uri.UnescapeDataString(pieces[1]) : string.Empty;
+        }
 
-        return window.PartitionBy.Any(ContainsSubquery)
-            || window.OrderBy.Any(orderBy => ContainsSubquery(orderBy.Expression))
-            || (window.Frame?.Start.Offset is not null && ContainsSubquery(window.Frame.Start.Offset))
-            || (window.Frame?.End.Offset is not null && ContainsSubquery(window.Frame.End.Offset));
+        var readOnly = mode.Equals("ro", StringComparison.OrdinalIgnoreCase);
+        var requireExisting = readOnly || mode.Equals("rw", StringComparison.OrdinalIgnoreCase);
+        if (!readOnly
+            && !mode.Equals("rw", StringComparison.OrdinalIgnoreCase)
+            && !mode.Equals("rwc", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new EmbeddedSqlException($"Managed ATTACH URI has unsupported access mode '{mode}'.");
+        }
+        if (requireExisting && (!_database.FileSystem.FileExists(path) || !_database.FileSystem.FileExists(path + "-wal")))
+            throw new EmbeddedSqlException($"unable to open database file: {path}");
+
+        return (path, readOnly);
     }
 
     private static string GetAttachmentPathIdentity(string path)
@@ -16737,17 +17517,143 @@ public sealed class EmbeddedConnection : IDisposable
         }
     }
 
+    private StringComparer GetAttachmentPathComparer()
+    {
+        var fileSystem = TursoEncryptionFileSystem.Unwrap(_database.FileSystem);
+        return fileSystem is PhysicalFileSystem
+            && (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+    }
+
     private void EnsureAutocommitAttachmentLifecycle()
     {
-        if (_transactionCatalog is not null)
+        if (_transactionDatabases is not null)
             throw new EmbeddedSqlException("Managed ATTACH and DETACH are not supported inside a transaction.");
     }
 
-    private void EnsureNoAttachedDatabasesForTransaction()
+    private TransactionDatabaseState? GetTransactionState(EmbeddedDatabase database)
     {
-        if (_attachedDatabases.Count != 0)
+        if (_transactionDatabases is null)
+            return null;
+        if (!_transactionDatabases.TryGetValue(database, out var state))
+            throw new InvalidOperationException("The managed transaction does not own the routed database.");
+
+        return state;
+    }
+
+    private void BeginTransaction(bool openedBySavepoint)
+    {
+        var databases = _attachedDatabases.Values
+            .OrderBy(attachment => attachment.PathIdentity, StringComparer.OrdinalIgnoreCase)
+            .Select(attachment => attachment.Database)
+            .Prepend(_database);
+        var states = new Dictionary<EmbeddedDatabase, TransactionDatabaseState>();
+        foreach (var database in databases)
+        {
+            var (catalog, version) = database.CreateTransactionSnapshot();
+            states.Add(database, new TransactionDatabaseState(
+                catalog,
+                version,
+                database.GetPragmaHeaderMetadata()));
+        }
+
+        _transactionDatabases = states;
+        _transactionWriteDatabase = null;
+        _transactionMutationDatabase = null;
+        _transactionOpenedBySavepoint = openedBySavepoint;
+        _savepoints.Clear();
+    }
+
+    private void EnsureTransactionMayMutate(EmbeddedDatabase database, ParsedStatement statement)
+    {
+        if (!EmbeddedDatabase.MayMutate(statement))
+            return;
+        if (database.IsReadOnly)
+            throw new EmbeddedSqlException("attempt to write a readonly database");
+        if (_transactionMutationDatabase is not null)
+        {
             throw new EmbeddedSqlException(
-                "Managed transactions are not supported while a database is attached; detach all databases first.");
+                "Managed connections do not support reentrant writes from SQL callbacks.");
+        }
+        if (_transactionWriteDatabase is null
+            || ReferenceEquals(_transactionWriteDatabase, database))
+        {
+            return;
+        }
+
+        throw new EmbeddedSqlException(
+            "Managed ATTACH transactions cannot modify more than one database because independent WAL files cannot be committed atomically.");
+    }
+
+    private bool ReserveTransactionMutation(EmbeddedDatabase database, ParsedStatement statement)
+    {
+        EnsureTransactionMayMutate(database, statement);
+        if (!EmbeddedDatabase.MayMutate(statement))
+            return false;
+
+        _transactionMutationDatabase = database;
+        return true;
+    }
+
+    private ExecutionResult ExecuteWithMutationReservation(
+        EmbeddedDatabase database,
+        Func<ExecutionResult> operation)
+    {
+        if (_transactionMutationDatabase is not null)
+        {
+            throw new EmbeddedSqlException(
+                "Managed connections do not support reentrant writes from SQL callbacks.");
+        }
+
+        _transactionMutationDatabase = database;
+        try
+        {
+            return operation();
+        }
+        finally
+        {
+            ReleaseTransactionMutation(database);
+        }
+    }
+
+    private void ReleaseTransactionMutation(EmbeddedDatabase database)
+    {
+        if (!ReferenceEquals(_transactionMutationDatabase, database))
+            throw new InvalidOperationException("The managed transaction mutation reservation was lost.");
+
+        _transactionMutationDatabase = null;
+    }
+
+    private void CommitTransaction()
+    {
+        if (_transactionDatabases is null)
+            throw new InvalidOperationException("No managed transaction is active.");
+
+        var changed = _transactionDatabases
+            .Where(pair => pair.Value.HasChanges)
+            .ToArray();
+        if (changed.Length > 1)
+            throw new InvalidOperationException("A managed ATTACH transaction reached an unsafe multi-database write state.");
+
+        if (changed.Length == 1)
+        {
+            var (database, state) = changed[0];
+            try
+            {
+                database.CommitTransaction(
+                    state.Catalog,
+                    state.Version,
+                    database.IsFileBacked ? null : state.PragmaHeader);
+            }
+            catch (EmbeddedPostCommitMaintenanceException)
+            {
+                ResetTransactionState();
+                throw;
+            }
+        }
+
+        ResetTransactionState();
     }
 
     // Runs an eligible top-level VALUES statement through its prepared, cached lowering. The lowering is
@@ -16778,7 +17684,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         // SQLite leaves this connection setting unchanged while a transaction or savepoint
         // is active; it is neither transactional nor shared with sibling connections.
-        if (statement.Enabled is { } enabled && _transactionCatalog is null)
+        if (statement.Enabled is { } enabled && _transactionDatabases is null)
             _foreignKeys = enabled;
 
         return statement.Enabled is null
@@ -16812,7 +17718,7 @@ public sealed class EmbeddedConnection : IDisposable
 
         if (statement.Value is null)
         {
-            var metadata = _transactionPragmaHeader ?? _database.GetPragmaHeaderMetadata();
+            var metadata = GetTransactionState(_database)?.PragmaHeader ?? _database.GetPragmaHeaderMetadata();
             var value = statement.Kind switch
             {
                 PragmaHeaderIntegerKind.SchemaVersion => metadata.SchemaVersion,
@@ -16834,7 +17740,7 @@ public sealed class EmbeddedConnection : IDisposable
                 $"Managed file-backed databases do not support writes to PRAGMA {columnName}.");
         }
 
-        var current = _transactionPragmaHeader ?? _database.GetPragmaHeaderMetadata();
+        var current = GetTransactionState(_database)?.PragmaHeader ?? _database.GetPragmaHeaderMetadata();
         var updated = statement.Kind switch
         {
             PragmaHeaderIntegerKind.SchemaVersion => current with { SchemaVersion = statement.Value.Value },
@@ -16843,14 +17749,18 @@ public sealed class EmbeddedConnection : IDisposable
             _ => throw new InvalidOperationException($"Unknown PRAGMA header integer kind {statement.Kind}."),
         };
 
-        if (_transactionCatalog is null)
+        if (_transactionDatabases is null)
         {
             _database.SetInMemoryPragmaHeaderMetadata(updated);
         }
         else if (updated != current)
         {
-            _transactionPragmaHeader = updated;
-            _transactionHasChanges = true;
+            EnsureTransactionMayMutate(_database, statement);
+            var state = GetTransactionState(_database)
+                ?? throw new InvalidOperationException("The managed transaction lost its primary database state.");
+            state.PragmaHeader = updated;
+            state.HasChanges = true;
+            _transactionWriteDatabase = _database;
         }
 
         return ExecutionResult.Empty;
@@ -16934,19 +17844,20 @@ public sealed class EmbeddedConnection : IDisposable
             return ["page_size"];
 
         var routed = RouteStatement(statement);
+        var transactionState = GetTransactionState(routed.Database);
         if (EmbeddedDatabase.TryGetReturning(routed.Statement, out var returningTable, out var returning))
         {
-            return routed.IsAttached || _transactionCatalog is null
+            return transactionState is null
                 ? routed.Database.DescribeReturning(returningTable, returning)
-                : _database.DescribeReturning(returningTable, returning, _transactionCatalog);
+                : routed.Database.DescribeReturning(returningTable, returning, transactionState.Catalog);
         }
 
         if (routed.Statement is not QueryStatement query)
             return [];
 
-        return routed.IsAttached || _transactionCatalog is null
+        return transactionState is null
             ? routed.Database.DescribeColumns(query)
-            : DescribeQueryColumns(query, _transactionCatalog);
+            : DescribeQueryColumns(query, transactionState.Catalog);
     }
 
     private static string[] DescribeQueryColumns(
@@ -16964,20 +17875,18 @@ public sealed class EmbeddedConnection : IDisposable
     {
         // A SAVEPOINT issued outside an explicit BEGIN...COMMIT opens a transaction
         // that stays active until its outermost savepoint is released or rolled back.
-        if (_transactionCatalog is null)
-        {
-            EnsureNoAttachedDatabasesForTransaction();
-            (_transactionCatalog, _transactionVersion) = _database.CreateTransactionSnapshot();
-            _transactionPragmaHeader = _database.GetPragmaHeaderMetadata();
-            _transactionHasChanges = false;
-            _transactionOpenedBySavepoint = true;
-        }
+        if (_transactionDatabases is null)
+            BeginTransaction(openedBySavepoint: true);
 
         _savepoints.Add(new SavepointEntry(
             name,
-            _transactionCatalog.Clone(),
-            _transactionHasChanges,
-            _transactionPragmaHeader));
+            _transactionDatabases!.ToDictionary(
+                pair => pair.Key,
+                pair => new SavepointDatabaseState(
+                    pair.Value.Catalog.Clone(),
+                    pair.Value.HasChanges,
+                    pair.Value.PragmaHeader)),
+            _transactionWriteDatabase));
     }
 
     private void ReleaseSavepoint(string name)
@@ -16987,15 +17896,7 @@ public sealed class EmbeddedConnection : IDisposable
         // Releasing the outermost savepoint of a savepoint-opened transaction commits it.
         if (index == 0 && _transactionOpenedBySavepoint)
         {
-            if (_transactionHasChanges && _transactionCatalog is not null)
-            {
-                _database.CommitTransaction(
-                    _transactionCatalog,
-                    _transactionVersion,
-                    _database.IsFileBacked ? null : _transactionPragmaHeader);
-            }
-
-            ResetTransactionState();
+            CommitTransaction();
             return;
         }
 
@@ -17011,9 +17912,16 @@ public sealed class EmbeddedConnection : IDisposable
 
         // Restore the state captured when the savepoint was created. Clone so the
         // stored snapshot stays pristine for a later ROLLBACK TO the same savepoint.
-        _transactionCatalog = savepoint.Catalog.Clone();
-        _transactionHasChanges = savepoint.HasChanges;
-        _transactionPragmaHeader = savepoint.PragmaHeader;
+        if (_transactionDatabases is null)
+            throw new InvalidOperationException("The managed savepoint lost its transaction state.");
+        foreach (var (database, savedState) in savepoint.Databases)
+        {
+            var state = _transactionDatabases[database];
+            state.Catalog = savedState.Catalog.Clone();
+            state.HasChanges = savedState.HasChanges;
+            state.PragmaHeader = savedState.PragmaHeader;
+        }
+        _transactionWriteDatabase = savepoint.WriteDatabase;
 
         // ROLLBACK TO keeps the named savepoint but cancels any created after it.
         if (index + 1 < _savepoints.Count)
@@ -17033,18 +17941,22 @@ public sealed class EmbeddedConnection : IDisposable
 
     private void ResetTransactionState()
     {
-        _transactionCatalog = null;
-        _transactionPragmaHeader = null;
-        _transactionHasChanges = false;
+        _transactionDatabases = null;
+        _transactionWriteDatabase = null;
+        _transactionMutationDatabase = null;
         _transactionOpenedBySavepoint = false;
         _savepoints.Clear();
     }
 
     private sealed record SavepointEntry(
         string Name,
+        IReadOnlyDictionary<EmbeddedDatabase, SavepointDatabaseState> Databases,
+        EmbeddedDatabase? WriteDatabase);
+
+    private sealed record SavepointDatabaseState(
         EmbeddedDatabase.SchemaCatalog Catalog,
         bool HasChanges,
-        PragmaHeaderMetadata? PragmaHeader);
+        PragmaHeaderMetadata PragmaHeader);
 
     private void ThrowIfDisposed()
     {

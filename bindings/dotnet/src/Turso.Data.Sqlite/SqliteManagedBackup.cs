@@ -22,6 +22,13 @@ internal static class SqliteManagedBackup
         {
             throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
         }
+        if (source.ManagedConnection.HasAttachedDatabases
+            || destination.ManagedConnection.HasAttachedDatabases)
+        {
+            throw new SqliteException(
+                Properties.Resources.SqliteNativeError(1, "managed backup is not supported while a database is attached"),
+                1);
+        }
 
         try
         {

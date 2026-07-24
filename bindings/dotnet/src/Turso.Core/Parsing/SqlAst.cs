@@ -180,7 +180,10 @@ internal sealed record PragmaJournalModeStatement(string? Mode) : ParsedStatemen
 
 internal sealed record PragmaPageSizeStatement(int? Value) : ParsedStatement;
 
-internal sealed record AttachDatabaseStatement(string Path, string Alias) : ParsedStatement;
+internal sealed record AttachDatabaseStatement(
+    Expression Path,
+    string Alias,
+    Expression? Key) : ParsedStatement;
 
 internal sealed record DetachDatabaseStatement(string Alias) : ParsedStatement;
 

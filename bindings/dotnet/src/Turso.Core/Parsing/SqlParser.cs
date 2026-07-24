@@ -105,17 +105,12 @@ internal sealed class SqlParser
     private ParsedStatement ParseAttach()
     {
         ConsumeKeyword("DATABASE");
-        if (_lexer.Current.Kind != TokenKind.String)
-            throw Error("Managed ATTACH requires a string-literal database path.");
-
-        var path = _lexer.Current.Text;
-        _lexer.Next();
+        var path = ParseExpression();
         ExpectKeyword("AS");
         var alias = ExpectIdentifier();
-        if (ConsumeKeyword("KEY"))
-            throw Error("Managed ATTACH does not support KEY or encrypted-database overrides.");
+        var key = ConsumeKeyword("KEY") ? ParseExpression() : null;
 
-        return new AttachDatabaseStatement(path, alias);
+        return new AttachDatabaseStatement(path, alias, key);
     }
 
     private ParsedStatement ParseDetach()

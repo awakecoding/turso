@@ -157,7 +157,7 @@ public sealed class ManagedBackupSnapshotTests
             var exception = Assert.Throws<SqliteException>(() => source.BackupDatabase(destination));
 
             exception!.SqliteErrorCode.Should().Be(1);
-            exception.Message.Should().Contain("transactions are not supported while a database is attached");
+            exception.Message.Should().Contain("managed backup is not supported while a database is attached");
             destination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
 
             attachedConnection.ExecuteNonQuery("DETACH DATABASE aux;");

@@ -51,7 +51,7 @@ public sealed class ManagedIncrementalBlobDatabaseBoundaryTests
     }
 
     [Test]
-    public void ManagedAttachedBlobBlocksDetachAndTransactionsWithoutChangingData()
+    public void ManagedAttachedBlobBlocksDetachButAllowsTransactionsWithoutChangingData()
     {
         var mainPath = CreateDatabasePath("attached-lifecycle-main");
         var attachedPath = CreateDatabasePath("attached-lifecycle-data");
@@ -66,10 +66,12 @@ public sealed class ManagedIncrementalBlobDatabaseBoundaryTests
             var blob = new SqliteBlob(connection, "aux", "data", "value", 1);
             var detach = Assert.Throws<SqliteException>(() => connection.ExecuteNonQuery("DETACH aux;"));
             detach!.Message.Should().Contain("database is locked");
-            Assert.Throws<SqliteException>(() => connection.BeginTransaction())!.Message
-                .Should().Contain("transactions are not supported while a database is attached");
-            connection.ExecuteScalar<byte[]>("SELECT value FROM aux.data WHERE rowid = 1;")
-                .Should().Equal(1, 2);
+            using (var transaction = connection.BeginTransaction())
+            {
+                connection.ExecuteScalar<byte[]>("SELECT value FROM aux.data WHERE rowid = 1;")
+                    .Should().Equal(1, 2);
+                transaction.Commit();
+            }
 
             blob.Dispose();
             connection.ExecuteNonQuery("DETACH aux;");

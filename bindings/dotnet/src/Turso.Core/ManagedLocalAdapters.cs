@@ -118,6 +118,8 @@ public interface IManagedConnectionAdapter : IDisposable
 {
     IManagedStatementAdapter Prepare(string sql);
 
+    bool HasAttachedDatabases => true;
+
     void ResetForPooling()
         => throw new NotSupportedException("This managed connection adapter does not support pooling.");
 
@@ -327,6 +329,8 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         ArgumentNullException.ThrowIfNull(connection);
         return new ManagedConnectionAdapter(connection);
     }
+
+    public bool HasAttachedDatabases => GetConnection().HasAttachedDatabases;
 
     public IManagedStatementAdapter Prepare(string sql)
     {
