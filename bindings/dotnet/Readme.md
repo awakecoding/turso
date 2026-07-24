@@ -217,6 +217,8 @@ The managed engine lowers generic source-less and single-table SELECT projection
 
 The tree-walking evaluator remains the explicit fallback for expression families not yet represented by this lowering, including comparison/logical/concatenation expressions, `CASE` and `CAST`, volatile, collation-sensitive, or context-dependent functions, shadowing user-defined functions, complex scan predicates whose streaming error order would differ, computed `DISTINCT` or `ORDER BY` projections, parameterized compound terms, computed or otherwise error-capable `INTERSECT`/`EXCEPT` terms, and compounds whose custom collation callbacks cannot be invoked at evaluator-equivalent points.
 
+Managed common table expressions accept SQLite's `AS MATERIALIZED` and `AS NOT MATERIALIZED` hints in SELECT, CTAS, and CTE-scoped DML. Unspecified and `MATERIALIZED` CTEs retain the one-shot materialization boundary. `NOT MATERIALIZED` is advisory: only one nonrecursive CTE consumed by a metadata-only `SELECT *` pass-through may elide the outer scan, so joins, compounds, windows, and VALUES inherit their existing route without repeating evaluation. Multiple references, nested multi-CTE scopes, DML, cancellation-capable plans, and every outer shape whose callback or error order is not proven equivalent remain materialized and evaluator-owned. Eligible linear recursive CTEs keep their existing guarded worktable route regardless of the hint.
+
 Managed join SELECTs have two compiled paths. Direct two-table `INNER`/`CROSS`/`LEFT` shapes retain the nested-loop cursor program. A materializing `OpenJoinCursor` path handles safe N-way joins plus parser-supported `RIGHT`/`FULL`, `USING`/`NATURAL` coalescing, qualified rowids, null extension, computed projections, direct filters, built-in-collation ordering, `DISTINCT`, and bounds; it also supports built-in scalar and direct-key grouped aggregates. The join cursor completes recursive `ON` phases and post-join filtering before later projection/sort/distinct phases, and `ProjectRegisters` publishes a projected row only after every expression succeeds. Declared comparison affinity and collation are shared with the evaluator. Computed or callback-bearing `ON`/`WHERE`, callback-bearing `ORDER BY`/custom distinct collations, aggregate combinations whose result/error order is not represented, non-base sources, subqueries/windows, and every cancellation-capable execution remain explicit evaluator fallback. `EXPLAIN` reports `OpenJoinCursor`, `ProjectRegisters`, sorter/aggregate instructions, and `DistinctFilter` only for genuinely compiled shapes; EQP reports the same compiled/fallback boundary.
 
 Managed SELECT, compound SELECT, window, and limited DML ordering all preserve explicit `NULLS FIRST` and `NULLS LAST`; omitting the clause uses SQLite's direction-dependent default.
@@ -491,8 +493,10 @@ before stepping; their values are used to choose the same route as normal execut
 are never rendered in the plan row. Planning never runs the emitted program, evaluator,
 or DML write target. Direct SELECT and DML plans stepped with a cancellation-capable
 token report evaluator fallback, matching their runtime cancellation boundaries. CTE
-plans report evaluator fallback because execution materializes CTE inputs before any
-later compiled phase. Unsupported non-query/non-DML statements fail explicitly.
+plans report evaluator fallback when execution materializes CTE inputs. A proven
+single-CTE `NOT MATERIALIZED` pass-through and the guarded linear recursive worktable
+route report compiled VDBE only when their whole-statement output matches the emitted
+program. Unsupported non-query/non-DML statements fail explicitly.
 
 These rows intentionally do not claim table scans, index choices, costs, cardinalities,
 or other planner details that the managed engine does not expose. SQLite's column shape
