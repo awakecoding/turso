@@ -680,6 +680,35 @@ public sealed class ManagedBackupSnapshotTests
     }
 
     [Test]
+    public void ManagedBackupRejectsCaseVariantPhysicalAliasOnMacOS()
+    {
+        if (!OperatingSystem.IsMacOS())
+            Assert.Ignore("This regression exercises macOS physical path identity.");
+
+        var path = CreateManagedDatabasePath();
+        var aliasPath = Path.Combine(
+            Path.GetDirectoryName(path)!,
+            Path.GetFileName(path).ToUpperInvariant());
+        try
+        {
+            using var source = OpenManagedConnection(path);
+            using var destination = OpenManagedConnection(aliasPath);
+            source.ExecuteNonQuery("CREATE TABLE preserved(value TEXT); INSERT INTO preserved VALUES ('source');");
+
+            var exception = Assert.Throws<SqliteException>(() => source.BackupDatabase(destination));
+
+            exception!.SqliteErrorCode.Should().Be(1);
+            exception.Message.Should().Contain("source and destination must be distinct");
+            source.ExecuteScalar<string>("SELECT value FROM preserved;").Should().Be("source");
+        }
+        finally
+        {
+            DeleteManagedDatabase(aliasPath);
+            DeleteManagedDatabase(path);
+        }
+    }
+
+    [Test]
     public void ManagedBackupSymbolicAliasCannotOpenAlongsideSource()
     {
         var path = CreateManagedDatabasePath();

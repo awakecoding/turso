@@ -226,6 +226,11 @@ public sealed class EmbeddedDatabase : IDisposable
     internal IFileSystem FileSystem
         => _fileSystem ?? throw new InvalidOperationException("The managed database is not file-backed.");
 
+    internal static StringComparer PhysicalPathComparer { get; } =
+        OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+
     internal bool ReferencesSameDatabase(EmbeddedDatabase other)
     {
         ArgumentNullException.ThrowIfNull(other);
@@ -238,13 +243,9 @@ public sealed class EmbeddedDatabase : IDisposable
         var otherFileSystem = TursoEncryptionFileSystem.Unwrap(other._fileSystem);
         if (fileSystem is PhysicalFileSystem && otherFileSystem is PhysicalFileSystem)
         {
-            var comparison = OperatingSystem.IsWindows()
-                ? StringComparison.OrdinalIgnoreCase
-                : StringComparison.Ordinal;
-            return string.Equals(
+            return PhysicalPathComparer.Equals(
                 Path.GetFullPath(_databasePath),
-                Path.GetFullPath(other._databasePath),
-                comparison);
+                Path.GetFullPath(other._databasePath));
         }
 
         return ReferenceEquals(fileSystem, otherFileSystem)
@@ -17822,8 +17823,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         var fileSystem = TursoEncryptionFileSystem.Unwrap(_database.FileSystem);
         return fileSystem is PhysicalFileSystem
-            && (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
-            ? StringComparer.OrdinalIgnoreCase
+            ? EmbeddedDatabase.PhysicalPathComparer
             : StringComparer.Ordinal;
     }
 
