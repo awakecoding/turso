@@ -96,6 +96,38 @@ public sealed class ManagedBackupCoreSnapshotAdapterBoundaryTests
     }
 
     [Test]
+    public void CoreSnapshotPreservesCompositeActionsAndDeferral()
+    {
+        using var sourceDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var destinationDatabase = ManagedDatabaseAdapter.Open(":memory:");
+        using var source = sourceDatabase.Connect();
+        using var destination = destinationDatabase.Connect();
+        Execute(source, "CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));");
+        Execute(
+            source,
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, "
+                + "FOREIGN KEY(a, b) REFERENCES parent "
+                + "ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);");
+        Execute(source, "INSERT INTO parent VALUES (1, 2);");
+        Execute(source, "INSERT INTO child VALUES (10, 1, 2);");
+        Execute(destination, "PRAGMA foreign_keys = ON;");
+
+        source.CopySnapshotTo(destination);
+
+        Scalar(destination, "PRAGMA foreign_keys;").Should().Be(1);
+        Execute(destination, "UPDATE parent SET a = 3, b = 4;");
+        Scalar(destination, "SELECT a FROM child WHERE id = 10;").Should().Be(3);
+        Execute(destination, "BEGIN;");
+        Execute(destination, "INSERT INTO child VALUES (11, 9, 9);");
+        Assert.Throws<EmbeddedSqlException>(() => Execute(destination, "COMMIT;"))!
+            .Message.Should().Be("FOREIGN KEY constraint failed");
+        Execute(destination, "INSERT INTO parent VALUES (9, 9);");
+        Execute(destination, "COMMIT;");
+        Execute(destination, "DELETE FROM parent WHERE a = 3 AND b = 4;");
+        Scalar(destination, "SELECT a IS NULL FROM child WHERE id = 10;").Should().Be(1);
+    }
+
+    [Test]
     public void CoreSnapshotCopyUsesAndPreservesAnExistingSourceTransaction()
     {
         using var sourceDatabase = ManagedDatabaseAdapter.Open(":memory:");

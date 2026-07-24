@@ -158,7 +158,7 @@ public class PersistentSecondaryIndexFileStoreTests
     }
 
     [Test]
-    public void RejectsCorruptCommittedSecondaryIndexAndUnsupportedSortOrder()
+    public void PersistsDescendingIndexAndRejectsCorruptCommittedSecondaryIndex()
     {
         var fileSystem = new InMemoryFileSystem();
         using (var database = EmbeddedDatabase.OpenFile("secondary-index-corrupt.db", fileSystem))
@@ -168,8 +168,7 @@ public class PersistentSecondaryIndexFileStoreTests
             Execute(connection, "INSERT INTO t VALUES (1, 'one');");
             Execute(connection, "CREATE INDEX t_value_binary ON t(value);");
 
-            var descending = () => Execute(connection, "CREATE INDEX t_value_desc ON t(value DESC);");
-            descending.Should().Throw<EmbeddedSqlException>().WithMessage("*descending*");
+            Execute(connection, "CREATE INDEX t_value_desc ON t(value DESC);");
         }
 
         uint rootPage;

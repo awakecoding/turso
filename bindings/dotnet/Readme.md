@@ -375,7 +375,7 @@ mode. Supported common connection string keywords include:
 | `Data Source` | Local database path or `:memory:`; remote URL for `TursoConnection`. Aliases include `DataSource` and `Filename`. |
 | `Mode` | Local only. Managed local honors `Memory`, `ReadOnly`, `ReadWrite`, and `ReadWriteCreate` with explicit file-existence checks. |
 | `Cache` | Local only. Managed `Cache=Shared` is supported only with a named `Data Source` and `Mode=Memory`; see below. |
-| `Foreign Keys` | Applied by local `SqliteConnection` through `PRAGMA foreign_keys`; direct managed `TursoConnection` rejects the keyword. |
+| `Foreign Keys` | Applied by local `SqliteConnection` through `PRAGMA foreign_keys`; the managed engine supports composite keys, referential actions, and deferred constraints. Direct managed `TursoConnection` rejects the keyword. |
 | `Local Provider` | `Managed` is the default for local databases. Set `Native` when `Turso.Data.Sqlite.Native` or a RID-specific `Turso.Data.Sqlite.NativeAot.*` companion is referenced. |
 | `Recursive Triggers` | Tracked by local `SqliteConnection`; direct managed `TursoConnection` rejects the keyword. |
 | `Default Timeout` | Default command timeout. Aliases include `Command Timeout`; for managed local databases it controls busy waits, not total query duration. |
@@ -388,6 +388,31 @@ mode. Supported common connection string keywords include:
 | `Read Your Writes` | Remote `TursoConnection` only. Keeps the Hrana session baton across commands; `False` uses stateless requests. |
 | `Sync Interval` | Retained for connection-string compatibility. Only `0` is accepted; call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly and await every operation. |
 | `Tls` | Remote `TursoConnection` only. Optional `libsql://` development override; conflicts with explicit HTTP(S) schemes fail early. |
+
+### Managed foreign-key semantics
+
+The managed local engine supports composite child and parent keys, explicit or omitted
+parent primary-key columns, UNIQUE parent keys, parent affinity and collation, generated
+columns, and `WITHOUT ROWID` tables within the storage shapes supported by the managed
+pager. `ON DELETE` and `ON UPDATE` implement `CASCADE`, `SET NULL`, `SET DEFAULT`,
+`RESTRICT`, and `NO ACTION`, including bounded self-referential and multi-table cascades.
+Foreign-key actions run before the engine's existing AFTER-trigger subset, and the whole
+statement (actions and trigger effects included) rolls back on failure.
+
+`DEFERRABLE INITIALLY DEFERRED` and `PRAGMA defer_foreign_keys` participate in managed
+transactions and savepoints. A failed deferred `COMMIT` or outermost `RELEASE` leaves the
+transaction open so the violation can be repaired. `PRAGMA foreign_keys` remains
+connection-local and cannot change while a transaction is active.
+`PRAGMA foreign_key_list` and `PRAGMA foreign_key_check` expose the retained schema and
+violations. As in SQLite, named `MATCH` clauses are accepted and use MATCH SIMPLE
+behavior.
+
+Foreign keys are always resolved within the database that owns the child table. A
+schema-qualified `REFERENCES` target is rejected, and an ATTACH transaction still may
+mutate only one database because independent files cannot be committed atomically.
+Managed schema rewriting still rejects `ALTER TABLE ADD COLUMN ... REFERENCES` and
+foreign-key-dependent column renames. Trigger forms outside the managed trigger subset
+(for example `UPDATE OF` with `OLD`/`NEW` row references) remain unsupported.
 
 ### Managed local encryption format
 
@@ -415,6 +440,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 - `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, managed fixed-length blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
 - Managed `ATTACH` supports file-backed aliases, filename expressions and parameters, `file:` URIs with `mode=ro|rw|rwc`, inherited page encryption, same-cipher hexadecimal `KEY` overrides, same-database SELECT/DML/CTE/subquery routing, and transactions/savepoints that modify at most one persistent database. A transaction may also modify its connection-private TEMP catalog. Statements whose reads span multiple database schemas and transactions that attempt to write a second persistent database are rejected before the unsafe operation because independent WAL files cannot be committed atomically. Attached in-memory databases, URI options other than `mode`, cross-database views/triggers, and plaintext-to-encrypted `KEY` attachment without a primary cipher remain unsupported.
 - Managed pooling retains at most 32 idle physical connections per canonical file/read-only key and at most 64 keys. `:memory:`, `Mode=Memory`, shared-memory, encrypted, native, remote/replica, and connections with custom functions, aggregates, or collations are not pooled. Returning a pooled connection closes readers and blobs, rolls back transactions, invalidates prepared commands, detaches databases, destroys the TEMP catalog, and resets connection-local pragmas and row-id state. Renting it refreshes the managed catalog from durable storage before reuse.
+- File-backed managed indexes preserve explicit, `UNIQUE`, and composite `PRIMARY KEY` origin and term metadata, including mixed `ASC`/`DESC` order and SQLite's built-in `BINARY`, `NOCASE`, and `RTRIM` collations. Rich index mutations use an atomic full-tree rewrite; the bounded in-place path remains limited to ascending `BINARY` terms. Application-defined index collations remain rejected before publication because their ordering cannot be reconstructed safely on reopen.
 - `SqliteConnection.ClearPool(connection)` retires the file/read-only pool selected by that connection string, and `SqliteConnection.ClearAllPools()` retires every managed pool. Idle handles are disposed immediately; rented handles are disposed instead of being reused when returned, so clearing is safe while connections are open.
 - `TursoConnection` uses the same contract when `Pooling=True` is explicitly selected and exposes corresponding `TursoConnection.ClearPool(connection)` and `TursoConnection.ClearAllPools()` methods.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
@@ -426,7 +452,8 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 - `PRAGMA read_uncommitted` remains connection-local compatibility state for native and managed private-cache connections. Managed shared-memory databases preserve transaction isolation and reject enabling `PRAGMA read_uncommitted` or beginning an `IsolationLevel.ReadUncommitted` transaction rather than claiming unsupported dirty-read behavior.
 - Managed `BackupDatabase` atomically replaces existing managed destinations, including schema, rows, `schema_version`, `user_version`, and `application_id`, and accepts `main` or attached database names. The connection-private TEMP database is excluded, and selecting `temp` as a named source or destination is rejected before destination mutation. Active `main` source transactions are copied from their current snapshot without being completed, and active source readers remain usable. Selecting an attached source while its owning connection has an active transaction fails busy before destination mutation because that attachment's transaction clone cannot yet be exposed as an independent backup source. Non-transactional file sources are reopened before snapshot acquisition so commits from other connections are included. Memory and physical-file endpoints are supported, including encrypted file-to-file re-encryption; failures before publication leave the destination unchanged.
 - Managed backup rejects an active destination transaction or reader, copying a recognized database identity onto itself, file-to-file copies through custom file systems with unknown identity semantics, and managed/native provider mixing before changing the destination. Physical files acquire exclusive SQLite lock-byte ownership when opened, so hard-link, junction, symbolic-link, short-path, and case aliases cannot be opened as a second managed database and therefore cannot reach destination mutation.
-- Managed file persistence rejects schema SQL that requires `sqlite_schema` overflow pages before publishing the catalog or WAL commit. Encryption reduces usable page space, so encrypted databases can reach this explicit bound sooner.
+- Managed file persistence reads and writes SQLite-compatible `sqlite_schema` overflow chains, including encrypted and small-page databases. Overflowing definitions remain atomic across WAL/DELETE commits, backup, ATTACH, pooling refresh, and page-size migration; malformed chains fail closed before publication.
+- Managed file persistence reads and writes SQLite-compatible `WITHOUT ROWID` tables with composite `ASC`/`DESC` primary keys, built-in `BINARY`/`NOCASE`/`RTRIM` collations, VIRTUAL and STORED generated columns, explicit secondary indexes, and implicit `UNIQUE` indexes. Secondary-index records carry the required primary-key suffix, and managed files round-trip through ordinary SQLite in WAL or DELETE mode, backup, ATTACH, pooling, encryption, and page-size migration. Application-defined collations and unsupported expression/partial-index shapes fail before publication because their durable comparison format cannot be restored while opening the catalog.
 - Managed `SqliteBlob` supports fixed-length reads and bounded writes for rowid tables in `main` and named attached databases. Use the database-name constructor for attachments. Blob writes participate in transactions subject to the managed `ATTACH` single-write-database boundary. A handle is invalidated if its row changes, and an open attached handle blocks `DETACH`.
 - Resizing, writable blobs on tables with `UPDATE` triggers, and `WITHOUT ROWID` tables are rejected before changing data. Attached databases inherit the primary managed file system, including encryption, and blob changes remain durable after reopen.
 - Native providers may expose virtual-table modules supplied by their native extension build. The managed provider has no safe module registration, lifecycle, planner, or execution interface, so `CREATE VIRTUAL TABLE` is rejected during parsing before schema mutation; it never fabricates FTS or other module support.
@@ -508,7 +535,7 @@ var options = new DbContextOptionsBuilder<AppDbContext>()
     .Options;
 ```
 
-The local provider supports the normal EF Core SQLite query pipeline, including composed `IQueryable<T>` filters, navigation-property joins, ordering, paging, grouping, aggregates, async materialization, and `SaveChangesAsync`. Schema creation can use `EnsureCreated`, `EnsureCreatedAsync`, and EF migrations against local database files. Managed migrations support history tracking, literal defaults, and model-backed table, column, and index renames when the renamed table or column has no foreign-key, table-constraint, trigger, or computed-column dependencies. Filtered indexes, descending indexes, SQL-expression defaults, raw SQL operations, idempotent migration scripts, and dependent renames fail before application schema mutation because the managed engine cannot execute those forms safely.
+The local provider supports the normal EF Core SQLite query pipeline, including composed `IQueryable<T>` filters, navigation-property joins, ordering, paging, grouping, aggregates, async materialization, and `SaveChangesAsync`. Schema creation can use `EnsureCreated`, `EnsureCreatedAsync`, and EF migrations against local database files. Managed migrations support history tracking, literal defaults, descending indexes, and model-backed table, column, and index renames when the renamed table or column has no foreign-key, table-constraint, trigger, or computed-column dependencies. Filtered indexes, SQL-expression defaults, raw SQL operations, idempotent migration scripts, and dependent renames fail before application schema mutation because the managed engine cannot execute those forms safely.
 
 Remote `libsql://`, `http://`, `https://`, `ws://`, and `wss://` EF Core support
 is not part of the local provider. `UseTurso` rejects those data sources during

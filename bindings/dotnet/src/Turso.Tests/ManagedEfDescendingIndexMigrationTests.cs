@@ -10,7 +10,7 @@ public class ManagedEfDescendingIndexMigrationTests
 {
     [TestCase(true)]
     [TestCase(false)]
-    public void ManagedMigrationsRejectDescendingIndexEncodingBeforeSqlGeneration(bool useEmptySortOrders)
+    public void ManagedMigrationsGenerateDescendingIndexEncoding(bool useEmptySortOrders)
     {
         var options = new DbContextOptionsBuilder<DescendingIndexMigrationContext>()
             .UseTurso("Data Source=:memory:;Local Provider=Managed")
@@ -33,11 +33,13 @@ public class ManagedEfDescendingIndexMigrationTests
             IsDescending = useEmptySortOrders ? [] : [true]
         };
 
-        var generate = () => context.GetService<IMigrationsSqlGenerator>().Generate([createTable, createIndex]);
+        var commands = context.GetService<IMigrationsSqlGenerator>().Generate([createTable, createIndex]);
 
-        generate.Should().Throw<NotSupportedException>()
-            .WithMessage(
-                "The managed local provider does not support descending indexes on file-backed databases ('IX_Items_Rank' on 'Items').");
+        commands.Select(command => command.CommandText)
+            .Should()
+            .Contain(command => command.Contains(
+                "CREATE INDEX \"IX_Items_Rank\" ON \"Items\" (\"Rank\" DESC)",
+                StringComparison.Ordinal));
     }
 
     private sealed class DescendingIndexMigrationContext(

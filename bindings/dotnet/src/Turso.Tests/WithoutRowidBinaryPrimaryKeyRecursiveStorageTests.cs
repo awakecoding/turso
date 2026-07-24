@@ -79,6 +79,69 @@ public sealed class WithoutRowidBinaryPrimaryKeyRecursiveStorageTests
     }
 
     [Test]
+    public void CompositeCollatedTableAndSecondaryIndexesSplitAndPassSqliteIntegrityCheck()
+    {
+        var path = CreateDatabasePath("composite-index-pressure");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, """
+                    CREATE TABLE entry(
+                        tenant TEXT,
+                        sequence INTEGER,
+                        value TEXT,
+                        payload TEXT,
+                        computed INTEGER GENERATED ALWAYS AS (sequence % 17) VIRTUAL,
+                        PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                        UNIQUE(value)
+                    ) WITHOUT ROWID;
+                    """);
+                Execute(connection, "CREATE INDEX entry_payload ON entry(payload DESC, tenant COLLATE BINARY);");
+                Execute(connection, "CREATE INDEX entry_computed ON entry(computed DESC);");
+                Execute(connection, BuildCompositeInsert(1, DeepBinaryRowCount));
+            }
+
+            using (var pager = SqlitePager.Open(
+                       PhysicalFileSystem.Instance,
+                       path,
+                       path + "-wal",
+                       readOnly: true))
+            {
+                var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+                foreach (var (type, name) in new[]
+                         {
+                             ("table", "entry"),
+                             ("index", "sqlite_autoindex_entry_2"),
+                             ("index", "entry_payload"),
+                             ("index", "entry_computed"),
+                         })
+                {
+                    var root = FindRootPage(pager.ReadCommittedPage(1), header, type, name);
+                    SqliteBtreePageHeader.Parse(pager.ReadCommittedPage(root)).PageType
+                        .Should().Be(SqliteBtreePageType.IndexInterior);
+                }
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Scalar(connection, "SELECT COUNT(*) FROM entry;").AsInteger().Should().Be(DeepBinaryRowCount);
+                Scalar(connection, "SELECT computed FROM entry WHERE value = 'value-01600';")
+                    .AsInteger().Should().Be(DeepBinaryRowCount % 17);
+            }
+
+            VerifyWithSqlite(path, DeepBinaryRowCount);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void EncryptedReadOnlyReopenLoadsDeepBinaryPrimaryKeyTree()
     {
         using var encryption = TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes256Gcm, Aes256Key);
@@ -261,11 +324,18 @@ public sealed class WithoutRowidBinaryPrimaryKeyRecursiveStorageTests
     }
 
     private static uint FindTableRootPage(ReadOnlySpan<byte> schemaPage, SqliteDatabaseHeader header, string name)
+        => FindRootPage(schemaPage, header, "table", name);
+
+    private static uint FindRootPage(
+        ReadOnlySpan<byte> schemaPage,
+        SqliteDatabaseHeader header,
+        string type,
+        string name)
     {
         var schema = SqliteTableLeafPageView.Parse(schemaPage, header.UsableSpace, isFirstPage: true);
         return checked((uint)schema.Cells
             .Select(cell => SqliteRecordCodec.Decode(cell.Cell.LocalPayload.Span, header.TextEncoding))
-            .Single(values => values[0].AsText() == "table" && values[1].AsText() == name)[3]
+            .Single(values => values[0].AsText() == type && values[1].AsText() == name)[3]
             .AsInteger());
     }
 
@@ -286,6 +356,12 @@ public sealed class WithoutRowidBinaryPrimaryKeyRecursiveStorageTests
         => $"INSERT INTO entry VALUES {string.Join(", ", Enumerable.Range(firstIndex, count)
             .Select(index => $"('{BinaryPayload(index)}', '{BinaryKey(index)}')"))};";
 
+    private static string BuildCompositeInsert(int firstIndex, int count)
+        => $"INSERT INTO entry(tenant, sequence, value, payload) VALUES {string.Join(", ", Enumerable.Range(firstIndex, count)
+            .Reverse()
+            .Select(index =>
+                $"('tenant-{index % 32:D2}', {index}, 'value-{index:D5}', 'payload-{index % 101:D3}-{new string('p', 96)}')"))};";
+
     private static string OverflowKey(int index)
         => $"key-{index:D5}-{new string('z', DeepOverflowKeyLength)}";
 
@@ -294,7 +370,7 @@ public sealed class WithoutRowidBinaryPrimaryKeyRecursiveStorageTests
 
     private static string BinaryPayload(int index) => $"payload-{index:D5}";
 
-    private static void VerifyWithSqlite(string path)
+    private static void VerifyWithSqlite(string path, int expectedRowCount = DeepOverflowRowCount)
     {
         var verificationPath = path + ".verify.db";
         File.Copy(path, verificationPath, overwrite: true);
@@ -311,7 +387,7 @@ public sealed class WithoutRowidBinaryPrimaryKeyRecursiveStorageTests
 
             using var count = sqlite.CreateCommand();
             count.CommandText = "SELECT COUNT(*) FROM entry;";
-            Convert.ToInt64(count.ExecuteScalar()).Should().Be(DeepOverflowRowCount);
+            Convert.ToInt64(count.ExecuteScalar()).Should().Be(expectedRowCount);
         }
         finally
         {

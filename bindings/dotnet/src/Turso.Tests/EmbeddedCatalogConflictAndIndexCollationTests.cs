@@ -92,7 +92,7 @@ public sealed class EmbeddedCatalogConflictAndIndexCollationTests
     }
 
     [Test]
-    public void FileIndexInheritedNoCaseIsRejectedBeforeWritingAndLeavesSqliteIntegrityIntact()
+    public void FileIndexInheritedNoCasePersistsAndEnforcesUniqueSemantics()
     {
         var path = CreateDatabasePath();
         try
@@ -101,12 +101,11 @@ public sealed class EmbeddedCatalogConflictAndIndexCollationTests
             using (var connection = database.Connect())
             {
                 Execute(connection, "CREATE TABLE entries(value TEXT COLLATE NOCASE);");
-
-                Action createIndex = () => Execute(
-                    connection,
-                    "CREATE UNIQUE INDEX entries_value ON entries(value);");
-                createIndex.Should().Throw<EmbeddedSqlException>()
-                    .WithMessage("*collation 'NOCASE' is not BINARY*");
+                Execute(connection, "CREATE UNIQUE INDEX entries_value ON entries(value);");
+                Execute(connection, "INSERT INTO entries VALUES ('a');");
+                Action duplicate = () => Execute(connection, "INSERT INTO entries VALUES ('A');");
+                duplicate.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("UNIQUE constraint failed: entries.value");
             }
 
             using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
@@ -117,7 +116,7 @@ public sealed class EmbeddedCatalogConflictAndIndexCollationTests
 
             using var indexes = sqlite.CreateCommand();
             indexes.CommandText = "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'entries_value';";
-            indexes.ExecuteScalar().Should().Be(0L);
+            indexes.ExecuteScalar().Should().Be(1L);
         }
         finally
         {

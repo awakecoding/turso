@@ -1,5 +1,6 @@
 using AwesomeAssertions;
 using Turso.Data.Sqlite;
+using MsData = Microsoft.Data.Sqlite;
 
 namespace Turso.Tests;
 
@@ -34,6 +35,66 @@ public sealed class ManagedBackupWithoutRowidSnapshotTests
         reader.GetString(1).Should().Be("b");
         ((byte[])reader.GetValue(2)).Should().Equal(254);
         reader.Read().Should().BeFalse();
+    }
+
+    [Test]
+    public void ManagedBackupPublishesCompositeGeneratedAndIndexedWithoutRowidFile()
+    {
+        var destinationPath = CreateDatabasePath();
+        try
+        {
+            using (var source = OpenManagedConnection())
+            using (var destination = OpenManagedConnection(destinationPath))
+            {
+                source.ExecuteNonQuery("""
+                    CREATE TABLE entry(
+                        tenant TEXT,
+                        sequence INTEGER,
+                        value TEXT,
+                        computed INTEGER GENERATED ALWAYS AS (sequence + 10) VIRTUAL,
+                        PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                        UNIQUE(value)
+                    ) WITHOUT ROWID;
+                    CREATE INDEX entry_computed ON entry(computed DESC);
+                    INSERT INTO entry(tenant, sequence, value) VALUES
+                        ('alpha', 1, 'one'),
+                        ('Alpha', 2, 'two');
+                    """);
+
+                source.BackupDatabase(destination);
+
+                destination.ExecuteScalar<long>("SELECT computed FROM entry WHERE value = 'two';").Should().Be(12);
+                destination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_schema WHERE name = 'entry_computed';")
+                    .Should().Be(1);
+            }
+
+            using (var reopened = OpenManagedConnection(destinationPath))
+            {
+                reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM entry;").Should().Be(2);
+                reopened.ExecuteScalar<string>("SELECT value FROM entry LIMIT 1;").Should().Be("two");
+            }
+
+            var verificationPath = destinationPath + ".verify.db";
+            File.Copy(destinationPath, verificationPath, overwrite: true);
+            try
+            {
+                using var sqlite = new MsData.SqliteConnection($"Data Source={verificationPath}");
+                sqlite.Open();
+                using var integrity = sqlite.CreateCommand();
+                integrity.CommandText = "PRAGMA integrity_check;";
+                integrity.ExecuteScalar().Should().Be("ok");
+            }
+            finally
+            {
+                MsData.SqliteConnection.ClearAllPools();
+                DeleteDatabase(verificationPath);
+            }
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            DeleteDatabase(destinationPath);
+        }
     }
 
     [Test]
@@ -85,5 +146,32 @@ public sealed class ManagedBackupWithoutRowidSnapshotTests
         var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         connection.Open();
         return connection;
+    }
+
+    private static SqliteConnection OpenManagedConnection(string path)
+    {
+        var connection = new SqliteConnection(
+            $"Data Source={path};Pooling=False;Local Provider=Managed");
+        connection.Open();
+        return connection;
+    }
+
+    private static string CreateDatabasePath()
+    {
+        var directory = Path.Combine(
+            TestContext.CurrentContext.WorkDirectory,
+            "managed-backup-without-rowid-snapshot-tests");
+        Directory.CreateDirectory(directory);
+        return Path.Combine(directory, $"{Guid.NewGuid():N}.db");
+    }
+
+    private static void DeleteDatabase(string path)
+    {
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm", "-journal" })
+        {
+            var candidate = path + suffix;
+            if (File.Exists(candidate))
+                File.Delete(candidate);
+        }
     }
 }

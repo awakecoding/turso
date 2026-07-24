@@ -198,6 +198,32 @@ public sealed class ManagedTempCtasStrictVirtualContractTests
     }
 
     [Test]
+    public void TempStrictCompositeForeignKeysUseThePrivateCatalog()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(
+            connection,
+            "PRAGMA foreign_keys=ON;"
+            + "CREATE TEMP TABLE parent(tenant TEXT,code INT,"
+            + "PRIMARY KEY(tenant,code)) WITHOUT ROWID, STRICT;"
+            + "CREATE TEMP TABLE child(tenant TEXT,code INT,"
+            + "FOREIGN KEY(tenant,code) REFERENCES parent(tenant,code) ON UPDATE CASCADE) STRICT;"
+            + "INSERT INTO parent VALUES('acme',1);"
+            + "INSERT INTO child VALUES('acme',1);"
+            + "UPDATE parent SET code=2 WHERE tenant='acme';");
+
+        ReadScalar(connection, "SELECT code FROM child;").Should().Be(SqlValue.Integer(2));
+        ReadRows(connection, "PRAGMA temp.foreign_key_list(child);")
+            .Should().HaveCount(2)
+            .And.OnlyContain(row => row[2] == SqlValue.Text("parent"));
+        ReadRows(connection, "PRAGMA temp.foreign_key_check;").Should().BeEmpty();
+
+        var violation = () => Execute(connection, "INSERT INTO child VALUES('missing',9);");
+        violation.Should().Throw<EmbeddedSqlException>().WithMessage("FOREIGN KEY constraint failed");
+    }
+
+    [Test]
     public void CtasDeclaredTypesNamesRowsAndEmptyResultsMatchSqlite()
     {
         string[] setup =
@@ -488,6 +514,47 @@ public sealed class ManagedTempCtasStrictVirtualContractTests
         ReadScalar(reopenedConnection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(pageSize));
         var temp = () => ReadScalar(reopenedConnection, "SELECT value FROM transient;");
         temp.Should().Throw<EmbeddedSqlException>().WithMessage("no such table: transient");
+    }
+
+    [Test]
+    public void StrictFullForeignKeysAndWithoutRowidSurvivePageMigration()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "strict-full-storage.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(
+                connection,
+                "PRAGMA foreign_keys=ON;"
+                + "CREATE TABLE parent(tenant TEXT,code INT,"
+                + "PRIMARY KEY(tenant DESC,code)) WITHOUT ROWID, STRICT;"
+                + "CREATE TABLE child(tenant TEXT,code INT,payload TEXT,"
+                + "FOREIGN KEY(tenant,code) REFERENCES parent(tenant,code) "
+                + "ON UPDATE CASCADE ON DELETE RESTRICT) STRICT;"
+                + "INSERT INTO parent VALUES('acme',1);"
+                + "INSERT INTO child VALUES('acme',1,'kept');"
+                + "CREATE TABLE copied AS SELECT tenant,code,payload FROM child;"
+                + "UPDATE parent SET code=2 WHERE tenant='acme' AND code=1;"
+                + "PRAGMA journal_mode=DELETE;"
+                + "PRAGMA page_size=8192;"
+                + "VACUUM;");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Execute(reopenedConnection, "PRAGMA foreign_keys=ON;");
+        ReadRows(reopenedConnection, "SELECT tenant,code,payload FROM child;")
+            .Should().ContainSingle().Which.Should().Equal(
+                SqlValue.Text("acme"),
+                SqlValue.Integer(2),
+                SqlValue.Text("kept"));
+        ReadScalar(reopenedConnection, "SELECT code FROM copied;").Should().Be(SqlValue.Integer(1));
+        ReadScalar(reopenedConnection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(8192));
+        ReadScalar(reopenedConnection, "SELECT sql FROM sqlite_schema WHERE name='parent';")
+            .AsText().Should().EndWith(" WITHOUT ROWID, STRICT");
+        ReadScalar(reopenedConnection, "SELECT sql FROM sqlite_schema WHERE name='child';")
+            .AsText().Should().Contain("FOREIGN KEY").And.EndWith(" STRICT");
     }
 
     [Test]
