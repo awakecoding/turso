@@ -94,9 +94,15 @@ public partial class SqliteConnection
                 using var columnReader = columns.ExecuteReader();
                 while (columnReader.Read())
                 {
-                    var columnName = columnReader.GetString(2);
+                    var columnName = columnReader.IsDBNull(2)
+                        ? null
+                        : columnReader.GetString(2);
                     if (columnNameRestriction is not null
-                        && !string.Equals(columnName, columnNameRestriction, StringComparison.OrdinalIgnoreCase))
+                        && (columnName is null
+                            || !string.Equals(
+                                columnName,
+                                columnNameRestriction,
+                                StringComparison.OrdinalIgnoreCase)))
                     {
                         continue;
                     }
@@ -108,7 +114,7 @@ public partial class SqliteConnection
                         indexName,
                         columnReader.GetInt32(0),
                         columnReader.GetInt32(1),
-                        columnName);
+                        columnName is null ? DBNull.Value : columnName);
                 }
             }
         }

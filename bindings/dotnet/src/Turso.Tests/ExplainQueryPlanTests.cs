@@ -184,6 +184,97 @@ public sealed class ExplainQueryPlanTests
             .Message.Should().Be("no such table: should_not_exist");
     }
 
+    [Test]
+    public void SelectsPartialExpressionIndexesOnlyForIdenticalImpliedPredicates()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT, active INTEGER);");
+        Execute(
+            connection,
+            "CREATE INDEX t_normalized ON t(lower(value) COLLATE NOCASE DESC) WHERE active = 1;");
+        Execute(
+            connection,
+            """
+            INSERT INTO t VALUES
+                (1, 'Alpha', 1),
+                (2, 'alpha', 0),
+                (3, 'Beta', 1);
+            """);
+
+        ReadPlan(
+                connection,
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id FROM t
+                WHERE active = 1 AND lower(value) COLLATE NOCASE = 'alpha';
+                """)
+            .Rows.Should().ContainSingle()
+            .Which[3].Should().Be(SqlValue.Text("SEARCH t USING INDEX t_normalized"));
+        ReadScalar(
+                connection,
+                """
+                SELECT id FROM t
+                WHERE active = 1 AND lower(value) COLLATE NOCASE = 'alpha';
+                """)
+            .Should().Be(SqlValue.Integer(1));
+        using (var explain = connection.Prepare(
+                   """
+                   EXPLAIN SELECT id FROM t
+                   WHERE active = 1 AND lower(value) COLLATE NOCASE = 'alpha';
+                   """))
+        {
+            var openReadTargets = new List<string>();
+            while (explain.Step() == StatementStepResult.Row)
+            {
+                if (explain.GetValue(1).AsText() == "OpenReadCursor")
+                    openReadTargets.Add(explain.GetValue(5).AsText());
+            }
+
+            openReadTargets.Should().ContainSingle()
+                .Which.Should().Be("t USING INDEX t_normalized");
+        }
+
+        ReadPlan(
+                connection,
+                "EXPLAIN QUERY PLAN SELECT id FROM t WHERE lower(value) COLLATE NOCASE = 'alpha';")
+            .Rows[0][3].AsText().Should().NotContain("USING INDEX t_normalized");
+        ReadPlan(
+                connection,
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id FROM t
+                WHERE active = 1
+                ORDER BY lower(value) COLLATE NOCASE DESC;
+                """)
+            .Rows.Should().ContainSingle()
+            .Which[3].Should().Be(SqlValue.Text("SCAN t USING INDEX t_normalized"));
+        ReadPlan(
+                connection,
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id FROM t
+                WHERE active = 1
+                ORDER BY lower(value) COLLATE NOCASE ASC;
+                """)
+            .Rows[0][3].AsText().Should().NotContain("USING INDEX t_normalized");
+        ReadPlan(
+                connection,
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id FROM t
+                WHERE active = 1 AND upper(value) COLLATE NOCASE = 'ALPHA';
+                """)
+            .Rows[0][3].AsText().Should().NotContain("USING INDEX t_normalized");
+        ReadPlan(
+                connection,
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id FROM t
+                WHERE active >= 1 AND lower(value) COLLATE NOCASE = 'alpha';
+                """)
+            .Rows[0][3].AsText().Should().NotContain("USING INDEX t_normalized");
+    }
+
     private static string ReadDetail(EmbeddedStatement statement)
     {
         statement.Step().Should().Be(StatementStepResult.Row);
