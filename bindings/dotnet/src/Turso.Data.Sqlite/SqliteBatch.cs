@@ -244,12 +244,15 @@ public sealed class SqliteBatch : DbBatch
         {
             foreach (var batchCommand in _batchCommands.AsReadOnly())
             {
-                var command = new SqliteCommand(batchCommand.CommandText, connection, _transaction)
+                var command = new SqliteCommand(batchCommand.CommandText, connection)
                 {
                     CommandTimeout = Timeout,
                 };
                 CopyParameters(batchCommand.Parameters, command.Parameters);
-                commands.Add(new SequentialBatchCommand(command, batchCommand.SetRecordsAffected));
+                commands.Add(new SequentialBatchCommand(
+                    command,
+                    batchCommand.SetRecordsAffected,
+                    () => GetActiveTransaction(connection)));
             }
 
             return commands;
@@ -317,4 +320,16 @@ public sealed class SqliteBatch : DbBatch
             ReadOnlyMemory<byte> memory => memory.ToArray(),
             _ => value,
         };
+
+    private static SqliteTransaction? GetActiveTransaction(SqliteConnection connection)
+    {
+        var transaction = connection.Transaction;
+        if (transaction?.WasRolledBackExternally == true)
+        {
+            transaction.Rollback();
+            transaction = connection.Transaction;
+        }
+
+        return transaction;
+    }
 }

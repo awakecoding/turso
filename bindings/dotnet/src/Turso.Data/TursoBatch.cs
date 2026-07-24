@@ -271,13 +271,16 @@ public sealed class TursoBatch : DbBatch
         {
             foreach (var batchCommand in _batchCommands.AsReadOnly())
             {
-                var command = new TursoCommand(connection, _transaction)
+                var command = new TursoCommand(connection)
                 {
                     CommandText = batchCommand.CommandText,
                     CommandTimeout = Timeout,
                 };
                 CopyParameters(batchCommand.Parameters, command.Parameters);
-                commands.Add(new SequentialBatchCommand(command, batchCommand.SetRecordsAffected));
+                commands.Add(new SequentialBatchCommand(
+                    command,
+                    batchCommand.SetRecordsAffected,
+                    () => connection.Transaction));
             }
 
             return commands;

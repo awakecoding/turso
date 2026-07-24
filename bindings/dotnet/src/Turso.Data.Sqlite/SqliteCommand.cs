@@ -241,6 +241,7 @@ public class SqliteCommand : DbCommand
             throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
 
         var recordsAffected = 0;
+        var hadRecordsAffectedStatement = false;
         var statements = SplitStatements(CommandText);
         try
         {
@@ -253,7 +254,15 @@ public class SqliteCommand : DbCommand
                 if (statement.ColumnCount > 0)
                 {
                     _hasOpenReader = true;
-                    return new SqliteDataReader(this, statement, statements[i], statements.Skip(i + 1).ToList(), recordsAffected, behavior, CloseReader);
+                    return new SqliteDataReader(
+                        this,
+                        statement,
+                        statements[i],
+                        statements.Skip(i + 1).ToList(),
+                        recordsAffected,
+                        hadRecordsAffectedStatement,
+                        behavior,
+                        CloseReader);
                 }
 
                 while (statement.Read())
@@ -261,7 +270,10 @@ public class SqliteCommand : DbCommand
                 }
 
                 if (CountsRowsAffected(statements[i]))
+                {
+                    hadRecordsAffectedStatement = true;
                     recordsAffected += statement.RowsAffected;
+                }
                 MarkTransactionCompletedExternally(statements[i]);
                 statement.Dispose();
             }
@@ -307,8 +319,9 @@ public class SqliteCommand : DbCommand
 
     internal void MarkTransactionCompletedExternally(string commandText)
     {
-        if (IsTransactionControlCommand(commandText))
-            Connection?.Transaction?.MarkCompletedExternally(IsRollbackCommand(commandText));
+        var completion = TransactionSqlParser.GetCompletionKind(commandText);
+        if (completion != TransactionCompletionKind.None)
+            Connection?.Transaction?.MarkCompletedExternally(completion == TransactionCompletionKind.Rollback);
     }
 
     internal SqliteStatementAdapter PrepareSingleStatement(string sql)
@@ -485,31 +498,7 @@ public class SqliteCommand : DbCommand
     }
 
     private static bool IsTransactionControlCommand(string commandText)
-    {
-        var trimmed = commandText.TrimStart();
-        return IsRollbackCommand(trimmed) || IsCommitCommand(trimmed);
-    }
-
-    private static bool IsRollbackCommand(string commandText)
-    {
-        var tail = GetCommandTail(commandText, "ROLLBACK");
-        return tail is not null
-               && !tail.StartsWith("TO", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsCommitCommand(string commandText)
-        => GetCommandTail(commandText, "COMMIT") is not null;
-
-    private static string? GetCommandTail(string commandText, string command)
-    {
-        var trimmed = commandText.TrimStart();
-        if (!trimmed.StartsWith(command, StringComparison.OrdinalIgnoreCase))
-            return null;
-        if (trimmed.Length > command.Length && char.IsLetterOrDigit(trimmed[command.Length]))
-            return null;
-
-        return trimmed[command.Length..].TrimStart();
-    }
+        => TransactionSqlParser.GetCompletionKind(commandText) != TransactionCompletionKind.None;
 
     private static bool IsWriteCommand(string commandText)
         => SplitStatements(commandText).Any(IsWriteStatement);

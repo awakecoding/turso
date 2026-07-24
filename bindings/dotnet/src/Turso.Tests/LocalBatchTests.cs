@@ -127,6 +127,30 @@ public class LocalBatchTests
             .WithMessage("The batch must be associated with the connection's active transaction.");
     }
 
+    [TestCase("Managed", "COMMIT", 2)]
+    [TestCase("Managed", "ROLLBACK", 1)]
+    [TestCase("Native", "COMMIT", 2)]
+    [TestCase("Native", "ROLLBACK", 1)]
+    public void TursoBatchRefreshesTransactionAfterCompletion(
+        string provider,
+        string completion,
+        long expectedRows)
+    {
+        using var connection = OpenTursoConnection(provider);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        using var transaction = connection.BeginTransaction();
+        using var batch = (TursoBatch)connection.CreateBatch();
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO data VALUES (1);"));
+        batch.BatchCommands.Add(new TursoBatchCommand(completion));
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO data VALUES (2);"));
+
+        batch.ExecuteNonQuery().Should().Be(2);
+
+        transaction.Invoking(static value => value.Commit())
+            .Should().Throw<InvalidOperationException>();
+        Scalar<long>(connection, "SELECT count(*) FROM data;").Should().Be(expectedRows);
+    }
+
     [Test]
     public void TursoBatchCancelStopsBeforeTheNextCommand()
     {
@@ -258,6 +282,35 @@ public class LocalBatchTests
             .Should().Throw<InvalidOperationException>();
     }
 
+    [TestCase("Managed", "COMMIT", 2)]
+    [TestCase("Managed", "ROLLBACK", 1)]
+    [TestCase("Native", "COMMIT", 2)]
+    [TestCase("Native", "ROLLBACK", 1)]
+    public void SqliteBatchRefreshesTransactionAfterCompletion(
+        string provider,
+        string completion,
+        long expectedRows)
+    {
+        using var connection = OpenSqliteConnection(provider);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        using var transaction = connection.BeginTransaction();
+        using var batch = (SqliteBatch)connection.CreateBatch();
+        batch.BatchCommands.Add(new SqliteBatchCommand("INSERT INTO data VALUES (1);"));
+        batch.BatchCommands.Add(new SqliteBatchCommand(completion));
+        batch.BatchCommands.Add(new SqliteBatchCommand("INSERT INTO data VALUES (2);"));
+
+        using (var reader = batch.ExecuteReader())
+        {
+            while (reader.NextResult())
+            {
+            }
+        }
+
+        transaction.Invoking(static value => value.Commit())
+            .Should().Throw<InvalidOperationException>();
+        connection.ExecuteScalar<long>("SELECT count(*) FROM data;").Should().Be(expectedRows);
+    }
+
     [Test]
     public void SqliteBatchSnapshotsParametersBeforeLazyResultTransitions()
     {
@@ -345,6 +398,89 @@ public class LocalBatchTests
             .Should().Throw<InvalidOperationException>();
         using var nextTransaction = connection.BeginTransaction();
         nextTransaction.Rollback();
+    }
+
+    [TestCase("Managed")]
+    [TestCase("Native")]
+    public void TransactionCompletionParsingHandlesCommentsAndRollbackToSavepoint(string provider)
+    {
+        using var connection = OpenTursoConnection(provider);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        using (var transaction = connection.BeginTransaction())
+        {
+            connection.ExecuteNonQuery("INSERT INTO data VALUES (1);");
+            connection.ExecuteNonQuery("SAVEPOINT pending;");
+            connection.ExecuteNonQuery("INSERT INTO data VALUES (2);");
+
+            connection.ExecuteNonQuery(
+                "/* leading */ ROLLBACK /* between */ TRANSACTION TO SAVEPOINT pending;");
+
+            transaction.Commit();
+        }
+
+        Scalar<long>(connection, "SELECT count(*) FROM data;").Should().Be(1);
+
+        using var completed = connection.BeginTransaction();
+        connection.ExecuteNonQuery("-- leading\nCOMMIT TRANSACTION;");
+        completed.Invoking(static value => value.Commit())
+            .Should().Throw<InvalidOperationException>();
+    }
+
+    [TestCase("Managed")]
+    [TestCase("Native")]
+    public void SelectOnlySqliteBatchPreservesUnknownRecordsAffected(string provider)
+    {
+        using var connection = OpenSqliteConnection(provider);
+        using var batch = (SqliteBatch)connection.CreateBatch();
+        var first = new SqliteBatchCommand("SELECT 1;");
+        var second = new SqliteBatchCommand("SELECT 2;");
+        batch.BatchCommands.Add(first);
+        batch.BatchCommands.Add(second);
+
+        using var reader = batch.ExecuteReader();
+        reader.RecordsAffected.Should().Be(-1);
+        reader.NextResult().Should().BeTrue();
+        reader.RecordsAffected.Should().Be(-1);
+        reader.NextResult().Should().BeFalse();
+        reader.RecordsAffected.Should().Be(-1);
+        first.RecordsAffected.Should().Be(-1);
+        second.RecordsAffected.Should().Be(-1);
+    }
+
+    [TestCase("Managed")]
+    [TestCase("Native")]
+    public void ZeroRowDmlChangesUnknownSqliteBatchRecordsAffectedToZero(string provider)
+    {
+        using var connection = OpenSqliteConnection(provider);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        using var batch = (SqliteBatch)connection.CreateBatch();
+        var command = new SqliteBatchCommand(
+            "SELECT 1; UPDATE data SET value = 2 WHERE 0;");
+        batch.BatchCommands.Add(command);
+
+        using var reader = batch.ExecuteReader();
+        reader.RecordsAffected.Should().Be(-1);
+        reader.NextResult().Should().BeFalse();
+        reader.RecordsAffected.Should().Be(0);
+        command.RecordsAffected.Should().Be(0);
+    }
+
+    [TestCase("Managed")]
+    [TestCase("Native")]
+    public void ZeroRowDmlBeforeResultSetStartsSqliteBatchRecordsAffectedAtZero(string provider)
+    {
+        using var connection = OpenSqliteConnection(provider);
+        connection.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        using var batch = (SqliteBatch)connection.CreateBatch();
+        var command = new SqliteBatchCommand(
+            "UPDATE data SET value = 2 WHERE 0; SELECT 1;");
+        batch.BatchCommands.Add(command);
+
+        using var reader = batch.ExecuteReader();
+        reader.RecordsAffected.Should().Be(-1);
+        reader.NextResult().Should().BeFalse();
+        reader.RecordsAffected.Should().Be(0);
+        command.RecordsAffected.Should().Be(0);
     }
 
     [Test]

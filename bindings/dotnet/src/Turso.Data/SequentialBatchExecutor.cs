@@ -85,17 +85,27 @@ internal sealed class BatchExecutionControl : IDisposable
 internal sealed class SequentialBatchCommand : IDisposable
 {
     private readonly Action<int> _setRecordsAffected;
+    private readonly Func<DbTransaction?> _getTransaction;
     private bool _disposed;
 
-    internal SequentialBatchCommand(DbCommand command, Action<int> setRecordsAffected)
+    internal SequentialBatchCommand(
+        DbCommand command,
+        Action<int> setRecordsAffected,
+        Func<DbTransaction?> getTransaction)
     {
         Command = command;
         _setRecordsAffected = setRecordsAffected;
+        _getTransaction = getTransaction;
     }
 
     internal DbCommand Command { get; }
 
     internal bool IsCompleted { get; private set; }
+
+    internal void PrepareForExecution()
+    {
+        Command.Transaction = _getTransaction();
+    }
 
     internal void Complete(int recordsAffected)
     {
@@ -128,6 +138,7 @@ internal static class SequentialBatchExecutor
             foreach (var entry in commands)
             {
                 execution.Token.ThrowIfCancellationRequested();
+                entry.PrepareForExecution();
                 execution.SetActiveCommand(entry.Command);
                 try
                 {
@@ -159,6 +170,7 @@ internal static class SequentialBatchExecutor
             foreach (var entry in commands)
             {
                 execution.Token.ThrowIfCancellationRequested();
+                entry.PrepareForExecution();
                 execution.SetActiveCommand(entry.Command);
                 try
                 {
@@ -191,6 +203,7 @@ internal static class SequentialBatchExecutor
         try
         {
             var first = commands[0];
+            first.PrepareForExecution();
             execution.SetActiveCommand(first.Command);
             reader = first.Command.ExecuteReader(WithoutCloseConnection(behavior));
             return new SequentialBatchDataReader(commands, execution, reader, behavior);
@@ -218,6 +231,7 @@ internal static class SequentialBatchExecutor
         try
         {
             var first = commands[0];
+            first.PrepareForExecution();
             execution.SetActiveCommand(first.Command);
             reader = await first.Command
                 .ExecuteReaderAsync(WithoutCloseConnection(behavior), execution.Token)
@@ -240,7 +254,12 @@ internal static class SequentialBatchExecutor
     }
 
     internal static int AddRecordsAffected(int total, int recordsAffected)
-        => recordsAffected > 0 ? checked(total + recordsAffected) : total;
+    {
+        if (recordsAffected < 0)
+            return total;
+
+        return total < 0 ? recordsAffected : checked(total + recordsAffected);
+    }
 
     private static CommandBehavior WithoutCloseConnection(CommandBehavior behavior)
         => behavior & ~CommandBehavior.CloseConnection;
@@ -275,7 +294,7 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
     private readonly ILocalReaderConnection? _readerConnection;
     private int _commandIndex;
     private DbDataReader? _reader;
-    private int _recordsAffected;
+    private int _recordsAffected = -1;
     private bool _finished;
     private bool _isClosed;
 
@@ -409,6 +428,7 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
             DisposeCurrent();
             _commandIndex++;
             var next = _commands[_commandIndex];
+            next.PrepareForExecution();
             _execution.SetActiveCommand(next.Command);
             _reader = next.Command.ExecuteReader(WithoutCloseConnection(_behavior));
             CompleteCurrentWithoutResultSet();
@@ -450,6 +470,7 @@ internal sealed class SequentialBatchDataReader : DbDataReader, IConnectionOwned
             DisposeCurrent();
             _commandIndex++;
             var next = _commands[_commandIndex];
+            next.PrepareForExecution();
             _execution.SetActiveCommand(next.Command);
             transitionToken.ThrowIfCancellationRequested();
             _reader = await next.Command

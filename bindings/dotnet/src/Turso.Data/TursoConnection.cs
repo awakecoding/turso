@@ -269,7 +269,8 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
 
     internal void MarkTransactionCompletedExternally(string commandText)
     {
-        if (_transaction is null || !IsTransactionCompletionCommand(commandText))
+        if (_transaction is null
+            || TransactionSqlParser.GetCompletionKind(commandText) == TransactionCompletionKind.None)
             return;
 
         var completedRemoteTransaction = IsRemote && _remoteTransactionActive;
@@ -578,22 +579,4 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
             reader.CloseFromConnection();
     }
 
-    private static bool IsTransactionCompletionCommand(string commandText)
-    {
-        var trimmed = commandText.TrimStart();
-        return GetCommandTail(trimmed, "COMMIT") is not null
-               || GetCommandTail(trimmed, "END") is not null
-               || GetCommandTail(trimmed, "ROLLBACK") is { } rollbackTail
-               && !rollbackTail.StartsWith("TO", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string? GetCommandTail(string commandText, string command)
-    {
-        if (!commandText.StartsWith(command, StringComparison.OrdinalIgnoreCase))
-            return null;
-        if (commandText.Length > command.Length && char.IsLetterOrDigit(commandText[command.Length]))
-            return null;
-
-        return commandText[command.Length..].TrimStart();
-    }
 }
