@@ -165,20 +165,41 @@ public sealed class SqlitePrimaryKeySchema
                 failures.Add(
                     $"primary-key term '{term.ColumnName}' is descending, but the managed index writer supports only ascending terms");
             }
+            AddBinaryCollationFailure(term, failures);
 
-            if (!term.Collation.IsAvailable)
-            {
-                failures.Add(
-                    $"primary-key term '{term.ColumnName}' has unavailable collation metadata");
-            }
-            else if (!term.Collation.IsBinary)
-            {
-                failures.Add(
-                    $"primary-key term '{term.ColumnName}' uses {term.Collation.Name} collation, but the managed index writer supports only BINARY");
-            }
         }
 
         if (failures.Count != 0)
             throw new NotSupportedException(string.Join("; ", failures) + ".");
+    }
+
+    /// <summary>
+    /// Rejects schema terms whose collation cannot be handled by the BINARY index writer.
+    /// ASC and DESC directions are both accepted.
+    /// </summary>
+    public void EnsureSupportedByBinaryIndexWriter()
+    {
+        var failures = new List<string>();
+        foreach (var term in _terms)
+            AddBinaryCollationFailure(term, failures);
+
+        if (failures.Count != 0)
+            throw new NotSupportedException(string.Join("; ", failures) + ".");
+    }
+
+    private static void AddBinaryCollationFailure(
+        SqlitePrimaryKeyTerm term,
+        ICollection<string> failures)
+    {
+        if (!term.Collation.IsAvailable)
+        {
+            failures.Add(
+                $"primary-key term '{term.ColumnName}' has unavailable collation metadata");
+        }
+        else if (!term.Collation.IsBinary)
+        {
+            failures.Add(
+                $"primary-key term '{term.ColumnName}' uses {term.Collation.Name} collation, but the managed index writer supports only BINARY");
+        }
     }
 }

@@ -316,7 +316,14 @@ internal sealed record EmbeddedColumn(
     InsertConflictAlgorithm? UniqueConflictAlgorithm = null,
     string? PrimaryKeyConstraintName = null,
     string? NotNullConstraintName = null,
-    string? UniqueConstraintName = null)
+    string? UniqueConstraintName = null,
+    string? DefaultConstraintName = null,
+    string? CollationConstraintName = null,
+    string? GenerationConstraintName = null,
+    string? ForeignKeyConstraintName = null,
+    string? NullConstraintName = null,
+    bool ExplicitNull = false,
+    bool GenerationAlways = false)
 {
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether
@@ -339,7 +346,11 @@ internal sealed record TableUniqueConstraint(
     IReadOnlyList<TablePrimaryKeyColumn> Columns,
     InsertConflictAlgorithm? ConflictAlgorithm = null);
 
-internal sealed record CheckConstraint(string? Name, Expression Expression, string Sql);
+internal sealed record CheckConstraint(
+    string? Name,
+    Expression Expression,
+    string Sql,
+    InsertConflictAlgorithm? ConflictAlgorithm = null);
 
 internal sealed record ForeignKeyDefinition(string ChildColumn, string ParentTable, string ParentColumn);
 
@@ -349,6 +360,7 @@ internal enum EmbeddedIndexOrigin
 {
     Explicit,
     UniqueConstraint,
+    PrimaryKey,
 }
 
 internal sealed record EmbeddedIndex(

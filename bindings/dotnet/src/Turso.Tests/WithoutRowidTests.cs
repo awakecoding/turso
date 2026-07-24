@@ -202,14 +202,23 @@ public class WithoutRowidTests
     }
 
     [Test]
-    public void TableLevelPrimaryKeyPersistenceIsRejected()
+    public void TableLevelPrimaryKeyPersistsWithDeclarationOrder()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var database = EmbeddedDatabase.OpenFile("reject-table-pk.db", fileSystem);
-        using var connection = database.Connect();
+        using (var database = EmbeddedDatabase.OpenFile("table-pk.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(a INT, b INT, PRIMARY KEY(b, a));");
+            Execute(connection, "INSERT INTO t VALUES (1, 2);");
+        }
 
-        var act = () => Execute(connection, "CREATE TABLE t(a INT, b INT, PRIMARY KEY(a, b));");
-        act.Should().Throw<EmbeddedSqlException>().WithMessage("*table-level PRIMARY KEY*");
+        using var reopened = EmbeddedDatabase.OpenFile("table-pk.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        using var statement = reopenedConnection.Prepare("PRAGMA table_info(t);");
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(5).AsInteger().Should().Be(2);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(5).AsInteger().Should().Be(1);
     }
 
     private static void AssertMatchesSqlite(IReadOnlyList<string> setup, string query)

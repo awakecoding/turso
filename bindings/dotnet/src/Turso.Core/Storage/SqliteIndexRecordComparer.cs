@@ -3,12 +3,11 @@ using System.Text;
 namespace Turso.Core.Storage;
 
 /// <summary>
-/// Compares SQLite index records using ascending BINARY collation.
+/// Compares SQLite index records using BINARY collation and retained term directions.
 /// </summary>
 /// <remarks>
-/// This is intentionally limited to SQLite's default ascending BINARY ordering.
-/// DESC terms, NOCASE, RTRIM, and application-defined collations need their own
-/// comparator before their index pages can be built or validated.
+/// NOCASE, RTRIM, and application-defined collations need their own comparator
+/// before their index pages can be built or validated.
 /// </remarks>
 public sealed class SqliteIndexRecordComparer
 {
@@ -16,13 +15,28 @@ public sealed class SqliteIndexRecordComparer
     private static readonly UnicodeEncoding StrictUtf16LittleEndian = new(false, false, true);
     private static readonly UnicodeEncoding StrictUtf16BigEndian = new(true, false, true);
 
+    private readonly bool[] _descendingFields;
+
     /// <summary>Creates a comparer for records encoded using <paramref name="textEncoding"/>.</summary>
     public SqliteIndexRecordComparer(SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8)
+        : this(textEncoding, [])
     {
+    }
+
+    /// <summary>
+    /// Creates a comparer whose listed leading fields use the supplied sort directions.
+    /// Fields after the list remain ascending, including the rowid suffix of ordinary indexes.
+    /// </summary>
+    public SqliteIndexRecordComparer(
+        SqliteTextEncoding textEncoding,
+        IReadOnlyList<bool> descendingFields)
+    {
+        ArgumentNullException.ThrowIfNull(descendingFields);
         TextEncoding = textEncoding is SqliteTextEncoding.Unset
             ? SqliteTextEncoding.Utf8
             : textEncoding;
         _ = GetTextEncoding(TextEncoding);
+        _descendingFields = descendingFields.ToArray();
     }
 
     /// <summary>The database text encoding used to interpret text record fields.</summary>
@@ -43,7 +57,9 @@ public sealed class SqliteIndexRecordComparer
         {
             var result = CompareValue(left[index], right[index]);
             if (result != 0)
-                return result;
+                return index < _descendingFields.Length && _descendingFields[index]
+                    ? -Math.Sign(result)
+                    : result;
         }
 
         return left.Count.CompareTo(right.Count);

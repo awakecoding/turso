@@ -9,9 +9,8 @@ namespace Turso.Tests;
 // (VIRTUAL/STORED). Every runtime behaviour is cross-checked against a real SQLite build
 // (Microsoft.Data.Sqlite): computed values and affinity, dependency ordering, recompute on
 // UPDATE, the generated-column exclusion from the default INSERT column list and from
-// PRAGMA table_info, and the family of CREATE/DML rejections. The deliberate divergences —
-// a bounded deterministic-function allow-list, and persisting only STORED (not VIRTUAL)
-// generated columns — are pinned by managed-only tests.
+// PRAGMA table_info, and the family of CREATE/DML rejections. The bounded deterministic-
+// function allow-list remains a deliberate managed-engine boundary.
 public class GeneratedColumnsTests
 {
     [Test]
@@ -331,14 +330,74 @@ public class GeneratedColumnsTests
     }
 
     [Test]
-    public void VirtualGeneratedColumnPersistenceIsRejected()
+    public void VirtualGeneratedColumnsAndDependenciesRoundTripWithoutStoredRecordFields()
     {
-        var fileSystem = new InMemoryFileSystem();
-        using var database = EmbeddedDatabase.OpenFile("reject-virtual.db", fileSystem);
-        using var connection = database.Connect();
+        var path = CreatePhysicalDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE t(
+                        a INT,
+                        c INT CONSTRAINT generated_c GENERATED ALWAYS AS (b + 1) VIRTUAL
+                            CONSTRAINT positive_c CHECK (c > 0),
+                        b INT CONSTRAINT generated_b AS (a + 1) VIRTUAL,
+                        d INT AS (c + 1) STORED,
+                        e INT AS (d + 1) VIRTUAL,
+                        CONSTRAINT unique_c UNIQUE(c) ON CONFLICT IGNORE
+                    );
+                    """);
+                Execute(connection, "INSERT INTO t(a) VALUES (10), (10), (20);");
+            }
 
-        var act = () => Execute(connection, "CREATE TABLE t(a INT, v AS (a + 1) VIRTUAL);");
-        act.Should().Throw<EmbeddedSqlException>().WithMessage("*VIRTUAL generated column*");
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                var rows = Query(connection, "SELECT a, b, c, d, e FROM t ORDER BY a;");
+                rows.Should().HaveCount(2);
+                rows[0].Should().Equal(
+                    SqlValue.Integer(10),
+                    SqlValue.Integer(11),
+                    SqlValue.Integer(12),
+                    SqlValue.Integer(13),
+                    SqlValue.Integer(14));
+                rows[1].Should().Equal(
+                    SqlValue.Integer(20),
+                    SqlValue.Integer(21),
+                    SqlValue.Integer(22),
+                    SqlValue.Integer(23),
+                    SqlValue.Integer(24));
+                Execute(connection, "UPDATE t SET a = 30 WHERE a = 20;");
+                Query(connection, "SELECT b, c, d, e FROM t WHERE a = 30;").Single()
+                    .Should().Equal(
+                        SqlValue.Integer(31),
+                        SqlValue.Integer(32),
+                        SqlValue.Integer(33),
+                        SqlValue.Integer(34));
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            Scalar(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Scalar(sqlite, "SELECT COUNT(*) FROM t;").Should().Be(2L);
+            Scalar(sqlite, "SELECT c FROM t WHERE a = 30;").Should().Be(32L);
+            Scalar(sqlite, "SELECT e FROM t WHERE a = 30;").Should().Be(34L);
+            Scalar(sqlite, "SELECT hidden FROM pragma_table_xinfo('t') WHERE name = 'b';").Should().Be(2L);
+            Scalar(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 't';")
+                .Should().BeOfType<string>()
+                .Which.Should().Contain("CONSTRAINT \"generated_c\" GENERATED ALWAYS AS (b + 1) VIRTUAL")
+                .And.Contain("CONSTRAINT \"positive_c\" CHECK (c > 0)")
+                .And.Contain("UNIQUE (\"c\") ON CONFLICT IGNORE");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeletePhysicalDatabase(path);
+        }
     }
 
     private static void AssertMatchesSqlite(IReadOnlyList<string> setup, string query)
@@ -542,6 +601,13 @@ public class GeneratedColumnsTests
         }
 
         return rows;
+    }
+
+    private static object? Scalar(MsData.SqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return command.ExecuteScalar();
     }
 
     private static string CreatePhysicalDatabasePath()
