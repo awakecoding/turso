@@ -86,6 +86,8 @@ public static class Resources
 
     public static string ManagedBackupDestinationMustBeEmpty => "BackupDatabase requires an empty destination when Local Provider=Managed.";
 
+    public static string ManagedBackupPhysicalFileIdentityNotSupported => "BackupDatabase cannot safely copy between file systems with unknown identity semantics when Local Provider=Managed.";
+
     public static string ManagedBackupSchemaObjectNotSupported(object? type) => $"BackupDatabase does not support schema object type '{type}' when Local Provider=Managed.";
 
     public static string ManagedBackupRowidNotAccessible(object? table) => $"BackupDatabase cannot preserve rowids for table '{table}' when Local Provider=Managed because all rowid aliases are declared columns.";

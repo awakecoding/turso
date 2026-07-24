@@ -10,29 +10,18 @@ internal static class SqliteManagedBackup
             throw new InvalidOperationException("Managed backup requires managed source and destination connections.");
         ArgumentNullException.ThrowIfNull(destinationName);
         ArgumentNullException.ThrowIfNull(sourceName);
-        if (!string.Equals(sourceName, "main", StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(destinationName, "main", StringComparison.OrdinalIgnoreCase))
+        if (ReferenceEquals(source, destination)
+            && string.Equals(sourceName, destinationName, StringComparison.OrdinalIgnoreCase))
         {
-            throw new NotSupportedException(Properties.Resources.ManagedBackupAttachedDatabasesNotSupported);
+            throw new SqliteException(Properties.Resources.SqliteNativeError(1, "source and destination must be distinct"), 1);
         }
-        if (ReferenceEquals(source, destination))
-            throw new ArgumentException(Properties.Resources.ManagedBackupSameConnectionNotSupported, nameof(destination));
-        if (source.Transaction is not null || destination.Transaction is not null
-            || source.HasOpenReader || destination.HasOpenReader)
+        if (destination.Transaction is not null || destination.HasOpenReader)
         {
             throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
         }
-        if (source.ManagedConnection.HasAttachedDatabases
-            || destination.ManagedConnection.HasAttachedDatabases)
-        {
-            throw new SqliteException(
-                Properties.Resources.SqliteNativeError(1, "managed backup is not supported while a database is attached"),
-                1);
-        }
-
         try
         {
-            source.ManagedConnection.CopySnapshotTo(destination.ManagedConnection);
+            source.ManagedConnection.CopySnapshotTo(destination.ManagedConnection, destinationName, sourceName);
         }
         catch (ManagedSnapshotException exception)
         {
@@ -48,14 +37,16 @@ internal static class SqliteManagedBackup
     {
         return exception.Failure switch
         {
-            ManagedSnapshotFailure.DestinationNotEmpty
-                => new InvalidOperationException(Properties.Resources.ManagedBackupDestinationMustBeEmpty),
+            ManagedSnapshotFailure.DestinationBusy
+                => new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5),
             ManagedSnapshotFailure.UnsupportedSchemaObject
                 => new NotSupportedException(Properties.Resources.ManagedBackupSchemaObjectNotSupported(exception.ObjectName)),
             ManagedSnapshotFailure.RowidNotAccessible
                 => new NotSupportedException(Properties.Resources.ManagedBackupRowidNotAccessible(exception.ObjectName)),
             ManagedSnapshotFailure.ColumnCountMismatch
                 => new InvalidOperationException(Properties.Resources.ManagedBackupColumnCountMismatch(exception.ObjectName)),
+            ManagedSnapshotFailure.PhysicalFileIdentityUnavailable
+                => new NotSupportedException(Properties.Resources.ManagedBackupPhysicalFileIdentityNotSupported),
             _ => throw new InvalidOperationException($"Unknown managed snapshot failure {exception.Failure}."),
         };
     }

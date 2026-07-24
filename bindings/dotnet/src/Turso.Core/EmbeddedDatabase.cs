@@ -16,6 +16,11 @@ public enum StatementStepResult
     Done,
 }
 
+internal readonly record struct TransactionSnapshot(
+    EmbeddedDatabase.SchemaCatalog Catalog,
+    long Version,
+    PragmaHeaderMetadata PragmaHeader);
+
 public class EmbeddedSqlException : Exception
 {
     public EmbeddedSqlException(string message) : base(message)
@@ -53,6 +58,24 @@ internal enum ManagedSchemaObjectKind
     View,
     Trigger,
     Index,
+}
+
+internal readonly record struct FileCatalogVersion(
+    uint ChangeCounter,
+    uint SchemaCookie,
+    uint DatabaseSizeInPages,
+    int UserVersion,
+    int ApplicationId,
+    int PageSize)
+{
+    public static FileCatalogVersion FromHeader(SqliteDatabaseHeader header)
+        => new(
+            header.ChangeCounter,
+            header.SchemaCookie,
+            header.DatabaseSizeInPages,
+            header.UserVersion,
+            header.ApplicationId,
+            header.PageSize);
 }
 
 internal sealed class EmbeddedConflictRollbackException : EmbeddedSqlException
@@ -201,6 +224,31 @@ public sealed class EmbeddedDatabase : IDisposable
 
     internal IFileSystem FileSystem
         => _fileSystem ?? throw new InvalidOperationException("The managed database is not file-backed.");
+
+    internal bool ReferencesSameDatabase(EmbeddedDatabase other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        if (ReferenceEquals(this, other))
+            return true;
+        if (!IsFileBacked || !other.IsFileBacked || _fileSystem is null || other._fileSystem is null)
+            return false;
+
+        var fileSystem = TursoEncryptionFileSystem.Unwrap(_fileSystem);
+        var otherFileSystem = TursoEncryptionFileSystem.Unwrap(other._fileSystem);
+        if (fileSystem is PhysicalFileSystem && otherFileSystem is PhysicalFileSystem)
+        {
+            var comparison = OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            return string.Equals(
+                Path.GetFullPath(_databasePath),
+                Path.GetFullPath(other._databasePath),
+                comparison);
+        }
+
+        return ReferenceEquals(fileSystem, otherFileSystem)
+               && string.Equals(_databasePath, other._databasePath, StringComparison.Ordinal);
+    }
 
     private sealed record ManagedAggregateFunction(
         SqlValue Seed,
@@ -513,11 +561,29 @@ public sealed class EmbeddedDatabase : IDisposable
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement;
 
-    internal (SchemaCatalog Catalog, long Version) CreateTransactionSnapshot()
+    internal TransactionSnapshot CreateTransactionSnapshot()
     {
         lock (_gate)
         {
-            return (new SchemaCatalog(_tables, _views, _triggers).Clone(), _version);
+            if (_fileStore is not null)
+            {
+                if (_fileCatalogWriteLock is null)
+                    throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+
+                lock (_fileCatalogWriteLock)
+                    EnsureFileCatalogVersionCurrent();
+            }
+
+            var pragmaHeader = _fileStore is null
+                ? _inMemoryPragmaHeader
+                : new PragmaHeaderMetadata(
+                    unchecked((int)_fileCatalogVersion.SchemaCookie),
+                    _fileCatalogVersion.UserVersion,
+                    _fileCatalogVersion.ApplicationId);
+            return new TransactionSnapshot(
+                new SchemaCatalog(_tables, _views, _triggers).Clone(),
+                _version,
+                pragmaHeader);
         }
     }
 
@@ -626,7 +692,7 @@ public sealed class EmbeddedDatabase : IDisposable
     internal void CommitTransaction(
         SchemaCatalog catalog,
         long version,
-        PragmaHeaderMetadata? inMemoryPragmaHeader = null)
+        PragmaHeaderMetadata? pragmaHeader = null)
     {
         lock (_gate)
         {
@@ -638,16 +704,13 @@ public sealed class EmbeddedDatabase : IDisposable
 
             if (_fileStore is null)
             {
-                if (inMemoryPragmaHeader is { } metadata)
+                if (pragmaHeader is { } metadata)
                     _inMemoryPragmaHeader = metadata;
                 PublishCatalog(catalog);
                 return;
             }
 
-            if (inMemoryPragmaHeader is not null)
-                throw new InvalidOperationException("File-backed managed databases cannot commit in-memory PRAGMA metadata.");
-
-            PersistFileCatalog(catalog);
+            PersistFileCatalog(catalog, pragmaHeader);
         }
     }
 
@@ -754,7 +817,9 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    private void PersistFileCatalog(SchemaCatalog catalog)
+    private void PersistFileCatalog(
+        SchemaCatalog catalog,
+        PragmaHeaderMetadata? pragmaHeader = null)
     {
         if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
             throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
@@ -765,15 +830,18 @@ public sealed class EmbeddedDatabase : IDisposable
             EnsureFileCatalogVersionCurrent();
             try
             {
-                _fileStore.Persist(catalog.Tables, catalog.Views, catalog.Triggers);
+                var committedVersion = _fileStore.Persist(
+                    catalog.Tables,
+                    catalog.Views,
+                    catalog.Triggers,
+                    pragmaHeader);
+                PublishCatalog(catalog, committedVersion);
             }
             catch (EmbeddedPostCommitMaintenanceException)
             {
-                PublishCatalog(catalog, ReadFileCatalogVersion(_fileSystem, _databasePath));
+                PublishCatalog(catalog, _fileStore.CommittedCatalogVersion);
                 throw;
             }
-
-            PublishCatalog(catalog, ReadFileCatalogVersion(_fileSystem, _databasePath));
         }
     }
 
@@ -950,14 +1018,6 @@ public sealed class EmbeddedDatabase : IDisposable
             }
         }
     }
-
-    private readonly record struct FileCatalogVersion(
-        uint ChangeCounter,
-        uint SchemaCookie,
-        uint DatabaseSizeInPages,
-        int UserVersion,
-        int ApplicationId,
-        int PageSize);
 
     internal ExecutionResult Execute(
         ParsedStatement statement,
@@ -16084,6 +16144,7 @@ public sealed class EmbeddedConnection : IDisposable
         public long Version { get; } = version;
         public PragmaHeaderMetadata PragmaHeader { get; set; } = pragmaHeader;
         public bool HasChanges { get; set; }
+        public bool HasSnapshotPragmaHeader { get; set; }
     }
 
     private readonly record struct RoutedStatement(
@@ -16094,6 +16155,75 @@ public sealed class EmbeddedConnection : IDisposable
     internal EmbeddedConnection(EmbeddedDatabase database)
     {
         _database = database;
+    }
+
+    internal bool HasActiveTransaction => _transactionDatabases is not null;
+
+    internal EmbeddedConnection OpenDatabaseConnection(string databaseName)
+        => ResolveDatabase(databaseName).Connect();
+
+    internal (EmbeddedConnection Connection, EmbeddedDatabase? Owner) OpenSnapshotConnection(
+        string databaseName)
+    {
+        var database = ResolveDatabase(databaseName);
+        if (!database.IsFileBacked)
+            return (database.Connect(), null);
+
+        var snapshot = EmbeddedDatabase.OpenFile(
+            database.DatabasePath,
+            database.FileSystem,
+            readOnly: true);
+        try
+        {
+            database.CopyFunctionAndCollationRegistriesTo(snapshot);
+            return (snapshot.Connect(), snapshot);
+        }
+        catch
+        {
+            snapshot.Dispose();
+            throw;
+        }
+    }
+
+    internal bool ReferencesSameDatabase(
+        string databaseName,
+        EmbeddedConnection other,
+        string otherDatabaseName)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        return ResolveDatabase(databaseName).ReferencesSameDatabase(other.ResolveDatabase(otherDatabaseName));
+    }
+
+    internal bool CannotProveDistinctSnapshotFiles(
+        string databaseName,
+        EmbeddedConnection other,
+        string otherDatabaseName)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        var database = ResolveDatabase(databaseName);
+        var otherDatabase = other.ResolveDatabase(otherDatabaseName);
+        if (!database.IsFileBacked || !otherDatabase.IsFileBacked)
+            return false;
+
+        var storageKind = GetSnapshotStorageKind(database.FileSystem);
+        var otherStorageKind = GetSnapshotStorageKind(otherDatabase.FileSystem);
+        return storageKind == SnapshotStorageKind.Unknown
+               || otherStorageKind == SnapshotStorageKind.Unknown;
+    }
+
+    private static SnapshotStorageKind GetSnapshotStorageKind(IFileSystem fileSystem)
+        => TursoEncryptionFileSystem.Unwrap(fileSystem) switch
+        {
+            PhysicalFileSystem => SnapshotStorageKind.Physical,
+            InMemoryFileSystem => SnapshotStorageKind.InMemory,
+            _ => SnapshotStorageKind.Unknown,
+        };
+
+    private enum SnapshotStorageKind
+    {
+        Physical,
+        InMemory,
+        Unknown,
     }
 
     public EmbeddedStatement Prepare(string sql)
@@ -16484,6 +16614,36 @@ public sealed class EmbeddedConnection : IDisposable
         }
 
         return ExecutionResult.Empty;
+    }
+
+    internal void ApplySnapshotPragmaHeader(int schemaVersion, int userVersion, int applicationId)
+    {
+        var state = GetTransactionState(_database);
+        if (state is null)
+            throw new InvalidOperationException("Snapshot PRAGMA metadata requires an active transaction.");
+
+        if (_transactionWriteDatabase is not null
+            && !ReferenceEquals(_transactionWriteDatabase, _database))
+        {
+            throw new InvalidOperationException(
+                "Snapshot PRAGMA metadata cannot cross the managed transaction write boundary.");
+        }
+
+        _transactionWriteDatabase = _database;
+        state.PragmaHeader = new PragmaHeaderMetadata(schemaVersion, userVersion, applicationId);
+        state.HasChanges = true;
+        state.HasSnapshotPragmaHeader = true;
+    }
+
+    private EmbeddedDatabase ResolveDatabase(string databaseName)
+    {
+        ArgumentNullException.ThrowIfNull(databaseName);
+        if (databaseName.Equals("main", StringComparison.OrdinalIgnoreCase))
+            return _database;
+        if (_attachedDatabases.TryGetValue(databaseName, out var attachment))
+            return attachment.Database;
+
+        throw new EmbeddedSqlException($"no such database: {databaseName}");
     }
 
     private ExecutionResult ExecuteDetach(DetachDatabaseStatement statement)
@@ -17551,11 +17711,11 @@ public sealed class EmbeddedConnection : IDisposable
         var states = new Dictionary<EmbeddedDatabase, TransactionDatabaseState>();
         foreach (var database in databases)
         {
-            var (catalog, version) = database.CreateTransactionSnapshot();
+            var snapshot = database.CreateTransactionSnapshot();
             states.Add(database, new TransactionDatabaseState(
-                catalog,
-                version,
-                database.GetPragmaHeaderMetadata()));
+                snapshot.Catalog,
+                snapshot.Version,
+                snapshot.PragmaHeader));
         }
 
         _transactionDatabases = states;
@@ -17644,7 +17804,9 @@ public sealed class EmbeddedConnection : IDisposable
                 database.CommitTransaction(
                     state.Catalog,
                     state.Version,
-                    database.IsFileBacked ? null : state.PragmaHeader);
+                    database.IsFileBacked && !state.HasSnapshotPragmaHeader
+                        ? null
+                        : state.PragmaHeader);
             }
             catch (EmbeddedPostCommitMaintenanceException)
             {
@@ -17885,7 +18047,8 @@ public sealed class EmbeddedConnection : IDisposable
                 pair => new SavepointDatabaseState(
                     pair.Value.Catalog.Clone(),
                     pair.Value.HasChanges,
-                    pair.Value.PragmaHeader)),
+                    pair.Value.PragmaHeader,
+                    pair.Value.HasSnapshotPragmaHeader)),
             _transactionWriteDatabase));
     }
 
@@ -17920,6 +18083,7 @@ public sealed class EmbeddedConnection : IDisposable
             state.Catalog = savedState.Catalog.Clone();
             state.HasChanges = savedState.HasChanges;
             state.PragmaHeader = savedState.PragmaHeader;
+            state.HasSnapshotPragmaHeader = savedState.HasSnapshotPragmaHeader;
         }
         _transactionWriteDatabase = savepoint.WriteDatabase;
 
@@ -17956,7 +18120,8 @@ public sealed class EmbeddedConnection : IDisposable
     private sealed record SavepointDatabaseState(
         EmbeddedDatabase.SchemaCatalog Catalog,
         bool HasChanges,
-        PragmaHeaderMetadata PragmaHeader);
+        PragmaHeaderMetadata PragmaHeader,
+        bool HasSnapshotPragmaHeader);
 
     private void ThrowIfDisposed()
     {

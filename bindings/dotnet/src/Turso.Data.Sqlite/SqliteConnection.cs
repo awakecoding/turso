@@ -481,17 +481,19 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         if (State != ConnectionState.Open)
             throw new InvalidOperationException(Properties.Resources.CallRequiresOpenConnection("BackupDatabase"));
         ArgumentNullException.ThrowIfNull(destination);
-        if (Transaction is not null)
-            throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
         if (IsManagedProvider != destination.IsManagedProvider)
             throw new NotSupportedException(Properties.Resources.ManagedBackupMixedProvidersNotSupported);
-        if (destination.State != ConnectionState.Open)
-            destination.Open();
         if (IsManagedProvider)
         {
+            if (destination.State != ConnectionState.Open)
+                destination.Open();
             SqliteManagedBackup.Copy(this, destination, destinationName, sourceName);
             return;
         }
+        if (Transaction is not null)
+            throw new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5);
+        if (destination.State != ConnectionState.Open)
+            destination.Open();
 
         foreach (var createSql in GetSchemaSql())
             destination.ExecuteNonQuery(createSql);

@@ -1098,11 +1098,14 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// a single atomic WAL transaction. Any unsupported schema or data is rejected
     /// before a byte is written so the on-disk database is never left invalid.
     /// </summary>
-    public void Persist(
+    public FileCatalogVersion Persist(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
-        IReadOnlyDictionary<string, TriggerDefinition> triggers)
-        => PersistCore(tables, views, triggers, reclaimTrailingPages: false);
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        PragmaHeaderMetadata? pragmaHeader = null)
+        => PersistCore(tables, views, triggers, reclaimTrailingPages: false, pragmaHeader);
+
+    internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
 
     /// <summary>
     /// Rebuilds the current managed catalog into the smallest complete page image
@@ -1115,14 +1118,15 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         ThrowIfDisposed();
         var catalog = Load();
-        PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true);
+        _ = PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true, pragmaHeader: null);
     }
 
-    private void PersistCore(
+    private FileCatalogVersion PersistCore(
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
-        bool reclaimTrailingPages)
+        bool reclaimTrailingPages,
+        PragmaHeaderMetadata? pragmaHeader)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1132,8 +1136,12 @@ internal sealed class EmbeddedFileStore : IDisposable
             EmbeddedFileStore.ValidateTableRepresentable(name, table);
         ValidateSchemaDefinitions(tables, views, triggers);
 
-        if (!reclaimTrailingPages && TryPersistBoundedTableLeafMutation(tables, views, triggers))
-            return;
+        if (!reclaimTrailingPages
+            && pragmaHeader is null
+            && TryPersistBoundedTableLeafMutation(tables, views, triggers))
+        {
+            return CommittedCatalogVersion;
+        }
 
         var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
         var currentFreelist = SqliteFreelist.Read(
@@ -1204,7 +1212,11 @@ internal sealed class EmbeddedFileStore : IDisposable
             DatabaseSizeInPages = target,
             FirstFreelistTrunkPage = freelist.FirstTrunkPage,
             FreelistPageCount = freelist.PageCount,
-            SchemaCookie = schemaChanged ? currentHeader.SchemaCookie + 1 : currentHeader.SchemaCookie,
+            SchemaCookie = pragmaHeader is { } metadata
+                ? unchecked((uint)metadata.SchemaVersion)
+                : schemaChanged ? currentHeader.SchemaCookie + 1 : currentHeader.SchemaCookie,
+            UserVersion = pragmaHeader?.UserVersion ?? currentHeader.UserVersion,
+            ApplicationId = pragmaHeader?.ApplicationId ?? currentHeader.ApplicationId,
         };
         newHeader.WriteTo(schemaTree.RootPage);
         ValidateRewritePlan(
@@ -1259,12 +1271,12 @@ internal sealed class EmbeddedFileStore : IDisposable
         // A full catalog rewrite rewrites every managed page. Once its exclusive
         // checkpoint has durably installed that view, retain neither its WAL frames
         // nor overlay so later rewrites do not rescan an unbounded history.
-        CheckpointCommittedMutation(reclaimTrailingPages);
-
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages);
         _tableRootPages = rootPages;
         _indexRootPages = indexRootPages;
         _lastSchemaSignature = signature;
+        return CommittedCatalogVersion;
     }
 
     /// <summary>
@@ -1705,8 +1717,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             transaction.Commit();
         }
 
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -1842,8 +1854,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -1956,8 +1968,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 appendedCell,
                 targetSchemaPage);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -2165,8 +2177,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -2534,8 +2546,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -2759,8 +2771,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -3035,8 +3047,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -3313,8 +3325,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -3399,8 +3411,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -3690,8 +3702,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -4068,8 +4080,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                     new SqlitePageImage(SchemaRootPage, leafTargetSchemaPage),
                 ]);
             leafMutation.CommitTo(_pager);
-            CheckpointCommittedMutation(reclaimTrailingPages: false);
             _header = leafHeader;
+            CheckpointCommittedMutation(reclaimTrailingPages: false);
             return true;
         }
 
@@ -4196,8 +4208,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -4491,8 +4503,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -4835,8 +4847,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5025,8 +5037,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5280,8 +5292,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5710,8 +5722,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5825,8 +5837,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5942,8 +5954,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -5977,8 +5989,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -6249,8 +6261,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 new SqlitePageImage(SchemaRootPage, targetSchemaPage),
             ]);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 
@@ -6348,8 +6360,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             sourcePages,
             writeImages);
         mutation.CommitTo(_pager);
-        CheckpointCommittedMutation(reclaimTrailingPages: false);
         _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
         return true;
     }
 

@@ -19,32 +19,20 @@ public sealed class ManagedDdlBoundaryTests
             .Be(1);
     }
 
-    [TestCase(
-        "CREATE TABLE items(value INTEGER CHECK (value > 0));",
-        "*CHECK constraints are not supported*")]
-    [TestCase(
-        "CREATE TABLE items(value INTEGER, CONSTRAINT items_value_unique UNIQUE(value));",
-        "*Table-level UNIQUE constraints are not supported*")]
-    [TestCase(
-        "CREATE TABLE items(value INTEGER NOT NULL ON CONFLICT IGNORE);",
-        "*Column constraint ON CONFLICT clauses are not supported*")]
-    [TestCase(
-        "CREATE TABLE items(value INTEGER UNIQUE ON CONFLICT REPLACE);",
-        "*Column constraint ON CONFLICT clauses are not supported*")]
-    [TestCase(
-        "CREATE TABLE items(value INTEGER PRIMARY KEY ON CONFLICT ABORT);",
-        "*Column constraint ON CONFLICT clauses are not supported*")]
-    public void ManagedEngineRejectsUnrepresentableDdlBeforeSchemaMutation(string sql, string message)
+    [TestCase("CREATE TABLE items(value INTEGER CHECK (value > 0));")]
+    [TestCase("CREATE TABLE items(value INTEGER, CONSTRAINT items_value_unique UNIQUE(value));")]
+    [TestCase("CREATE TABLE items(value INTEGER NOT NULL ON CONFLICT IGNORE);")]
+    [TestCase("CREATE TABLE items(value INTEGER UNIQUE ON CONFLICT REPLACE);")]
+    [TestCase("CREATE TABLE items(value INTEGER PRIMARY KEY ON CONFLICT ABORT);")]
+    public void ManagedEngineAcceptsConstraintDdl(string sql)
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
 
-        var create = () => Execute(connection, sql);
-
-        create.Should().Throw<EmbeddedSqlException>().WithMessage(message);
+        Execute(connection, sql);
         ReadCount(connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';")
             .Should()
-            .Be(0);
+            .Be(1);
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

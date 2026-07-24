@@ -876,17 +876,22 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
     private static void DeletePackageDirectory(string packageDirectory)
     {
+        const int maxAttempts = 100;
         IOException? lastError = null;
-        for (var attempt = 0; attempt < 10; attempt++)
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
             try
             {
                 Directory.Delete(packageDirectory, recursive: true);
                 return;
             }
-            catch (IOException exception) when (attempt < 9)
+            catch (IOException exception) when (attempt < maxAttempts - 1)
             {
                 lastError = exception;
+                Thread.Sleep(100);
+            }
+            catch (UnauthorizedAccessException) when (attempt < maxAttempts - 1)
+            {
                 Thread.Sleep(100);
             }
         }

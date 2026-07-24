@@ -56,7 +56,7 @@ public sealed class ManagedSharedCacheContractTests
     {
         var name = "managed-cross-surface-" + Guid.NewGuid().ToString("N");
         var connectionString =
-            $"Data Source={name};Mode=Memory;Cache=Shared;Pooling=True;Local Provider=Managed";
+            $"Data Source={name};Mode=Memory;Cache=Shared;Pooling=False;Local Provider=Managed";
         using var turso = new TursoConnection(connectionString);
         using var sqlite = new SqliteConnection(connectionString);
 
@@ -316,7 +316,7 @@ public sealed class ManagedSharedCacheContractTests
     private static string CreateConnectionString()
     {
         var name = "managed-shared-memory-" + Guid.NewGuid().ToString("N");
-        return $"Data Source={name};Mode=Memory;Cache=Shared;Pooling=True;Local Provider=Managed";
+        return $"Data Source={name};Mode=Memory;Cache=Shared;Pooling=False;Local Provider=Managed";
     }
 
     private static long CountTable(SqliteConnection connection, string name)
