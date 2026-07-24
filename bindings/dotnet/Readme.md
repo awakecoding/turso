@@ -188,6 +188,12 @@ The managed engine lowers generic source-less and single-table SELECT projection
 
 The tree-walking evaluator remains the explicit fallback for expression families not yet represented by this lowering, including comparison/logical/concatenation expressions, `CASE` and `CAST`, volatile, collation-sensitive, or context-dependent functions, shadowing user-defined functions, complex scan predicates whose streaming error order would differ, computed `DISTINCT` or `ORDER BY` projections, parameterized compound terms, computed or otherwise error-capable `INTERSECT`/`EXCEPT` terms, and compounds whose custom collation callbacks cannot be invoked at evaluator-equivalent points.
 
+### Managed DML bytecode
+
+Managed `INSERT`, `UPDATE`, and `DELETE` reuse the same generic expression lowering for `RETURNING`: literals, late-bound parameters, affected-row columns or rowid, qualified stars/columns, nested numeric arithmetic with SQLite affinity, value-only `COLLATE`, and the allow-listed built-ins above compile. `UPDATE` and `DELETE` predicates may use the evaluator's row-local scalar expression subset, including nested arithmetic, logical/comparison operators, and scalar functions, because the VDBE filter invokes that evaluator at the original per-row position.
+
+The compiled program first scans predicates and buffers all mutations, then evaluates buffered `RETURNING` rows in source and projection order, and commits only after projection succeeds. This retains predicate/assignment user-callback timing, keeps projection errors statement-atomic, and remains resumable across returned rows. Subqueries, aggregates/windows, `CASE`, `CAST`, concatenation/comparison projections, volatile or context-dependent functions, and shadowed user functions remain evaluator-owned. DML with a cancellation-capable token, foreign-key enforcement, open incremental blobs, conflict algorithms, source `INSERT`, CTE scope, or schema tables also falls back.
+
 ## Getting started
 
 ```C#

@@ -2504,7 +2504,7 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (CanCompileDml(context)
             && TryCompileInsert(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
-            return RunCompiledDml(compiled, columns, hasReturning);
+            return RunCompiledDml(compiled, columns, hasReturning, parameters);
 
         return PerformInsertEvaluated(statement, parameters, context);
     }
@@ -2777,7 +2777,7 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (CanCompileDml(context)
             && TryCompileUpdate(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
-            return RunCompiledDml(compiled, columns, hasReturning);
+            return RunCompiledDml(compiled, columns, hasReturning, parameters);
 
         return PerformUpdateEvaluated(statement, parameters, context);
     }
@@ -3360,15 +3360,18 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (CanCompileDml(context)
             && TryCompileDelete(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
-            return RunCompiledDml(compiled, columns, hasReturning);
+            return RunCompiledDml(compiled, columns, hasReturning, parameters);
 
         return PerformDeleteEvaluated(statement, parameters, context);
     }
 
     // Compiled DML reports only an aggregate affected-row count; live blob handles need
-    // the evaluator's matched rowids to expire only when their own row is mutated.
+    // the evaluator's matched rowids to expire only when their own row is mutated. A cancelable
+    // execution also stays evaluator-owned because the current VDBE loop has no cancellation opcode.
     private bool CanCompileDml(QueryContext context)
-        => !context.ForeignKeysEnabled && !HasOpenBlobHandles;
+        => !context.CancellationToken.CanBeCanceled
+            && !context.ForeignKeysEnabled
+            && !HasOpenBlobHandles;
 
     private ExecutionResult PerformDeleteEvaluated(
         DeleteStatement statement,
@@ -5995,12 +5998,17 @@ public sealed class EmbeddedDatabase : IDisposable
 
     // Executes a lowered INSERT/UPDATE/DELETE program, buffering any RETURNING rows and
     // surfacing the rows-affected count and last-insert rowid the write opcodes tracked.
-    private static ExecutionResult RunCompiledDml(CompiledDml compiled, string[] columns, bool hasReturning)
+    private static ExecutionResult RunCompiledDml(
+        CompiledDml compiled,
+        string[] columns,
+        bool hasReturning,
+        SqlValue[] parameters)
     {
         using var runtime = new ResumableStatement(
             compiled.Program,
-            cursorSources: null,
-            writeTargets: compiled.WriteTargets);
+            compiled.CursorSources,
+            compiled.RuntimeWriteTargets,
+            BuildValuesBinding(compiled.ParameterIndices ?? [], parameters));
         var rows = new List<SqlValue[]>();
         while (true)
         {
@@ -6050,13 +6058,22 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        var returningOps = new List<DmlReturningExpression>();
-        if (!TryLowerReturningClause(statement.Returning, table, statement.TableName, parameters, context, returningOps, out columns, out hasReturning))
+        if (!TryCompileReturningClause(
+                statement.Returning,
+                table,
+                statement.TableName,
+                parameters,
+                context,
+                out var returningProgram,
+                out columns,
+                out hasReturning))
             return false;
 
         var plan = PrepareInsert(statement, table);
         var rowsToInsert = new List<SqlValue[]>(statement.Rows.Count);
         var insertedRowIds = new List<long>(statement.Rows.Count);
+        var returningRows = hasReturning ? new List<SqlValue[]>(statement.Rows.Count) : null;
+        var returningRowIds = hasReturning ? new List<long>(statement.Rows.Count) : null;
         var writeTarget = new VdbeWriteTarget
         {
             TableName = statement.TableName,
@@ -6066,6 +6083,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 var (row, rowid) = BuildInsertRow(statement, table, plan, statement.Rows[index], parameters, context);
                 rowsToInsert.Add(row);
                 insertedRowIds.Add(rowid);
+                returningRows?.Add(row);
+                returningRowIds?.Add(rowid);
                 return new VdbeRowMutation(row, rowid);
             },
             Commit = () =>
@@ -6075,13 +6094,24 @@ public sealed class EmbeddedDatabase : IDisposable
             },
         };
 
-        compiled = DmlStatementCompiler.Compile(
-            DmlKind.Insert,
-            statement.TableName,
-            table.Columns.Length,
-            predicate: null,
-            returningOps,
-            writeTarget);
+        compiled = hasReturning
+            ? DmlStatementCompiler.CompileWithFilter(
+                DmlKind.Insert,
+                statement.TableName,
+                table.Columns.Length,
+                filter: null,
+                returningProgram!,
+                writeTarget,
+                new VdbeCursorSource(
+                    returningRows!,
+                    table.HasRowid ? returningRowIds : null))
+            : DmlStatementCompiler.Compile(
+                DmlKind.Insert,
+                statement.TableName,
+                table.Columns.Length,
+                predicate: null,
+                returning: Array.Empty<DmlReturningExpression>(),
+                writeTarget);
         return true;
     }
 
@@ -6112,8 +6142,15 @@ public sealed class EmbeddedDatabase : IDisposable
                 return false;
         }
 
-        var returningOps = new List<DmlReturningExpression>();
-        if (!TryLowerReturningClause(statement.Returning, table, statement.TableName, parameters, context, returningOps, out columns, out hasReturning))
+        if (!TryCompileReturningClause(
+                statement.Returning,
+                table,
+                statement.TableName,
+                parameters,
+                context,
+                out var returningProgram,
+                out columns,
+                out hasReturning))
             return false;
 
         var plan = PrepareUpdate(statement, table);
@@ -6121,6 +6158,8 @@ public sealed class EmbeddedDatabase : IDisposable
         var newRows = new List<SqlValue[]>(rowCount);
         var newRowIds = new List<long>(rowCount);
         var updatedPositions = new List<int>();
+        var returningRows = hasReturning ? new List<SqlValue[]>(rowCount) : null;
+        var returningRowIds = hasReturning ? new List<long>(rowCount) : null;
         for (var index = 0; index < rowCount; index++)
         {
             newRows.Add(table.Rows[index]);
@@ -6141,6 +6180,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 newRows[index] = updated;
                 newRowIds[index] = newRowid;
                 updatedPositions.Add(index);
+                returningRows?.Add(updated);
+                returningRowIds?.Add(newRowid);
                 return new VdbeRowMutation(updated, newRowid);
             },
             Commit = () =>
@@ -6158,13 +6199,24 @@ public sealed class EmbeddedDatabase : IDisposable
             },
         };
 
-        compiled = DmlStatementCompiler.CompileWithFilter(
-            DmlKind.Update,
-            statement.TableName,
-            table.Columns.Length,
-            filter,
-            returningOps,
-            writeTarget);
+        compiled = hasReturning
+            ? DmlStatementCompiler.CompileWithFilter(
+                DmlKind.Update,
+                statement.TableName,
+                table.Columns.Length,
+                filter,
+                returningProgram!,
+                writeTarget,
+                new VdbeCursorSource(
+                    returningRows!,
+                    table.HasRowid ? returningRowIds : null))
+            : DmlStatementCompiler.CompileWithFilter(
+                DmlKind.Update,
+                statement.TableName,
+                table.Columns.Length,
+                filter,
+                Array.Empty<DmlReturningExpression>(),
+                writeTarget);
         return true;
     }
 
@@ -6195,19 +6247,33 @@ public sealed class EmbeddedDatabase : IDisposable
                 return false;
         }
 
-        var returningOps = new List<DmlReturningExpression>();
-        if (!TryLowerReturningClause(statement.Returning, table, statement.TableName, parameters, context, returningOps, out columns, out hasReturning))
+        if (!TryCompileReturningClause(
+                statement.Returning,
+                table,
+                statement.TableName,
+                parameters,
+                context,
+                out var returningProgram,
+                out columns,
+                out hasReturning))
             return false;
 
         var rowCount = table.Rows.Count;
         var deleted = new bool[rowCount];
+        var returningRows = hasReturning ? new List<SqlValue[]>(rowCount) : null;
+        var returningRowIds = hasReturning ? new List<long>(rowCount) : null;
         var writeTarget = new VdbeWriteTarget
         {
             TableName = statement.TableName,
             RowCount = rowCount,
             GetRow = index => table.Rows[index],
             GetRowId = index => index < table.RowIds.Count ? table.RowIds[index] : index + 1,
-            DeleteRow = index => deleted[index] = true,
+            DeleteRow = index =>
+            {
+                deleted[index] = true;
+                returningRows?.Add(table.Rows[index]);
+                returningRowIds?.Add(index < table.RowIds.Count ? table.RowIds[index] : index + 1);
+            },
             Commit = () =>
             {
                 var keptRows = new List<SqlValue[]>(rowCount);
@@ -6228,215 +6294,96 @@ public sealed class EmbeddedDatabase : IDisposable
             },
         };
 
-        compiled = DmlStatementCompiler.CompileWithFilter(
-            DmlKind.Delete,
-            statement.TableName,
-            table.Columns.Length,
-            filter,
-            returningOps,
-            writeTarget);
+        compiled = hasReturning
+            ? DmlStatementCompiler.CompileWithFilter(
+                DmlKind.Delete,
+                statement.TableName,
+                table.Columns.Length,
+                filter,
+                returningProgram!,
+                writeTarget,
+                new VdbeCursorSource(
+                    returningRows!,
+                    table.HasRowid ? returningRowIds : null))
+            : DmlStatementCompiler.CompileWithFilter(
+                DmlKind.Delete,
+                statement.TableName,
+                table.Columns.Length,
+                filter,
+                Array.Empty<DmlReturningExpression>(),
+                writeTarget);
         return true;
     }
 
-    // Lowers a RETURNING clause (if present) into projection expressions plus its column
-    // names, reporting whether a clause was present. Returns false when any projection falls
-    // outside the compilable subset so the whole statement stays on the evaluator.
-    private bool TryLowerReturningClause(
+    // Reuses the SELECT expression emitter for RETURNING. The write loop first buffers every affected
+    // row, then this block runs over that buffer in source order before Commit, preserving evaluator
+    // predicate/assignment callback order while keeping projection failures statement-atomic.
+    private bool TryCompileReturningClause(
         IReadOnlyList<Projection>? returning,
         EmbeddedTable table,
         string tableName,
         SqlValue[] parameters,
         QueryContext context,
-        List<DmlReturningExpression> ops,
+        out DmlReturningProgram? program,
         out string[] columns,
         out bool hasReturning)
     {
+        program = null;
         columns = [];
         hasReturning = false;
         if (returning is null)
             return true;
 
-        if (!TryLowerReturning(returning, table, tableName, parameters, context, ops))
+        var qualifiedColumns = BuildQualifiedColumns(tableName, table.Columns);
+        var target = new ScanTarget(
+            tableName,
+            tableName,
+            table.Columns,
+            table.Rows,
+            name => ResolveScanColumnIndex(name, table.Columns, qualifiedColumns),
+            table.HasRowid ? table.RowIds : null);
+        if (!SelectStatementCompiler.TryExpandProjections(returning, target, out var projections))
             return false;
 
         var outputColumns = BuildOutputColumns(tableName, table.Columns);
         columns = GetColumnNames(returning, outputColumns, outputColumns);
-        if (columns.Length != ops.Count)
+        if (columns.Length != projections.Count)
             return false;
 
+        var instructions = new List<VdbeInstruction>();
+        var emitter = new SelectStatementCompiler.ExpressionEmitter(
+            target,
+            new Cursor(1),
+            projections.Count,
+            instructions,
+            IsConstantScalarExpression,
+            expression => Evaluate(expression, parameters, null, context),
+            function => TryGetRoutableBuiltinScalarCall(function, out var routable)
+                ? BuildBuiltinScalarFunction(routable, parameters, context)
+                : null,
+            ArithmeticNumericAffinity,
+            ModuloNumericAffinity);
+        for (var index = 0; index < projections.Count; index++)
+        {
+            var projection = projections[index];
+            if (projection.ColumnIndex is { } columnIndex)
+            {
+                instructions.Add(new ColumnInstruction(new Cursor(1), columnIndex, new Register(index)));
+            }
+            else if (!emitter.TryEmit(projection.Expression!, new Register(index)))
+            {
+                return false;
+            }
+        }
+
+        program = new DmlReturningProgram(
+            instructions,
+            projections.Count,
+            emitter.RegisterCount,
+            emitter.ParameterIndices);
         hasReturning = true;
         return true;
     }
-
-    // Lowers each RETURNING projection into a Column/RowId/constant leaf or an Arithmetic node,
-    // mirroring the evaluator's per-row resolution: "*" expands to every column, bare column
-    // names and (unshadowed) rowid aliases become reads, constant scalars fold, and an
-    // arithmetic expression over the byte-identical-safe operand subset (numeric-affinity
-    // columns, rowid, INTEGER/REAL/NULL constants/parameters, and nested arithmetic over them)
-    // routes to the real Arithmetic opcode. Anything else (qualified "t.*", qualified/unknown
-    // names, text/blob-affinity columns, functions, subqueries, collations, and other complex
-    // expressions) declines so the evaluator owns it.
-    private bool TryLowerReturning(
-        IReadOnlyList<Projection> returning,
-        EmbeddedTable table,
-        string tableName,
-        SqlValue[] parameters,
-        QueryContext context,
-        List<DmlReturningExpression> ops)
-    {
-        foreach (var projection in returning)
-        {
-            switch (projection.Expression)
-            {
-                case StarExpression:
-                    if (table.Columns.Length == 0)
-                        return false;
-                    for (var index = 0; index < table.Columns.Length; index++)
-                        ops.Add(DmlReturningExpression.Column(index));
-                    break;
-                case QualifiedStarExpression:
-                    return false;
-                case ColumnExpression column:
-                    if (!TryLowerReturningColumn(column, table, ops))
-                        return false;
-                    break;
-                default:
-                    if (IsConstantScalarExpression(projection.Expression))
-                    {
-                        ops.Add(DmlReturningExpression.Constant(Evaluate(projection.Expression, parameters, null, context)));
-                        break;
-                    }
-
-                    if (TryLowerReturningArithmetic(projection.Expression, table, parameters, out var arithmetic))
-                    {
-                        ops.Add(arithmetic);
-                        break;
-                    }
-
-                    return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static bool TryLowerReturningColumn(ColumnExpression column, EmbeddedTable table, List<DmlReturningExpression> ops)
-    {
-        // A bare column projection is a direct value read, byte-identical to the evaluator
-        // regardless of the column's affinity, so no affinity requirement is imposed here.
-        if (!TryResolveReturningColumnLeaf(column, table, requireNumericAffinity: false, out var leaf))
-            return false;
-
-        ops.Add(leaf);
-        return true;
-    }
-
-    // Resolves an unqualified RETURNING column reference to a Column/RowId leaf, matching
-    // SourceRow.GetValue: a declared column shadows the rowid pseudo-column, and rowid/_rowid_/
-    // oid alias the hidden rowid on a rowid table. Qualified ("t.x") and unknown names decline
-    // so the evaluator resolves (or rejects) them exactly. When <paramref name="requireNumericAffinity"/>
-    // is set (arithmetic operands), a text/blob-affinity column declines because the Arithmetic
-    // opcode does not apply the numeric affinity the evaluator would.
-    private static bool TryResolveReturningColumnLeaf(
-        ColumnExpression column,
-        EmbeddedTable table,
-        bool requireNumericAffinity,
-        out DmlReturningExpression leaf)
-    {
-        leaf = null!;
-        if (column.Name.Contains('.'))
-            return false;
-
-        for (var index = 0; index < table.Columns.Length; index++)
-        {
-            if (string.Equals(table.Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
-            {
-                if (requireNumericAffinity && !table.ColumnHasNumericAffinity(index))
-                    return false;
-
-                leaf = DmlReturningExpression.Column(index);
-                return true;
-            }
-        }
-
-        if (table.HasRowid && EmbeddedTable.IsRowidAliasName(column.Name))
-        {
-            leaf = DmlReturningExpression.RowId();
-            return true;
-        }
-
-        return false;
-    }
-
-    // Routes a RETURNING projection that is an arithmetic operation (+, -, *, /, %) over the
-    // affected row into a DmlReturningExpression tree, so the compiler emits the real Arithmetic
-    // opcode instead of deferring to the evaluator. Only actual arithmetic operations enter here
-    // (bare leaves are owned by the star/column/constant projection paths), matching the
-    // source-less SELECT arithmetic route; every operand must lower through
-    // TryLowerReturningArithmeticOperand or the whole statement falls back.
-    private static bool TryLowerReturningArithmetic(
-        Expression expression,
-        EmbeddedTable table,
-        SqlValue[] parameters,
-        out DmlReturningExpression lowered)
-    {
-        lowered = null!;
-        if (expression is not BinaryExpression binary || !TryMapArithmeticOperator(binary.Operator, out _))
-            return false;
-
-        return TryLowerReturningArithmeticOperand(binary, table, parameters, out lowered);
-    }
-
-    // Lowers one arithmetic operand, recursing through nested arithmetic. Routes exactly the
-    // subset where VdbeArithmetic.Evaluate is byte-identical to the evaluator's numeric
-    // operators: a numeric-affinity column or the rowid (read from the affected row), an
-    // INTEGER/REAL/NULL literal, a parameter whose currently bound value classifies the same way
-    // (re-baked per execution, so a rebind to text/blob re-classifies and declines), or a nested
-    // arithmetic node over them. Every other operand (text/blob-affinity or qualified/unknown
-    // column, non-numeric constant/parameter, function, subquery, collation, cast, comparison,
-    // concatenation, ...) declines so the evaluator, which applies numeric affinity, keeps
-    // ownership.
-    private static bool TryLowerReturningArithmeticOperand(
-        Expression expression,
-        EmbeddedTable table,
-        SqlValue[] parameters,
-        out DmlReturningExpression lowered)
-    {
-        lowered = null!;
-        switch (expression)
-        {
-            case LiteralExpression literal:
-                if (!IsRoutableArithmeticValue(literal.Value))
-                    return false;
-                lowered = DmlReturningExpression.Constant(literal.Value);
-                return true;
-            case ParameterExpression parameter:
-                var value = ReadParameter(parameters, parameter.Index);
-                if (!IsRoutableArithmeticValue(value))
-                    return false;
-                lowered = DmlReturningExpression.Constant(value);
-                return true;
-            case ColumnExpression column:
-                return TryResolveReturningColumnLeaf(column, table, requireNumericAffinity: true, out lowered);
-            case BinaryExpression binary when TryMapArithmeticOperator(binary.Operator, out var op):
-                if (!TryLowerReturningArithmeticOperand(binary.Left, table, parameters, out var left)
-                    || !TryLowerReturningArithmeticOperand(binary.Right, table, parameters, out var right))
-                {
-                    return false;
-                }
-
-                lowered = DmlReturningExpression.Arithmetic(op, left, right);
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    // An arithmetic operand value routes only when VdbeArithmetic processes it byte-identically
-    // to the evaluator's affinity-applying operators: INTEGER, REAL, or NULL. A text or blob value
-    // declines (the opcode raises a type error where the evaluator coerces via numeric affinity).
-    private static bool IsRoutableArithmeticValue(SqlValue value)
-        => value.Kind is SqlValueKind.Integer or SqlValueKind.Real or SqlValueKind.Null;
 
     // Builds a per-row predicate for a compilable DML WHERE clause. The emitted filter
     // builds the same SourceRow shape the evaluated UPDATE/DELETE use (no qualified

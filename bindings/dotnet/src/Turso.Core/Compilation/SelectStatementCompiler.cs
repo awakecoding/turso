@@ -208,7 +208,7 @@ internal sealed class SelectStatementCompiler
         return true;
     }
 
-    private ProjectionEmitter CreateEmitter(
+    private ExpressionEmitter CreateEmitter(
         ScanTarget? target,
         Cursor? cursor,
         int outputCount,
@@ -224,7 +224,7 @@ internal sealed class SelectStatementCompiler
             _numericAffinity,
             _moduloAffinity);
 
-    private static bool TryExpandProjections(
+    internal static bool TryExpandProjections(
         IReadOnlyList<Projection> source,
         ScanTarget target,
         out List<ProjectionSource> expanded)
@@ -273,14 +273,14 @@ internal sealed class SelectStatementCompiler
                     StringComparison.OrdinalIgnoreCase));
     }
 
-    private readonly record struct ProjectionSource(Expression? Expression, int? ColumnIndex)
+    internal readonly record struct ProjectionSource(Expression? Expression, int? ColumnIndex)
     {
         public static ProjectionSource ForExpression(Expression expression) => new(expression, null);
 
         public static ProjectionSource ForColumn(int columnIndex) => new(null, columnIndex);
     }
 
-    private sealed class ProjectionEmitter
+    internal sealed class ExpressionEmitter
     {
         private readonly ScanTarget? _target;
         private readonly Cursor? _cursor;
@@ -294,7 +294,7 @@ internal sealed class SelectStatementCompiler
         private readonly List<int> _parameterIndices = [];
         private int _nextRegister;
 
-        public ProjectionEmitter(
+        public ExpressionEmitter(
             ScanTarget? target,
             Cursor? cursor,
             int firstScratchRegister,
