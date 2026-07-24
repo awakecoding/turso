@@ -48,8 +48,13 @@ Embedded replicas require the matching-version `Turso.Data.Sqlite.Sync` companio
 
 Specify a remote `Data Source` and a local `Replica Path`. The companion bootstraps
 the replica on first open, and `Sync()` or `SyncAsync(CancellationToken)` explicitly
-pushes local changes then pulls and applies remote changes. Automatic `Sync Interval`
-is intentionally unsupported. The companion resolves its native runtime assets on
+pushes local changes then pulls and applies remote changes. `Sync Interval` is retained
+for connection-string compatibility, but zero is the only supported value: the provider
+never starts background synchronization. Applications that need a cadence must own the
+scheduler, keep at most one outstanding sync per connection, await every call, observe
+every failure, and choose their own retry and backoff policy. Closing or disposing a
+connection cancels an in-flight explicit sync and waits for it to quiesce; reopening starts
+a new explicit lifecycle. The companion resolves its native runtime assets on
 Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and
 `android-x86`), and iOS as an XCFramework with an arm64 device slice and a
 universal arm64+x64 simulator slice.
@@ -123,7 +128,9 @@ applies to custom HTTP handlers and response bodies while application code is
 executing under the serialized replica operation. Cancellation stops in-flight HTTP
 or file I/O and does not report `Completed`.
 
-Current boundaries are intentional: automatic `Sync Interval` remains unsupported;
+Current boundaries are intentional: nonzero `Sync Interval` values fail before native
+or network access; no background work is started and explicit sync failures are never
+swallowed;
 local at-rest encryption options cannot be used for replicas (remote encryption is
 configured separately); logical MVCC pull is not enabled by the .NET provider; and
 partial bootstrap requires initial bootstrap to be enabled. These settings fail
@@ -351,7 +358,7 @@ Supported common connection string keywords include:
 | `Auth Token` | Bearer token for remote Turso/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
 | `Replica Path` | Local path for an embedded replica. Requires the `Turso.Data.Sqlite.Sync` companion package and a remote Turso URL. |
 | `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |
-| `Sync Interval` | Automatic replica synchronization is not supported. Call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly. |
+| `Sync Interval` | Retained for connection-string compatibility. Only `0` is accepted; call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly and await every operation. |
 | `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
 
 ### Managed local encryption format

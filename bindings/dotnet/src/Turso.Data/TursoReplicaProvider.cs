@@ -308,4 +308,6 @@ public abstract class TursoReplicaDatabase : TursoNativeDatabase
     internal virtual void EnsureCanClose()
     {
     }
+
+    internal virtual Exception? CancelPendingOperationsForClose() => null;
 }
