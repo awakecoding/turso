@@ -243,6 +243,27 @@ Supported common connection string keywords include:
 | `Sync Interval` | Automatic replica synchronization is not supported. Call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly. |
 | `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
 
+### Managed local encryption format
+
+Managed local encryption implements Turso encrypted database format version `0` only. Page 1 starts with the 16-byte header `"Turso"`, version byte `0`, a cipher ID, and nine zero reserved bytes. The remaining SQLite header bytes stay readable and are authenticated as associated data. AES-GCM pages reserve 28 bytes for a 16-byte authentication tag and 12-byte nonce.
+
+| Cipher ID | Rust format cipher | Key bytes | Page metadata bytes | Managed provider |
+| ---: | --- | ---: | ---: | --- |
+| 1 | AES-128-GCM | 16 | 28 | Supported |
+| 2 | AES-256-GCM | 32 | 28 | Supported |
+| 3 | AEGIS-256 | 32 | 48 | Rejected |
+| 4 | AEGIS-256X2 | 32 | 48 | Rejected |
+| 5 | AEGIS-256X4 | 32 | 48 | Rejected |
+| 6 | AEGIS-128L | 16 | 32 | Rejected |
+| 7 | AEGIS-128X2 | 16 | 32 | Rejected |
+| 8 | AEGIS-128X4 | 16 | 32 | Rejected |
+
+The managed provider never guesses a format or cipher. An unsupported version, unsupported cipher ID, configured/header cipher mismatch, missing key, wrong key, or authentication failure aborts the open without plaintext or alternate-cipher fallback.
+
+Encrypted WAL files retain SQLite WAL format version `3007000`: the 32-byte WAL header and 24-byte frame headers are standard SQLite structures, while each frame's page image uses the database page cipher. A WAL therefore has no independent cipher marker. Managed connections always authenticate the main database header first and then use that exact cipher and key for WAL recovery. The low-level `SqliteWalFile` API must only be used with encryption options obtained from its paired database; a WAL cannot safely negotiate encryption by itself.
+
+Managed backup is a logical snapshot copy. The source key decrypts the source connection and the destination connection independently chooses its output format and key, so backup can copy between plaintext, AES-128-GCM, and AES-256-GCM databases without copying encryption metadata or keys.
+
 ## SQLite-compatible facade coverage
 
 - `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, managed fixed-length blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.

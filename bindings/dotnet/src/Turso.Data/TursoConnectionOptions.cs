@@ -219,9 +219,9 @@ public class TursoConnectionOptions
         ManagedLocalOpenMode mode,
         string dataSource)
     {
-        var cipher = GetEncryptionCipher();
+        var cipher = _builder.GetOption("Encryption Cipher");
         var key = _builder.GetOption("Encryption Key");
-        if (!cipher.HasValue)
+        if (string.IsNullOrWhiteSpace(cipher))
         {
             if (key is not null)
                 throw new NotSupportedException("Encryption is not available for the managed engine.");
@@ -237,16 +237,17 @@ public class TursoConnectionOptions
                 "Encryption is supported only for file-backed databases when Local Provider=Managed.");
         }
 
-        return cipher.Value switch
+        return cipher.ToLowerInvariant() switch
         {
-            TursoEncryptionCipher.Aes128Gcm => ManagedEncryptionOptions.FromHex(
+            "aes128gcm" => ManagedEncryptionOptions.FromHex(
                 Turso.Core.Storage.TursoEncryptionCipher.Aes128Gcm,
                 key),
-            TursoEncryptionCipher.Aes256Gcm => ManagedEncryptionOptions.FromHex(
+            "aes256gcm" => ManagedEncryptionOptions.FromHex(
                 Turso.Core.Storage.TursoEncryptionCipher.Aes256Gcm,
                 key),
             _ => throw new NotSupportedException(
-                "Local Provider=Managed supports only AES128GCM and AES256GCM encryption ciphers."),
+                "Local Provider=Managed supports only Turso encrypted format version 0 with "
+                + "AES128GCM (cipher ID 1) or AES256GCM (cipher ID 2); cipher fallback is not permitted."),
         };
     }
 }

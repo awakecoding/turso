@@ -21,7 +21,8 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         try
         {
             var projectPath = FindProjectPath();
-            var packageVersion = "0.0.0-package-validation";
+            var packageVersion = $"0.0.0-package-validation-{Guid.NewGuid():N}";
+            BuildForPackage(projectPath, "net9.0");
             Pack(projectPath, packageDirectory, packageVersion);
             Pack(
                 Path.Combine(
@@ -603,6 +604,44 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             """
             using Microsoft.EntityFrameworkCore;
             using Turso.Data.Sqlite;
+
+            const string key = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+            var path = Path.Combine(Path.GetTempPath(), $"turso-package-artifact-{Guid.NewGuid():N}.db");
+            var connectionString =
+                $"Data Source={path};Local Provider=Managed;Encryption Cipher=AES256GCM;Encryption Key={key}";
+            try
+            {
+                using (var managed = new SqliteConnection(connectionString))
+                {
+                    managed.Open();
+                    managed.ExecuteNonQuery("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('encrypted');");
+                }
+
+                using (var reopened = new SqliteConnection(connectionString))
+                {
+                    reopened.Open();
+                    if (reopened.ExecuteScalar<string>("SELECT value FROM data;") != "encrypted")
+                        throw new InvalidOperationException("The packed managed provider did not reopen encrypted data.");
+                }
+
+                using var unsupported = new SqliteConnection(
+                    $"Data Source={path};Local Provider=Managed;Encryption Cipher=AEGIS256;Encryption Key={key}");
+                try
+                {
+                    unsupported.Open();
+                    throw new InvalidOperationException("The packed managed provider accepted AEGIS.");
+                }
+                catch (NotSupportedException exception) when (
+                    exception.Message.Contains("cipher ID 1", StringComparison.Ordinal)
+                    && exception.Message.Contains("cipher ID 2", StringComparison.Ordinal))
+                {
+                }
+            }
+            finally
+            {
+                foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+                    File.Delete(path + suffix);
+            }
 
             using var managed = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
             managed.Open();

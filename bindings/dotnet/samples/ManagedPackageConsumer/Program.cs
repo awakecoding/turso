@@ -57,6 +57,44 @@ catch (NotSupportedException exception) when (
 {
 }
 
+const string encryptionKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+var encryptedPath = Path.Combine(Path.GetTempPath(), $"turso-managed-package-{Guid.NewGuid():N}.db");
+try
+{
+    var encryptedConnectionString =
+        $"Data Source={encryptedPath};Local Provider=Managed;Encryption Cipher=AES256GCM;Encryption Key={encryptionKey}";
+    using (var encrypted = new SqliteConnection(encryptedConnectionString))
+    {
+        encrypted.Open();
+        encrypted.ExecuteNonQuery("CREATE TABLE encrypted_data(value TEXT); INSERT INTO encrypted_data VALUES ('package');");
+    }
+
+    using (var reopened = new SqliteConnection(encryptedConnectionString))
+    {
+        reopened.Open();
+        if (reopened.ExecuteScalar<string>("SELECT value FROM encrypted_data;") != "package")
+            throw new InvalidOperationException("The managed package did not reopen its encrypted database.");
+    }
+
+    using var unsupported = new SqliteConnection(
+        $"Data Source={encryptedPath};Local Provider=Managed;Encryption Cipher=AEGIS256;Encryption Key={encryptionKey}");
+    try
+    {
+        unsupported.Open();
+        throw new InvalidOperationException("The managed package accepted an unsupported encryption cipher.");
+    }
+    catch (NotSupportedException exception) when (
+        exception.Message.Contains("cipher ID 1", StringComparison.Ordinal)
+        && exception.Message.Contains("cipher ID 2", StringComparison.Ordinal))
+    {
+    }
+}
+finally
+{
+    foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+        File.Delete(encryptedPath + suffix);
+}
+
 if (AppDomain.CurrentDomain.GetAssemblies().Any(assembly =>
         string.Equals(assembly.GetName().Name, "Turso.Raw", StringComparison.Ordinal)))
 {

@@ -342,9 +342,7 @@ public sealed class SqlitePager : IDisposable
             try
             {
                 var pager = new SqlitePager(pageStore, wal, effectiveLockManager, pageCacheCapacity);
-                var recovery = readOnly
-                    ? wal.ScanRecovery()
-                    : wal.RecoverToLastCommittedFrame();
+                var recovery = wal.ScanRecovery();
                 try
                 {
                     pager.InitializeCommittedView(recovery);
@@ -355,6 +353,15 @@ public sealed class SqlitePager : IDisposable
                         "Cannot safely open the SQLite database read-only because its WAL cannot establish a non-mutating committed snapshot. "
                         + "Open it writable to recover the WAL.",
                         exception);
+                }
+                if (!readOnly)
+                {
+                    var repairRecovery = wal.RecoverToLastCommittedFrame();
+                    if (repairRecovery != recovery)
+                    {
+                        throw new InvalidDataException(
+                            "SQLite WAL changed between authenticated recovery scanning and tail repair.");
+                    }
                 }
                 pager._lockGeneration = readOnly
                     ? effectiveLockManager.Generation
