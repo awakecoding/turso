@@ -220,27 +220,49 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
             _disposeRequested = true;
         }
 
-        _disposeCancellation.Cancel();
-        _operationGate.Wait();
+        Exception? cancellationError = null;
         try
         {
-            foreach (var statement in _statements)
-                statement.DisposeFromDatabase();
-            _statements.Clear();
-            _connection?.Dispose();
-            _connection = null;
-            _database.Dispose();
-            _httpClient.Dispose();
-            _disposeCancellation.Dispose();
-            lock (_lifecycleLock)
+            _disposeCancellation.Cancel();
+        }
+        catch (AggregateException exception)
+        {
+            cancellationError = exception;
+        }
+
+        try
+        {
+            _operationGate.Wait();
+            try
             {
-                _disposed = true;
+                foreach (var statement in _statements)
+                    statement.DisposeFromDatabase();
+                _statements.Clear();
+                _connection?.Dispose();
+                _connection = null;
+                _database.Dispose();
+                _httpClient.Dispose();
+                _disposeCancellation.Dispose();
+                lock (_lifecycleLock)
+                {
+                    _disposed = true;
+                }
+            }
+            finally
+            {
+                _operationGate.Release();
             }
         }
-        finally
+        catch (Exception cleanupError) when (cancellationError is not null)
         {
-            _operationGate.Release();
+            throw new AggregateException(
+                "Embedded replica cancellation and disposal both failed.",
+                cancellationError,
+                cleanupError);
         }
+
+        if (cancellationError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cancellationError).Throw();
     }
 
     internal override void EnsureCanClose()
@@ -251,6 +273,29 @@ internal sealed class SyncReplicaDatabase : TursoReplicaDatabase
                 "An embedded replica cannot be closed from a sync progress callback.");
         }
         _options.ThrowIfApplicationHttpReentrant(closing: true);
+    }
+
+    internal override Exception? CancelPendingOperationsForClose()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_disposed || _disposeRequested)
+                return null;
+        }
+
+        try
+        {
+            _disposeCancellation.Cancel();
+            return null;
+        }
+        catch (ObjectDisposedException)
+        {
+            return null;
+        }
+        catch (AggregateException exception)
+        {
+            return exception;
+        }
     }
 
     internal T UseExclusiveOperation<T>(Func<T> operation)

@@ -10,9 +10,24 @@ The `Turso.Data.Sqlite` package includes both a SQLite-compatible `Turso.Data.Sq
 dotnet add package Turso.Data.Sqlite
 ```
 
-Application code only needs to reference `Turso.Data.Sqlite`.
+Managed local and remote Hrana applications only need `Turso.Data.Sqlite`. Native
+local and embedded replica modes require an optional matching-version companion.
 
-The package targets `net8.0`, `net9.0`, and `net10.0`. It is managed-only: local connections use the managed provider by default and no Rust toolchain or native runtime asset is needed to restore, build, pack, or run it. Its package contains no `runtimes/` assets, `Turso.Raw` dependency, or native build target.
+All managed assemblies and dynamic companions target `net8.0`, `net9.0`, and
+`net10.0`.
+
+| Package | Contract |
+| --- | --- |
+| `Turso.Data.Sqlite` | Managed-only primary package. Includes `TursoConnection` for managed local and remote Hrana access, plus the local-only `Turso.Data.Sqlite` compatibility facade. Contains no native runtime assets or `Turso.Raw` dependency. |
+| `Turso.Data.Sqlite.Native` | Optional dynamic native local provider selected with `Local Provider=Native`; depends on `Turso.Raw`. |
+| `Turso.Data.Sqlite.Sync` | Optional native embedded-replica provider for `TursoConnection`; enables explicit `Sync`/`SyncAsync`. |
+| `Turso.Data.Sqlite.NativeAot.<rid>` | Optional RID-specific desktop static-link package for native local NativeAOT publishing. |
+| `Turso.EntityFrameworkCore.Sqlite` | Local-only EF Core 9.x provider. |
+| `Turso.Raw` | Runtime/interop dependency of `Turso.Data.Sqlite.Native` and binding dependency of the static NativeAOT packages. The primary and Sync packages do not reference it directly. |
+
+The primary package uses the managed provider by default. No Rust toolchain or
+native runtime asset is needed to restore, build, pack, or run managed local or
+remote Hrana applications.
 
 ## Dynamic native compatibility
 
@@ -20,12 +35,19 @@ Applications that intentionally select `Local Provider=Native` can reference the
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Turso.Data.Sqlite" Version="0.7.0-pre.18" />
-  <PackageReference Include="Turso.Data.Sqlite.Native" Version="0.7.0-pre.18" />
+  <PackageReference Include="Turso.Data.Sqlite" Version="x.y.z" />
+  <PackageReference Include="Turso.Data.Sqlite.Native" Version="x.y.z" />
 </ItemGroup>
 ```
 
-`Turso.Data.Sqlite.Native` activates the native provider and resolves its `Turso.Raw` runtime companion for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with an arm64 device slice and a universal arm64+x64 simulator slice. These are optional companion packages with their own native-asset validation; they are not restored or packed by the managed release path. Remote Turso/libSQL connections use the managed HTTP client and do not require either native package.
+`Turso.Data.Sqlite.Native` activates the native provider and resolves its
+`Turso.Raw` runtime companion. Desktop package consumers are restored and
+executed in release gates on Windows, Linux, and macOS. Android
+(`android-arm64`, `android-arm`, `android-x64`, and `android-x86`) and iOS
+assets are architecture- and package-target validated, but the release gates do
+not claim device or emulator execution. These optional companions are not
+restored or packed by the managed release path. Remote Turso/libSQL connections
+use the managed HTTP client and do not require a native package.
 
 Calls on one native connection are serialized because its connection and
 statement handles require exclusive access; use separate connections for
@@ -41,15 +63,20 @@ Embedded replicas require the matching-version `Turso.Data.Sqlite.Sync` companio
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Turso.Data.Sqlite" Version="0.7.0-pre.18" />
-  <PackageReference Include="Turso.Data.Sqlite.Sync" Version="0.7.0-pre.18" />
+  <PackageReference Include="Turso.Data.Sqlite" Version="x.y.z" />
+  <PackageReference Include="Turso.Data.Sqlite.Sync" Version="x.y.z" />
 </ItemGroup>
 ```
 
 Specify a remote `Data Source` and a local `Replica Path`. The companion bootstraps
 the replica on first open, and `Sync()` or `SyncAsync(CancellationToken)` explicitly
-pushes local changes then pulls and applies remote changes. Automatic `Sync Interval`
-is intentionally unsupported. The companion resolves its native runtime assets on
+pushes local changes then pulls and applies remote changes. `Sync Interval` is retained
+for connection-string compatibility, but zero is the only supported value: the provider
+never starts background synchronization. Applications that need a cadence must own the
+scheduler, keep at most one outstanding sync per connection, await every call, observe
+every failure, and choose their own retry and backoff policy. Closing or disposing a
+connection cancels an in-flight explicit sync and waits for it to quiesce; reopening starts
+a new explicit lifecycle. The companion resolves its native runtime assets on
 Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and
 `android-x86`), and iOS as an XCFramework with an arm64 device slice and a
 universal arm64+x64 simulator slice.
@@ -123,7 +150,9 @@ applies to custom HTTP handlers and response bodies while application code is
 executing under the serialized replica operation. Cancellation stops in-flight HTTP
 or file I/O and does not report `Completed`.
 
-Current boundaries are intentional: automatic `Sync Interval` remains unsupported;
+Current boundaries are intentional: nonzero `Sync Interval` values fail before native
+or network access; no background work is started and explicit sync failures are never
+swallowed;
 local at-rest encryption options cannot be used for replicas (remote encryption is
 configured separately); logical MVCC pull is not enabled by the .NET provider; and
 partial bootstrap requires initial bootstrap to be enabled. These settings fail
@@ -135,8 +164,8 @@ NativeAOT apps can opt into statically linking the Turso native library so publi
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Turso.Data.Sqlite" Version="0.7.0-pre.18" />
-  <PackageReference Include="Turso.Data.Sqlite.NativeAot.win-x64" Version="0.7.0-pre.18" PrivateAssets="all" />
+  <PackageReference Include="Turso.Data.Sqlite" Version="x.y.z" />
+  <PackageReference Include="Turso.Data.Sqlite.NativeAot.win-x64" Version="x.y.z" PrivateAssets="all" />
 </ItemGroup>
 ```
 
@@ -188,11 +217,15 @@ The managed engine lowers generic source-less and single-table SELECT projection
 
 The tree-walking evaluator remains the explicit fallback for expression families not yet represented by this lowering, including comparison/logical/concatenation expressions, `CASE` and `CAST`, volatile, collation-sensitive, or context-dependent functions, shadowing user-defined functions, complex scan predicates whose streaming error order would differ, computed `DISTINCT` or `ORDER BY` projections, parameterized compound terms, computed or otherwise error-capable `INTERSECT`/`EXCEPT` terms, and compounds whose custom collation callbacks cannot be invoked at evaluator-equivalent points.
 
+Managed SELECT, compound SELECT, window, and limited DML ordering all preserve explicit `NULLS FIRST` and `NULLS LAST`; omitting the clause uses SQLite's direction-dependent default.
+
 ### Managed DML bytecode
 
 Managed `INSERT`, `UPDATE`, and `DELETE` reuse the same generic expression lowering for `RETURNING`: literals, late-bound parameters, affected-row columns or rowid, qualified stars/columns, nested numeric arithmetic with SQLite affinity, value-only `COLLATE`, and the allow-listed built-ins above compile. `UPDATE` and `DELETE` predicates may use the evaluator's row-local scalar expression subset, including nested arithmetic, logical/comparison operators, and scalar functions, because the VDBE filter invokes that evaluator at the original per-row position.
 
 The compiled program first scans predicates and buffers all mutations, then evaluates buffered `RETURNING` rows in source and projection order, and commits only after projection succeeds. This retains predicate/assignment user-callback timing, keeps projection errors statement-atomic, and remains resumable across returned rows. Subqueries, aggregates/windows, `CASE`, `CAST`, concatenation/comparison projections, volatile or context-dependent functions, and shadowed user functions remain evaluator-owned. DML with a cancellation-capable token, foreign-key enforcement, open incremental blobs, conflict algorithms, source `INSERT`, CTE scope, or schema tables also falls back.
+
+The managed SQL contract enables SQLite's optional single-table `UPDATE`/`DELETE` `ORDER BY ... LIMIT` grammar independently of the bundled native SQLite compile options. `LIMIT ... OFFSET ...` and `LIMIT offset, count` accept bound parameters, negative limits are unbounded, and negative offsets clamp to zero. `RETURNING`, when present, precedes `ORDER BY`; ordering chooses the affected subset but does not reorder mutation or `RETURNING` output. Limited DML stays evaluator-owned so selection expressions run before source-ordered buffered mutation and statement-atomic projection; `EXPLAIN QUERY PLAN` reports `MANAGED EVALUATOR FALLBACK` for that route. UPDATE conflict algorithms, UPDATE-FROM, row-value assignments, target aliases, `INDEXED BY`/`NOT INDEXED`, `ORDER BY` without `LIMIT`, and limited DML inside trigger bodies are rejected during parsing.
 
 ## Getting started
 
@@ -285,26 +318,27 @@ that contract, so generic ADO.NET callers and the provider cannot drift.
 | Capability | `TursoConnection` managed local | `TursoConnection` native local | `TursoConnection` remote Hrana | `TursoConnection` embedded replica | `SqliteConnection` managed local | `SqliteConnection` native local |
 | --- | --- | --- | --- | --- | --- | --- |
 | `DbBatch` / `CanCreateBatch` | Yes, sequential | Yes, sequential | Yes, one Hrana batch | No | Yes, sequential | Yes, sequential |
-| Async open, command, reader, transaction, batch | Yes, worker-backed local I/O | Yes, worker-backed local I/O | Yes, HTTP I/O | Yes, replica/native I/O | Yes, worker-backed local I/O | Yes, worker-backed local I/O |
+| Async open, command, reader, transaction | Yes, worker-backed local I/O | Yes, worker-backed local I/O | Yes, HTTP I/O | Yes, replica/native I/O | Yes, worker-backed local I/O | Yes, worker-backed local I/O |
 | Transactions | Yes | Yes | Yes | Yes | Yes | Yes |
 | Savepoints | Yes | Yes | Yes | Yes | Yes | Yes |
-| `BackupDatabase` | No facade API | No facade API | No | No | Yes | Yes |
+| `BackupDatabase` | No facade API | No facade API | No | No | Yes, same-provider connections | Yes, same-provider connections |
 | `SqliteBlob` fixed-length incremental I/O | No facade API | No facade API | No | No | Yes, managed handle | Yes, SQL-backed compatibility |
 | Scalar UDFs / aggregates / collations | No facade API | No facade API | No | No | Yes | Yes |
 | Loadable extensions | No facade API | No facade API | No | No | No | Yes, disabled by default |
 | `ATTACH` / `DETACH` | Yes, with managed limits | Yes | No | No | Yes, with managed limits | Yes |
-| Managed connection pooling | Eligible unencrypted files when `Pooling=True`; named shared memory accepts the keyword but is not pooled | No | No | No | Eligible unencrypted files; named shared memory accepts the keyword but is not pooled | No |
-| Explicit `Sync` | No | No | No | Yes | No | No |
+| Managed connection pooling | Eligible unencrypted files when `Pooling=True`; named shared memory requires `Pooling=False` | No | No | No | Eligible unencrypted files; named shared memory accepts the default keyword but is not pooled | No |
+| Explicit `Sync` | No | No | No | Yes, with Sync companion | No | No |
+| Encryption | AES-128/256-GCM managed format | Native SDK cipher set | Local encryption options rejected | Remote encryption options; local at-rest options rejected | AES-128/256-GCM managed format | `Encryption Cipher`/`Encryption Key` rejected |
 
 `Turso.Data.Sqlite` is a local-only migration facade; remote URLs fail before they
 can be interpreted as file paths. Use `TursoConnection` for Hrana and embedded
-replicas. `TursoConnection` also rejects `Pooling=True` before provider or network
-access unless the target is an eligible unencrypted managed file or a valid named
-managed shared-memory database. Named shared memory accepts the compatibility
-keyword without placing its shared owner in the physical connection pool. The SQLite facade
-continues to accept its default `Pooling=True` keyword for native compatibility, but
-native handles are not pooled. Memory, shared-memory, encrypted, callback-bearing,
-remote, and replica connections are never pooled.
+replicas. `TursoConnection` rejects `Pooling=True` before provider or network
+access unless the target is an eligible unencrypted managed file; named shared
+memory requires `Pooling=False`. The SQLite facade accepts its default
+`Pooling=True` keyword for named shared-memory and native compatibility without
+placing either kind of handle in the managed physical connection pool. Memory,
+shared-memory, encrypted, callback-bearing, native, remote, and replica connections
+are never pooled.
 
 Remote Hrana and embedded replicas reject `ATTACH` and `DETACH` before network or
 native execution; syncing or routing an attached database is not implied. Native
@@ -333,26 +367,27 @@ For common embedded SQLite usage, `Turso.Data.Sqlite` exposes a SQLite-compatibl
 + using var connection = new SqliteConnection("Data Source=app.db");
 ```
 
-Supported common connection string keywords include:
+The builders share keyword names, but execution support depends on the facade and
+mode. Supported common connection string keywords include:
 
 | Keyword | Notes |
 | --- | --- |
-| `Data Source` | Database path or `:memory:`. Aliases include `DataSource` and `Filename`. |
-| `Mode` | Parsed and preserved for compatibility. |
-| `Cache` | Managed `Cache=Shared` is supported only with a named `Data Source` and `Mode=Memory`; see the shared-cache contract below. |
-| `Foreign Keys` | Parsed and preserved for compatibility. |
+| `Data Source` | Local database path or `:memory:`; remote URL for `TursoConnection`. Aliases include `DataSource` and `Filename`. |
+| `Mode` | Local only. Managed local honors `Memory`, `ReadOnly`, `ReadWrite`, and `ReadWriteCreate` with explicit file-existence checks. |
+| `Cache` | Local only. Managed `Cache=Shared` is supported only with a named `Data Source` and `Mode=Memory`; see below. |
+| `Foreign Keys` | Applied by local `SqliteConnection` through `PRAGMA foreign_keys`; direct managed `TursoConnection` rejects the keyword. |
 | `Local Provider` | `Managed` is the default for local databases. Set `Native` when `Turso.Data.Sqlite.Native` or a RID-specific `Turso.Data.Sqlite.NativeAot.*` companion is referenced. |
-| `Recursive Triggers` | Parsed and preserved for compatibility. |
-| `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
-| `Pooling` | Defaults to `True` on the SQLite-compatible facade. Managed physical pooling applies only to ordinary unencrypted file-backed databases; valid named shared-memory databases accept the keyword without being pooled. |
-| `Vfs` | Parsed and preserved for compatibility. |
-| `Encryption Cipher` | Turso local encryption cipher. |
-| `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
+| `Recursive Triggers` | Tracked by local `SqliteConnection`; direct managed `TursoConnection` rejects the keyword. |
+| `Default Timeout` | Default command timeout. Aliases include `Command Timeout`; for managed local databases it controls busy waits, not total query duration. |
+| `Pooling` | Defaults to `True` on the SQLite-compatible facade. Managed physical pooling applies only to ordinary unencrypted file-backed databases. Named shared memory accepts the default keyword only through `SqliteConnection` and is not pooled; `TursoConnection` requires `Pooling=False`. |
+| `Vfs` | Native `SqliteConnection` only. Managed local rejects native SQLite VFS names. |
+| `Encryption Cipher` | Local only. Managed local supports AES-128-GCM and AES-256-GCM; native `TursoConnection` uses the SDK cipher set; native `SqliteConnection` rejects it. |
+| `Encryption Key` | Hex-encoded local key used with `Encryption Cipher`; follows the same facade/provider boundaries. |
 | `Auth Token` | Bearer token for remote Turso/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
-| `Replica Path` | Local path for an embedded replica. Requires the `Turso.Data.Sqlite.Sync` companion package and a remote Turso URL. |
-| `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |
-| `Sync Interval` | Automatic replica synchronization is not supported. Call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly. |
-| `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
+| `Replica Path` | Embedded replica `TursoConnection` only. Requires `Turso.Data.Sqlite.Sync` and a remote Turso URL. |
+| `Read Your Writes` | Remote `TursoConnection` only. Keeps the Hrana session baton across commands; `False` uses stateless requests. |
+| `Sync Interval` | Retained for connection-string compatibility. Only `0` is accepted; call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly and await every operation. |
+| `Tls` | Remote `TursoConnection` only. Optional `libsql://` development override; conflicts with explicit HTTP(S) schemes fail early. |
 
 ### Managed local encryption format
 
@@ -429,7 +464,11 @@ stable managed contract.
 
 ## Entity Framework Core
 
-`Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local and embedded Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through `Turso.Data.Sqlite`.
+`Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local
+managed or native Turso databases. It reuses EF Core SQLite's LINQ translation
+pipeline and executes generated SQL through the local-only `Turso.Data.Sqlite`
+facade. Embedded replicas and remote Hrana URLs are not part of this provider
+line.
 
 The current provider line supports EF Core 9.x on `net8.0`, `net9.0`, and `net10.0`. Its package dependency is constrained to `Microsoft.EntityFrameworkCore.Sqlite.Core` versions `[9.0.9, 10.0.0)` because the provider integrates with EF Core's internal SQLite services, and `UseTurso` rejects any other loaded EF Core major during options configuration. Do not override that dependency with EF Core 8.x or 10.x; those majors require separately compiled and tested provider lines.
 
@@ -463,4 +502,9 @@ var options = new DbContextOptionsBuilder<AppDbContext>()
 
 The local provider supports the normal EF Core SQLite query pipeline, including composed `IQueryable<T>` filters, navigation-property joins, ordering, paging, grouping, aggregates, async materialization, and `SaveChangesAsync`. Schema creation can use `EnsureCreated`, `EnsureCreatedAsync`, and EF migrations against local database files. Managed migrations support history tracking, literal defaults, and model-backed table, column, and index renames when the renamed table or column has no foreign-key, table-constraint, trigger, or computed-column dependencies. Filtered indexes, descending indexes, SQL-expression defaults, raw SQL operations, idempotent migration scripts, and dependent renames fail before application schema mutation because the managed engine cannot execute those forms safely.
 
-Remote `libsql://`, `http://`, `https://`, `ws://`, and `wss://` EF Core support is not part of the local provider. `UseTurso` rejects those data sources during options configuration, before a context or connection is used. Use the local/embedded provider for EF Core today or use `TursoConnection` directly for remote ADO.NET access; remote/serverless EF support needs a separate retry and transaction design.
+Remote `libsql://`, `http://`, `https://`, `ws://`, and `wss://` EF Core support
+is not part of the local provider. `UseTurso` rejects those data sources during
+options configuration, before a context or connection is used. Embedded replicas
+are also excluded because `UseTurso` executes through `SqliteConnection`. Use
+`TursoConnection` directly for remote or replica ADO.NET access; remote/serverless
+EF support needs a separate retry and transaction design.

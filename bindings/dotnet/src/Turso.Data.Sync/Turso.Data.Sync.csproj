@@ -8,7 +8,7 @@
 
     <PackageId>Turso.Data.Sqlite.Sync</PackageId>
     <Title>Turso embedded replica companion</Title>
-    <Description>Optional native embedded-replica support for the Turso ADO.NET provider.</Description>
+    <Description>Optional native embedded-replica and explicit Sync companion for TursoConnection, with desktop and mobile runtime assets.</Description>
     <Authors>Turso authors</Authors>
     <PackageTags>turso;sqlite;database;sync;replica;native;interop</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

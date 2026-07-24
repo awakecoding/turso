@@ -253,6 +253,66 @@ public class WithoutRowidTests
     }
 
     [Test]
+    public void LimitedDmlUsesExplicitNullPlacementAndClusteredFallbackOrder()
+    {
+        var setup = new[]
+        {
+            """
+            CREATE TABLE t(
+                tenant TEXT,
+                sequence INTEGER,
+                rank INTEGER,
+                value TEXT,
+                PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC)
+            ) WITHOUT ROWID
+            """,
+            """
+            INSERT INTO t VALUES
+                ('Alpha', 2, NULL, 'a2'),
+                ('alpha', 1, 2, 'a1'),
+                ('beta', 3, 1, 'b3'),
+                ('charlie', 4, NULL, 'c4')
+            """,
+        };
+
+        OutputsShouldMatch(
+            RunManaged(
+                setup,
+                """
+                UPDATE t SET value = 'updated'
+                RETURNING tenant, sequence
+                ORDER BY rank ASC NULLS LAST, tenant COLLATE NOCASE ASC
+                LIMIT 1
+                """),
+            RunSqlite(
+                setup,
+                """
+                SELECT tenant, sequence FROM t
+                ORDER BY rank ASC NULLS LAST, tenant COLLATE NOCASE ASC
+                LIMIT 1
+                """));
+        OutputsShouldMatch(
+            RunManaged(
+                setup,
+                """
+                DELETE FROM t
+                RETURNING tenant, sequence
+                ORDER BY rank DESC NULLS FIRST, tenant COLLATE NOCASE DESC
+                LIMIT 1
+                """),
+            RunSqlite(
+                setup,
+                """
+                SELECT tenant, sequence FROM t
+                ORDER BY rank DESC NULLS FIRST, tenant COLLATE NOCASE DESC
+                LIMIT 1
+                """));
+        OutputsShouldMatch(
+            RunManaged(setup, "UPDATE t SET value = 'clustered' RETURNING tenant, sequence LIMIT 1"),
+            RunSqlite(setup, "SELECT tenant, sequence FROM t LIMIT 1"));
+    }
+
+    [Test]
     public void InsertAndDeleteReturningPreserveGeneratedValuesAndClusteredOrder()
     {
         AssertMatchesSqlite(

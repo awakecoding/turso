@@ -139,12 +139,24 @@ internal sealed record UpdateStatement(
     string TableName,
     IReadOnlyList<ColumnAssignment> Assignments,
     Expression? Where,
-    IReadOnlyList<Projection>? Returning = null) : ParsedStatement;
+    IReadOnlyList<Projection>? Returning = null,
+    IReadOnlyList<OrderByTerm>? OrderBy = null,
+    Expression? Limit = null,
+    Expression? Offset = null) : ParsedStatement
+{
+    public IReadOnlyList<OrderByTerm> EffectiveOrderBy => OrderBy ?? [];
+}
 
 internal sealed record DeleteStatement(
     string TableName,
     Expression? Where,
-    IReadOnlyList<Projection>? Returning = null) : ParsedStatement;
+    IReadOnlyList<Projection>? Returning = null,
+    IReadOnlyList<OrderByTerm>? OrderBy = null,
+    Expression? Limit = null,
+    Expression? Offset = null) : ParsedStatement
+{
+    public IReadOnlyList<OrderByTerm> EffectiveOrderBy => OrderBy ?? [];
+}
 
 internal sealed record PragmaTableInfoStatement(string TableName) : ParsedStatement;
 
@@ -278,7 +290,18 @@ internal enum CompoundOperator
 
 internal sealed record Projection(Expression Expression, string? Alias);
 
-internal sealed record OrderByTerm(Expression Expression, bool Descending);
+internal enum NullPlacement
+{
+    Default,
+    First,
+    Last,
+}
+
+internal sealed record OrderByTerm(
+    Expression Expression,
+    bool Descending,
+    NullPlacement NullPlacement = NullPlacement.Default,
+    long? Ordinal = null);
 
 // Aggregate window functions (func(...) OVER (...)). Only the ROWS frame type is
 // materialized; RANGE/GROUPS/EXCLUDE and dedicated ranking functions are rejected
