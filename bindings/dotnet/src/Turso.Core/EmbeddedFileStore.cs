@@ -40,6 +40,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private readonly IFileSystem _fileSystem;
     private readonly string _databasePath;
     private readonly string _walPath;
+    private readonly EmbeddedDatabase _indexExpressionEvaluator = new();
     private int _pageSize;
     private int _usableSpace;
     private SqliteDatabaseHeader _header;
@@ -6522,8 +6523,10 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private static bool IsBoundedIndexLeafMutationCompatible(IndexDefinition definition)
         => definition.Index.Columns.Count != 0
+           && !definition.Index.IsPartial
            && definition.Index.Columns.All(column =>
-               !column.Descending
+               !column.IsExpression
+               && !column.Descending
                && (column.Collation is null
                    || string.Equals(column.Collation, "BINARY", StringComparison.OrdinalIgnoreCase)));
 
@@ -8917,19 +8920,36 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"The managed file engine cannot persist index '{index.Name}' because table '{tableName}' has a row with an invalid column count.");
             }
 
+            var rowId = table.HasRowid ? table.RowIds[rowIndex] : (long?)null;
+            if (!IndexExpressionSemantics.Qualifies(
+                    index,
+                    table,
+                    row,
+                    rowId,
+                    _indexExpressionEvaluator.EvaluateIndexExpression))
+            {
+                continue;
+            }
+            var key = IndexExpressionSemantics.ProjectKey(
+                index,
+                table,
+                row,
+                rowId,
+                _indexExpressionEvaluator.EvaluateIndexExpression);
+
             SqlValue[] values;
             if (table.WithoutRowid)
             {
                 values = new SqlValue[storageColumns!.Count];
-                for (var column = 0; column < storageColumns.Count; column++)
+                Array.Copy(key, values, key.Length);
+                for (var column = index.Columns.Count; column < storageColumns.Count; column++)
                     values[column] = row[storageColumns[column].ColumnIndex];
             }
             else
             {
                 values = new SqlValue[index.Columns.Count + 1];
-                for (var column = 0; column < index.Columns.Count; column++)
-                    values[column] = row[index.Columns[column].ColumnIndex];
-                values[^1] = SqlValue.Integer(table.RowIds[rowIndex]);
+                Array.Copy(key, values, key.Length);
+                values[^1] = SqlValue.Integer(rowId!.Value);
             }
             var record = SqliteRecordCodec.Encode(values, _textEncoding);
             comparer.Validate(record);
@@ -9005,12 +9025,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private static SqliteKeyCollation GetIndexCollation(EmbeddedTable table, EmbeddedIndexColumn column)
-    {
-        var name = column.Collation
-            ?? table.ColumnDefinitions[column.ColumnIndex].Collation
-            ?? "BINARY";
-        return SqliteKeyCollation.FromName(name);
-    }
+        => SqliteKeyCollation.FromName(IndexExpressionSemantics.GetCollationName(table, column));
 
     private PreparedSchemaTree BuildSchemaTree(
         IReadOnlyList<SchemaEntry> entries,
@@ -9247,19 +9262,13 @@ internal sealed class EmbeddedFileStore : IDisposable
         EmbeddedIndex index)
     {
         ArgumentNullException.ThrowIfNull(index);
-        if (string.IsNullOrWhiteSpace(index.Name))
-            throw new EmbeddedSqlException($"The managed file engine cannot persist an unnamed index on table '{tableName}'.");
-        if (index.Columns.Count == 0)
-            throw new EmbeddedSqlException($"The managed file engine cannot persist index '{index.Name}' because it has no key columns.");
+        IndexExpressionSemantics.ValidateDefinition(tableName, table, index);
+        IndexExpressionSemantics.ValidateRoundTrip(tableName, table, index);
 
         foreach (var column in index.Columns)
         {
-            if (column.ColumnIndex < 0 || column.ColumnIndex >= table.Columns.Length)
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist index '{index.Name}' because it has an invalid column reference.");
-            }
-            if (!string.Equals(table.Columns[column.ColumnIndex], column.Name, StringComparison.OrdinalIgnoreCase))
+            if (!column.IsExpression
+                && !string.Equals(table.Columns[column.ColumnIndex], column.Name, StringComparison.OrdinalIgnoreCase))
             {
                 throw new EmbeddedSqlException(
                     $"The managed file engine cannot persist index '{index.Name}' because its column metadata is inconsistent.");
@@ -9296,32 +9305,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         string tableName,
         EmbeddedTable table,
         CreateIndexStatement statement)
-    {
-        if (statement.Columns.Count == 0)
-            throw new EmbeddedSqlException($"Stored index '{statement.Name}' has no key columns.");
-
-        var columns = new EmbeddedIndexColumn[statement.Columns.Count];
-        for (var index = 0; index < statement.Columns.Count; index++)
-        {
-            var column = statement.Columns[index];
-            var columnIndex = Array.FindIndex(
-                table.Columns,
-                name => string.Equals(name, column.Name, StringComparison.OrdinalIgnoreCase));
-            if (columnIndex < 0)
-            {
-                throw new EmbeddedSqlException(
-                    $"Stored index '{statement.Name}' references missing column '{column.Name}' on table '{tableName}'.");
-            }
-
-            columns[index] = new EmbeddedIndexColumn(
-                table.Columns[columnIndex],
-                columnIndex,
-                column.Collation ?? table.ColumnDefinitions[columnIndex].Collation,
-                column.Descending);
-        }
-
-        return new EmbeddedIndex(statement.Name, statement.Unique, columns);
-    }
+        => EmbeddedIndexFactory.Create(tableName, table, statement);
 
     private void ValidateStoredIndex(
         SchemaEntry entry,
@@ -9683,19 +9667,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private static string BuildCreateIndexSql(string tableName, EmbeddedIndex index)
-    {
-        var columns = index.Columns.Select(column =>
-        {
-            var definition = QuoteIdentifier(column.Name);
-            if (column.Collation is { } collation)
-                definition += " COLLATE " + collation;
-            if (column.Descending)
-                definition += " DESC";
-            return definition;
-        });
-        var unique = index.Unique ? "UNIQUE " : string.Empty;
-        return $"CREATE {unique}INDEX {QuoteIdentifier(index.Name)} ON {QuoteIdentifier(tableName)} ({string.Join(", ", columns)})";
-    }
+        => IndexSqlFormatter.BuildCreateIndexSql(tableName, index);
 
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";

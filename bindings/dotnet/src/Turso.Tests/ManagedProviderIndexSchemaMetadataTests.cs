@@ -86,6 +86,34 @@ public sealed class ManagedProviderIndexSchemaMetadataTests
     }
 
     [Test]
+    public void GetSchemaRepresentsPartialExpressionIndexTermsWithoutInventingColumns()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE products(id INTEGER PRIMARY KEY, sku TEXT, active INTEGER);
+            CREATE UNIQUE INDEX ux_products_normalized
+                ON products(lower(sku) COLLATE NOCASE DESC)
+                WHERE active = 1;
+            """);
+
+        var index = connection.GetSchema("Indexes").Rows.Cast<DataRow>()
+            .Single(row => (string)row["INDEX_NAME"] == "ux_products_normalized");
+        index["IS_UNIQUE"].Should().Be(true);
+        index["IS_PARTIAL"].Should().Be(true);
+
+        var term = connection.GetSchema(
+                "IndexColumns",
+                [null, null, "products", "ux_products_normalized"])
+            .Rows.Cast<DataRow>()
+            .Should().ContainSingle().Which;
+        term["ORDINAL_POSITION"].Should().Be(0);
+        term["COLUMN_ORDINAL"].Should().Be(-2);
+        term["COLUMN_NAME"].Should().Be(DBNull.Value);
+    }
+
+    [Test]
     public void ReaderSchemaPreservesBaseMetadataForManagedAliasedColumns()
     {
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");

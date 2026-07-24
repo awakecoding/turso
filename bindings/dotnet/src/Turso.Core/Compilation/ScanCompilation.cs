@@ -16,13 +16,15 @@ namespace Turso.Core.Compilation;
 /// the reference does not name a column of this table.
 /// </param>
 /// <param name="RowIds">The optional hidden rowids aligned with <paramref name="Rows"/>.</param>
+/// <param name="IndexName">The selected logical index, when the rows are in index order.</param>
 internal sealed record ScanTarget(
     string TableName,
     string Qualifier,
     string[] Columns,
     IReadOnlyList<SqlValue[]> Rows,
     Func<string, int?> ResolveColumnIndex,
-    IReadOnlyList<long>? RowIds = null)
+    IReadOnlyList<long>? RowIds = null,
+    string? IndexName = null)
 {
     public bool HasRowId => RowIds is not null;
 }

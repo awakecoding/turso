@@ -26,11 +26,21 @@ internal sealed record CreateIndexStatement(
     string TableName,
     IReadOnlyList<IndexedColumnDefinition> Columns,
     bool Unique,
-    bool IfNotExists) : ParsedStatement;
+    bool IfNotExists,
+    Expression? Where = null,
+    string? WhereSql = null) : ParsedStatement;
 
 internal sealed record DropIndexStatement(string Name, bool IfExists) : ParsedStatement;
 
-internal sealed record IndexedColumnDefinition(string Name, string? Collation, bool Descending);
+internal sealed record IndexedColumnDefinition(
+    string? Name,
+    string? Collation,
+    bool Descending,
+    Expression? Expression = null,
+    string? ExpressionSql = null)
+{
+    public bool IsExpression => Expression is not null;
+}
 
 internal sealed record CreateViewStatement(
     string Name,
@@ -122,7 +132,15 @@ internal enum InsertConflictAlgorithm
     Replace,
 }
 
-internal sealed record UpsertTargetColumn(string Name, string? Collation);
+internal sealed record UpsertTargetColumn(
+    string? Name,
+    string? Collation,
+    bool Descending = false,
+    Expression? Expression = null,
+    string? ExpressionSql = null)
+{
+    public bool IsExpression => Expression is not null;
+}
 
 internal abstract record UpsertAction;
 
@@ -134,7 +152,9 @@ internal sealed record DoUpdateUpsertAction(
 
 internal sealed record UpsertClause(
     IReadOnlyList<UpsertTargetColumn> Target,
-    UpsertAction Action);
+    UpsertAction Action,
+    Expression? TargetWhere = null,
+    string? TargetWhereSql = null);
 
 internal sealed record UpdateStatement(
     string TableName,
@@ -166,6 +186,8 @@ internal sealed record PragmaTableXInfoStatement(string TableName) : ParsedState
 internal sealed record PragmaIndexListStatement(string TableName) : ParsedStatement;
 
 internal sealed record PragmaIndexInfoStatement(string IndexName) : ParsedStatement;
+
+internal sealed record PragmaIndexXInfoStatement(string IndexName) : ParsedStatement;
 
 internal sealed record PragmaForeignKeyListStatement(string TableName) : ParsedStatement;
 
@@ -450,7 +472,16 @@ internal sealed record ForeignKeyDefinition(
     ForeignKeyDeferral Deferral = ForeignKeyDeferral.NotDeferrable,
     string? ConstraintName = null);
 
-internal sealed record EmbeddedIndexColumn(string Name, int ColumnIndex, string? Collation, bool Descending);
+internal sealed record EmbeddedIndexColumn(
+    string Name,
+    int ColumnIndex,
+    string? Collation,
+    bool Descending,
+    Expression? Expression = null,
+    string? ExpressionSql = null)
+{
+    public bool IsExpression => Expression is not null;
+}
 
 internal enum EmbeddedIndexOrigin
 {
@@ -464,7 +495,12 @@ internal sealed record EmbeddedIndex(
     bool Unique,
     IReadOnlyList<EmbeddedIndexColumn> Columns,
     EmbeddedIndexOrigin Origin = EmbeddedIndexOrigin.Explicit,
-    InsertConflictAlgorithm? ConflictAlgorithm = null);
+    InsertConflictAlgorithm? ConflictAlgorithm = null,
+    Expression? Where = null,
+    string? WhereSql = null)
+{
+    public bool IsPartial => Where is not null;
+}
 
 internal abstract record Expression;
 

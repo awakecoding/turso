@@ -261,6 +261,12 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private sealed record LimitedDmlCandidate(int Position, SqlValue[] OrderValues);
 
+    private sealed record ManagedIndexScanPlan(
+        NamedTableSource Source,
+        EmbeddedTable Table,
+        EmbeddedIndex Index,
+        bool Search);
+
     internal sealed record QueryContext(
         Dictionary<string, EmbeddedTable> Tables,
         IReadOnlyDictionary<string, SourceData> CommonTableExpressions,
@@ -277,6 +283,7 @@ public sealed class EmbeddedDatabase : IDisposable
         int TriggerDepth = 0,
         int ForeignKeyActionDepth = 0,
         ForeignKeyStatementState? ForeignKeyStatement = null,
+        bool IndexExpression = false,
         CancellationToken CancellationToken = default);
 
     internal sealed class ForeignKeyStatementState
@@ -1176,6 +1183,7 @@ public sealed class EmbeddedDatabase : IDisposable
             PragmaTableXInfoStatement tableXInfo => ExecutePragmaTableXInfo(tableXInfo, tables),
             PragmaIndexListStatement indexList => ExecutePragmaIndexList(indexList, tables),
             PragmaIndexInfoStatement indexInfo => ExecutePragmaIndexInfo(indexInfo, tables),
+            PragmaIndexXInfoStatement indexXInfo => ExecutePragmaIndexXInfo(indexXInfo, tables),
             PragmaForeignKeyListStatement foreignKeyList => ExecutePragmaForeignKeyList(foreignKeyList, tables),
             PragmaForeignKeyCheckStatement foreignKeyCheck => ExecutePragmaForeignKeyCheck(foreignKeyCheck, tables),
             PragmaTableListStatement => ExecutePragmaTableList(catalog),
@@ -1351,7 +1359,7 @@ public sealed class EmbeddedDatabase : IDisposable
                     EmbeddedIndexOrigin.PrimaryKey => "pk",
                     _ => "u",
                 }),
-                SqlValue.Integer(0),
+                SqlValue.Integer(index.IsPartial ? 1 : 0),
             ];
         }
 
@@ -1374,8 +1382,74 @@ public sealed class EmbeddedDatabase : IDisposable
             [
                 SqlValue.Integer(seqno),
                 SqlValue.Integer(column.ColumnIndex),
-                SqlValue.Text(column.Name),
+                column.IsExpression ? SqlValue.Null : SqlValue.Text(column.Name),
             ];
+        }
+
+        return new ExecutionResult(columns, rows, 0);
+    }
+
+    private static ExecutionResult ExecutePragmaIndexXInfo(
+        PragmaIndexXInfoStatement statement,
+        Dictionary<string, EmbeddedTable> tables)
+    {
+        string[] columns = ["seqno", "cid", "name", "desc", "coll", "key"];
+        if (!TryFindIndex(tables, statement.IndexName, out var table, out var index))
+            return new ExecutionResult(columns, [], 0);
+
+        var rows = new List<SqlValue[]>(index.Columns.Count + table.PrimaryKeyColumns.Count + 1);
+        for (var seqno = 0; seqno < index.Columns.Count; seqno++)
+        {
+            var term = index.Columns[seqno];
+            rows.Add(
+            [
+                SqlValue.Integer(seqno),
+                SqlValue.Integer(term.ColumnIndex),
+                term.IsExpression ? SqlValue.Null : SqlValue.Text(term.Name),
+                SqlValue.Integer(term.Descending ? 1 : 0),
+                SqlValue.Text(IndexExpressionSemantics.GetCollationName(table, term)),
+                SqlValue.Integer(1),
+            ]);
+        }
+
+        if (table.WithoutRowid)
+        {
+            var primaryKey = table.PrimaryKeySchema
+                ?? throw new InvalidOperationException("WITHOUT ROWID table has no primary-key metadata.");
+            foreach (var suffix in primaryKey.Terms)
+            {
+                var alreadyPresent = index.Columns.Any(term =>
+                    !term.IsExpression
+                    && term.ColumnIndex == suffix.ColumnIndex
+                    && string.Equals(
+                        IndexExpressionSemantics.GetCollationName(table, term),
+                        suffix.Collation.Name ?? "BINARY",
+                        StringComparison.OrdinalIgnoreCase));
+                if (alreadyPresent)
+                    continue;
+
+                rows.Add(
+                [
+                    SqlValue.Integer(rows.Count),
+                    SqlValue.Integer(suffix.ColumnIndex),
+                    SqlValue.Text(suffix.ColumnName),
+                    SqlValue.Integer(suffix.SortOrder == SqliteKeySortOrder.Descending ? 1 : 0),
+                    SqlValue.Text(suffix.Collation.Name ?? "BINARY"),
+                    SqlValue.Integer(0),
+                ]);
+            }
+        }
+        else
+        {
+            rows.Add(
+            [
+                SqlValue.Integer(rows.Count),
+                SqlValue.Integer(-1),
+                SqlValue.Null,
+                SqlValue.Integer(0),
+                SqlValue.Text("BINARY"),
+                SqlValue.Integer(0),
+            ]);
         }
 
         return new ExecutionResult(columns, rows, 0);
@@ -1671,29 +1745,29 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
-        var columns = new EmbeddedIndexColumn[statement.Columns.Count];
-        for (var index = 0; index < statement.Columns.Count; index++)
+        var definition = EmbeddedIndexFactory.Create(statement.TableName, table, statement);
+        if (definition.Columns.Any(column =>
+                column.Expression is not null
+                && IndexExpressionSemantics.ContainsFunction(column.Expression, IsRegisteredScalarFunction))
+            || definition.Where is not null
+                && IndexExpressionSemantics.ContainsFunction(definition.Where, IsRegisteredScalarFunction))
         {
-            var column = statement.Columns[index];
-            var columnIndex = Array.FindIndex(
-                table.Columns,
-                name => string.Equals(name, column.Name, StringComparison.OrdinalIgnoreCase));
-            if (columnIndex < 0)
-                throw new EmbeddedSqlException($"no such column: {column.Name}");
-
-            columns[index] = new EmbeddedIndexColumn(
-                table.Columns[columnIndex],
-                columnIndex,
-                column.Collation ?? table.ColumnDefinitions[columnIndex].Collation,
-                column.Descending);
+            throw new EmbeddedSqlException(
+                "application-defined functions are prohibited in index expressions and partial index WHERE clauses");
         }
-
-        var definition = new EmbeddedIndex(statement.Name, statement.Unique, columns);
+        IndexExpressionSemantics.ValidateRoundTrip(statement.TableName, table, definition);
         if (definition.Unique)
-            ValidateUniqueIndex(statement.TableName, definition, table.Rows);
+            ValidateUniqueIndex(statement.TableName, table, definition, table.Rows);
 
         table.Indexes.Add(definition);
         return new ExecutionResult([], [], 0, true);
+    }
+
+    private bool IsRegisteredScalarFunction(string name, int arity)
+    {
+        var normalized = name.ToUpperInvariant();
+        return _scalarFunctions.ContainsKey((normalized, arity))
+            || _scalarFunctions.ContainsKey((normalized, -1));
     }
 
     private static ExecutionResult ExecuteDropIndex(DropIndexStatement statement, Dictionary<string, EmbeddedTable> tables)
@@ -2441,18 +2515,13 @@ public sealed class EmbeddedDatabase : IDisposable
                 .ToArray());
         }
 
-        foreach (var index in table.Indexes.Where(index => index.Unique))
-        {
-            constraints.Add(index.Columns
-                .Select(column => new UpsertConflictColumn(column.Name, column.ColumnIndex, column.Collation))
-                .ToArray());
-        }
-
         var conflicts = new HashSet<int>();
         for (var position = 0; position < table.Rows.Count; position++)
         {
             if (table.RowIds[position] == candidateRowId
-                || constraints.Any(constraint => RowsConflictOnConstraint(table.Rows[position], candidate, constraint)))
+                || constraints.Any(constraint => RowsConflictOnConstraint(table.Rows[position], candidate, constraint))
+                || table.Indexes.Any(index =>
+                    index.Unique && RowsConflictOnIndex(table, index, table.Rows[position], candidate)))
             {
                 conflicts.Add(position);
             }
@@ -2531,7 +2600,7 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
-        var conflictTarget = ResolveUpsertConflictTarget(statement.TableName, table, statement.Upsert.Target);
+        var conflictTarget = ResolveUpsertConflictTarget(statement.TableName, table, statement.Upsert);
         var insertPlan = PrepareInsert(statement, table);
         var updateAction = statement.Upsert.Action as DoUpdateUpsertAction;
         UpdatePlan? updatePlan = null;
@@ -2566,7 +2635,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 parameters,
                 context,
                 allowExistingRowid: true);
-            var conflictPosition = FindUpsertConflictPosition(conflictTarget, candidate, table.Rows);
+            var conflictPosition = FindUpsertConflictPosition(table, conflictTarget, candidate, table.Rows);
 
             if (conflictPosition < 0)
             {
@@ -2704,32 +2773,26 @@ public sealed class EmbeddedDatabase : IDisposable
     private UpsertConflictTarget ResolveUpsertConflictTarget(
         string tableName,
         EmbeddedTable table,
-        IReadOnlyList<UpsertTargetColumn> target)
+        UpsertClause upsert)
     {
+        var target = upsert.Target;
         if (target.Count == 0)
             throw new InvalidOperationException("UPSERT conflict target cannot be empty.");
 
         var matches = new List<UpsertConflictTarget>();
         foreach (var index in table.Indexes)
         {
-            if (!index.Unique || !UpsertTargetMatches(
-                    target,
-                    index.Columns.Select(column => new UpsertConflictColumn(
-                        column.Name,
-                        column.ColumnIndex,
-                        column.Collation)).ToArray()))
+            if (!index.Unique
+                || !IndexExpressionSemantics.ExpressionsEqual(upsert.TargetWhere, index.Where)
+                || !UpsertTargetMatches(table, target, index.Columns))
             {
                 continue;
             }
 
-            matches.Add(new UpsertConflictTarget(
-                index.Columns.Select(column => new UpsertConflictColumn(
-                    column.Name,
-                    column.ColumnIndex,
-                    column.Collation)).ToArray()));
+            matches.Add(new UpsertConflictTarget(index, Columns: null));
         }
 
-        if (table.PrimaryKeyColumns.Count > 0)
+        if (upsert.TargetWhere is null && table.PrimaryKeyColumns.Count > 0)
         {
             var columns = table.PrimaryKeyColumns
                 .Select((entry, position) => new UpsertConflictColumn(
@@ -2739,7 +2802,7 @@ public sealed class EmbeddedDatabase : IDisposable
                         ?? table.ColumnDefinitions[entry.Index].Collation))
                 .ToArray();
             if (UpsertTargetMatches(target, columns))
-                matches.Add(new UpsertConflictTarget(columns));
+                matches.Add(new UpsertConflictTarget(Index: null, columns));
         }
 
         return matches.Count switch
@@ -2753,6 +2816,43 @@ public sealed class EmbeddedDatabase : IDisposable
     }
 
     private static bool UpsertTargetMatches(
+        EmbeddedTable table,
+        IReadOnlyList<UpsertTargetColumn> target,
+        IReadOnlyList<EmbeddedIndexColumn> constraint)
+    {
+        if (target.Count != constraint.Count)
+            return false;
+
+        for (var index = 0; index < target.Count; index++)
+        {
+            var targetTerm = target[index];
+            var indexTerm = constraint[index];
+            if (targetTerm.IsExpression != indexTerm.IsExpression)
+                return false;
+            if (targetTerm.IsExpression)
+            {
+                if (!IndexExpressionSemantics.ExpressionsEqual(targetTerm.Expression, indexTerm.Expression))
+                    return false;
+            }
+            else if (!string.Equals(targetTerm.Name, indexTerm.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (targetTerm.Collation is not null
+                && !string.Equals(
+                    targetTerm.Collation,
+                    IndexExpressionSemantics.GetCollationName(table, indexTerm),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool UpsertTargetMatches(
         IReadOnlyList<UpsertTargetColumn> target,
         IReadOnlyList<UpsertConflictColumn> constraint)
     {
@@ -2761,7 +2861,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
         for (var index = 0; index < target.Count; index++)
         {
-            if (!string.Equals(target[index].Name, constraint[index].Name, StringComparison.OrdinalIgnoreCase)
+            if (target[index].IsExpression
+                || !string.Equals(target[index].Name, constraint[index].Name, StringComparison.OrdinalIgnoreCase)
                 || (target[index].Collation is not null
                     && !string.Equals(
                         target[index].Collation,
@@ -2776,11 +2877,35 @@ public sealed class EmbeddedDatabase : IDisposable
     }
 
     private int FindUpsertConflictPosition(
+        EmbeddedTable table,
         UpsertConflictTarget target,
         SqlValue[] candidate,
         IReadOnlyList<SqlValue[]> rows)
     {
-        foreach (var column in target.Columns)
+        if (target.Index is { } index)
+        {
+            if (!IndexExpressionSemantics.Qualifies(
+                    index,
+                    table,
+                    candidate,
+                    rowId: null,
+                    EvaluateIndexExpression))
+            {
+                return -1;
+            }
+
+            for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+            {
+                if (RowsConflictOnIndex(table, index, rows[rowIndex], candidate))
+                    return rowIndex;
+            }
+
+            return -1;
+        }
+
+        var columns = target.Columns
+            ?? throw new InvalidOperationException("UPSERT conflict target has no key metadata.");
+        foreach (var column in columns)
         {
             if (candidate[column.Index].Kind == SqlValueKind.Null)
                 return -1;
@@ -2789,7 +2914,7 @@ public sealed class EmbeddedDatabase : IDisposable
         for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
         {
             var matches = true;
-            foreach (var column in target.Columns)
+            foreach (var column in columns)
             {
                 if (Compare(rows[rowIndex][column.Index], candidate[column.Index], column.Collation) != 0)
                 {
@@ -2978,7 +3103,9 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private sealed record UpsertConflictColumn(string Name, int Index, string? Collation);
 
-    private sealed record UpsertConflictTarget(IReadOnlyList<UpsertConflictColumn> Columns);
+    private sealed record UpsertConflictTarget(
+        EmbeddedIndex? Index,
+        IReadOnlyList<UpsertConflictColumn>? Columns);
 
     // Materializes every generated column into the row in dependency order, applying the
     // declared-type affinity and enforcing NOT NULL with a table-qualified message. The
@@ -3038,6 +3165,30 @@ public sealed class EmbeddedDatabase : IDisposable
                 },
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase)),
             virtualOnly: true);
+    }
+
+    internal SqlValue EvaluateIndexExpression(
+        Expression expression,
+        EmbeddedTable table,
+        SqlValue[] row,
+        long? rowId)
+    {
+        var source = new SourceRow(
+            table.Columns,
+            row,
+            RowId: table.HasRowid ? rowId : null,
+            RowIdQualifier: table.Name);
+        return Evaluate(
+            expression,
+            EmptyParameters,
+            source,
+            new QueryContext(
+                new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [table.Name] = table,
+                },
+                new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
+                IndexExpression: true));
     }
 
     // Enforces primary-key integrity that a rowid alias cannot cover: WITHOUT ROWID keys are
@@ -4504,6 +4655,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var uniqueIndex = parent.Indexes.FirstOrDefault(index =>
             index.Unique
+            && !index.IsPartial
+            && index.Columns.All(column => !column.IsExpression)
             && index.Columns.Count == parentColumns.Length
             && index.Columns.Select(column => column.ColumnIndex).SequenceEqual(parentColumns)
             && index.Columns.Select(column => NormalizeCollation(column.Collation)).SequenceEqual(
@@ -4780,26 +4933,34 @@ public sealed class EmbeddedDatabase : IDisposable
         foreach (var index in table.Indexes)
         {
             if (index.Unique)
-                ValidateUniqueIndex(tableName, index, rows);
+                ValidateUniqueIndex(tableName, table, index, rows);
         }
     }
 
-    private void ValidateUniqueIndex(string tableName, EmbeddedIndex index, IReadOnlyList<SqlValue[]> rows)
+    private void ValidateUniqueIndex(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<SqlValue[]> rows)
     {
         var seenKeys = new List<SqlValue[]>();
         foreach (var row in rows)
         {
-            var key = new SqlValue[index.Columns.Count];
-            var hasNull = false;
-            for (var column = 0; column < index.Columns.Count; column++)
-            {
-                key[column] = row[index.Columns[column].ColumnIndex];
-                if (key[column].Kind == SqlValueKind.Null)
-                {
-                    hasNull = true;
-                    break;
-                }
-            }
+            if (!IndexExpressionSemantics.Qualifies(
+                    index,
+                    table,
+                    row,
+                    rowId: null,
+                    EvaluateIndexExpression))
+                continue;
+
+            var key = IndexExpressionSemantics.ProjectKey(
+                index,
+                table,
+                row,
+                rowId: null,
+                EvaluateIndexExpression);
+            var hasNull = key.Any(value => value.Kind == SqlValueKind.Null);
 
             // SQLite treats NULLs in a UNIQUE index as distinct, so such rows never conflict.
             if (hasNull)
@@ -4810,7 +4971,10 @@ public sealed class EmbeddedDatabase : IDisposable
                 var conflict = true;
                 for (var column = 0; column < index.Columns.Count; column++)
                 {
-                    if (Compare(existing[column], key[column], index.Columns[column].Collation) != 0)
+                    if (Compare(
+                            existing[column],
+                            key[column],
+                            IndexExpressionSemantics.GetCollationName(table, index.Columns[column])) != 0)
                     {
                         conflict = false;
                         break;
@@ -4819,15 +4983,68 @@ public sealed class EmbeddedDatabase : IDisposable
 
                 if (conflict)
                 {
-                    var qualified = index.Columns.Select(column => $"{tableName}.{column.Name}");
+                    var message = index.Columns.Any(column => column.IsExpression)
+                        ? $"UNIQUE constraint failed: index '{index.Name}'"
+                        : "UNIQUE constraint failed: "
+                            + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}"));
                     throw new EmbeddedSqlException(
-                        $"UNIQUE constraint failed: {string.Join(", ", qualified)}",
+                        message,
                         index.ConflictAlgorithm);
                 }
             }
 
             seenKeys.Add(key);
         }
+    }
+
+    private bool RowsConflictOnIndex(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        SqlValue[] existing,
+        SqlValue[] candidate)
+    {
+        if (!IndexExpressionSemantics.Qualifies(
+                index,
+                table,
+                existing,
+                rowId: null,
+                EvaluateIndexExpression)
+            || !IndexExpressionSemantics.Qualifies(
+                index,
+                table,
+                candidate,
+                rowId: null,
+                EvaluateIndexExpression))
+        {
+            return false;
+        }
+
+        var existingKey = IndexExpressionSemantics.ProjectKey(
+            index,
+            table,
+            existing,
+            rowId: null,
+            EvaluateIndexExpression);
+        var candidateKey = IndexExpressionSemantics.ProjectKey(
+            index,
+            table,
+            candidate,
+            rowId: null,
+            EvaluateIndexExpression);
+        for (var position = 0; position < index.Columns.Count; position++)
+        {
+            if (existingKey[position].Kind == SqlValueKind.Null
+                || candidateKey[position].Kind == SqlValueKind.Null
+                || Compare(
+                    existingKey[position],
+                    candidateKey[position],
+                    IndexExpressionSemantics.GetCollationName(table, index.Columns[position])) != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private ExecutionResult ExecuteDelete(
@@ -5251,8 +5468,24 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         context.CancellationToken.ThrowIfCancellationRequested();
-        if (!context.CancellationToken.CanBeCanceled
-            && TryCompileSelect(select, parameters, context, outerRow, out var compiled))
+        CompiledSelect? compiled = null;
+        if (!context.CancellationToken.CanBeCanceled)
+        {
+            var indexPlan = TryPlanManagedIndexScan(select, context);
+            if (indexPlan is not null)
+                TryCompileManagedIndexSelect(
+                    select,
+                    indexPlan,
+                    parameters,
+                    context,
+                    outerRow,
+                    materializeIndexRows: true,
+                    out compiled);
+            else
+                TryCompileSelect(select, parameters, context, outerRow, out compiled);
+        }
+
+        if (compiled is not null)
         {
             var columns = GetColumnNames(
                 select.Projections,
@@ -5393,6 +5626,58 @@ public sealed class EmbeddedDatabase : IDisposable
                 : null,
             (where, target) => CompileSimpleRowIdPredicate(where, target, parameters, context, outerRow),
             (select, target) => CompileDistinctScanEquality(select, target, context),
+            function => TryGetRoutableBuiltinScalarCall(function, out var routable)
+                ? BuildBuiltinScalarFunction(routable, parameters, context)
+                : null,
+            ArithmeticNumericAffinity,
+            ModuloNumericAffinity,
+            BitwiseIntegerAffinity);
+        return compiler.TryCompile(select, out compiled);
+    }
+
+    private bool TryCompileManagedIndexSelect(
+        SelectStatement select,
+        ManagedIndexScanPlan plan,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        bool materializeIndexRows,
+        out CompiledSelect compiled)
+    {
+        IReadOnlyList<SqlValue[]> rows;
+        IReadOnlyList<long>? rowIds;
+        if (materializeIndexRows)
+        {
+            var indexed = GetManagedIndexRows(plan, context, outerRow);
+            rows = indexed.Rows.Select(row => row.Values).ToArray();
+            rowIds = plan.Table.HasRowid
+                ? indexed.Rows.Select(row =>
+                    row.RowId ?? throw new InvalidOperationException("Indexed row is missing its rowid.")).ToArray()
+                : null;
+        }
+        else
+        {
+            rows = plan.Table.Rows;
+            rowIds = plan.Table.HasRowid ? plan.Table.RowIds : null;
+        }
+
+        var qualifier = plan.Source.Alias ?? plan.Source.Name;
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, plan.Table.Columns);
+        var target = new ScanTarget(
+            plan.Source.Name,
+            qualifier,
+            plan.Table.Columns,
+            rows,
+            name => ResolveScanColumnIndex(name, plan.Table.Columns, qualifiedColumns),
+            rowIds,
+            plan.Index.Name);
+        var compiler = new SelectStatementCompiler(
+            IsConstantScalarExpression,
+            expression => Evaluate(expression, parameters, null, context),
+            _ => target,
+            (where, scan) => CompileRowPredicate(where, scan, parameters, context, outerRow),
+            (where, scan) => CompileSimpleRowIdPredicate(where, scan, parameters, context, outerRow),
+            (statement, scan) => CompileDistinctScanEquality(statement, scan, context),
             function => TryGetRoutableBuiltinScalarCall(function, out var routable)
                 ? BuildBuiltinScalarFunction(routable, parameters, context)
                 : null,
@@ -9238,6 +9523,26 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        if (statement.Inner is SelectStatement plannedSelect
+            && TryPlanManagedIndexScan(plannedSelect, context) is { } indexPlan)
+        {
+            if (TryCompileManagedIndexSelect(
+                    plannedSelect,
+                    indexPlan,
+                    parameters,
+                    context,
+                    outerRow: null,
+                    materializeIndexRows: false,
+                    out var compiledIndexSelect))
+            {
+                return DescribeProgram(compiledIndexSelect.Program);
+            }
+
+            throw new EmbeddedSqlException(
+                "EXPLAIN is not available for this evaluator-managed index plan; "
+                + "use EXPLAIN QUERY PLAN to inspect the selected index.");
+        }
+
         switch (statement.Inner)
         {
             case SelectStatement select
@@ -9278,6 +9583,25 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        if (statement.Inner is SelectStatement plannedSelect
+            && TryPlanManagedIndexScan(plannedSelect, context) is { } indexPlan)
+        {
+            var operation = indexPlan.Search ? "SEARCH" : "SCAN";
+            return new ExecutionResult(
+                ExplainQueryPlanColumns(),
+                [
+                    [
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Integer(0),
+                        SqlValue.Text(
+                            $"{operation} {indexPlan.Source.Alias ?? indexPlan.Source.Name} "
+                            + $"USING INDEX {indexPlan.Index.Name}"),
+                    ],
+                ],
+                0);
+        }
+
         var usesCompiledProgram = statement.Inner switch
         {
             SelectStatement select => !context.CancellationToken.CanBeCanceled
@@ -9650,6 +9974,201 @@ public sealed class EmbeddedDatabase : IDisposable
         return builder.ToString();
     }
 
+    private ManagedIndexScanPlan? TryPlanManagedIndexScan(
+        SelectStatement statement,
+        QueryContext context)
+    {
+        if (statement.Source is not NamedTableSource source
+            || IsSchemaTable(source.Name)
+            || context.CommonTableExpressions.ContainsKey(source.Name)
+            || context.Views?.ContainsKey(source.Name) == true
+            || !context.Tables.TryGetValue(source.Name, out var table))
+        {
+            return null;
+        }
+
+        foreach (var index in table.Indexes.OrderBy(candidate => candidate.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            if ((!index.IsPartial && index.Columns.All(term => !term.IsExpression))
+                || !IndexExpressionSemantics.PredicateImplies(statement.Where, index.Where)
+                || IndexUsesRegisteredFunctions(index))
+            {
+                continue;
+            }
+
+            var leading = index.Columns[0];
+            var search = WhereUsesIndexTerm(statement.Where, table, leading);
+            var ordered = statement.OrderBy.Count > 0
+                && statement.OrderBy[0].Ordinal is null
+                && statement.OrderBy[0].NullPlacement == NullPlacement.Default
+                && statement.OrderBy[0].Descending == leading.Descending
+                && QueryExpressionMatchesIndexTerm(statement.OrderBy[0].Expression, table, leading);
+            if (search || ordered)
+                return new ManagedIndexScanPlan(source, table, index, search);
+        }
+
+        return null;
+    }
+
+    private bool IndexUsesRegisteredFunctions(EmbeddedIndex index)
+        => index.Columns.Any(term =>
+                term.Expression is not null
+                && IndexExpressionSemantics.ContainsFunction(term.Expression, IsRegisteredScalarFunction))
+            || index.Where is not null
+                && IndexExpressionSemantics.ContainsFunction(index.Where, IsRegisteredScalarFunction);
+
+    private static bool WhereUsesIndexTerm(
+        Expression? expression,
+        EmbeddedTable table,
+        EmbeddedIndexColumn term)
+    {
+        if (expression is null)
+            return false;
+        if (expression is BinaryExpression { Operator: BinaryOperator.And } and)
+            return WhereUsesIndexTerm(and.Left, table, term)
+                || WhereUsesIndexTerm(and.Right, table, term);
+        if (expression is not BinaryExpression binary
+            || binary.Operator is not (
+                BinaryOperator.Equal
+                or BinaryOperator.Is
+                or BinaryOperator.LessThan
+                or BinaryOperator.LessThanOrEqual
+                or BinaryOperator.GreaterThan
+                or BinaryOperator.GreaterThanOrEqual))
+        {
+            return false;
+        }
+
+        return QueryExpressionMatchesIndexTerm(binary.Left, table, term)
+            || QueryExpressionMatchesIndexTerm(binary.Right, table, term);
+    }
+
+    private static bool QueryExpressionMatchesIndexTerm(
+        Expression expression,
+        EmbeddedTable table,
+        EmbeddedIndexColumn term)
+    {
+        string? queryCollation = null;
+        if (expression is CollationExpression collated)
+        {
+            queryCollation = collated.Name;
+            expression = collated.Expression;
+        }
+
+        var indexedExpression = term.Expression ?? new ColumnExpression(term.Name);
+        if (!IndexExpressionSemantics.ExpressionsEqual(expression, indexedExpression))
+            return false;
+
+        queryCollation ??= expression is ColumnExpression column
+            && table.TryGetColumnIndex(column.UnqualifiedName ?? column.Name, out var columnIndex)
+                ? table.ColumnDefinitions[columnIndex].Collation ?? "BINARY"
+                : "BINARY";
+        return string.Equals(
+            queryCollation,
+            IndexExpressionSemantics.GetCollationName(table, term),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private SourceData GetManagedIndexRows(
+        ManagedIndexScanPlan plan,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        var table = plan.Table;
+        var entries = new List<(int Position, SqlValue[] Key)>(table.Rows.Count);
+        for (var position = 0; position < table.Rows.Count; position++)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var rowId = table.HasRowid ? table.RowIds[position] : (long?)null;
+            if (!IndexExpressionSemantics.Qualifies(
+                    plan.Index,
+                    table,
+                    table.Rows[position],
+                    rowId,
+                    EvaluateIndexExpression))
+            {
+                continue;
+            }
+
+            entries.Add((
+                position,
+                IndexExpressionSemantics.ProjectKey(
+                    plan.Index,
+                    table,
+                    table.Rows[position],
+                    rowId,
+                    EvaluateIndexExpression)));
+        }
+
+        entries.Sort((left, right) => CompareManagedIndexEntries(table, plan.Index, left, right));
+        var qualifier = plan.Source.Alias ?? plan.Source.Name;
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
+        var rows = new SourceRow[entries.Count];
+        for (var index = 0; index < entries.Count; index++)
+        {
+            var position = entries[index].Position;
+            var rowId = table.HasRowid ? table.RowIds[position] : (long?)null;
+            rows[index] = new SourceRow(
+                table.Columns,
+                table.Rows[position],
+                qualifiedColumns,
+                outerRow,
+                RowId: rowId,
+                RowIdQualifier: qualifier);
+        }
+
+        return new SourceData(table.Columns, rows);
+    }
+
+    private int CompareManagedIndexEntries(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        (int Position, SqlValue[] Key) left,
+        (int Position, SqlValue[] Key) right)
+    {
+        for (var position = 0; position < index.Columns.Count; position++)
+        {
+            var term = index.Columns[position];
+            var comparison = Compare(
+                left.Key[position],
+                right.Key[position],
+                IndexExpressionSemantics.GetCollationName(table, term));
+            if (comparison != 0)
+                return term.Descending ? -comparison : comparison;
+        }
+
+        if (table.HasRowid)
+            return table.RowIds[left.Position].CompareTo(table.RowIds[right.Position]);
+
+        var primaryKey = table.PrimaryKeySchema
+            ?? throw new InvalidOperationException("WITHOUT ROWID table has no primary-key metadata.");
+        foreach (var suffix in primaryKey.Terms)
+        {
+            var alreadyPresent = index.Columns.Any(term =>
+                !term.IsExpression
+                && term.ColumnIndex == suffix.ColumnIndex
+                && string.Equals(
+                    IndexExpressionSemantics.GetCollationName(table, term),
+                    suffix.Collation.Name ?? "BINARY",
+                    StringComparison.OrdinalIgnoreCase));
+            if (alreadyPresent)
+                continue;
+
+            var comparison = Compare(
+                table.Rows[left.Position][suffix.ColumnIndex],
+                table.Rows[right.Position][suffix.ColumnIndex],
+                suffix.Collation.Name);
+            if (comparison != 0)
+            {
+                return suffix.SortOrder == SqliteKeySortOrder.Descending
+                    ? -comparison
+                    : comparison;
+            }
+        }
+
+        return 0;
+    }
+
     private ExecutionResult ExecuteSelect(
         SelectStatement statement,
         SqlValue[] parameters,
@@ -9702,7 +10221,10 @@ public sealed class EmbeddedDatabase : IDisposable
             && limit is >= 0
             ? limit
             : null;
-        var source = GetSourceRows(statement.Source, parameters, context, sourceLimit, outerRow);
+        var indexPlan = TryPlanManagedIndexScan(statement, context);
+        var source = indexPlan is null
+            ? GetSourceRows(statement.Source, parameters, context, sourceLimit, outerRow)
+            : GetManagedIndexRows(indexPlan, context, outerRow);
         var selectedRows = new List<SourceRow>();
         foreach (var row in source.Rows)
         {
@@ -12633,19 +13155,7 @@ public sealed class EmbeddedDatabase : IDisposable
         => algorithm is null ? string.Empty : " ON CONFLICT " + algorithm.Value.ToString().ToUpperInvariant();
 
     private static string BuildCreateIndexSql(string tableName, EmbeddedIndex index)
-    {
-        var columns = index.Columns.Select(column =>
-        {
-            var definition = QuoteIdentifier(column.Name);
-            if (column.Collation is { } collation)
-                definition += " COLLATE " + collation;
-            if (column.Descending)
-                definition += " DESC";
-            return definition;
-        });
-        var unique = index.Unique ? "UNIQUE " : string.Empty;
-        return $"CREATE {unique}INDEX {QuoteIdentifier(index.Name)} ON {QuoteIdentifier(tableName)} ({string.Join(", ", columns)})";
-    }
+        => IndexSqlFormatter.BuildCreateIndexSql(tableName, index);
 
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
@@ -14666,8 +15176,9 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var arguments = function.Arguments.Select(argument => Evaluate(argument, parameters, row, context)).ToArray();
         var normalizedName = function.Name.ToUpperInvariant();
-        if (_scalarFunctions.TryGetValue((normalizedName, arguments.Length), out var managedFunction)
-            || _scalarFunctions.TryGetValue((normalizedName, -1), out managedFunction))
+        if (!context.IndexExpression
+            && (_scalarFunctions.TryGetValue((normalizedName, arguments.Length), out var managedFunction)
+                || _scalarFunctions.TryGetValue((normalizedName, -1), out managedFunction)))
             return managedFunction(arguments);
 
         return function.Name.ToUpperInvariant() switch
@@ -14698,7 +15209,7 @@ public sealed class EmbeddedDatabase : IDisposable
             "LAST_INSERT_ROWID" => EvaluateLastInsertRowId(arguments, context),
             "LENGTH" => EvaluateLength(arguments),
             "LIKE" => EvaluateLikeFunction(arguments),
-            "LOWER" => EvaluateCase(arguments, static value => value.ToLowerInvariant()),
+            "LOWER" => EvaluateCase(arguments, ToSqliteLower),
             "MIN" => EvaluateScalarMinMax(arguments, maximum: false),
             "MAX" => EvaluateScalarMinMax(arguments, maximum: true),
             "NULLIF" => EvaluateNullIf(function, arguments),
@@ -14707,7 +15218,7 @@ public sealed class EmbeddedDatabase : IDisposable
             "TIME" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.Time),
             "TYPEOF" => EvaluateTypeOf(arguments),
             "UNIXEPOCH" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.UnixEpoch),
-            "UPPER" => EvaluateCase(arguments, static value => value.ToUpperInvariant()),
+            "UPPER" => EvaluateCase(arguments, ToSqliteUpper),
             "UUID4_STR" or "GEN_RANDOM_UUID" => SqlValue.Text(FormatUuid(CreateUuid4())),
             "UUID4" => SqlValue.Blob(CreateUuid4()),
             "UUID7_STR" => EvaluateUuid7String(arguments),
@@ -15810,6 +16321,30 @@ public sealed class EmbeddedDatabase : IDisposable
 
         return SqlValue.Real(Math.Abs(AsReal(value)));
     }
+
+    private static string ToSqliteLower(string value)
+        => string.Create(value.Length, value, static (destination, source) =>
+        {
+            for (var index = 0; index < source.Length; index++)
+            {
+                var character = source[index];
+                destination[index] = character is >= 'A' and <= 'Z'
+                    ? (char)(character + ('a' - 'A'))
+                    : character;
+            }
+        });
+
+    private static string ToSqliteUpper(string value)
+        => string.Create(value.Length, value, static (destination, source) =>
+        {
+            for (var index = 0; index < source.Length; index++)
+            {
+                var character = source[index];
+                destination[index] = character is >= 'a' and <= 'z'
+                    ? (char)(character - ('a' - 'A'))
+                    : character;
+            }
+        });
 
     private static SqlValue EvaluateCoalesce(IReadOnlyList<SqlValue> arguments)
     {
@@ -18039,7 +18574,7 @@ public sealed class EmbeddedDatabase : IDisposable
         throw new EmbeddedSqlException("datatype mismatch");
     }
 
-    private static bool IsTrue(SqlValue value)
+    internal static bool IsTrue(SqlValue value)
     {
         return value.Kind switch
         {
@@ -22831,6 +23366,8 @@ public sealed class EmbeddedConnection : IDisposable
             return ["seq", "name", "unique", "origin", "partial"];
         if (statement is PragmaIndexInfoStatement)
             return ["seqno", "cid", "name"];
+        if (statement is PragmaIndexXInfoStatement)
+            return ["seqno", "cid", "name", "desc", "coll", "key"];
         if (statement is PragmaForeignKeyListStatement)
             return ["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"];
         if (statement is PragmaForeignKeyCheckStatement)
@@ -23054,7 +23591,8 @@ public sealed class EmbeddedStatement : IDisposable
     {
         ThrowIfDisposed();
         if (_statement is (QueryStatement or PragmaTableInfoStatement or PragmaTableXInfoStatement
-            or PragmaIndexListStatement or PragmaIndexInfoStatement or PragmaForeignKeyListStatement
+            or PragmaIndexListStatement or PragmaIndexInfoStatement or PragmaIndexXInfoStatement
+            or PragmaForeignKeyListStatement
             or PragmaForeignKeyCheckStatement or PragmaTableListStatement
             or PragmaDatabaseListStatement or PragmaEncodingStatement or ExplainStatement)
             || _statement is ExplainQueryPlanStatement
@@ -24289,12 +24827,15 @@ internal sealed class EmbeddedTable
             || HasGeneratedColumns
             || TableLevelPrimaryKey is not null
             || TableUniqueConstraints.Count > 0
+            || Indexes.Any(definition =>
+                definition.IsPartial || definition.Columns.Any(column => column.IsExpression))
             || ForeignKeys.Any(foreignKey =>
                 foreignKey.ChildColumns.Contains(name, StringComparer.OrdinalIgnoreCase)))
         {
             throw new EmbeddedSqlException(
                 "ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, "
-                + "or foreign-key schema expressions until managed schema token rewriting is implemented.");
+                + "index-expression, partial-index, or foreign-key schema expressions until managed "
+                + "schema token rewriting is implemented.");
         }
 
         Columns[index] = newName;

@@ -170,7 +170,12 @@ internal sealed class SelectStatementCompiler
         var closeAddr = nextAddr + 1;
         var instructions = new List<VdbeInstruction>(closeAddr + 2)
         {
-            new OpenReadCursorInstruction(cursor, target.TableName, target.Columns.Length),
+            new OpenReadCursorInstruction(
+                cursor,
+                target.IndexName is null
+                    ? target.TableName
+                    : $"{target.TableName} USING INDEX {target.IndexName}",
+                target.Columns.Length),
             new RewindCursorInstruction(cursor, new ProgramCounter(closeAddr)),
         };
 

@@ -151,6 +151,8 @@ internal sealed class SqlParser
             return new PragmaIndexListStatement(ParsePragmaObjectName());
         if (name.Equals("index_info", StringComparison.OrdinalIgnoreCase))
             return new PragmaIndexInfoStatement(ParsePragmaObjectName());
+        if (name.Equals("index_xinfo", StringComparison.OrdinalIgnoreCase))
+            return new PragmaIndexXInfoStatement(ParsePragmaObjectName());
         if (name.Equals("foreign_key_list", StringComparison.OrdinalIgnoreCase))
             return new PragmaForeignKeyListStatement(ParsePragmaObjectName());
         if (name.Equals("foreign_key_check", StringComparison.OrdinalIgnoreCase))
@@ -681,30 +683,51 @@ internal sealed class SqlParser
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
 
-        if (CurrentIsKeyword("WHERE"))
-            throw Error("Partial indexes are not supported.");
+        Expression? where = null;
+        string? whereSql = null;
+        if (ConsumeKeyword("WHERE"))
+        {
+            var startOffset = _lexer.Current.Offset;
+            where = ParseExpression();
+            whereSql = _sql[startOffset.._lexer.Current.Offset].Trim();
+            if (whereSql.Length == 0)
+                throw Error("Partial index WHERE clause requires an expression.");
+        }
 
-        return new CreateIndexStatement(name, tableName, columns, unique, ifNotExists);
+        return new CreateIndexStatement(name, tableName, columns, unique, ifNotExists, where, whereSql);
     }
 
     private IndexedColumnDefinition ParseIndexedColumn()
     {
-        if (_lexer.Current.Kind != TokenKind.Identifier)
-            throw Error("Expression indexes are not supported.");
-
-        var name = ExpectIdentifier();
-        string? collation = null;
-        if (ConsumeKeyword("COLLATE"))
-            collation = ExpectIdentifier();
+        var startOffset = _lexer.Current.Offset;
+        var expression = ParseExpression();
+        var expressionSql = _sql[startOffset.._lexer.Current.Offset].Trim();
+        if (expressionSql.Length == 0)
+            throw Error("Index requires an expression.");
 
         var descending = false;
         if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
             descending = true;
 
         if (_lexer.Current.Kind is not TokenKind.Comma and not TokenKind.RightParen)
-            throw Error("Expression indexes are not supported.");
+            throw Error("Unexpected token in index expression.");
 
-        return new IndexedColumnDefinition(name, collation, descending);
+        string? collation = null;
+        if (expression is CollationExpression collated)
+        {
+            collation = collated.Name;
+            expression = collated.Expression;
+        }
+
+        if (expression is ColumnExpression { Qualifier: null } column)
+            return new IndexedColumnDefinition(column.Name, collation, descending);
+
+        return new IndexedColumnDefinition(
+            Name: null,
+            collation,
+            descending,
+            expression,
+            expressionSql);
     }
 
     private ParsedStatement ParseAlterTable()
@@ -988,24 +1011,31 @@ internal sealed class SqlParser
         var target = new List<UpsertTargetColumn>();
         do
         {
-            var name = ExpectIdentifier();
-            string? collation = null;
-            if (ConsumeKeyword("COLLATE"))
-                collation = ExpectIdentifier();
-            if (CurrentIsKeyword("ASC") || CurrentIsKeyword("DESC"))
-                throw Error("UPSERT conflict targets with sort order are not supported.");
-
-            target.Add(new UpsertTargetColumn(name, collation));
+            var term = ParseIndexedColumn();
+            target.Add(new UpsertTargetColumn(
+                term.Name,
+                term.Collation,
+                term.Descending,
+                term.Expression,
+                term.ExpressionSql));
         }
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
 
+        Expression? targetWhere = null;
+        string? targetWhereSql = null;
         if (ConsumeKeyword("WHERE"))
-            throw Error("UPSERT conflict-target WHERE clauses are not supported.");
+        {
+            var startOffset = _lexer.Current.Offset;
+            targetWhere = ParseExpression();
+            targetWhereSql = _sql[startOffset.._lexer.Current.Offset].Trim();
+            if (targetWhereSql.Length == 0)
+                throw Error("UPSERT conflict-target WHERE clause requires an expression.");
+        }
 
         ExpectKeyword("DO");
         if (ConsumeKeyword("NOTHING"))
-            return new UpsertClause(target, new DoNothingUpsertAction());
+            return new UpsertClause(target, new DoNothingUpsertAction(), targetWhere, targetWhereSql);
 
         ExpectKeyword("UPDATE");
         ExpectKeyword("SET");
@@ -1015,7 +1045,11 @@ internal sealed class SqlParser
         if (ConsumeKeyword("WHERE"))
             where = ParseExpression();
 
-        return new UpsertClause(target, new DoUpdateUpsertAction(assignments, where));
+        return new UpsertClause(
+            target,
+            new DoUpdateUpsertAction(assignments, where),
+            targetWhere,
+            targetWhereSql);
     }
 
     private ParsedStatement ParseUpdate()
