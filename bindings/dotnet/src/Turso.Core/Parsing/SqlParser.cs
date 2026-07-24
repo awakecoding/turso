@@ -870,33 +870,72 @@ internal sealed class SqlParser
 
     private ParsedStatement ParseUpdate()
     {
+        if (CurrentIsKeyword("OR"))
+            throw Error("Managed UPDATE conflict algorithms are not supported.");
+
         var tableName = ParseSchemaQualifiedName();
+        RejectUnsupportedDmlTargetSuffix("UPDATE");
         ExpectKeyword("SET");
         var assignments = new List<ColumnAssignment>();
         do
         {
+            if (_lexer.Current.Kind == TokenKind.LeftParen)
+                throw Error("Managed UPDATE does not support row-value assignments.");
+
             var column = ExpectIdentifier();
             Expect(TokenKind.Equal);
             assignments.Add(new ColumnAssignment(column, ParseExpression()));
         }
         while (Consume(TokenKind.Comma));
 
+        if (CurrentIsKeyword("FROM"))
+            throw Error("Managed UPDATE FROM is not supported.");
+
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
             where = ParseExpression();
 
-        return new UpdateStatement(tableName, assignments, where, ParseReturning());
+        var returning = ParseReturning();
+        var (orderBy, limit, offset) = ParseLimitedDmlTail("UPDATE");
+        return new UpdateStatement(tableName, assignments, where, returning, orderBy, limit, offset);
     }
 
     private ParsedStatement ParseDelete()
     {
         ExpectKeyword("FROM");
         var tableName = ParseSchemaQualifiedName();
+        RejectUnsupportedDmlTargetSuffix("DELETE");
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
             where = ParseExpression();
 
-        return new DeleteStatement(tableName, where, ParseReturning());
+        var returning = ParseReturning();
+        var (orderBy, limit, offset) = ParseLimitedDmlTail("DELETE");
+        return new DeleteStatement(tableName, where, returning, orderBy, limit, offset);
+    }
+
+    private void RejectUnsupportedDmlTargetSuffix(string statementKind)
+    {
+        if (CurrentIsKeyword("AS"))
+            throw Error($"Managed {statementKind} target aliases are not supported.");
+        if (CurrentIsKeyword("INDEXED") || CurrentIsKeyword("NOT"))
+            throw Error($"Managed {statementKind} does not support INDEXED BY or NOT INDEXED.");
+    }
+
+    private (IReadOnlyList<OrderByTerm> OrderBy, Expression? Limit, Expression? Offset)
+        ParseLimitedDmlTail(string statementKind)
+    {
+        if (_inTriggerBody && (CurrentIsKeyword("ORDER") || CurrentIsKeyword("LIMIT")))
+        {
+            throw Error(
+                $"ORDER BY and LIMIT are not available on {statementKind} statements inside trigger bodies.");
+        }
+
+        var (orderBy, limit, offset) = ParseOrderByAndLimit();
+        if (orderBy.Count > 0 && limit is null)
+            throw Error($"ORDER BY without LIMIT on {statementKind} is not supported.");
+
+        return (orderBy, limit, offset);
     }
 
     // Parses an optional RETURNING clause shared by INSERT/UPDATE/DELETE. RETURNING is
