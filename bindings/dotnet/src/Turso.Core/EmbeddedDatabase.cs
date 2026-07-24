@@ -136,11 +136,6 @@ public sealed class EmbeddedDatabase : IDisposable
             using var catalogWriteLease = readOnly
                 ? null
                 : EnterPhysicalFileCatalogWriteLock(effectiveFileSystem, path);
-            var hasStoragePair = effectiveFileSystem.FileExists(path)
-                && effectiveFileSystem.FileExists(path + "-wal");
-            var versionBeforeOpen = hasStoragePair
-                ? ReadFileCatalogVersion(effectiveFileSystem, path)
-                : (FileCatalogVersion?)null;
             var store = EmbeddedFileStore.Open(
                 path,
                 effectiveFileSystem,
@@ -148,11 +143,9 @@ public sealed class EmbeddedDatabase : IDisposable
                 readOnly: readOnly);
             try
             {
-                // Capturing the version before reconstruction is conservative: if another
-                // process publishes between the two operations, this handle will reject a
-                // write rather than publish a catalog that predates that durable change.
-                var catalogVersion = versionBeforeOpen
-                    ?? ReadFileCatalogVersion(effectiveFileSystem, path);
+                // The store now owns the physical database before this second pager
+                // reads the durable version, so no foreign client can race catalog load.
+                var catalogVersion = ReadFileCatalogVersion(effectiveFileSystem, path);
                 return new EmbeddedDatabase(
                     store,
                     catalog,

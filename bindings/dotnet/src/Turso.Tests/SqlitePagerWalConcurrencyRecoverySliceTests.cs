@@ -37,7 +37,7 @@ public class SqlitePagerWalConcurrencyRecoverySliceTests
 
     [Test]
     [NonParallelizable]
-    public void PhysicalPagerRetriesCrossProcessWriterContentionUntilReleased()
+    public void PhysicalPagerRetriesCrossProcessOwnershipUntilOwnerDisposes()
     {
         if (!OperatingSystem.IsWindows())
             Assert.Ignore("Physical SQLite WAL shared-memory locks are only enabled on Windows.");
@@ -48,12 +48,12 @@ public class SqlitePagerWalConcurrencyRecoverySliceTests
             var databasePath = Path.Combine(workDirectory, "main.db");
             var waitingPath = Path.Combine(workDirectory, "worker-waiting");
             var resultPath = Path.Combine(workDirectory, "worker-result");
-            using (var pager = SqlitePager.Create(
-                       PhysicalFileSystem.Instance,
-                       databasePath,
-                       databasePath + "-wal",
-                       CreateWalHeader()))
-            using (var writer = pager.BeginTransaction(targetDatabaseSizeInPages: 1))
+            var pager = SqlitePager.Create(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal",
+                CreateWalHeader());
+            using (pager)
             using (var worker = StartRetryWorker(databasePath, waitingPath, resultPath))
             {
                 try
@@ -68,7 +68,7 @@ public class SqlitePagerWalConcurrencyRecoverySliceTests
                 }
                 finally
                 {
-                    writer.Dispose();
+                    pager.Dispose();
                     if (!worker.HasExited
                         && !worker.WaitForExit(TimeSpan.FromSeconds(10)))
                     {
@@ -104,12 +104,12 @@ public class SqlitePagerWalConcurrencyRecoverySliceTests
 
         try
         {
-            var initialContention = Assert.Throws<SqlitePagerBusyException>(() => SqlitePager.Open(
+            var initialContention = Assert.Throws<SqlitePagerClientOwnershipException>(() => SqlitePager.Open(
                 PhysicalFileSystem.Instance,
                 databasePath,
                 databasePath + "-wal",
                 busyTimeout: TimeSpan.Zero));
-            initialContention!.Operation.Should().Be(SqlitePagerLockOperation.Writer);
+            initialContention!.DatabasePath.Should().Be(Path.GetFullPath(databasePath));
             File.WriteAllText(waitingPath, "waiting");
 
             using var pager = SqlitePager.Open(

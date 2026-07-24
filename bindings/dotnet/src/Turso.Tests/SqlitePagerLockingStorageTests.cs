@@ -198,7 +198,7 @@ public class SqlitePagerLockingStorageTests
 
     [Test]
     [NonParallelizable]
-    public void PhysicalPagerReportsBusyToAnotherProcessHoldingWalWriterLock()
+    public void PhysicalPagerRetainsCrossProcessOwnershipAfterWriterReleases()
     {
         if (!OperatingSystem.IsWindows())
             Assert.Ignore("Physical SQLite WAL shared-memory locks are only enabled on Windows.");
@@ -211,13 +211,15 @@ public class SqlitePagerLockingStorageTests
             var writer = pager.BeginTransaction(targetDatabaseSizeInPages: 1);
             try
             {
-                RunWriterWorker(databasePath, "busy");
+                RunWriterWorker(databasePath, "owned");
             }
             finally
             {
                 writer.Dispose();
             }
 
+            RunWriterWorker(databasePath, "owned");
+            pager.Dispose();
             RunWriterWorker(databasePath, "available");
         }
         finally
@@ -238,14 +240,14 @@ public class SqlitePagerLockingStorageTests
         var expectedResult = Environment.GetEnvironmentVariable("TURSO_SQLITE_WAL_LOCK_WORKER_EXPECTED_RESULT");
         switch (expectedResult)
         {
-            case "busy":
+            case "owned":
                 {
-                    var busy = Assert.Throws<SqlitePagerBusyException>(() => SqlitePager.Open(
+                    var ownership = Assert.Throws<SqlitePagerClientOwnershipException>(() => SqlitePager.Open(
                         PhysicalFileSystem.Instance,
                         databasePath,
                         databasePath + "-wal",
                         busyTimeout: TimeSpan.Zero));
-                    busy!.Operation.Should().Be(SqlitePagerLockOperation.Writer);
+                    ownership!.DatabasePath.Should().Be(Path.GetFullPath(databasePath));
                     break;
                 }
             case "available":

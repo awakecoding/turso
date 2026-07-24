@@ -75,12 +75,11 @@ public interface ISqlitePagerLockCoordinator
 /// </summary>
 /// <remarks>
 /// The default manager for a physical filesystem uses the <c>-shm</c> lock-byte
-/// range for managed cross-process writer, checkpoint, recovery, and reader
-/// coordination on Windows and Linux. Other platforms fail lock acquisition
-/// rather than silently falling back to process-local ownership. It does not
-/// maintain SQLite's WAL-index or the main-database shared lock, and therefore
-/// is not SQLite-client interoperable. Explicitly supplied managers and
-/// non-physical filesystems are process-local.
+/// range for managed writer, checkpoint, recovery, and reader coordination on
+/// Windows and Linux. The pager separately holds exclusive process ownership of
+/// SQLite's main-file lock-byte range for its lifetime because this manager does
+/// not maintain SQLite's WAL-index. Explicitly supplied managers and
+/// non-physical filesystems coordinate only the roles represented here.
 /// </remarks>
 public sealed class SqlitePagerLockManager
 {
