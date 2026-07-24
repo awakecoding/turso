@@ -186,6 +186,13 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case NumericAffinityInstruction numericAffinity:
+                    {
+                        var value = _registers[numericAffinity.Value.Index];
+                        _registers[numericAffinity.Value.Index] = numericAffinity.Affinity.Apply(value);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
                 case OpenReadCursorInstruction open:
                     OpenCursor(open.Cursor);
                     _cursorPositions[open.Cursor.Index] = -1;

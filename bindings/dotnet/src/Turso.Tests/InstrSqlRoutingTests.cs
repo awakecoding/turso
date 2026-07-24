@@ -26,7 +26,7 @@ public sealed class InstrSqlRoutingTests
         using var explainConnection = new EmbeddedDatabase().Connect();
         Opcodes(ReadRows(explainConnection, "EXPLAIN SELECT instr(?1, ?2);", SqlValue.Null, SqlValue.Null))
             .Should()
-            .Equal("LoadConstant", "LoadConstant", "Function", "ResultRow", "Halt");
+            .Equal("LoadParameter", "LoadParameter", "Function", "ResultRow", "Halt");
     }
 
     [Test]
@@ -50,7 +50,7 @@ public sealed class InstrSqlRoutingTests
     }
 
     [Test]
-    public void UnsafeInstrFormsRemainOnTheEvaluator()
+    public void ShadowedInstrFallsBackWhileNestedBuiltinCallsRoute()
     {
         using var connection = new EmbeddedDatabase().Connect();
         connection.RegisterScalarFunction("instr", 2, _ => SqlValue.Text("shadowed"));
@@ -64,11 +64,15 @@ public sealed class InstrSqlRoutingTests
         ReadSingle(nestedConnection, "SELECT instr(lower(?1), ?2);", SqlValue.Text("ABC"), SqlValue.Text("b"))
             .Should()
             .Be(SqlValue.Integer(2));
-        ExplainIsRefused(
-            nestedConnection,
-            "EXPLAIN SELECT instr(lower(?1), ?2);",
-            SqlValue.Text("ABC"),
-            SqlValue.Text("b"));
+        Opcodes(ReadRows(
+                nestedConnection,
+                "EXPLAIN SELECT instr(lower(?1), ?2);",
+                SqlValue.Text("ABC"),
+                SqlValue.Text("b")))
+            .Should()
+            .Equal(
+                "LoadParameter", "Function", "LoadParameter", "Function",
+                "ResultRow", "Halt");
 
         using var errorConnection = new EmbeddedDatabase().Connect();
         using var statement = errorConnection.Prepare("SELECT instr(?1);");

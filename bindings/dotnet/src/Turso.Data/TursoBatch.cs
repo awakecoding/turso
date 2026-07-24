@@ -9,6 +9,7 @@ public sealed class TursoBatch : DbBatch
     private TursoConnection? _connection;
     private TursoTransaction? _transaction;
     private int _timeout = 30;
+    private readonly CommandCancellationController _cancellation = new();
 
     public TursoBatch()
     {
@@ -67,19 +68,22 @@ public sealed class TursoBatch : DbBatch
         }
     }
 
-    public override void Cancel()
-    {
-    }
+    public override void Cancel() => _cancellation.Cancel();
 
     public override int ExecuteNonQuery()
     {
-        var results = ExecuteBatch(wantRows: false, CancellationToken.None).GetAwaiter().GetResult();
+        var results = _cancellation
+            .RunAsync(token => ExecuteBatch(wantRows: false, token), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
         return SetRecordsAffected(results);
     }
 
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
-        var results = await ExecuteBatch(wantRows: false, cancellationToken).ConfigureAwait(false);
+        var results = await _cancellation
+            .RunAsync(token => ExecuteBatch(wantRows: false, token), cancellationToken)
+            .ConfigureAwait(false);
         return SetRecordsAffected(results);
     }
 
@@ -116,7 +120,10 @@ public sealed class TursoBatch : DbBatch
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
-        var results = ExecuteBatch(wantRows: true, CancellationToken.None).GetAwaiter().GetResult();
+        var results = _cancellation
+            .RunAsync(token => ExecuteBatch(wantRows: true, token), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
         SetRecordsAffected(results);
         return new TursoRemoteDataReader(_connection, results, behavior);
     }
@@ -125,7 +132,9 @@ public sealed class TursoBatch : DbBatch
         CommandBehavior behavior,
         CancellationToken cancellationToken)
     {
-        var results = await ExecuteBatch(wantRows: true, cancellationToken).ConfigureAwait(false);
+        var results = await _cancellation
+            .RunAsync(token => ExecuteBatch(wantRows: true, token), cancellationToken)
+            .ConfigureAwait(false);
         SetRecordsAffected(results);
         return new TursoRemoteDataReader(_connection, results, behavior);
     }

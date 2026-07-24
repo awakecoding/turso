@@ -580,11 +580,14 @@ public class SqliteDataReader : DbDataReader
     }
 
     public override bool NextResult()
+        => _command.RunOperation(NextResultCore);
+
+    private bool NextResultCore(CancellationToken cancellationToken)
     {
         EnsureOpen();
         if (_statement is null)
             return false;
-        while (GetStatement().Read())
+        while (GetStatement().Read(cancellationToken))
         {
         }
 
@@ -605,18 +608,24 @@ public class SqliteDataReader : DbDataReader
                 if (_command.TryHandleFacadeStatement(sql, out var rewrittenSql))
                     continue;
 
+                cancellationToken.ThrowIfCancellationRequested();
                 var statement = _command.PrepareSingleStatement(rewrittenSql);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    statement.Dispose();
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
                 if (statement.ColumnCount > 0)
                 {
                     _statement = statement;
                     _currentSql = rewrittenSql;
                     _hadResultSet = true;
                     _currentStatementRowsAffectedCounted = false;
-                    _hasPrefetchedRow = statement.Read();
+                    _hasPrefetchedRow = statement.Read(cancellationToken);
                     return true;
                 }
 
-                while (statement.Read())
+                while (statement.Read(cancellationToken))
                 {
                 }
 
@@ -639,6 +648,9 @@ public class SqliteDataReader : DbDataReader
     }
 
     public override bool Read()
+        => _command.RunOperation(ReadCore);
+
+    private bool ReadCore(CancellationToken cancellationToken)
     {
         EnsureOpen();
         if (_statement is null)
@@ -652,7 +664,7 @@ public class SqliteDataReader : DbDataReader
 
         try
         {
-            _hasCurrentRow = GetStatement().Read();
+            _hasCurrentRow = GetStatement().Read(cancellationToken);
             if (!_hasCurrentRow)
                 CountCurrentStatementRowsAffected();
             return _hasCurrentRow;
@@ -664,10 +676,10 @@ public class SqliteDataReader : DbDataReader
     }
 
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
-        => CompleteAsync(Read, cancellationToken);
+        => _command.RunOperationAsync(ReadCore, cancellationToken);
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
-        => CompleteAsync(NextResult, cancellationToken);
+        => _command.RunOperationAsync(NextResultCore, cancellationToken);
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
         => CompleteAsync(() => IsDBNull(ordinal), cancellationToken);

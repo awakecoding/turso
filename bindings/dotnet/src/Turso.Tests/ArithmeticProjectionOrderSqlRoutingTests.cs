@@ -21,8 +21,8 @@ public class ArithmeticProjectionOrderSqlRoutingTests
 
         using var connection = OpenManaged(Setup);
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Equal(
-            "OpenReadCursor", "Rewind", "Column", "Column", "Column", "Column", "Column", "Arithmetic",
-            "ResultRow", "Next", "CloseCursor", "Halt");
+            "OpenReadCursor", "Rewind", "Column", "Column", "NumericAffinity", "NumericAffinity",
+            "Arithmetic", "Column", "Column", "Column", "ResultRow", "Next", "CloseCursor", "Halt");
     }
 
     [Test]
@@ -41,7 +41,7 @@ public class ArithmeticProjectionOrderSqlRoutingTests
     }
 
     [Test]
-    public void ParameterAndCollatedOrderShapesRemainOnEvaluatorAndMatchSqlite()
+    public void ParameterRoutesWhileCollatedOrderRemainsOnEvaluator()
     {
         const string parameterQuery = "SELECT left_value + ?1 AS total FROM t WHERE id = 1;";
         const string orderedQuery = "SELECT left_value + right_value AS total, label FROM t ORDER BY label COLLATE NOCASE;";
@@ -53,12 +53,13 @@ public class ArithmeticProjectionOrderSqlRoutingTests
             SqlValue.Null,
             SqlValue.Text("Alpha"),
             SqlValue.Text("beta"));
-        ExplainRefused(connection, "EXPLAIN " + parameterQuery, SqlValue.Integer(2));
+        Opcodes(ReadRows(connection, "EXPLAIN " + parameterQuery, SqlValue.Integer(2)))
+            .Should().Contain("LoadParameter").And.Contain("Arithmetic");
         ExplainRefused(connection, "EXPLAIN " + orderedQuery);
     }
 
     [Test]
-    public void TextArithmeticOperandsRemainOnTheEvaluator()
+    public void TextArithmeticOperandsRouteThroughNumericAffinity()
     {
         const string query = "SELECT id, left_value + right_value AS total FROM t;";
         string[] setup =
@@ -70,7 +71,8 @@ public class ArithmeticProjectionOrderSqlRoutingTests
         AssertMatchesSqlite(setup, query);
 
         using var connection = OpenManaged(setup);
-        ExplainRefused(connection, "EXPLAIN " + query);
+        Opcodes(ReadRows(connection, "EXPLAIN " + query))
+            .Should().Contain("NumericAffinity").And.Contain("Arithmetic");
     }
 
     private static void AssertMatchesSqlite(IReadOnlyList<string> setup, string query, params SqlValue[] parameters)
@@ -197,9 +199,14 @@ public class ArithmeticProjectionOrderSqlRoutingTests
         statement.Step().Should().Be(StatementStepResult.Done);
     }
 
-    private static List<SqlValue[]> ReadRows(EmbeddedConnection connection, string sql)
+    private static List<SqlValue[]> ReadRows(
+        EmbeddedConnection connection,
+        string sql,
+        params SqlValue[] parameters)
     {
         using var statement = connection.Prepare(sql);
+        for (var index = 0; index < parameters.Length; index++)
+            statement.Bind(index + 1, parameters[index]);
         return Drain(statement);
     }
 

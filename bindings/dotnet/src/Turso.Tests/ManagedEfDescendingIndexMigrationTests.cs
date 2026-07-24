@@ -37,7 +37,7 @@ public class ManagedEfDescendingIndexMigrationTests
 
         generate.Should().Throw<NotSupportedException>()
             .WithMessage(
-                "The managed local provider does not support descending indexes ('IX_Items_Rank' on 'Items').");
+                "The managed local provider does not support descending indexes on file-backed databases ('IX_Items_Rank' on 'Items').");
     }
 
     private sealed class DescendingIndexMigrationContext(

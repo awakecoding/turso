@@ -76,6 +76,12 @@ public static class VdbeExplain
                 arithmetic.Operands.Count,
                 VdbeArithmetic.Symbol(arithmetic.Operator),
                 FormatArithmetic(arithmetic)),
+            NumericAffinityInstruction numericAffinity => (
+                numericAffinity.Value.Index,
+                0,
+                0,
+                numericAffinity.Affinity.Name,
+                $"r[{numericAffinity.Value.Index}]={numericAffinity.Affinity.Name}(r[{numericAffinity.Value.Index}])"),
             OpenReadCursorInstruction open => (
                 open.Cursor.Index,
                 0,

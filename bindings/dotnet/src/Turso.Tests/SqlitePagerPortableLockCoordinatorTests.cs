@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using AwesomeAssertions;
+using Microsoft.Data.Sqlite;
+using Turso.Core;
 using Turso.Core.Storage;
+using NativeSqliteConnection = Microsoft.Data.Sqlite.SqliteConnection;
 
 namespace Turso.Tests;
 
@@ -66,7 +69,7 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
 
     [Test]
     [NonParallelizable]
-    public void PhysicalPagerCoordinatesManagedWritersAcrossProcessesOnSupportedPlatforms()
+    public void PhysicalPagerRejectsAnotherManagedProcessUntilOwnerDisposes()
     {
         if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
             Assert.Ignore("Physical managed WAL lock coordination requires Windows or Linux byte-range locks.");
@@ -82,10 +85,10 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
                        CreateWalHeader()))
             using (var writer = pager.BeginTransaction(targetDatabaseSizeInPages: 1))
             {
-                RunWriterWorker(databasePath, "busy");
+                RunManagedWorker(databasePath, "owned");
             }
 
-            RunWriterWorker(databasePath, "available");
+            RunManagedWorker(databasePath, "available");
         }
         finally
         {
@@ -106,13 +109,15 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
             ?? throw new InvalidOperationException("The portable WAL lock worker is missing its expected result.");
         switch (expectedResult)
         {
-            case "busy":
-                var busy = Assert.Throws<SqlitePagerBusyException>(() => SqlitePager.Open(
+            case "owned":
+                var ownership = Assert.Throws<SqlitePagerClientOwnershipException>(() => SqlitePager.Open(
                     PhysicalFileSystem.Instance,
                     databasePath,
                     databasePath + "-wal",
                     busyTimeout: TimeSpan.Zero));
-                busy!.Operation.Should().Be(SqlitePagerLockOperation.Writer);
+                ownership!.DatabasePath.Should().Be(Path.GetFullPath(databasePath));
+                ownership.Timeout.Should().Be(TimeSpan.Zero);
+                ownership.Message.Should().Contain("ordinary SQLite client is unsupported");
                 break;
             case "available":
                 using (var pager = SqlitePager.Open(
@@ -131,6 +136,373 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
         }
     }
 
+    [Test]
+    [NonParallelizable]
+    public void ManagedOwnershipRemainsUntilLastLocalPagerClosesThenAllowsSqlite()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            Assert.Ignore("Physical managed WAL ownership requires Windows or Linux byte-range locks.");
+
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            var first = SqlitePager.Create(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal",
+                CreateWalHeader());
+            var second = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal");
+
+            first.Dispose();
+            RunSqliteWorker(databasePath, "busy");
+
+            second.Dispose();
+            RunSqliteWorker(databasePath, "available");
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void LinuxEmbeddedDatabaseOwnershipSurvivesVersionReaderDisposal()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("This regression covers Linux process-owned fcntl lock release semantics.");
+
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            using (EmbeddedDatabase.OpenFile(databasePath))
+            {
+                RunSqliteWorker(databasePath, "busy");
+                RunManagedWorker(databasePath, "owned");
+            }
+
+            RunSqliteWorker(databasePath, "available");
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void OrdinarySqliteReaderPreventsManagedOpenUntilReaderCloses()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            Assert.Ignore("Physical managed WAL ownership requires Windows or Linux byte-range locks.");
+
+        var workDirectory = CreateWorkDirectory();
+        Process? worker = null;
+        var releasePath = Path.Combine(workDirectory, "release");
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            using (SqlitePager.Create(
+                       PhysicalFileSystem.Instance,
+                       databasePath,
+                       databasePath + "-wal",
+                       CreateWalHeader()))
+            {
+            }
+
+            var readyPath = Path.Combine(workDirectory, "ready");
+            worker = StartWorker(
+                nameof(CrossProcessOrdinarySqliteReaderWorkerHoldsMainFileLock),
+                new Dictionary<string, string>
+                {
+                    ["TURSO_SQLITE_READER_WORKER_DATABASE_PATH"] = databasePath,
+                    ["TURSO_SQLITE_READER_WORKER_READY_PATH"] = readyPath,
+                    ["TURSO_SQLITE_READER_WORKER_RELEASE_PATH"] = releasePath,
+                });
+            WaitForFile(worker, readyPath);
+
+            var ownership = Assert.Throws<SqlitePagerClientOwnershipException>(() => SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal",
+                busyTimeout: TimeSpan.Zero));
+
+            ownership!.DatabasePath.Should().Be(Path.GetFullPath(databasePath));
+            ownership.Timeout.Should().Be(TimeSpan.Zero);
+
+            File.WriteAllText(releasePath, string.Empty);
+            AssertWorkerExit(worker);
+            worker = null;
+
+            File.Exists(databasePath + "-wal").Should().BeFalse(
+                "ordinary SQLite owns its companion-file lifecycle after handoff");
+            var reopen = Assert.Throws<EmbeddedSqlException>(
+                () => EmbeddedDatabase.OpenFile(databasePath));
+            reopen!.Message.Should().Contain("missing its companion write-ahead log");
+        }
+        finally
+        {
+            File.WriteAllText(releasePath, string.Empty);
+            if (worker is not null)
+                AssertWorkerExit(worker);
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ConcurrentOwnershipWaiterHonorsItsOwnZeroTimeout()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            Assert.Ignore("Physical managed WAL ownership requires Windows or Linux byte-range locks.");
+
+        var workDirectory = CreateWorkDirectory();
+        Process? worker = null;
+        var releasePath = Path.Combine(workDirectory, "release");
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            using (SqlitePager.Create(
+                       PhysicalFileSystem.Instance,
+                       databasePath,
+                       databasePath + "-wal",
+                       CreateWalHeader()))
+            {
+            }
+
+            var readyPath = Path.Combine(workDirectory, "ready");
+            worker = StartWorker(
+                nameof(CrossProcessMainFileLockWorkerHoldsOwnershipRange),
+                new Dictionary<string, string>
+                {
+                    ["TURSO_MAIN_FILE_LOCK_WORKER_DATABASE_PATH"] = databasePath,
+                    ["TURSO_MAIN_FILE_LOCK_WORKER_READY_PATH"] = readyPath,
+                    ["TURSO_MAIN_FILE_LOCK_WORKER_RELEASE_PATH"] = releasePath,
+                });
+            WaitForFile(worker, readyPath);
+
+            var longWaiter = Task.Run(() => SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal",
+                busyTimeout: TimeSpan.FromSeconds(5)));
+            Thread.Sleep(TimeSpan.FromMilliseconds(200));
+
+            var stopwatch = Stopwatch.StartNew();
+            var ownership = Assert.Throws<SqlitePagerClientOwnershipException>(() => SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                databasePath + "-wal",
+                busyTimeout: TimeSpan.Zero));
+            stopwatch.Stop();
+
+            ownership!.Timeout.Should().Be(TimeSpan.Zero);
+            stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(1));
+
+            File.WriteAllText(releasePath, string.Empty);
+            using var opened = longWaiter.WaitAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult();
+            AssertWorkerExit(worker);
+            worker = null;
+        }
+        finally
+        {
+            File.WriteAllText(releasePath, string.Empty);
+            if (worker is not null)
+                AssertWorkerExit(worker);
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ManagedOwnerRecoversCommittedWalBeforeSqliteHandoff()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            Assert.Ignore("Physical managed WAL ownership requires Windows or Linux byte-range locks.");
+
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            var walPath = databasePath + "-wal";
+            var committedPage = CreatePage(SqlitePageSize.Default, 0x5A);
+            using (var pager = SqlitePager.Create(
+                       PhysicalFileSystem.Instance,
+                       databasePath,
+                       walPath,
+                       CreateWalHeader()))
+            {
+                CommitPageTwo(pager, committedPage);
+            }
+
+            using (var recovered = SqlitePager.Open(
+                       PhysicalFileSystem.Instance,
+                       databasePath,
+                       walPath))
+            {
+                recovered.RecoveryInfo.LastCommittedFrameNumber.Should().BeGreaterThan(0);
+                recovered.ReadCommittedPage(2).Should().Equal(committedPage);
+                recovered.CheckpointToMainStoreAndResetWal().RetainedCommittedFrameCount.Should().Be(0);
+            }
+
+            RunSqliteWorker(databasePath, "available");
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void FailedManagedRecoveryReleasesOwnershipForRepairAndReopen()
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            Assert.Ignore("Physical managed WAL ownership requires Windows or Linux byte-range locks.");
+
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            var walPath = databasePath + "-wal";
+            var walHeader = CreateWalHeader();
+            using (SqlitePager.Create(
+                       PhysicalFileSystem.Instance,
+                       databasePath,
+                       walPath,
+                       walHeader))
+            {
+            }
+
+            using (var wal = SqliteWalFile.Open(PhysicalFileSystem.Instance, walPath))
+            {
+                wal.AppendFrame(
+                    pageNumber: 1,
+                    CreatePage(SqlitePageSize.Default, 0xFF),
+                    databaseSizeInPages: 1);
+                wal.Flush();
+            }
+
+            Assert.Throws<InvalidDataException>(() => SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                walPath));
+
+            File.Delete(walPath);
+            using (SqliteWalFile.Create(PhysicalFileSystem.Instance, walPath, walHeader))
+            {
+            }
+
+            using var reopened = SqlitePager.Open(
+                PhysicalFileSystem.Instance,
+                databasePath,
+                walPath);
+            reopened.State.Should().Be(SqlitePagerState.Ready);
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public void CrossProcessOrdinarySqliteWorkerObservesManagedOwnership()
+    {
+        var databasePath = Environment.GetEnvironmentVariable("TURSO_SQLITE_LOCK_WORKER_DATABASE_PATH");
+        if (string.IsNullOrEmpty(databasePath))
+            return;
+
+        var expectedResult = Environment.GetEnvironmentVariable("TURSO_SQLITE_LOCK_WORKER_EXPECTED_RESULT")
+            ?? throw new InvalidOperationException("The SQLite lock worker is missing its expected result.");
+        switch (expectedResult)
+        {
+            case "busy":
+                var busy = Assert.Throws<SqliteException>(() => QueryPageCountWithSqlite(databasePath));
+                Assert.That(busy!.SqliteErrorCode, Is.EqualTo(5).Or.EqualTo(6));
+                break;
+            case "available":
+                QueryPageCountWithSqlite(databasePath).Should().BeGreaterThanOrEqualTo(1);
+                break;
+            default:
+                throw new InvalidOperationException("The SQLite lock worker received an unknown expected result.");
+        }
+    }
+
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public void CrossProcessOrdinarySqliteReaderWorkerHoldsMainFileLock()
+    {
+        var databasePath = Environment.GetEnvironmentVariable("TURSO_SQLITE_READER_WORKER_DATABASE_PATH");
+        if (string.IsNullOrEmpty(databasePath))
+            return;
+
+        var readyPath = Environment.GetEnvironmentVariable("TURSO_SQLITE_READER_WORKER_READY_PATH")
+            ?? throw new InvalidOperationException("The SQLite reader worker is missing its ready path.");
+        var releasePath = Environment.GetEnvironmentVariable("TURSO_SQLITE_READER_WORKER_RELEASE_PATH")
+            ?? throw new InvalidOperationException("The SQLite reader worker is missing its release path.");
+        using var connection = new NativeSqliteConnection(
+            $"Data Source={databasePath};Mode=ReadWrite;Default Timeout=1");
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT COUNT(*) FROM sqlite_schema;";
+        command.ExecuteScalar().Should().Be(0L);
+        File.WriteAllText(readyPath, string.Empty);
+
+        var stopwatch = Stopwatch.StartNew();
+        while (!File.Exists(releasePath))
+        {
+            if (stopwatch.Elapsed >= TimeSpan.FromSeconds(30))
+                Assert.Fail("The SQLite reader worker was not released within 30 seconds.");
+            Thread.Sleep(TimeSpan.FromMilliseconds(10));
+        }
+    }
+
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public void CrossProcessMainFileLockWorkerHoldsOwnershipRange()
+    {
+        var databasePath = Environment.GetEnvironmentVariable("TURSO_MAIN_FILE_LOCK_WORKER_DATABASE_PATH");
+        if (string.IsNullOrEmpty(databasePath))
+            return;
+
+        var readyPath = Environment.GetEnvironmentVariable("TURSO_MAIN_FILE_LOCK_WORKER_READY_PATH")
+            ?? throw new InvalidOperationException("The main-file lock worker is missing its ready path.");
+        var releasePath = Environment.GetEnvironmentVariable("TURSO_MAIN_FILE_LOCK_WORKER_RELEASE_PATH")
+            ?? throw new InvalidOperationException("The main-file lock worker is missing its release path.");
+        using var stream = new FileStream(
+            databasePath,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.ReadWrite | FileShare.Delete);
+        LockMainFileOwnershipRange(stream);
+        try
+        {
+            File.WriteAllText(readyPath, string.Empty);
+            var stopwatch = Stopwatch.StartNew();
+            while (!File.Exists(releasePath))
+            {
+                if (stopwatch.Elapsed >= TimeSpan.FromSeconds(30))
+                    Assert.Fail("The main-file lock worker was not released within 30 seconds.");
+                Thread.Sleep(TimeSpan.FromMilliseconds(10));
+            }
+        }
+        finally
+        {
+            UnlockMainFileOwnershipRange(stream);
+        }
+    }
+
     private static SqliteWalHeader CreateWalHeader()
         => SqliteWalHeader.Create(
             SqlitePageSize.Default,
@@ -138,7 +510,31 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
             salt2: 0x5566_7788,
             checkpointSequence: 9);
 
-    private static void RunWriterWorker(string databasePath, string expectedResult)
+    private static void RunManagedWorker(string databasePath, string expectedResult)
+    {
+        using var worker = StartWorker(
+            nameof(CrossProcessPortableWriterWorkerObservesSharedMemoryLock),
+            new Dictionary<string, string>
+            {
+                ["TURSO_PORTABLE_WAL_LOCK_WORKER_DATABASE_PATH"] = databasePath,
+                ["TURSO_PORTABLE_WAL_LOCK_WORKER_EXPECTED_RESULT"] = expectedResult,
+            });
+        AssertWorkerExit(worker);
+    }
+
+    private static void RunSqliteWorker(string databasePath, string expectedResult)
+    {
+        using var worker = StartWorker(
+            nameof(CrossProcessOrdinarySqliteWorkerObservesManagedOwnership),
+            new Dictionary<string, string>
+            {
+                ["TURSO_SQLITE_LOCK_WORKER_DATABASE_PATH"] = databasePath,
+                ["TURSO_SQLITE_LOCK_WORKER_EXPECTED_RESULT"] = expectedResult,
+            });
+        AssertWorkerExit(worker);
+    }
+
+    private static Process StartWorker(string testName, IReadOnlyDictionary<string, string> environment)
     {
         var testDirectory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         var startInfo = new ProcessStartInfo(
@@ -153,12 +549,36 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
         startInfo.ArgumentList.Add(
             Path.Combine(testDirectory.FullName, "Turso.Tests.dll"));
         startInfo.ArgumentList.Add(
-            "--TestCaseFilter:FullyQualifiedName=Turso.Tests.SqlitePagerPortableLockCoordinatorTests.CrossProcessPortableWriterWorkerObservesSharedMemoryLock");
-        startInfo.Environment["TURSO_PORTABLE_WAL_LOCK_WORKER_DATABASE_PATH"] = databasePath;
-        startInfo.Environment["TURSO_PORTABLE_WAL_LOCK_WORKER_EXPECTED_RESULT"] = expectedResult;
+            $"--TestCaseFilter:FullyQualifiedName=Turso.Tests.SqlitePagerPortableLockCoordinatorTests.{testName}");
+        foreach (var (key, value) in environment)
+            startInfo.Environment[key] = value;
 
-        using var worker = Process.Start(startInfo)
+        return Process.Start(startInfo)
             ?? throw new InvalidOperationException("Failed to start the portable WAL lock worker.");
+    }
+
+    private static void WaitForFile(Process worker, string path)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (!File.Exists(path))
+        {
+            if (worker.HasExited)
+            {
+                var output = worker.StandardOutput.ReadToEnd() + worker.StandardError.ReadToEnd();
+                Assert.Fail($"The worker exited before acquiring its lock:{Environment.NewLine}{output}");
+            }
+            if (stopwatch.Elapsed >= TimeSpan.FromSeconds(30))
+            {
+                worker.Kill(entireProcessTree: true);
+                Assert.Fail("The worker did not acquire its lock within 30 seconds.");
+            }
+
+            Thread.Sleep(TimeSpan.FromMilliseconds(10));
+        }
+    }
+
+    private static void AssertWorkerExit(Process worker)
+    {
         if (!worker.WaitForExit(TimeSpan.FromSeconds(30)))
         {
             worker.Kill(entireProcessTree: true);
@@ -167,6 +587,57 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
 
         var output = worker.StandardOutput.ReadToEnd() + worker.StandardError.ReadToEnd();
         worker.ExitCode.Should().Be(0, $"worker output:{Environment.NewLine}{output}");
+    }
+
+    private static long QueryPageCountWithSqlite(string databasePath)
+    {
+        using var connection = new NativeSqliteConnection(
+            $"Data Source={databasePath};Mode=ReadWrite;Default Timeout=1");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA page_count;";
+        return (long)command.ExecuteScalar()!;
+    }
+
+    private static void CommitPageTwo(SqlitePager pager, byte[] pageTwo)
+    {
+        var pageOne = pager.ReadCommittedPage(1);
+        var header = SqliteDatabaseHeader.Parse(pageOne);
+        (header with { DatabaseSizeInPages = 2 }).WriteTo(pageOne);
+
+        using var transaction = pager.BeginTransaction(targetDatabaseSizeInPages: 2);
+        transaction.WritePage(2, pageTwo);
+        transaction.WritePage(1, pageOne);
+        transaction.Commit();
+    }
+
+    private static byte[] CreatePage(int pageSize, byte fill)
+    {
+        var page = new byte[pageSize];
+        Array.Fill(page, fill);
+        return page;
+    }
+
+    private static void LockMainFileOwnershipRange(FileStream stream)
+    {
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
+        {
+            stream.Lock(0x4000_0000, 512);
+            return;
+        }
+
+        throw new PlatformNotSupportedException();
+    }
+
+    private static void UnlockMainFileOwnershipRange(FileStream stream)
+    {
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
+        {
+            stream.Unlock(0x4000_0000, 512);
+            return;
+        }
+
+        throw new PlatformNotSupportedException();
     }
 
     private static string CreateWorkDirectory()
