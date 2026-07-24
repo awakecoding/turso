@@ -260,6 +260,8 @@ Supported common connection string keywords include:
 
 `Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local and embedded Turso databases. It reuses EF Core SQLite's LINQ translation pipeline and executes generated SQL through `Turso.Data.Sqlite`.
 
+The current provider line supports EF Core 9.x on `net8.0`, `net9.0`, and `net10.0`. Its package dependency is constrained to `Microsoft.EntityFrameworkCore.Sqlite.Core` versions `[9.0.9, 10.0.0)` because the provider integrates with EF Core's internal SQLite services, and `UseTurso` rejects any other loaded EF Core major during options configuration. Do not override that dependency with EF Core 8.x or 10.x; those majors require separately compiled and tested provider lines.
+
 ```bash
 dotnet add package Turso.EntityFrameworkCore.Sqlite
 ```
@@ -290,4 +292,4 @@ var options = new DbContextOptionsBuilder<AppDbContext>()
 
 The local provider supports the normal EF Core SQLite query pipeline, including composed `IQueryable<T>` filters, navigation-property joins, ordering, paging, grouping, aggregates, async materialization, and `SaveChangesAsync`. Schema creation can use the standard EF Core SQLite mechanisms such as `EnsureCreated`, `EnsureCreatedAsync`, and migrations against local database files.
 
-Remote `libsql://`/auth-token EF Core support is not part of the local provider. Use the local/embedded provider for EF Core today; remote/serverless EF support needs a separate connection, retry, and transaction design.
+Remote `libsql://`, `http://`, `https://`, `ws://`, and `wss://` EF Core support is not part of the local provider. `UseTurso` rejects those data sources during options configuration, before a context or connection is used. Use the local/embedded provider for EF Core today or use `TursoConnection` directly for remote ADO.NET access; remote/serverless EF support needs a separate retry and transaction design.

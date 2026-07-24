@@ -33,6 +33,7 @@ MANAGED_PACKAGE_OUTPUT_ARG = $(if $(MANAGED_PACKAGE_OUTPUT),--output "$(MANAGED_
 MANAGED_PACKAGE_VERSION_ARG = $(if $(MANAGED_PACKAGE_VERSION),-p:PackageVersion=$(MANAGED_PACKAGE_VERSION))
 MANAGED_PACKAGE_OUTPUT_ABSOLUTE = $(abspath $(MANAGED_PACKAGE_OUTPUT))
 MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG = ./samples/ManagedPackageConsumer/obj/managed-package-consumer.nuget.config
+MANAGED_PACKAGE_CONSUMER_FRAMEWORKS = net8.0 net9.0 net10.0
 MANAGED_NATIVEAOT_OUTPUT ?= ./artifacts/managed-nativeaot-smoke
 MANAGED_NATIVEAOT_PACKAGES ?= $(MANAGED_PACKAGE_OUTPUT)/.nuget-packages
 MANAGED_NATIVEAOT_NUGET_CONFIG = ./samples/ManagedNativeAot/obj/managed-nativeaot.nuget.config
@@ -232,14 +233,32 @@ validate-managed-packed-closure:
 validate-managed-package: validate-managed-project-closure
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local
 	$(MAKE) validate-managed-packed-closure
-	rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)"
-	mkdir -p ./samples/ManagedPackageConsumer/obj
-	printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration>' '  <packageSources>' '    <clear />' '    <add key="managed-package" value="$(MANAGED_PACKAGE_OUTPUT_ABSOLUTE)" />' '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />' '  </packageSources>' '</configuration>' > "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)"
-	dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --configfile "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local
-	dotnet build --no-restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
-	dotnet run --no-build --no-restore --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
-	dotnet publish --configuration Debug --no-build --no-restore --output "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)" ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local
-	$(MANAGED_CLOSURE_VALIDATOR) -ProjectAssetsFile ./samples/ManagedPackageConsumer/obj/project.assets.json -PublishOutput "$(MANAGED_PACKAGE_CONSUMER_OUTPUT)"
+	@set -e; for target_framework in $(MANAGED_PACKAGE_CONSUMER_FRAMEWORKS); do \
+		consumer_output="$(MANAGED_PACKAGE_CONSUMER_OUTPUT)/$$target_framework"; \
+		rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj "$$consumer_output"; \
+		mkdir -p ./samples/ManagedPackageConsumer/obj; \
+		printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration>' '  <packageSources>' '    <clear />' '    <add key="managed-package" value="$(MANAGED_PACKAGE_OUTPUT_ABSOLUTE)" />' '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />' '  </packageSources>' '</configuration>' > "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)"; \
+		dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --configfile "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=$$target_framework; \
+		dotnet build --no-restore --framework $$target_framework ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=$$target_framework; \
+		dotnet run --no-build --no-restore --framework $$target_framework --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=$$target_framework; \
+		dotnet publish --configuration Debug --no-build --no-restore --framework $$target_framework --output "$$consumer_output" ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=$$target_framework; \
+		$(MANAGED_CLOSURE_VALIDATOR) -ProjectAssetsFile ./samples/ManagedPackageConsumer/obj/project.assets.json -PublishOutput "$$consumer_output"; \
+	done
+	@set -e; \
+		restore_log="$(MANAGED_PACKAGE_OUTPUT)/unsupported-ef-restore.log"; \
+		rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj "$$restore_log"; \
+		mkdir -p ./samples/ManagedPackageConsumer/obj; \
+		printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration>' '  <packageSources>' '    <clear />' '    <add key="managed-package" value="$(MANAGED_PACKAGE_OUTPUT_ABSOLUTE)" />' '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />' '  </packageSources>' '</configuration>' > "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)"; \
+		if dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --configfile "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=net10.0 -p:TursoConsumerEntityFrameworkCoreVersion=10.0.0 > "$$restore_log" 2>&1; then \
+			echo "Managed EF package must reject an EF Core 10 override"; \
+			cat "$$restore_log"; \
+			exit 1; \
+		elif ! grep -Fq 'NU1608' "$$restore_log"; then \
+			echo "Unsupported EF Core restore did not fail with the expected package-range conflict"; \
+			cat "$$restore_log"; \
+			exit 1; \
+		fi; \
+		rm -f "$$restore_log"
 
 validate-managed-nativeaot: validate-managed-project-closure
 	$(MAKE) pack-managed MANAGED_PACKAGE_VERSION=0.0.0-managed-local

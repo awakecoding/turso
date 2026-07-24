@@ -11,6 +11,33 @@ command.CommandText = "SELECT 1";
 if (command.ExecuteScalar() is not 1L)
     throw new InvalidOperationException("The managed Turso package consumer returned an unexpected result.");
 
+var options = new DbContextOptionsBuilder<ConsumerContext>()
+    .UseTurso(connection)
+    .Options;
+using (var context = new ConsumerContext(options))
+{
+    context.Database.EnsureCreated();
+    context.Records.Add(new ConsumerRecord { Id = 1, Value = "packaged" });
+    context.SaveChanges();
+
+    if (context.Records.Single().Value != "packaged")
+        throw new InvalidOperationException("The packaged Turso EF Core provider returned an unexpected result.");
+}
+
+if (typeof(DbContext).Assembly.GetName().Version?.Major != 9)
+    throw new InvalidOperationException("The managed Turso package consumer must run against EF Core 9.x.");
+
+try
+{
+    _ = new DbContextOptionsBuilder<ConsumerContext>()
+        .UseTurso("Data Source=libsql://example-org.turso.io");
+    throw new InvalidOperationException("UseTurso must reject remote URLs during configuration.");
+}
+catch (NotSupportedException exception) when (
+    exception.Message.Contains("retry and transaction semantics", StringComparison.Ordinal))
+{
+}
+
 if (AppDomain.CurrentDomain.GetAssemblies().Any(assembly =>
         string.Equals(assembly.GetName().Name, "Turso.Raw", StringComparison.Ordinal)))
 {
@@ -20,7 +47,8 @@ if (AppDomain.CurrentDomain.GetAssemblies().Any(assembly =>
 EnsureNoNativeCompanionWasRestored();
 await VerifyEntityFrameworkIntegrationAsync(connection);
 
-Console.WriteLine("Managed package consumer succeeded.");
+Console.WriteLine(
+    $"Managed package consumer succeeded on {AppContext.TargetFrameworkName} with EF Core {typeof(DbContext).Assembly.GetName().Version}.");
 
 static async Task VerifyEntityFrameworkIntegrationAsync(SqliteConnection connection)
 {
@@ -72,6 +100,18 @@ static bool IsNativeCompanionPackage(string packageIdentity)
        packageIdentity.StartsWith("Turso.Data.Sqlite.Native/", StringComparison.OrdinalIgnoreCase) ||
        packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot", StringComparison.OrdinalIgnoreCase) ||
        packageIdentity.StartsWith("Turso.Data.Sqlite.Sync/", StringComparison.OrdinalIgnoreCase);
+
+sealed class ConsumerContext(DbContextOptions<ConsumerContext> options) : DbContext(options)
+{
+    public DbSet<ConsumerRecord> Records => Set<ConsumerRecord>();
+}
+
+sealed class ConsumerRecord
+{
+    public int Id { get; set; }
+
+    public required string Value { get; set; }
+}
 
 sealed class ManagedPackageContext(DbContextOptions<ManagedPackageContext> options) : DbContext(options)
 {

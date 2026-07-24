@@ -513,6 +513,16 @@ jobs:
                   exit 1
                 fi
                 ;;
+              *Turso.EntityFrameworkCore.Sqlite.*)
+                if ! unzip -p "$package" README.md | grep -Fq 'supports EF Core 9.x'; then
+                  echo "$package README must document the supported EF Core major version"
+                  exit 1
+                fi
+                if ! unzip -p "$package" README.md | grep -Fq 'rejects those data sources during options configuration'; then
+                  echo "$package README must document the remote UseTurso contract"
+                  exit 1
+                fi
+                ;;
             esac
           done
 
