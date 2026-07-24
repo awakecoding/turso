@@ -353,7 +353,6 @@ public sealed class ExtendedDmlGrammarSqlRoutingTests
             ("UPDATE t AS target SET value = 20;", "target aliases"),
             ("UPDATE t INDEXED BY t_value SET value = 20;", "INDEXED BY"),
             ("UPDATE t NOT INDEXED SET value = 20;", "NOT INDEXED"),
-            ("UPDATE t SET (value) = (20);", "row-value assignments"),
             ("UPDATE t SET value = source.value FROM source WHERE source.id = t.id;", "UPDATE FROM"),
             ("DELETE FROM t AS target WHERE id = 1;", "target aliases"),
             ("DELETE FROM t INDEXED BY t_value WHERE id = 1;", "INDEXED BY"),
