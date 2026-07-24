@@ -6,7 +6,7 @@ namespace Turso.Tests;
 public sealed class ManagedBackupTriggerSnapshotCoverageTests
 {
     [Test]
-    public void ManagedBackupCopiesTriggersAfterRestoringRows()
+    public void ManagedBackupCopiesRowTriggersInDeclarationOrderAfterRestoringRows()
     {
         using var source = OpenManagedConnection();
         using var destination = OpenManagedConnection();
@@ -14,9 +14,13 @@ public sealed class ManagedBackupTriggerSnapshotCoverageTests
             CREATE TABLE event_data(value TEXT);
             CREATE TABLE audit(value TEXT);
             INSERT INTO event_data VALUES ('before backup');
-            CREATE TRIGGER event_data_audit AFTER INSERT ON event_data
+            CREATE TRIGGER event_data_first AFTER INSERT ON event_data
             BEGIN
-                INSERT INTO audit VALUES ('inserted');
+                INSERT INTO audit VALUES ('first:' || NEW.value);
+            END;
+            CREATE TRIGGER event_data_second AFTER INSERT ON event_data WHEN NEW.value IS NOT NULL
+            BEGIN
+                INSERT INTO audit VALUES ('second:' || NEW.value);
             END;
             """);
 
@@ -25,11 +29,21 @@ public sealed class ManagedBackupTriggerSnapshotCoverageTests
         destination.ExecuteScalar<long>("SELECT COUNT(*) FROM event_data;").Should().Be(1);
         destination.ExecuteScalar<long>("SELECT COUNT(*) FROM audit;").Should().Be(0);
         destination.ExecuteNonQuery("INSERT INTO event_data VALUES ('after backup');");
-        destination.ExecuteScalar<long>("SELECT COUNT(*) FROM audit;").Should().Be(1);
+        destination.ExecuteScalar<long>("SELECT COUNT(*) FROM audit;").Should().Be(2);
+        using (var command = destination.CreateCommand())
+        {
+            command.CommandText = "SELECT value FROM audit ORDER BY rowid";
+            using var reader = command.ExecuteReader();
+            reader.Read().Should().BeTrue();
+            reader.GetString(0).Should().Be("second:after backup");
+            reader.Read().Should().BeTrue();
+            reader.GetString(0).Should().Be("first:after backup");
+            reader.Read().Should().BeFalse();
+        }
         destination.ExecuteScalar<string>(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'event_data_audit';")
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'event_data_second';")
             .Should()
-            .Contain("CREATE TRIGGER event_data_audit AFTER INSERT ON event_data");
+            .Contain("WHEN NEW.value IS NOT NULL");
     }
 
     [Test]

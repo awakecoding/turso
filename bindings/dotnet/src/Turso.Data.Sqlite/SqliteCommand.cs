@@ -800,13 +800,16 @@ public class SqliteCommand : DbCommand
     {
         return header switch
         {
-            TriggerHeader.ExpectTrigger => IsKeyword(sql, token, "TRIGGER")
-                ? TriggerHeader.ExpectNameOrIf
-                : TriggerHeader.NotTrigger,
+            TriggerHeader.ExpectTrigger => IsKeyword(sql, token, "TEMP")
+                || IsKeyword(sql, token, "TEMPORARY")
+                    ? TriggerHeader.ExpectTrigger
+                    : IsKeyword(sql, token, "TRIGGER")
+                        ? TriggerHeader.ExpectNameOrIf
+                        : TriggerHeader.NotTrigger,
             TriggerHeader.ExpectNameOrIf => IsKeyword(sql, token, "IF")
                 ? TriggerHeader.ExpectNot
                 : IsIdentifier(token)
-                    ? TriggerHeader.ExpectAfter
+                    ? TriggerHeader.SeekOn
                     : TriggerHeader.NotTrigger,
             TriggerHeader.ExpectNot => IsKeyword(sql, token, "NOT")
                 ? TriggerHeader.ExpectExists
@@ -815,23 +818,25 @@ public class SqliteCommand : DbCommand
                 ? TriggerHeader.ExpectName
                 : TriggerHeader.NotTrigger,
             TriggerHeader.ExpectName => IsIdentifier(token)
-                ? TriggerHeader.ExpectAfter
+                ? TriggerHeader.SeekOn
                 : TriggerHeader.NotTrigger,
-            TriggerHeader.ExpectAfter => IsKeyword(sql, token, "AFTER")
-                ? TriggerHeader.ExpectEvent
-                : TriggerHeader.NotTrigger,
-            TriggerHeader.ExpectEvent => IsKeyword(sql, token, "INSERT")
-                || IsKeyword(sql, token, "UPDATE")
-                || IsKeyword(sql, token, "DELETE")
-                    ? TriggerHeader.ExpectOn
-                    : TriggerHeader.NotTrigger,
-            TriggerHeader.ExpectOn => IsKeyword(sql, token, "ON")
+            TriggerHeader.SeekOn => IsKeyword(sql, token, "ON")
                 ? TriggerHeader.ExpectTable
-                : TriggerHeader.NotTrigger,
+                : TriggerHeader.SeekOn,
             TriggerHeader.ExpectTable => IsIdentifier(token)
-                ? TriggerHeader.ExpectBegin
+                ? TriggerHeader.AfterTableName
                 : TriggerHeader.NotTrigger,
-            TriggerHeader.ExpectBegin => EnterTriggerBody(sql, token, ref triggerBlockDepth, ref triggerBodyAtStatementStart),
+            TriggerHeader.AfterTableName => IsDot(sql, token)
+                ? TriggerHeader.ExpectTableLocal
+                : IsKeyword(sql, token, "BEGIN")
+                    ? EnterTriggerBody(sql, token, ref triggerBlockDepth, ref triggerBodyAtStatementStart)
+                    : TriggerHeader.SeekBegin,
+            TriggerHeader.ExpectTableLocal => IsIdentifier(token)
+                ? TriggerHeader.SeekBegin
+                : TriggerHeader.NotTrigger,
+            TriggerHeader.SeekBegin => IsKeyword(sql, token, "BEGIN")
+                ? EnterTriggerBody(sql, token, ref triggerBlockDepth, ref triggerBodyAtStatementStart)
+                : TriggerHeader.SeekBegin,
             _ => header,
         };
     }
@@ -857,6 +862,11 @@ public class SqliteCommand : DbCommand
 
     private static bool IsIdentifier(ScriptToken token)
         => token.Kind is ScriptTokenKind.Identifier or ScriptTokenKind.QuotedIdentifier;
+
+    private static bool IsDot(string sql, ScriptToken token)
+        => token.Kind == ScriptTokenKind.Other
+            && token.Length == 1
+            && sql[token.Offset] == '.';
 
     private static bool TryReadScriptToken(string sql, ref int offset, out ScriptToken token)
     {
@@ -1000,11 +1010,11 @@ public class SqliteCommand : DbCommand
         ExpectNot,
         ExpectExists,
         ExpectName,
-        ExpectAfter,
-        ExpectEvent,
-        ExpectOn,
+        SeekOn,
         ExpectTable,
-        ExpectBegin,
+        AfterTableName,
+        ExpectTableLocal,
+        SeekBegin,
     }
 
     private enum ScriptTokenKind

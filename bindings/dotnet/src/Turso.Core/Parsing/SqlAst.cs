@@ -48,10 +48,20 @@ internal enum TriggerEvent
     Delete,
 }
 
+internal enum TriggerTiming
+{
+    Before,
+    After,
+    InsteadOf,
+}
+
 internal sealed record CreateTriggerStatement(
     string Name,
+    TriggerTiming Timing,
     TriggerEvent Event,
+    IReadOnlyList<string>? UpdateOfColumns,
     string TableName,
+    Expression? When,
     IReadOnlyList<ParsedStatement> Body,
     string Sql,
     bool IfNotExists) : ParsedStatement;
@@ -66,10 +76,14 @@ internal sealed record ViewDefinition(
 
 internal sealed record TriggerDefinition(
     string Name,
+    TriggerTiming Timing,
     TriggerEvent Event,
+    IReadOnlyList<string>? UpdateOfColumns,
     string TableName,
+    Expression? When,
     IReadOnlyList<ParsedStatement> Body,
-    string Sql);
+    string Sql,
+    long DeclarationOrder);
 
 // A parser-only separator retains whether a dot was SQL syntax rather than part of a
 // quoted identifier. Catalog object names remain ordinary strings after connection routing.
@@ -454,6 +468,16 @@ internal enum CurrentTimeKind
 internal sealed record CurrentTimeExpression(CurrentTimeKind Kind) : Expression;
 
 internal sealed record ParameterExpression(int Index) : Expression;
+
+internal enum RaiseAction
+{
+    Ignore,
+    Rollback,
+    Abort,
+    Fail,
+}
+
+internal sealed record RaiseExpression(RaiseAction Action, string? Message) : Expression;
 
 internal sealed record ColumnExpression(
     string Name,

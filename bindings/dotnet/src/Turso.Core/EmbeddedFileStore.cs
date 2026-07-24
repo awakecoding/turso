@@ -144,6 +144,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         var triggers = new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase);
         var rootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         var indexRootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        long triggerDeclarationOrder = 0;
 
         var schemaEntries = ReadSchemaEntries();
         ValidateSchemaEntries(schemaEntries);
@@ -244,13 +245,17 @@ internal sealed class EmbeddedFileStore : IDisposable
                     views[entry.Name] = new ViewDefinition(view.Name, view.Columns, view.Query, view.Sql);
                     break;
                 case "trigger" when statement is CreateTriggerStatement trigger:
-                    ValidateStoredTrigger(entry, trigger, tables);
+                    ValidateStoredTrigger(entry, trigger, tables, views);
                     triggers[entry.Name] = new TriggerDefinition(
                         trigger.Name,
+                        trigger.Timing,
                         trigger.Event,
+                        trigger.UpdateOfColumns,
                         trigger.TableName,
+                        trigger.When,
                         trigger.Body,
-                        trigger.Sql);
+                        trigger.Sql,
+                        triggerDeclarationOrder++);
                     break;
                 default:
                     throw new EmbeddedSqlException($"Stored schema entry '{entry.Name}' has an unsupported type '{entry.Type}'.");
@@ -7292,7 +7297,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             ValidateViewDefinition(catalogName, view);
 
         foreach (var (catalogName, trigger) in triggers)
-            ValidateTriggerDefinition(catalogName, trigger, tables);
+            ValidateTriggerDefinition(catalogName, trigger, tables, views);
     }
 
     private static void ValidateViewDefinition(string catalogName, ViewDefinition view)
@@ -7319,23 +7324,29 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static void ValidateTriggerDefinition(
         string catalogName,
         TriggerDefinition trigger,
-        IReadOnlyDictionary<string, EmbeddedTable> tables)
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views)
     {
         if (!string.Equals(catalogName, trigger.Name, StringComparison.OrdinalIgnoreCase))
         {
             throw new EmbeddedSqlException(
                 $"The managed file engine cannot persist trigger '{catalogName}' because its catalog key and definition name differ.");
         }
-        if (!tables.ContainsKey(trigger.TableName))
+        var targetExists = trigger.Timing == TriggerTiming.InsteadOf
+            ? views.ContainsKey(trigger.TableName)
+            : tables.ContainsKey(trigger.TableName);
+        if (!targetExists)
         {
             throw new EmbeddedSqlException(
-                $"The managed file engine cannot persist trigger '{catalogName}' because its table '{trigger.TableName}' does not exist.");
+                $"The managed file engine cannot persist trigger '{catalogName}' because its target '{trigger.TableName}' does not exist.");
         }
 
         var statement = SqlParser.Parse(trigger.Sql, SqlParameterMap.Parse(trigger.Sql));
         if (statement is not CreateTriggerStatement persisted
             || !string.Equals(persisted.Name, trigger.Name, StringComparison.OrdinalIgnoreCase)
+            || persisted.Timing != trigger.Timing
             || persisted.Event != trigger.Event
+            || !SameColumnList(persisted.UpdateOfColumns, trigger.UpdateOfColumns)
             || !string.Equals(persisted.TableName, trigger.TableName, StringComparison.OrdinalIgnoreCase)
             || persisted.Body.Count != trigger.Body.Count
             || !HaveSameStatementKinds(persisted.Body, trigger.Body))
@@ -7344,8 +7355,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                 $"The managed file engine cannot persist trigger '{catalogName}' because its SQL cannot reconstruct its statement-level definition.");
         }
 
-        ValidateRuntimeIndependentTriggerBody(catalogName, trigger.Body);
-        ValidateRuntimeIndependentTriggerBody(catalogName, persisted.Body);
+        ValidateRuntimeIndependentTriggerBody(catalogName, trigger.When, trigger.Body);
+        ValidateRuntimeIndependentTriggerBody(catalogName, persisted.When, persisted.Body);
+        ValidateTriggerCollationDependencies(catalogName, trigger, tables, views);
     }
 
     private static void ValidateStoredView(SchemaEntry entry, CreateViewStatement view)
@@ -7362,7 +7374,8 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static void ValidateStoredTrigger(
         SchemaEntry entry,
         CreateTriggerStatement trigger,
-        IReadOnlyDictionary<string, EmbeddedTable> tables)
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views)
     {
         if (!string.Equals(trigger.Name, entry.Name, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(trigger.TableName, entry.TableName, StringComparison.OrdinalIgnoreCase))
@@ -7370,13 +7383,240 @@ internal sealed class EmbeddedFileStore : IDisposable
             throw new EmbeddedSqlException(
                 $"Stored schema entry for trigger '{entry.Name}' does not match its CREATE TRIGGER definition.");
         }
-        if (!tables.ContainsKey(trigger.TableName))
+        var targetExists = trigger.Timing == TriggerTiming.InsteadOf
+            ? views.ContainsKey(trigger.TableName)
+            : tables.ContainsKey(trigger.TableName);
+        if (!targetExists)
         {
             throw new EmbeddedSqlException(
-                $"Stored trigger '{entry.Name}' references missing table '{trigger.TableName}'.");
+                $"Stored trigger '{entry.Name}' references missing target '{trigger.TableName}'.");
         }
 
-        ValidateRuntimeIndependentTriggerBody(entry.Name, trigger.Body);
+        ValidateRuntimeIndependentTriggerBody(entry.Name, trigger.When, trigger.Body);
+        ValidateTriggerCollationDependencies(entry.Name, new TriggerDefinition(
+            trigger.Name,
+            trigger.Timing,
+            trigger.Event,
+            trigger.UpdateOfColumns,
+            trigger.TableName,
+            trigger.When,
+            trigger.Body,
+            trigger.Sql,
+            DeclarationOrder: 0), tables, views);
+    }
+
+    private static void ValidateTriggerCollationDependencies(
+        string name,
+        TriggerDefinition trigger,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views)
+    {
+        var referencedTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            trigger.TableName,
+        };
+        foreach (var statement in trigger.Body)
+            CollectTriggerReferencedTables(statement, referencedTables);
+        if (views.TryGetValue(trigger.TableName, out var targetView))
+            CollectTriggerReferencedTables(targetView.Query, referencedTables);
+
+        foreach (var tableName in referencedTables)
+        {
+            if (!tables.TryGetValue(tableName, out var table))
+                continue;
+            var collation = table.ColumnDefinitions
+                .Select(column => column.Collation)
+                .FirstOrDefault(value => value is not null && !IsBuiltInCollation(value));
+            if (collation is not null)
+            {
+                throw new EmbeddedSqlException(
+                    $"The managed file engine cannot persist trigger '{name}' because table "
+                    + $"'{tableName}' uses custom collation '{collation}'.");
+            }
+        }
+    }
+
+    private static bool IsBuiltInCollation(string collation)
+        => collation.Equals("BINARY", StringComparison.OrdinalIgnoreCase)
+            || collation.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
+            || collation.Equals("RTRIM", StringComparison.OrdinalIgnoreCase);
+
+    private static void CollectTriggerReferencedTables(
+        ParsedStatement statement,
+        ISet<string> tables)
+    {
+        switch (statement)
+        {
+            case InsertStatement insert:
+                tables.Add(insert.TableName);
+                if (insert.Source is not null)
+                    CollectTriggerReferencedTables(insert.Source, tables);
+                foreach (var expression in insert.Rows.SelectMany(row => row))
+                    CollectTriggerReferencedTables(expression, tables);
+                if (insert.Upsert?.Action is DoUpdateUpsertAction upsertUpdate)
+                {
+                    foreach (var assignment in upsertUpdate.Assignments)
+                        CollectTriggerReferencedTables(assignment.Value, tables);
+                    CollectTriggerReferencedTables(upsertUpdate.Where, tables);
+                }
+                break;
+            case UpdateStatement update:
+                tables.Add(update.TableName);
+                foreach (var assignment in update.Assignments)
+                    CollectTriggerReferencedTables(assignment.Value, tables);
+                CollectTriggerReferencedTables(update.Where, tables);
+                break;
+            case DeleteStatement delete:
+                tables.Add(delete.TableName);
+                CollectTriggerReferencedTables(delete.Where, tables);
+                break;
+            case QueryStatement query:
+                CollectTriggerReferencedTables(query, tables);
+                break;
+        }
+    }
+
+    private static void CollectTriggerReferencedTables(
+        QueryStatement query,
+        ISet<string> tables)
+    {
+        switch (query)
+        {
+            case SelectStatement select:
+                CollectTriggerReferencedTables(select.Source, tables);
+                foreach (var expression in select.Projections.Select(projection => projection.Expression)
+                             .Append(select.Where)
+                             .Concat(select.GroupBy)
+                             .Append(select.Having)
+                             .Concat(select.OrderBy.Select(term => term.Expression))
+                             .Append(select.Limit)
+                             .Append(select.Offset))
+                {
+                    CollectTriggerReferencedTables(expression, tables);
+                }
+                break;
+            case ValuesClause values:
+                foreach (var expression in values.Rows.SelectMany(row => row))
+                    CollectTriggerReferencedTables(expression, tables);
+                break;
+            case CompoundSelectStatement compound:
+                foreach (var term in compound.Terms)
+                    CollectTriggerReferencedTables(term, tables);
+                foreach (var expression in compound.OrderBy.Select(term => term.Expression)
+                             .Append(compound.Limit)
+                             .Append(compound.Offset))
+                {
+                    CollectTriggerReferencedTables(expression, tables);
+                }
+                break;
+            case WithSelectStatement with:
+                foreach (var commonTableExpression in with.CommonTableExpressions)
+                    CollectTriggerReferencedTables(commonTableExpression.Query, tables);
+                CollectTriggerReferencedTables(with.Query, tables);
+                break;
+        }
+    }
+
+    private static void CollectTriggerReferencedTables(
+        TableSource? source,
+        ISet<string> tables)
+    {
+        switch (source)
+        {
+            case NamedTableSource named:
+                tables.Add(named.Name);
+                break;
+            case DerivedTableSource derived:
+                CollectTriggerReferencedTables(derived.Query, tables);
+                break;
+            case JoinTableSource join:
+                CollectTriggerReferencedTables(join.Left, tables);
+                CollectTriggerReferencedTables(join.Right, tables);
+                CollectTriggerReferencedTables(join.Condition, tables);
+                break;
+            case GenerateSeriesSource series:
+                CollectTriggerReferencedTables(series.Start, tables);
+                CollectTriggerReferencedTables(series.Stop, tables);
+                CollectTriggerReferencedTables(series.Step, tables);
+                break;
+        }
+    }
+
+    private static void CollectTriggerReferencedTables(
+        Expression? expression,
+        ISet<string> tables)
+    {
+        switch (expression)
+        {
+            case null:
+                return;
+            case ScalarSubqueryExpression scalar:
+                CollectTriggerReferencedTables(scalar.Query, tables);
+                return;
+            case ExistsExpression exists:
+                CollectTriggerReferencedTables(exists.Query, tables);
+                return;
+            case InSubqueryExpression @in:
+                CollectTriggerReferencedTables(@in.Value, tables);
+                CollectTriggerReferencedTables(@in.Query, tables);
+                return;
+            case FunctionExpression function:
+                foreach (var argument in function.Arguments)
+                    CollectTriggerReferencedTables(argument, tables);
+                CollectTriggerReferencedTables(function.Filter, tables);
+                if (function.Window is not null)
+                {
+                    foreach (var child in function.Window.PartitionBy
+                                 .Concat(function.Window.OrderBy.Select(term => term.Expression))
+                                 .Append(function.Window.Frame?.Start.Offset)
+                                 .Append(function.Window.Frame?.End.Offset))
+                    {
+                        CollectTriggerReferencedTables(child, tables);
+                    }
+                }
+                return;
+            case CollationExpression collation:
+                CollectTriggerReferencedTables(collation.Expression, tables);
+                return;
+            case CastExpression cast:
+                CollectTriggerReferencedTables(cast.Expression, tables);
+                return;
+            case CaseExpression @case:
+                CollectTriggerReferencedTables(@case.Operand, tables);
+                foreach (var clause in @case.Clauses)
+                {
+                    CollectTriggerReferencedTables(clause.When, tables);
+                    CollectTriggerReferencedTables(clause.Then, tables);
+                }
+                CollectTriggerReferencedTables(@case.Else, tables);
+                return;
+            case LikeExpression like:
+                CollectTriggerReferencedTables(like.Value, tables);
+                CollectTriggerReferencedTables(like.Pattern, tables);
+                CollectTriggerReferencedTables(like.Escape, tables);
+                return;
+            case GlobExpression glob:
+                CollectTriggerReferencedTables(glob.Value, tables);
+                CollectTriggerReferencedTables(glob.Pattern, tables);
+                return;
+            case InExpression @in:
+                CollectTriggerReferencedTables(@in.Value, tables);
+                foreach (var value in @in.Values)
+                    CollectTriggerReferencedTables(value, tables);
+                return;
+            case BetweenExpression between:
+                CollectTriggerReferencedTables(between.Value, tables);
+                CollectTriggerReferencedTables(between.Lower, tables);
+                CollectTriggerReferencedTables(between.Upper, tables);
+                return;
+            case UnaryExpression unary:
+                CollectTriggerReferencedTables(unary.Operand, tables);
+                return;
+            case BinaryExpression binary:
+                CollectTriggerReferencedTables(binary.Left, tables);
+                CollectTriggerReferencedTables(binary.Right, tables);
+                return;
+        }
     }
 
     private static bool SameColumnList(IReadOnlyList<string>? left, IReadOnlyList<string>? right)
@@ -7410,8 +7650,17 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private static void ValidateRuntimeIndependentTriggerBody(
         string name,
+        Expression? when,
         IReadOnlyList<ParsedStatement> statements)
     {
+        var whenDependency = FindRuntimeDependency(when);
+        if (whenDependency is not null)
+        {
+            throw new EmbeddedSqlException(
+                $"The managed file engine cannot persist trigger '{name}' because it uses {whenDependency}. "
+                + "File-backed schema definitions cannot retain bind parameters, managed callbacks, or custom collations across reopen.");
+        }
+
         foreach (var statement in statements)
         {
             var dependency = FindRuntimeDependency(statement);
@@ -7475,7 +7724,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             InsertStatement insert => FirstRuntimeDependency(
                 FindRuntimeDependency(insert.Rows),
-                FindRuntimeDependency(insert.Returning)),
+                insert.Source is null ? null : FindRuntimeDependency(insert.Source),
+                FindRuntimeDependency(insert.Returning),
+                FindRuntimeDependency(insert.Upsert)),
             UpdateStatement update => FirstRuntimeDependency(
                 FindRuntimeDependency(update.Assignments),
                 FindRuntimeDependency(update.Where),
@@ -7483,6 +7734,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             DeleteStatement delete => FirstRuntimeDependency(
                 FindRuntimeDependency(delete.Where),
                 FindRuntimeDependency(delete.Returning)),
+            QueryStatement query => FindRuntimeDependency(query),
             _ => $"unsupported trigger body statement {statement.GetType().Name}",
         };
     }
@@ -7491,12 +7743,15 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         return expression switch
         {
-            null or LiteralExpression or ColumnExpression or StarExpression or QualifiedStarExpression => null,
+            null or LiteralExpression or CurrentTimeExpression or ColumnExpression or RaiseExpression
+                or StarExpression or QualifiedStarExpression => null,
             ParameterExpression => "a bind parameter",
             FunctionExpression function => $"function {function.Name}()",
             ScalarSubqueryExpression subquery => FindRuntimeDependency(subquery.Query),
             ExistsExpression exists => FindRuntimeDependency(exists.Query),
-            CollationExpression collation => $"explicit collation '{collation.Name}'",
+            CollationExpression collation => IsBuiltInCollation(collation.Name)
+                ? FindRuntimeDependency(collation.Expression)
+                : $"explicit collation '{collation.Name}'",
             CastExpression cast => FindRuntimeDependency(cast.Expression),
             CaseExpression @case => FirstRuntimeDependency(
                 FindRuntimeDependency(@case.Operand),
@@ -7540,6 +7795,22 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         return null;
+    }
+
+    private static string? FindRuntimeDependency(UpsertClause? upsert)
+    {
+        if (upsert is null)
+            return null;
+        var collation = upsert.Target
+            .Select(column => column.Collation)
+            .FirstOrDefault(name => name is not null);
+        if (collation is not null)
+            return $"explicit collation '{collation}'";
+        return upsert.Action is DoUpdateUpsertAction update
+            ? FirstRuntimeDependency(
+                FindRuntimeDependency(update.Assignments),
+                FindRuntimeDependency(update.Where))
+            : null;
     }
 
     private static string? FindRuntimeDependency(IEnumerable<OrderByTerm> terms)
@@ -9171,9 +9442,10 @@ internal sealed class EmbeddedFileStore : IDisposable
             entries.Add(new SchemaEntry("view", view.Name, view.Name, 0, view.Sql));
         }
 
-        foreach (var name in triggers.Keys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+        foreach (var trigger in triggers.Values
+                     .OrderBy(value => value.DeclarationOrder)
+                     .ThenBy(value => value.Name, StringComparer.OrdinalIgnoreCase))
         {
-            var trigger = triggers[name];
             entries.Add(new SchemaEntry("trigger", trigger.Name, trigger.TableName, 0, trigger.Sql));
         }
 
@@ -9680,7 +9952,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static string ComputeSchemaSignature(IReadOnlyList<SchemaEntry> entries)
     {
         var builder = new StringBuilder();
-        foreach (var entry in entries.OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase))
+        foreach (var entry in entries)
         {
             builder.Append(entry.Type).Append('\u0001')
                 .Append(entry.Name).Append('\u0001')

@@ -57,4 +57,32 @@ public sealed class SqlScriptTriggerBoundaryTests
 
         exception!.Message.Should().Contain("Expected End");
     }
+
+    [Test]
+    public void PrepareScriptRecognizesFullRowTriggerHeaders()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        var statements = connection.PrepareScript("""
+            CREATE TABLE source(id INTEGER, value TEXT);
+            CREATE TABLE audit(value TEXT);
+            CREATE TRIGGER source_before UPDATE OF value ON source FOR EACH ROW
+            WHEN NEW.value <> OLD.value
+            BEGIN
+                INSERT INTO audit VALUES (OLD.value || ':' || NEW.value);
+            END;
+            INSERT INTO source VALUES (1, 'old');
+            UPDATE source SET value = 'new';
+            """);
+
+        foreach (var statement in statements)
+        {
+            using (statement)
+                statement.Step().Should().Be(StatementStepResult.Done);
+        }
+
+        using var value = connection.Prepare("SELECT value FROM audit;");
+        value.Step().Should().Be(StatementStepResult.Row);
+        value.GetValue(0).Should().Be(SqlValue.Text("old:new"));
+        value.Step().Should().Be(StatementStepResult.Done);
+    }
 }

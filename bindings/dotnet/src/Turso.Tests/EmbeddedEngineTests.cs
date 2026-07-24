@@ -1753,6 +1753,23 @@ public class EmbeddedEngineTests
     }
 
     [Test]
+    public void DropViewCascadesToItsInsteadOfTriggers()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(a INTEGER);");
+        Execute(connection, "CREATE VIEW v AS SELECT a FROM t;");
+        Execute(
+            connection,
+            "CREATE TRIGGER v_insert INSTEAD OF INSERT ON v "
+                + "BEGIN INSERT INTO t VALUES (NEW.a); END;");
+
+        Execute(connection, "DROP VIEW v;");
+
+        AssertCount(connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger';", 0);
+    }
+
+    [Test]
     public void DropViewIfExistsIsAllowedWhenMissing()
     {
         var database = new EmbeddedDatabase();
@@ -1841,7 +1858,7 @@ public class EmbeddedEngineTests
         Execute(connection, "CREATE TRIGGER trg AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (1); END;");
         Execute(connection, "UPDATE t SET id = id + 10;");
 
-        AssertCount(connection, "SELECT COUNT(*) FROM log;", 1);
+        AssertCount(connection, "SELECT COUNT(*) FROM log;", 2);
     }
 
     [Test]
@@ -1859,7 +1876,7 @@ public class EmbeddedEngineTests
     }
 
     [Test]
-    public void TriggerFiresOncePerStatementNotPerRow()
+    public void TriggerFiresOncePerAffectedRow()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -1868,7 +1885,7 @@ public class EmbeddedEngineTests
         Execute(connection, "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO cnt VALUES (1); END;");
         Execute(connection, "INSERT INTO t VALUES (1), (2), (3);");
 
-        AssertCount(connection, "SELECT COUNT(*) FROM cnt;", 1);
+        AssertCount(connection, "SELECT COUNT(*) FROM cnt;", 3);
     }
 
     [Test]
@@ -1903,7 +1920,7 @@ public class EmbeddedEngineTests
     }
 
     [Test]
-    public void MultipleTriggersFireInNameOrder()
+    public void MultipleTriggersFireInReverseDeclarationOrder()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -2048,92 +2065,127 @@ public class EmbeddedEngineTests
     }
 
     [Test]
-    public void InsteadOfTriggerIsRejected()
+    public void InsteadOfTriggerOnTableIsRejected()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER);");
 
         Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("CREATE TRIGGER trg INSTEAD OF INSERT ON t BEGIN DELETE FROM t; END;"));
+            () => Execute(connection, "CREATE TRIGGER trg INSTEAD OF INSERT ON t BEGIN DELETE FROM t; END;"));
     }
 
     [Test]
-    public void BeforeTriggerIsRejected()
+    public void BeforeTriggerRunsBeforeTheRowMutation()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TABLE log(id INTEGER);");
+        Execute(
+            connection,
+            "CREATE TRIGGER trg BEFORE INSERT ON t BEGIN INSERT INTO log VALUES (NEW.id); END;");
+        Execute(connection, "INSERT INTO t VALUES (7);");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("CREATE TRIGGER trg BEFORE INSERT ON t BEGIN DELETE FROM t; END;"));
+        ReadRows(connection, "SELECT id FROM log;").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Integer(7));
     }
 
     [Test]
-    public void TriggerWithOmittedTimingIsRejected()
+    public void TriggerWithOmittedTimingDefaultsToBefore()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TABLE log(id INTEGER);");
+        Execute(connection, "CREATE TRIGGER trg INSERT ON t BEGIN INSERT INTO log VALUES (NEW.id); END;");
+        Execute(connection, "INSERT INTO t VALUES (8);");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("CREATE TRIGGER trg INSERT ON t BEGIN DELETE FROM t; END;"));
+        ReadRows(connection, "SELECT id FROM log;").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Integer(8));
     }
 
     [Test]
-    public void ForEachRowTriggerIsRejected()
+    public void ExplicitForEachRowTriggerRunsForEveryRow()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TABLE log(id INTEGER);");
+        Execute(
+            connection,
+            "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW "
+                + "BEGIN INSERT INTO log VALUES (NEW.id); END;");
+        Execute(connection, "INSERT INTO t VALUES (1), (2);");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN DELETE FROM t; END;"));
+        AssertCount(connection, "SELECT COUNT(*) FROM log;", 2);
     }
 
     [Test]
-    public void WhenClauseTriggerIsRejected()
+    public void WhenClauseFiltersEachAffectedRow()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TABLE log(id INTEGER);");
+        Execute(
+            connection,
+            "CREATE TRIGGER trg AFTER INSERT ON t WHEN NEW.id > 1 "
+                + "BEGIN INSERT INTO log VALUES (NEW.id); END;");
+        Execute(connection, "INSERT INTO t VALUES (1), (2);");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("CREATE TRIGGER trg AFTER INSERT ON t WHEN 1 = 1 BEGIN DELETE FROM t; END;"));
+        ReadRows(connection, "SELECT id FROM log;").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Integer(2));
     }
 
     [Test]
-    public void UpdateOfColumnsTriggerIsRejected()
+    public void UpdateOfColumnsMatchesTheSetList()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, name TEXT);");
+        Execute(connection, "CREATE TABLE log(value TEXT);");
+        Execute(
+            connection,
+            "CREATE TRIGGER trg AFTER UPDATE OF name ON t "
+                + "BEGIN INSERT INTO log VALUES (NEW.name); END;");
+        Execute(connection, "INSERT INTO t VALUES (1, 'old');");
+        Execute(connection, "UPDATE t SET id = 2;");
+        Execute(connection, "UPDATE t SET name = 'new';");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("CREATE TRIGGER trg AFTER UPDATE OF name ON t BEGIN DELETE FROM t; END;"));
+        ReadRows(connection, "SELECT value FROM log;").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Text("new"));
     }
 
     [Test]
-    public void NewOrOldReferencesInTriggerBodyAreRejected()
+    public void NewAndOldReferencesExposeAffectedRowImages()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER);");
         Execute(connection, "CREATE TABLE log(n INTEGER);");
+        Execute(
+            connection,
+            "CREATE TRIGGER trg AFTER UPDATE ON t "
+                + "BEGIN INSERT INTO log VALUES (OLD.id); INSERT INTO log VALUES (NEW.id); END;");
+        Execute(connection, "INSERT INTO t VALUES (1);");
+        Execute(connection, "UPDATE t SET id = 2;");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.id); END;"));
+        ReadRows(connection, "SELECT n FROM log ORDER BY rowid;")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(1, 2);
     }
 
     [Test]
-    public void NonDmlTriggerBodyStatementIsRejected()
+    public void SelectTriggerBodyStatementExecutesAndDiscardsItsRows()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT NEW.id; END;");
+        Execute(connection, "INSERT INTO t VALUES (1);");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END;"));
+        AssertCount(connection, "SELECT COUNT(*) FROM t;", 1);
     }
 
     [Test]

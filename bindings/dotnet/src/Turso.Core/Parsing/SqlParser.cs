@@ -791,27 +791,36 @@ internal sealed class SqlParser
         var ifNotExists = ParseIfNotExists();
         var name = ParseSchemaQualifiedName();
 
+        var timing = TriggerTiming.Before;
         if (ConsumeKeyword("BEFORE"))
-            throw Error("BEFORE triggers are not supported.");
-        if (ConsumeKeyword("INSTEAD"))
-            throw Error("INSTEAD OF triggers are not supported.");
-        if (!ConsumeKeyword("AFTER"))
-            throw Error("Only AFTER triggers are supported; specify the AFTER timing explicitly.");
+            timing = TriggerTiming.Before;
+        else if (ConsumeKeyword("AFTER"))
+            timing = TriggerTiming.After;
+        else if (ConsumeKeyword("INSTEAD"))
+        {
+            ExpectKeyword("OF");
+            timing = TriggerTiming.InsteadOf;
+        }
 
-        var triggerEvent = ParseTriggerEvent();
+        var (triggerEvent, updateOfColumns) = ParseTriggerEvent();
         ExpectKeyword("ON");
         var tableName = ParseSchemaQualifiedName();
 
-        if (ConsumeKeyword("FOR"))
-            throw Error("FOR EACH ROW triggers are not supported.");
-        if (CurrentIsKeyword("WHEN"))
-            throw Error("WHEN clauses in triggers are not supported.");
-
-        ExpectKeyword("BEGIN");
-        var body = new List<ParsedStatement>();
         _inTriggerBody = true;
         try
         {
+            if (ConsumeKeyword("FOR"))
+            {
+                ExpectKeyword("EACH");
+                ExpectKeyword("ROW");
+            }
+
+            Expression? when = null;
+            if (ConsumeKeyword("WHEN"))
+                when = ParseExpression();
+
+            ExpectKeyword("BEGIN");
+            var body = new List<ParsedStatement>();
             while (!ConsumeKeyword("END"))
             {
                 if (_lexer.Current.Kind == TokenKind.End)
@@ -820,30 +829,40 @@ internal sealed class SqlParser
                 body.Add(ParseTriggerBodyStatement());
                 Expect(TokenKind.Semicolon);
             }
+
+            if (body.Count == 0)
+                throw Error("A trigger body must contain at least one statement.");
+
+            return new CreateTriggerStatement(
+                name,
+                timing,
+                triggerEvent,
+                updateOfColumns,
+                tableName,
+                when,
+                body,
+                NormalizeObjectSql(),
+                ifNotExists);
         }
         finally
         {
             _inTriggerBody = false;
         }
-
-        if (body.Count == 0)
-            throw Error("A trigger body must contain at least one statement.");
-
-        return new CreateTriggerStatement(name, triggerEvent, tableName, body, NormalizeObjectSql(), ifNotExists);
     }
 
-    private TriggerEvent ParseTriggerEvent()
+    private (TriggerEvent Event, IReadOnlyList<string>? UpdateOfColumns) ParseTriggerEvent()
     {
         if (ConsumeKeyword("INSERT"))
-            return TriggerEvent.Insert;
+            return (TriggerEvent.Insert, null);
         if (ConsumeKeyword("DELETE"))
-            return TriggerEvent.Delete;
+            return (TriggerEvent.Delete, null);
         if (ConsumeKeyword("UPDATE"))
         {
+            IReadOnlyList<string>? updateOfColumns = null;
             if (ConsumeKeyword("OF"))
-                throw Error("UPDATE OF column triggers are not supported.");
+                updateOfColumns = ParseIdentifierList();
 
-            return TriggerEvent.Update;
+            return (TriggerEvent.Update, updateOfColumns);
         }
 
         throw Error("Expected INSERT, UPDATE, or DELETE as the trigger event.");
@@ -857,8 +876,10 @@ internal sealed class SqlParser
             return ParseUpdate();
         if (ConsumeKeyword("DELETE"))
             return ParseDelete();
+        if (IsQueryStart())
+            return ParseQuery();
 
-        throw Error("Only INSERT, UPDATE, and DELETE statements are allowed in a trigger body.");
+        throw Error("Only INSERT, UPDATE, DELETE, and SELECT statements are allowed in a trigger body.");
     }
 
     private ParsedStatement ParseDropView()
@@ -870,7 +891,7 @@ internal sealed class SqlParser
     private ParsedStatement ParseDropTrigger()
     {
         var ifExists = ParseIfExists();
-        return new DropTriggerStatement(ExpectIdentifier(), ifExists);
+        return new DropTriggerStatement(ParseSchemaQualifiedName(), ifExists);
     }
 
     private bool ParseIfNotExists()
@@ -908,6 +929,7 @@ internal sealed class SqlParser
         var conflictAlgorithm = ParseInsertConflictAlgorithm();
         ExpectKeyword("INTO");
         var tableName = ParseSchemaQualifiedName();
+        RejectQualifiedTriggerDmlTarget(tableName);
         string[]? columns = null;
         if (Consume(TokenKind.LeftParen))
         {
@@ -932,6 +954,8 @@ internal sealed class SqlParser
         }
         else if (ConsumeKeyword("DEFAULT"))
         {
+            if (_inTriggerBody)
+                throw Error("DEFAULT VALUES is not available inside a trigger body.");
             if (columns is not null)
                 throw Error("DEFAULT VALUES cannot be used with a column list.");
 
@@ -1029,6 +1053,7 @@ internal sealed class SqlParser
             throw Error("Managed UPDATE conflict algorithms are not supported.");
 
         var tableName = ParseSchemaQualifiedName();
+        RejectQualifiedTriggerDmlTarget(tableName);
         RejectUnsupportedDmlTargetSuffix("UPDATE");
         ExpectKeyword("SET");
         var assignments = new List<ColumnAssignment>();
@@ -1059,6 +1084,7 @@ internal sealed class SqlParser
     {
         ExpectKeyword("FROM");
         var tableName = ParseSchemaQualifiedName();
+        RejectQualifiedTriggerDmlTarget(tableName);
         RejectUnsupportedDmlTargetSuffix("DELETE");
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
@@ -1075,6 +1101,15 @@ internal sealed class SqlParser
             throw Error($"Managed {statementKind} target aliases are not supported.");
         if (CurrentIsKeyword("INDEXED") || CurrentIsKeyword("NOT"))
             throw Error($"Managed {statementKind} does not support INDEXED BY or NOT INDEXED.");
+    }
+
+    private void RejectQualifiedTriggerDmlTarget(string tableName)
+    {
+        if (_inTriggerBody && ManagedSchemaName.TrySplit(tableName, out _, out _))
+        {
+            throw Error(
+                "Qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers.");
+        }
     }
 
     private (IReadOnlyList<OrderByTerm> OrderBy, Expression? Limit, Expression? Offset)
@@ -1903,13 +1938,6 @@ internal sealed class SqlParser
                 _lexer.Next();
                 return new ParameterExpression(ResolveParameterIndex(token.Text));
             case TokenKind.Identifier:
-                if (_inTriggerBody
-                    && (string.Equals(token.Text, "NEW", StringComparison.OrdinalIgnoreCase)
-                        || string.Equals(token.Text, "OLD", StringComparison.OrdinalIgnoreCase)))
-                {
-                    throw Error("NEW and OLD row references are not supported; only statement-level trigger bodies are allowed.");
-                }
-
                 _lexer.Next();
                 if (Consume(TokenKind.Dot))
                 {
@@ -1919,17 +1947,24 @@ internal sealed class SqlParser
                         token.Text,
                         columnName);
                 }
-                if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
+                if (!token.IsQuoted
+                    && string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
                     return new LiteralExpression(SqlValue.Null);
-                if (string.Equals(token.Text, "CURRENT_DATE", StringComparison.OrdinalIgnoreCase))
+                if (!token.IsQuoted
+                    && string.Equals(token.Text, "CURRENT_DATE", StringComparison.OrdinalIgnoreCase))
                     return new CurrentTimeExpression(CurrentTimeKind.Date);
-                if (string.Equals(token.Text, "CURRENT_TIME", StringComparison.OrdinalIgnoreCase))
+                if (!token.IsQuoted
+                    && string.Equals(token.Text, "CURRENT_TIME", StringComparison.OrdinalIgnoreCase))
                     return new CurrentTimeExpression(CurrentTimeKind.Time);
-                if (string.Equals(token.Text, "CURRENT_TIMESTAMP", StringComparison.OrdinalIgnoreCase))
+                if (!token.IsQuoted
+                    && string.Equals(token.Text, "CURRENT_TIMESTAMP", StringComparison.OrdinalIgnoreCase))
                     return new CurrentTimeExpression(CurrentTimeKind.Timestamp);
-                if (string.Equals(token.Text, "CASE", StringComparison.OrdinalIgnoreCase))
+                if (!token.IsQuoted
+                    && string.Equals(token.Text, "CASE", StringComparison.OrdinalIgnoreCase))
                     return ParseCaseExpression();
-                if (string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) && Consume(TokenKind.LeftParen))
+                if (!token.IsQuoted
+                    && string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase)
+                    && Consume(TokenKind.LeftParen))
                 {
                     var expression = ParseExpression();
                     ExpectKeyword("AS");
@@ -1941,6 +1976,10 @@ internal sealed class SqlParser
                 }
                 if (Consume(TokenKind.LeftParen))
                 {
+                    if (!token.IsQuoted
+                        && string.Equals(token.Text, "RAISE", StringComparison.OrdinalIgnoreCase))
+                        return ParseRaiseExpression();
+
                     var functionName = token.Text.ToUpperInvariant();
                     if (string.Equals(token.Text, "COUNT", StringComparison.OrdinalIgnoreCase) && Consume(TokenKind.Asterisk))
                     {
@@ -1979,6 +2018,33 @@ internal sealed class SqlParser
             default:
                 throw Error("Expected an expression.");
         }
+    }
+
+    private Expression ParseRaiseExpression()
+    {
+        if (!_inTriggerBody)
+            throw Error("RAISE() may only be used within a trigger program.");
+        if (ConsumeKeyword("IGNORE"))
+        {
+            Expect(TokenKind.RightParen);
+            return new RaiseExpression(RaiseAction.Ignore, null);
+        }
+
+        var action = ConsumeKeyword("ROLLBACK")
+            ? RaiseAction.Rollback
+            : ConsumeKeyword("ABORT")
+                ? RaiseAction.Abort
+                : ConsumeKeyword("FAIL")
+                    ? RaiseAction.Fail
+                    : throw Error("Expected ROLLBACK, ABORT, FAIL, or IGNORE in RAISE().");
+        Expect(TokenKind.Comma);
+        if (_lexer.Current.Kind != TokenKind.String)
+            throw Error("RAISE() error messages must be string literals.");
+
+        var message = _lexer.Current.Text;
+        _lexer.Next();
+        Expect(TokenKind.RightParen);
+        return new RaiseExpression(action, message);
     }
 
     private QueryStatement ParseParenthesizedQuery()
@@ -2420,6 +2486,7 @@ internal sealed class SqlParser
     private bool ConsumeKeyword(string keyword)
     {
         if (_lexer.Current.Kind != TokenKind.Identifier
+            || _lexer.Current.IsQuoted
             || !string.Equals(_lexer.Current.Text, keyword, StringComparison.OrdinalIgnoreCase))
         {
             return false;
@@ -2431,6 +2498,7 @@ internal sealed class SqlParser
 
     private bool CurrentIsKeyword(string keyword)
         => _lexer.Current.Kind == TokenKind.Identifier
+            && !_lexer.Current.IsQuoted
             && string.Equals(_lexer.Current.Text, keyword, StringComparison.OrdinalIgnoreCase);
 
     private void ExpectKeyword(string keyword)
