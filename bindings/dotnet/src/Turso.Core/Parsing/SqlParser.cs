@@ -1151,11 +1151,7 @@ internal sealed class SqlParser
             ExpectKeyword("BY");
             do
             {
-                var expression = ParseExpression();
-                var descending = ConsumeKeyword("DESC");
-                if (!descending)
-                    ConsumeKeyword("ASC");
-                orderBy.Add(new OrderByTerm(expression, descending));
+                orderBy.Add(ParseOrderByTerm());
             }
             while (Consume(TokenKind.Comma));
         }
@@ -1177,6 +1173,87 @@ internal sealed class SqlParser
         }
 
         return (orderBy, limit, offset);
+    }
+
+    private OrderByTerm ParseOrderByTerm()
+    {
+        var expressionOffset = _lexer.Current.Offset;
+        var expression = ParseExpression();
+        var ordinal = TryParseOrderByOrdinal(
+            _sql.AsSpan(expressionOffset, _lexer.Current.Offset - expressionOffset));
+        var descending = ConsumeKeyword("DESC");
+        if (!descending)
+            ConsumeKeyword("ASC");
+
+        var nullPlacement = NullPlacement.Default;
+        if (ConsumeKeyword("NULLS"))
+        {
+            if (ConsumeKeyword("FIRST"))
+                nullPlacement = NullPlacement.First;
+            else if (ConsumeKeyword("LAST"))
+                nullPlacement = NullPlacement.Last;
+            else
+                throw Error("Expected FIRST or LAST after NULLS.");
+        }
+
+        return new OrderByTerm(expression, descending, nullPlacement, ordinal);
+    }
+
+    private static long? TryParseOrderByOrdinal(ReadOnlySpan<char> expression)
+    {
+        var collation = expression.IndexOf("COLLATE", StringComparison.OrdinalIgnoreCase);
+        if (collation >= 0)
+            expression = expression[..collation];
+
+        expression = expression.Trim();
+        while (TryStripOuterParentheses(ref expression))
+            expression = expression.Trim();
+
+        var sign = '\0';
+        if (!expression.IsEmpty && expression[0] is '+' or '-')
+        {
+            sign = expression[0];
+            expression = expression[1..].Trim();
+            while (TryStripOuterParentheses(ref expression))
+                expression = expression.Trim();
+        }
+
+        if (expression.IsEmpty || expression.IndexOfAnyExceptInRange('0', '9') >= 0)
+            return null;
+
+        var text = sign == '\0'
+            ? expression.ToString()
+            : sign + expression.ToString();
+        return long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ordinal)
+            ? ordinal
+            : null;
+    }
+
+    private static bool TryStripOuterParentheses(ref ReadOnlySpan<char> expression)
+    {
+        if (expression.Length < 2 || expression[0] != '(' || expression[^1] != ')')
+            return false;
+
+        var depth = 0;
+        for (var index = 0; index < expression.Length; index++)
+        {
+            depth += expression[index] switch
+            {
+                '(' => 1,
+                ')' => -1,
+                _ => 0,
+            };
+            if (depth == 0 && index != expression.Length - 1)
+                return false;
+            if (depth < 0)
+                return false;
+        }
+
+        if (depth != 0)
+            return false;
+
+        expression = expression[1..^1];
+        return true;
     }
 
     private Projection ParseProjection()
@@ -1265,11 +1342,7 @@ internal sealed class SqlParser
             ExpectKeyword("BY");
             do
             {
-                var expression = ParseExpression();
-                var descending = ConsumeKeyword("DESC");
-                if (!descending)
-                    ConsumeKeyword("ASC");
-                orderBy.Add(new OrderByTerm(expression, descending));
+                orderBy.Add(ParseOrderByTerm());
             }
             while (Consume(TokenKind.Comma));
         }
