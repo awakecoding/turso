@@ -16,7 +16,11 @@ public sealed class ManagedIncrementalBlobBoundaryTests
         GetPrivateField(connection, "_database").Should().BeNull();
         ((object?)connection.Handle).Should().BeNull();
 
-        using var blob = new SqliteBlob(connection, "data", "value", 1);
+        using var blob = new SqliteBlob(
+            connection,
+            tableName: "data",
+            columnName: "value",
+            rowid: 1);
         blob.Length.Should().Be(3);
 
         var read = new byte[4];

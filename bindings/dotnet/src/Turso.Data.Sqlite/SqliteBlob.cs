@@ -17,8 +17,8 @@ public class SqliteBlob : Stream
     private long _position;
     private bool _disposed;
 
-    public SqliteBlob(SqliteConnection connection, string tableName, string columnName, long rowId, bool readOnly = false)
-        : this(connection, "main", tableName, columnName, rowId, readOnly)
+    public SqliteBlob(SqliteConnection connection, string tableName, string columnName, long rowid, bool readOnly = false)
+        : this(connection, "main", tableName, columnName, rowid, readOnly)
     {
     }
 
