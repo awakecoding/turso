@@ -176,6 +176,73 @@ public sealed class ManagedBackupSnapshotTests
     }
 
     [Test]
+    public void ManagedBackupPreservesActiveConstraintMetadataAcrossDestinationReopen()
+    {
+        var sourcePath = CreateManagedDatabasePath();
+        var destinationPath = CreateManagedDatabasePath();
+        try
+        {
+            using (var source = OpenManagedConnection(sourcePath))
+            using (var destination = OpenManagedConnection(destinationPath))
+            using (var transaction = source.BeginTransaction())
+            {
+                source.ExecuteNonQuery(
+                    """
+                    CREATE TABLE constrained(
+                        id INTEGER PRIMARY KEY,
+                        code TEXT CONSTRAINT uq_code UNIQUE ON CONFLICT IGNORE,
+                        required INTEGER CONSTRAINT nn_required NOT NULL ON CONFLICT REPLACE DEFAULT (2 + 3),
+                        amount DOUBLE PRECISION DEFAULT (abs(-4) + 1),
+                        label CHARACTER VARYING(20),
+                        CONSTRAINT positive CHECK (amount > 0),
+                        CONSTRAINT metric_value UNIQUE (label, amount) ON CONFLICT IGNORE
+                    );
+                    INSERT INTO constrained(id, code, label) VALUES (1, 'A', 'X');
+                    """);
+
+                source.BackupDatabase(destination);
+                transaction.Rollback();
+                source.ExecuteScalar<long>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'constrained';").Should().Be(0);
+            }
+
+            using var reopened = OpenManagedConnection(destinationPath);
+            var schemaSql = reopened.ExecuteScalar<string>(
+                "SELECT sql FROM sqlite_master WHERE name = 'constrained';");
+            schemaSql.Should().Contain("CONSTRAINT \"uq_code\" UNIQUE ON CONFLICT IGNORE")
+                .And.Contain("CONSTRAINT \"nn_required\" NOT NULL ON CONFLICT REPLACE DEFAULT (2 + 3)")
+                .And.Contain("DOUBLE PRECISION DEFAULT (abs(-4) + 1)")
+                .And.Contain("CHARACTER VARYING(20)")
+                .And.Contain("CONSTRAINT \"positive\" CHECK (amount > 0)")
+                .And.Contain("CONSTRAINT \"metric_value\" UNIQUE (\"label\", \"amount\") ON CONFLICT IGNORE");
+
+            reopened.ExecuteScalar<long>(
+                "SELECT required FROM constrained WHERE id = 1;").Should().Be(5);
+            reopened.ExecuteNonQuery(
+                "INSERT INTO constrained(id, code, required, label) VALUES (2, 'B', NULL, 'Y');");
+            reopened.ExecuteScalar<long>(
+                "SELECT required FROM constrained WHERE id = 2;").Should().Be(5);
+            reopened.ExecuteNonQuery(
+                "INSERT INTO constrained(id, code, label) VALUES (3, 'A', 'Z');");
+            reopened.ExecuteNonQuery(
+                "INSERT INTO constrained(id, code, label) VALUES (4, 'C', 'Y');");
+            reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM constrained;").Should().Be(2);
+
+            reopened.Invoking(connection => connection.ExecuteNonQuery(
+                    "UPDATE constrained SET amount = -1 WHERE id = 2;"))
+                .Should().Throw<SqliteException>()
+                .WithMessage("*CHECK constraint failed: positive*");
+            reopened.ExecuteScalar<double>(
+                "SELECT amount FROM constrained WHERE id = 2;").Should().Be(5);
+        }
+        finally
+        {
+            DeleteManagedDatabase(sourcePath);
+            DeleteManagedDatabase(destinationPath);
+        }
+    }
+
+    [Test]
     public void ManagedBackupCopiesWhileSourceReaderRemainsActive()
     {
         using var source = OpenManagedConnection();

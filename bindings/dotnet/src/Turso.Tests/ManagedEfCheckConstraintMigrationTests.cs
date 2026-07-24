@@ -10,7 +10,7 @@ namespace Turso.Tests;
 public class ManagedEfCheckConstraintMigrationTests
 {
     [Test]
-    public async Task EnsureCreatedRejectsCheckConstraintsBeforeSchemaMutation()
+    public async Task EnsureCreatedPersistsCheckConstraints()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         await connection.OpenAsync();
@@ -20,15 +20,13 @@ public class ManagedEfCheckConstraintMigrationTests
             .Options;
         await using var context = new CheckConstraintContext(options);
 
-        var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
-
-        await ensureCreated.Should().ThrowAsync<NotSupportedException>()
-            .WithMessage("*check constraints*");
+        (await context.Database.EnsureCreatedAsync()).Should().BeTrue();
 
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table';";
+        command.CommandText = "SELECT \"sql\" FROM \"sqlite_master\" WHERE \"name\" = 'Items';";
 
-        (await command.ExecuteScalarAsync()).Should().Be(0L);
+        (await command.ExecuteScalarAsync()).Should().BeOfType<string>()
+            .Which.Should().Contain("CONSTRAINT \"CK_Items_Name\" CHECK");
     }
 
     [Test]
