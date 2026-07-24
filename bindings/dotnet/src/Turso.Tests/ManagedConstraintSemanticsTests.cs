@@ -202,6 +202,160 @@ public sealed class ManagedConstraintSemanticsTests
         Execute(connection, "INSERT INTO values_table VALUES (1, 2);");
     }
 
+    [Test]
+    public void EmptyTableAddColumnRejectsInvalidSchemaBeforeCatalogPublication()
+    {
+        using (var sqlite = new MsData.SqliteConnection("Data Source=:memory:"))
+        {
+            sqlite.Open();
+            Execute(sqlite, "CREATE TABLE values_table(id INTEGER);");
+            Action invalidCheck = () => Execute(
+                sqlite,
+                "ALTER TABLE values_table ADD COLUMN checked INTEGER CHECK(missing > 0);");
+            invalidCheck.Should().Throw<MsData.SqliteException>().WithMessage("*no such column: missing*");
+            Action invalidDefault = () => Execute(
+                sqlite,
+                "ALTER TABLE values_table ADD COLUMN defaulted INTEGER DEFAULT (missing);");
+            invalidDefault.Should().Throw<MsData.SqliteException>()
+                .WithMessage("*default value of column [defaulted] is not constant*");
+        }
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE TABLE values_table(id INTEGER);");
+
+                Action invalidCheck = () => Execute(
+                    connection,
+                    "ALTER TABLE values_table ADD COLUMN checked INTEGER CHECK(missing > 0);");
+                invalidCheck.Should().Throw<EmbeddedSqlException>().WithMessage("no such column: missing");
+
+                Action invalidDefault = () => Execute(
+                    connection,
+                    "ALTER TABLE values_table ADD COLUMN defaulted INTEGER DEFAULT (missing);");
+                invalidDefault.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("default value of column is not constant: missing");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                ScalarInteger(sqlite, "SELECT COUNT(*) FROM pragma_table_info('values_table');").Should().Be(1);
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            ReadRows(reopenedConnection, "PRAGMA table_info(values_table);").Should().HaveCount(1);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void GeneratedColumnUniqueMetadataRoundTripsThroughFileCatalog()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE generated_values(
+                        value INTEGER,
+                        computed INTEGER GENERATED ALWAYS AS (value + 1) STORED
+                            CONSTRAINT generated_unique UNIQUE ON CONFLICT IGNORE
+                    );
+                    """);
+                Execute(connection, "INSERT INTO generated_values(value) VALUES (1), (1);");
+                ScalarInteger(connection, "SELECT COUNT(*) FROM generated_values;").Should().Be(1);
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'generated_values';")
+                    .Should().Contain("CONSTRAINT \"generated_unique\" UNIQUE ON CONFLICT IGNORE");
+                ScalarInteger(
+                    sqlite,
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'sqlite_autoindex_generated_values_1' AND sql IS NULL;")
+                    .Should().Be(1);
+                Execute(sqlite, "INSERT INTO generated_values(value) VALUES (2), (2);");
+                ScalarInteger(sqlite, "SELECT COUNT(*) FROM generated_values;").Should().Be(2);
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Execute(reopenedConnection, "INSERT INTO generated_values(value) VALUES (3), (3);");
+            ReadRows(reopenedConnection, "SELECT value, computed FROM generated_values ORDER BY value;")
+                .Should().BeEquivalentTo(
+                [
+                    new[] { SqlValue.Integer(1), SqlValue.Integer(2) },
+                    new[] { SqlValue.Integer(2), SqlValue.Integer(3) },
+                    new[] { SqlValue.Integer(3), SqlValue.Integer(4) },
+                ],
+                options => options.WithStrictOrdering());
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void TableQualifiedChecksMatchSqliteAndSurviveReopen()
+    {
+        const string create = "CREATE TABLE qualified(value INTEGER, CHECK(qualified.value > 0));";
+        AssertQueryMatchesSqlite(
+            [create, "INSERT INTO qualified VALUES (1);"],
+            "SELECT value FROM qualified;");
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, create);
+                Execute(connection, "INSERT INTO qualified VALUES (1);");
+                Action invalid = () => Execute(connection, "INSERT INTO qualified VALUES (0);");
+                invalid.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("CHECK constraint failed: qualified.value > 0");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                Action invalid = () => Execute(sqlite, "INSERT INTO qualified VALUES (0);");
+                invalid.Should().Throw<MsData.SqliteException>()
+                    .WithMessage("*CHECK constraint failed: qualified.value > 0*");
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Action reopenedInvalid = () => Execute(reopenedConnection, "INSERT INTO qualified VALUES (-1);");
+            reopenedInvalid.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("CHECK constraint failed: qualified.value > 0");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     private static void AssertQueryMatchesSqlite(IReadOnlyList<string> setup, string query)
     {
         var managed = RunManaged(setup, query);

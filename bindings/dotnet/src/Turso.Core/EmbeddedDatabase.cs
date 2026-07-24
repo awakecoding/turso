@@ -3055,6 +3055,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var source = new SourceRow(
             table.Columns,
             row,
+            BuildQualifiedColumns(tableName, table.Columns),
             RowId: table.HasRowid ? rowid : null,
             RowIdQualifier: tableName);
         foreach (var column in table.ColumnDefinitions)
@@ -9836,7 +9837,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 definition += " COLLATE " + collation;
 
             // A generated column carries its expression instead of PRIMARY KEY / DEFAULT
-            // markers (which SQLite forbids on generated columns); NOT NULL still applies.
+            // markers (which SQLite forbids on generated columns); NOT NULL and UNIQUE still apply.
             if (column.IsGenerated)
             {
                 definition += $" AS ({column.GenerationSql}) " + (column.GeneratedStored ? "STORED" : "VIRTUAL");
@@ -9845,6 +9846,12 @@ public sealed class EmbeddedDatabase : IDisposable
                     definition += FormatConstraintName(column.NotNullConstraintName)
                         + " NOT NULL"
                         + FormatConflictClause(column.NotNullConflictAlgorithm);
+                }
+                if (column.Unique)
+                {
+                    definition += FormatConstraintName(column.UniqueConstraintName)
+                        + " UNIQUE"
+                        + FormatConflictClause(column.UniqueConflictAlgorithm);
                 }
                 foreach (var check in column.CheckConstraints)
                     definition += FormatCheckConstraint(check);
@@ -17189,7 +17196,7 @@ internal sealed class EmbeddedTable
             case ColumnExpression column:
                 if (!allowColumns)
                     throw new EmbeddedSqlException($"default value of column is not constant: {column.Name}");
-                if (!_columnIndices.ContainsKey(column.Name))
+                if (!IsConstraintColumn(column.Name))
                     throw new EmbeddedSqlException($"no such column: {column.Name}");
                 return;
             case ParameterExpression:
@@ -17253,6 +17260,16 @@ internal sealed class EmbeddedTable
             default:
                 throw new EmbeddedSqlException($"expression is not allowed in a {context}");
         }
+    }
+
+    private bool IsConstraintColumn(string name)
+    {
+        var separator = name.IndexOf('.');
+        if (separator < 0)
+            return _columnIndices.ContainsKey(name);
+
+        return string.Equals(name[..separator], Name, StringComparison.OrdinalIgnoreCase)
+            && _columnIndices.ContainsKey(name[(separator + 1)..]);
     }
 
     public string Name { get; private set; }
@@ -17755,6 +17772,16 @@ internal sealed class EmbeddedTable
             throw new EmbeddedSqlException("ALTER TABLE ADD COLUMN with REFERENCES is not supported.");
         if (column.PrimaryKey || column.Unique)
             throw new EmbeddedSqlException("Cannot add a PRIMARY KEY or UNIQUE column.");
+
+        _ = new EmbeddedTable(
+            Name,
+            [.. ColumnDefinitions, column],
+            WithoutRowid,
+            TableLevelPrimaryKey,
+            TableUniqueConstraints,
+            CheckConstraints,
+            TablePrimaryKeyConflictAlgorithm,
+            TablePrimaryKeyConstraintName);
 
         if (column.DefaultExpression is not null && Rows.Count > 0)
             throw new EmbeddedSqlException("Cannot add a column with non-constant default.");
