@@ -31,6 +31,7 @@ public partial class SqliteConnection : DbConnection
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
     private bool _recursiveTriggers;
     private bool _readUncommitted;
+    private bool _managedSharedMemory;
     private string? _sharedMemoryPath;
     private bool _extensionsEnabled;
     private readonly List<(string File, string? Proc)> _pendingExtensions = [];
@@ -84,7 +85,13 @@ public partial class SqliteConnection : DbConnection
     internal bool ReadUncommitted
     {
         get => _readUncommitted;
-        set => _readUncommitted = value;
+        set
+        {
+            if (value && _managedSharedMemory)
+                throw new NotSupportedException(Properties.Resources.ManagedSharedCacheReadUncommittedNotSupported);
+
+            _readUncommitted = value;
+        }
     }
 
     public override string ServerVersion => "3.0.0";
@@ -100,18 +107,15 @@ public partial class SqliteConnection : DbConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_database is not null || _managedDatabase is not null)
             throw new InvalidOperationException("The connection is already open.");
-        if (_connectionOptions.EffectiveLocalProvider == TursoLocalProvider.Managed
-            && _connectionOptions.Cache == SqliteCacheMode.Shared)
-        {
-            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheNotSupported);
-        }
+        ValidateManagedSharedCacheOptions();
         if (!string.IsNullOrEmpty(_connectionOptions.Password))
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
 
         var originalState = State;
         var filename = NormalizeDataSource(_connectionOptions);
         var readOnly = _connectionOptions.Mode == SqliteOpenMode.ReadOnly;
-        var sharedMemoryPath = IsSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
+        var managedSharedMemory = IsManagedSharedMemoryConfiguration(_connectionOptions);
+        var sharedMemoryPath = IsNativeSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
         TursoEncryptionOptions? managedEncryption = null;
         try
         {
@@ -119,12 +123,18 @@ public partial class SqliteConnection : DbConnection
             {
                 managedEncryption = _connectionOptions.CreateManagedEncryptionOptions();
                 if (managedEncryption is not null
-                    && filename.Equals(":memory:", StringComparison.Ordinal))
+                    && (_connectionOptions.Mode == SqliteOpenMode.Memory
+                        || filename.Equals(":memory:", StringComparison.Ordinal)))
                 {
                     throw new NotSupportedException(Properties.Resources.ManagedMemoryEncryptionNotSupported);
                 }
 
-                if (CanUseManagedPooling(filename, managedEncryption))
+                if (managedSharedMemory)
+                {
+                    _managedDatabase = ManagedSharedMemoryDatabase.Open(filename);
+                    _managedSharedMemory = true;
+                }
+                else if (CanUseManagedPooling(filename, managedEncryption))
                 {
                     var poolKey = ManagedConnectionPoolKey.Create(filename, readOnly);
                     _managedPoolLease = ManagedConnectionPool.Rent(
@@ -228,6 +238,7 @@ public partial class SqliteConnection : DbConnection
             _readOnly = false;
             _recursiveTriggers = false;
             _readUncommitted = false;
+            _managedSharedMemory = false;
             if (_sharedMemoryPath is not null)
             {
                 ReleaseSharedMemoryFile(_sharedMemoryPath);
@@ -507,6 +518,8 @@ public partial class SqliteConnection : DbConnection
 
     internal bool UsesManagedDatabase => IsManagedConnection;
 
+    internal bool IsManagedSharedMemory => _managedSharedMemory;
+
     internal bool HasOpenReader
     {
         get
@@ -766,6 +779,7 @@ public partial class SqliteConnection : DbConnection
         DisposeDatabaseAndManagedEncryptionFileSystem();
         _dataSource = null;
         _readOnly = false;
+        _managedSharedMemory = false;
         _sharedMemoryPath = null;
         if (sharedMemoryPath is not null)
             ReleaseSharedMemoryFile(sharedMemoryPath);
@@ -1037,7 +1051,9 @@ public partial class SqliteConnection : DbConnection
             return dataSource;
         if (options.Mode == SqliteOpenMode.Memory)
             return options.Cache == SqliteCacheMode.Shared && dataSource.Length > 0
-                ? GetSharedMemoryFile(dataSource)
+                ? options.EffectiveLocalProvider == TursoLocalProvider.Managed
+                    ? dataSource
+                    : GetSharedMemoryFile(dataSource)
                 : ":memory:";
         if (dataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
             return NormalizeUriDataSource(dataSource, validateFileExists);
@@ -1108,8 +1124,32 @@ public partial class SqliteConnection : DbConnection
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 
-    private static bool IsSharedMemory(SqliteConnectionStringBuilder options)
-        => options.Mode == SqliteOpenMode.Memory && options.Cache == SqliteCacheMode.Shared && options.DataSource.Length > 0;
+    private static bool IsManagedSharedMemoryConfiguration(SqliteConnectionStringBuilder options)
+        => options.EffectiveLocalProvider == TursoLocalProvider.Managed
+           && options.Mode == SqliteOpenMode.Memory
+           && options.Cache == SqliteCacheMode.Shared
+           && !string.IsNullOrWhiteSpace(options.DataSource)
+           && !options.DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNativeSharedMemory(SqliteConnectionStringBuilder options)
+        => options.EffectiveLocalProvider != TursoLocalProvider.Managed
+           && options.Mode == SqliteOpenMode.Memory
+           && options.Cache == SqliteCacheMode.Shared
+           && options.DataSource.Length > 0;
+
+    private void ValidateManagedSharedCacheOptions()
+    {
+        if (_connectionOptions.EffectiveLocalProvider != TursoLocalProvider.Managed
+            || _connectionOptions.Cache != SqliteCacheMode.Shared)
+        {
+            return;
+        }
+
+        if (!IsManagedSharedMemoryConfiguration(_connectionOptions))
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheNotSupported);
+        if (HasManagedCallbacks)
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheCallbacksNotSupported);
+    }
 
     private bool CanUseManagedPooling(string filename, TursoEncryptionOptions? encryption)
         => _connectionOptions.Pooling

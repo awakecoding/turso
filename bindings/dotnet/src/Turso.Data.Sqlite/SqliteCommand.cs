@@ -628,18 +628,8 @@ public class SqliteCommand : DbCommand
         else
             return false;
 
-        enabled = ParsePragmaEnabled(value);
+        enabled = TursoCommand.ParsePragmaEnabled(value);
         return true;
-    }
-
-    private static bool ParsePragmaEnabled(string value)
-    {
-        value = value.Trim('\'', '"');
-        return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var number)
-            ? number != 0
-            : value.Equals("ON", StringComparison.OrdinalIgnoreCase)
-              || value.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
-              || value.Equals("YES", StringComparison.OrdinalIgnoreCase);
     }
 
     internal static bool CountsRowsAffected(string commandText)

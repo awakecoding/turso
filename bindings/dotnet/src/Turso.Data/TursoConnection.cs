@@ -18,6 +18,7 @@ public class TursoConnection : DbConnection
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
     private bool _disposed;
     private bool _readUncommitted;
+    private bool _managedSharedMemory;
     private bool _remoteTransactionActive;
     private bool _managedReadOnly;
     private readonly HashSet<TursoDataReader> _openReaders = [];
@@ -150,6 +151,7 @@ public class TursoConnection : DbConnection
                 {
                     managedEncryptionFileSystem?.Dispose();
                     _readUncommitted = false;
+                    _managedSharedMemory = false;
                     _managedReadOnly = false;
                 }
             }
@@ -234,7 +236,13 @@ public class TursoConnection : DbConnection
     internal bool ReadUncommitted
     {
         get => _readUncommitted;
-        set => _readUncommitted = value;
+        set
+        {
+            if (value && _managedSharedMemory)
+                throw new NotSupportedException(ManagedSharedCacheContract.ReadUncommittedNotSupportedMessage);
+
+            _readUncommitted = value;
+        }
     }
 
     internal TursoNativeDatabase NativeDatabase
@@ -542,7 +550,12 @@ public class TursoConnection : DbConnection
 
     private void OpenManagedDatabase(ManagedLocalOpenOptions options)
     {
-        if (_connectionOptions.Pooling
+        if (options.SharedMemoryName is not null)
+        {
+            _managedDatabase = ManagedSharedMemoryDatabase.Open(options.SharedMemoryName);
+            _managedSharedMemory = true;
+        }
+        else if (_connectionOptions.Pooling
             && options.Encryption is null
             && !options.DataSource.Equals(":memory:", StringComparison.Ordinal))
         {

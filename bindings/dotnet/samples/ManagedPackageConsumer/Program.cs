@@ -3,10 +3,10 @@ using Microsoft.EntityFrameworkCore;
 using Turso.Data.Sqlite;
 
 var databasePath = Path.Combine(AppContext.BaseDirectory, $"managed-package-{Guid.NewGuid():N}.db");
+using var connection = new SqliteConnection(
+    $"Data Source={databasePath};Pooling=True;Local Provider=Managed");
 try
 {
-    using var connection = new SqliteConnection(
-        $"Data Source={databasePath};Pooling=True;Local Provider=Managed");
     connection.Open();
 
     using var command = connection.CreateCommand();
@@ -23,89 +23,90 @@ try
     SqliteConnection.ClearPool(connection);
     connection.Close();
     SqliteConnection.ClearAllPools();
+
+    var options = new DbContextOptionsBuilder<ConsumerContext>()
+        .UseTurso(connection)
+        .Options;
+    using (var context = new ConsumerContext(options))
+    {
+        context.Database.EnsureCreated();
+        context.Records.Add(new ConsumerRecord { Id = 1, Value = "packaged" });
+        context.SaveChanges();
+
+        if (context.Records.Single().Value != "packaged")
+            throw new InvalidOperationException("The packaged Turso EF Core provider returned an unexpected result.");
+    }
+
+    if (typeof(DbContext).Assembly.GetName().Version?.Major != 9)
+        throw new InvalidOperationException("The managed Turso package consumer must run against EF Core 9.x.");
+
+    try
+    {
+        _ = new DbContextOptionsBuilder<ConsumerContext>()
+            .UseTurso("Data Source=libsql://example-org.turso.io");
+        throw new InvalidOperationException("UseTurso must reject remote URLs during configuration.");
+    }
+    catch (NotSupportedException exception) when (
+        exception.Message.Contains("retry and transaction semantics", StringComparison.Ordinal))
+    {
+    }
+
+    const string encryptionKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+    var encryptedPath = Path.Combine(Path.GetTempPath(), $"turso-managed-package-{Guid.NewGuid():N}.db");
+    try
+    {
+        var encryptedConnectionString =
+            $"Data Source={encryptedPath};Local Provider=Managed;Encryption Cipher=AES256GCM;Encryption Key={encryptionKey}";
+        using (var encrypted = new SqliteConnection(encryptedConnectionString))
+        {
+            encrypted.Open();
+            encrypted.ExecuteNonQuery("CREATE TABLE encrypted_data(value TEXT); INSERT INTO encrypted_data VALUES ('package');");
+        }
+
+        using (var reopened = new SqliteConnection(encryptedConnectionString))
+        {
+            reopened.Open();
+            if (reopened.ExecuteScalar<string>("SELECT value FROM encrypted_data;") != "package")
+                throw new InvalidOperationException("The managed package did not reopen its encrypted database.");
+        }
+
+        using var unsupported = new SqliteConnection(
+            $"Data Source={encryptedPath};Local Provider=Managed;Encryption Cipher=AEGIS256;Encryption Key={encryptionKey}");
+        try
+        {
+            unsupported.Open();
+            throw new InvalidOperationException("The managed package accepted an unsupported encryption cipher.");
+        }
+        catch (NotSupportedException exception) when (
+            exception.Message.Contains("cipher ID 1", StringComparison.Ordinal)
+            && exception.Message.Contains("cipher ID 2", StringComparison.Ordinal))
+        {
+        }
+    }
+    finally
+    {
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+            File.Delete(encryptedPath + suffix);
+    }
+
+    if (AppDomain.CurrentDomain.GetAssemblies().Any(assembly =>
+            string.Equals(assembly.GetName().Name, "Turso.Raw", StringComparison.Ordinal)))
+    {
+        throw new InvalidOperationException("The managed Turso package consumer must not load Turso.Raw.");
+    }
+
+    EnsureNoNativeCompanionWasRestored();
+    await VerifyEntityFrameworkIntegrationAsync(connection);
+
+    Console.WriteLine(
+        $"Managed package consumer succeeded on {AppContext.TargetFrameworkName} with EF Core {typeof(DbContext).Assembly.GetName().Version}.");
 }
 finally
 {
+    connection.Close();
     SqliteConnection.ClearAllPools();
     DeleteDatabase(databasePath);
 }
-
-var options = new DbContextOptionsBuilder<ConsumerContext>()
-    .UseTurso(connection)
-    .Options;
-using (var context = new ConsumerContext(options))
-{
-    context.Database.EnsureCreated();
-    context.Records.Add(new ConsumerRecord { Id = 1, Value = "packaged" });
-    context.SaveChanges();
-
-    if (context.Records.Single().Value != "packaged")
-        throw new InvalidOperationException("The packaged Turso EF Core provider returned an unexpected result.");
-}
-
-if (typeof(DbContext).Assembly.GetName().Version?.Major != 9)
-    throw new InvalidOperationException("The managed Turso package consumer must run against EF Core 9.x.");
-
-try
-{
-    _ = new DbContextOptionsBuilder<ConsumerContext>()
-        .UseTurso("Data Source=libsql://example-org.turso.io");
-    throw new InvalidOperationException("UseTurso must reject remote URLs during configuration.");
-}
-catch (NotSupportedException exception) when (
-    exception.Message.Contains("retry and transaction semantics", StringComparison.Ordinal))
-{
-}
-
-const string encryptionKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
-var encryptedPath = Path.Combine(Path.GetTempPath(), $"turso-managed-package-{Guid.NewGuid():N}.db");
-try
-{
-    var encryptedConnectionString =
-        $"Data Source={encryptedPath};Local Provider=Managed;Encryption Cipher=AES256GCM;Encryption Key={encryptionKey}";
-    using (var encrypted = new SqliteConnection(encryptedConnectionString))
-    {
-        encrypted.Open();
-        encrypted.ExecuteNonQuery("CREATE TABLE encrypted_data(value TEXT); INSERT INTO encrypted_data VALUES ('package');");
-    }
-
-    using (var reopened = new SqliteConnection(encryptedConnectionString))
-    {
-        reopened.Open();
-        if (reopened.ExecuteScalar<string>("SELECT value FROM encrypted_data;") != "package")
-            throw new InvalidOperationException("The managed package did not reopen its encrypted database.");
-    }
-
-    using var unsupported = new SqliteConnection(
-        $"Data Source={encryptedPath};Local Provider=Managed;Encryption Cipher=AEGIS256;Encryption Key={encryptionKey}");
-    try
-    {
-        unsupported.Open();
-        throw new InvalidOperationException("The managed package accepted an unsupported encryption cipher.");
-    }
-    catch (NotSupportedException exception) when (
-        exception.Message.Contains("cipher ID 1", StringComparison.Ordinal)
-        && exception.Message.Contains("cipher ID 2", StringComparison.Ordinal))
-    {
-    }
-}
-finally
-{
-    foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
-        File.Delete(encryptedPath + suffix);
-}
-
-if (AppDomain.CurrentDomain.GetAssemblies().Any(assembly =>
-        string.Equals(assembly.GetName().Name, "Turso.Raw", StringComparison.Ordinal)))
-{
-    throw new InvalidOperationException("The managed Turso package consumer must not load Turso.Raw.");
-}
-
-EnsureNoNativeCompanionWasRestored();
-await VerifyEntityFrameworkIntegrationAsync(connection);
-
-Console.WriteLine(
-    $"Managed package consumer succeeded on {AppContext.TargetFrameworkName} with EF Core {typeof(DbContext).Assembly.GetName().Version}.");
 
 static async Task VerifyEntityFrameworkIntegrationAsync(SqliteConnection connection)
 {
@@ -118,7 +119,7 @@ static async Task VerifyEntityFrameworkIntegrationAsync(SqliteConnection connect
     context.Records.Add(new ManagedPackageRecord { Value = "entity-framework" });
     await context.SaveChangesAsync();
 
-    var value = await context.Records.SingleAsync();
+    var value = await context.Records.SingleAsync(record => record.Value == "entity-framework");
     if (value.Value != "entity-framework")
         throw new InvalidOperationException("The managed Entity Framework package consumer returned an unexpected result.");
 }

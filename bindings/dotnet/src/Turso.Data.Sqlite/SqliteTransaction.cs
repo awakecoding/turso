@@ -156,6 +156,9 @@ public class SqliteTransaction : DbTransaction
 
     private static IsolationLevel NormalizeIsolationLevel(SqliteConnection connection, IsolationLevel isolationLevel, bool deferred)
     {
+        if (isolationLevel == IsolationLevel.ReadUncommitted && connection.IsManagedSharedMemory)
+            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheReadUncommittedNotSupported);
+
         if ((isolationLevel == IsolationLevel.ReadUncommitted && (!connection.IsSharedCache || !deferred))
             || isolationLevel == IsolationLevel.ReadCommitted
             || isolationLevel == IsolationLevel.RepeatableRead

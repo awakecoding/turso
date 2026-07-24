@@ -122,7 +122,7 @@ public class ManagedConnectionStringOptionParityTests
         }
     }
 
-    [TestCase("Cache=Shared", "Cache=Shared is not supported when Local Provider=Managed because managed connections do not share page caches.")]
+    [TestCase("Cache=Shared", "Cache=Shared with Local Provider=Managed is supported only for named in-memory databases using Mode=Memory and a non-empty Data Source other than :memory:; file-backed and anonymous in-memory shared caches are not supported.")]
     [TestCase("Password=secret", "Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.")]
     [TestCase("Encryption Key=0011", "Encryption is not available for the managed engine.")]
     [TestCase("Vfs=win32-longpath", "Vfs is not supported when Local Provider=Managed because the managed engine does not use native SQLite VFS implementations.")]
