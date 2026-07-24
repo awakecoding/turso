@@ -85,6 +85,7 @@ public static class TursoDbContextOptionsBuilderExtensions
             ? configuredOptions
                 .ReplaceService<IQuerySqlGeneratorFactory, TursoManagedSqliteQuerySqlGeneratorFactory>()
                 .ReplaceService<IQueryableMethodTranslatingExpressionVisitorFactory, TursoManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory>()
+                .ReplaceService<IHistoryRepository, TursoManagedSqliteHistoryRepository>()
                 .ReplaceService<IMigrationsSqlGenerator, TursoManagedSqliteMigrationsSqlGenerator>()
                 .ReplaceService<IRelationalParameterBasedSqlProcessorFactory, TursoSqliteParameterBasedSqlProcessorFactory>()
             : configuredOptions
