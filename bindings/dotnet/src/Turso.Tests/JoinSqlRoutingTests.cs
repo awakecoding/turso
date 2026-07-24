@@ -3,14 +3,10 @@ using Turso.Core;
 
 namespace Turso.Tests;
 
-// Proves that EmbeddedDatabase routes the supported two-table INNER/LEFT OUTER join subset
-// through the real nested-loop opcode family
-// (OpenReadCursor/Rewind/Column/FilterRegisters/JumpIf/ResultRow/Next/CloseCursor/Halt) and
-// that the routed rows stay byte-identical to the tree-walking evaluator. As in the aggregate
-// and sorted routing suites, EXPLAIN is the ground truth for "was this lowered to bytecode?":
-// a routed statement dumps the join opcodes, while every deliberate fallback shape throws
-// because EXPLAIN only describes lowered programs. Fallback tests also assert the evaluator
-// still produces the correct rows.
+// Covers both managed join lowerings: the direct two-table INNER/LEFT nested loop and the
+// materializing join cursor used for N-way/RIGHT/FULL/USING/NATURAL and downstream SELECT phases.
+// EXPLAIN is the routing ground truth; deliberately unsafe callback/error-order shapes remain
+// evaluator-owned and therefore have no bytecode dump.
 public class JoinSqlRoutingTests
 {
     [Test]
@@ -313,25 +309,27 @@ public class JoinSqlRoutingTests
     }
 
     [Test]
-    public void RightJoinFallsBackToEvaluator()
+    public void RightJoinRoutesThroughMaterializingJoinCursor()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
         Execute(connection, "INSERT INTO orders VALUES (200, 9, 99);");
 
-        // RIGHT joins are evaluator-only; the orphan order surfaces with NULL user columns.
+        // The orphan order surfaces with NULL user columns.
         var rows = ReadRows(
             connection,
             "SELECT u.name, o.amount FROM users u RIGHT JOIN orders o ON u.id = o.user_id;");
         rows.Should().HaveCount(4);
         rows[3].Should().Equal(SqlValue.Null, SqlValue.Integer(99));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT u.name, o.amount FROM users u RIGHT JOIN orders o ON u.id = o.user_id;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT u.name, o.amount FROM users u RIGHT JOIN orders o ON u.id = o.user_id;"))
+            .Should().Contain("OpenJoinCursor");
     }
 
     [Test]
-    public void FullJoinFallsBackToEvaluator()
+    public void FullJoinRoutesThroughMaterializingJoinCursor()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
@@ -341,12 +339,14 @@ public class JoinSqlRoutingTests
             "SELECT u.name, o.amount FROM users u FULL JOIN orders o ON u.id = o.user_id;");
         rows.Should().HaveCount(3);
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT u.name, o.amount FROM users u FULL JOIN orders o ON u.id = o.user_id;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT u.name, o.amount FROM users u FULL JOIN orders o ON u.id = o.user_id;"))
+            .Should().Contain("OpenJoinCursor");
     }
 
     [Test]
-    public void UsingJoinFallsBackToEvaluator()
+    public void UsingJoinRoutesWithCoalescedColumns()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE l(id INTEGER, tag TEXT);");
@@ -354,18 +354,17 @@ public class JoinSqlRoutingTests
         Execute(connection, "INSERT INTO l VALUES (1, 'a'), (2, 'b');");
         Execute(connection, "INSERT INTO r VALUES (1, 'x'), (3, 'y');");
 
-        // USING coalesces the join column into a single output, which the raw-concatenating
-        // builder cannot reproduce, so the evaluator keeps ownership.
+        // USING coalesces the join column into a single output.
         var rows = ReadRows(connection, "SELECT id, tag, note FROM l JOIN r USING (id);");
         rows.Should().ContainSingle();
         rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Text("a"), SqlValue.Text("x"));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT id, tag, note FROM l JOIN r USING (id);"));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT id, tag, note FROM l JOIN r USING (id);"))
+            .Should().Contain("OpenJoinCursor").And.Contain("ProjectRegisters");
     }
 
     [Test]
-    public void NaturalJoinFallsBackToEvaluator()
+    public void NaturalJoinRoutesWithCoalescedColumns()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE l(id INTEGER, tag TEXT);");
@@ -377,12 +376,12 @@ public class JoinSqlRoutingTests
         rows.Should().ContainSingle();
         rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Text("b"), SqlValue.Text("x"));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT id, tag, note FROM l NATURAL JOIN r;"));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT id, tag, note FROM l NATURAL JOIN r;"))
+            .Should().Contain("OpenJoinCursor");
     }
 
     [Test]
-    public void ThreeTableJoinFallsBackToEvaluator()
+    public void ThreeTableJoinRoutesThroughMaterializingJoinCursor()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE a(id INTEGER, av TEXT);");
@@ -398,13 +397,14 @@ public class JoinSqlRoutingTests
         rows.Should().ContainSingle();
         rows[0].Should().Equal(SqlValue.Text("a1"), SqlValue.Text("b1"), SqlValue.Text("c1"));
 
-        // The outer join's left side is itself a join, so the two-table route declines.
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT a.av, b.bv, c.cv FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT a.av, b.bv, c.cv FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id;"))
+            .Should().Contain("OpenJoinCursor");
     }
 
     [Test]
-    public void GroupByOverJoinFallsBackToEvaluator()
+    public void GroupByOverJoinRoutesThroughAggregateOpcodes()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
@@ -416,12 +416,14 @@ public class JoinSqlRoutingTests
         rows[0].Should().Equal(SqlValue.Text("ada"), SqlValue.Integer(2));
         rows[1].Should().Equal(SqlValue.Text("bo"), SqlValue.Integer(1));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT u.name, count(*) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT u.name, count(*) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name;"))
+            .Should().Contain("OpenJoinCursor").And.Contain("AggStep").And.Contain("AggFinalize");
     }
 
     [Test]
-    public void OrderByOverJoinFallsBackToEvaluator()
+    public void OrderByOverJoinRoutesThroughSorterOpcodes()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
@@ -432,12 +434,14 @@ public class JoinSqlRoutingTests
         rows.Select(row => row[0])
             .Should().Equal(SqlValue.Integer(30), SqlValue.Integer(20), SqlValue.Integer(10));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.amount DESC;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.amount DESC;"))
+            .Should().Contain("OpenJoinCursor").And.Contain("OpenSorter");
     }
 
     [Test]
-    public void DistinctOverJoinFallsBackToEvaluator()
+    public void DistinctOverJoinRoutesThroughDistinctFilter()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
@@ -447,8 +451,10 @@ public class JoinSqlRoutingTests
             "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;");
         rows.Select(row => row[0]).Should().Equal(SqlValue.Text("ada"), SqlValue.Text("bo"));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;"))
+            .Should().Contain("OpenJoinCursor").And.Contain("DistinctFilter");
     }
 
     [Test]
@@ -468,9 +474,8 @@ public class JoinSqlRoutingTests
                 "SELECT u.id AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;")
             .Should().Equal("user_id", "cost", "marker");
 
-        // The computed equivalent deliberately falls back because bounded joins currently project
-        // only direct columns/literals. Its evaluator result is the differential oracle for the
-        // routed row stream.
+        // The computed equivalent uses the materializing join cursor and is the differential
+        // oracle for the legacy direct nested-loop row stream.
         var evaluated = ReadRows(
             connection,
             "SELECT u.id + 0 AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;");
@@ -484,9 +489,10 @@ public class JoinSqlRoutingTests
             .And.Contain("OffsetGate")
             .And.Contain("LimitGate")
             .And.NotContain("JumpIf");
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
-            connection,
-            "EXPLAIN SELECT u.id + 0 AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT u.id + 0 AS user_id, o.amount AS cost, 7 AS marker FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount >= 10 LIMIT 2 OFFSET 1;"))
+            .Should().Contain("OpenJoinCursor").And.Contain("ProjectRegisters");
     }
 
     [Test]
@@ -644,8 +650,8 @@ public class JoinSqlRoutingTests
             (SqlValue.Integer(2), SqlValue.Integer(10), SqlValue.Integer(7)));
         ColumnNames(connection, routedSql).Should().Equal("left_value", "right_value", "marker");
 
-        // The computed projection remains evaluator-owned and supplies a behavioral oracle for
-        // the direct-column routed stream.
+        // The computed projection uses the materializing join cursor and supplies a behavioral
+        // oracle for the direct-column nested-loop stream.
         var evaluated = ReadRows(
             connection,
             "SELECT a.x + 0 AS left_value, b.y AS right_value, 7 AS marker FROM a CROSS JOIN b WHERE a.x < b.y LIMIT 3 OFFSET 1;");
@@ -657,9 +663,10 @@ public class JoinSqlRoutingTests
             .And.Contain("OffsetGate")
             .And.Contain("LimitGate")
             .And.NotContain("JumpIf");
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
-            connection,
-            "EXPLAIN SELECT a.x + 0 AS left_value, b.y AS right_value, 7 AS marker FROM a CROSS JOIN b WHERE a.x < b.y LIMIT 3 OFFSET 1;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT a.x + 0 AS left_value, b.y AS right_value, 7 AS marker FROM a CROSS JOIN b WHERE a.x < b.y LIMIT 3 OFFSET 1;"))
+            .Should().Contain("OpenJoinCursor").And.Contain("ProjectRegisters");
     }
 
     [Test]
@@ -681,7 +688,7 @@ public class JoinSqlRoutingTests
     }
 
     [Test]
-    public void BoundedComputedAndAmbiguousJoinShapesFallBackToEvaluator()
+    public void BoundedComputedPredicatesRemainOnEvaluator()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
@@ -699,8 +706,8 @@ public class JoinSqlRoutingTests
                 connection,
                 "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount + 0 > 10 LIMIT 1;")
             .Should().ContainSingle();
-        // Bounded lowering admits only direct equi or conditionless cross joins with direct
-        // projections and WHERE predicates, so computed ON/WHERE shapes stay evaluator-owned.
+        // Computed ON/WHERE expressions can fail or invoke user code while SQLite is still
+        // traversing the join, so the materializing cursor does not claim their callback order.
         foreach (var sql in new[]
         {
             "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id + 0 = o.user_id LIMIT 1;",
@@ -769,7 +776,7 @@ public class JoinSqlRoutingTests
         routed[0].Should().Equal(SqlValue.Text("cy"), SqlValue.Null);
         ColumnNames(connection, routedSql).Should().Equal("user_name", "order_amount");
 
-        // The computed projection declines lowering and supplies the evaluator differential oracle.
+        // The computed projection uses the materializing join cursor as the differential oracle.
         var evaluated = ReadRows(
             connection,
             "SELECT u.name || '' AS user_name, o.amount AS order_amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL LIMIT 5 OFFSET 0;");
@@ -779,13 +786,14 @@ public class JoinSqlRoutingTests
         var explain = ReadRows(
             connection,
             "EXPLAIN SELECT u.name AS user_name, o.amount AS order_amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL LIMIT 5 OFFSET 0;");
-        Opcodes(explain).Should().Contain("JumpIf").And.Contain("LimitGate");
-        Opcodes(explain).Count(opcode => opcode == "FilterRegisters").Should().Be(3);
-        Comments(explain).Should().Contain(comment => comment.StartsWith("skip result when post-join WHERE is false"));
+        Opcodes(explain).Should().Contain("OpenJoinCursor")
+            .And.Contain("ProjectRegisters")
+            .And.Contain("LimitGate")
+            .And.NotContain("JumpIf");
     }
 
     [Test]
-    public void UnboundedLeftOuterJoinWhereFallsBackToEvaluator()
+    public void UnboundedLeftOuterJoinWhereRoutesAfterNullExtension()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
@@ -797,27 +805,29 @@ public class JoinSqlRoutingTests
         rows.Should().ContainSingle();
         rows[0].Should().Equal(SqlValue.Text("cy"), SqlValue.Null);
 
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(
-            connection,
-            "EXPLAIN SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount IS NULL;"))
+            .Should().Contain("OpenJoinCursor");
     }
 
     [Test]
-    public void ComputedExpressionProjectionFallsBackToEvaluator()
+    public void ComputedExpressionProjectionRoutesThroughProjectRegisters()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedOrders(connection);
 
-        // A computed projection is neither a column read nor a folded constant, so the builder
-        // declines and the evaluator computes it.
+        // The materializing cursor completes ON/WHERE before ProjectRegisters computes each result.
         var rows = ReadRows(
             connection,
             "SELECT o.amount + 1 FROM users u JOIN orders o ON u.id = o.user_id;");
         rows.Select(row => row[0])
             .Should().Equal(SqlValue.Integer(11), SqlValue.Integer(21), SqlValue.Integer(31));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT o.amount + 1 FROM users u JOIN orders o ON u.id = o.user_id;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT o.amount + 1 FROM users u JOIN orders o ON u.id = o.user_id;"))
+            .Should().Contain("OpenJoinCursor").And.Contain("ProjectRegisters");
     }
 
     [Test]

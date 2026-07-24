@@ -90,6 +90,12 @@ public static class VdbeExplain
                 open.TableName is null
                     ? $"open read cursor {open.Cursor.Index}"
                     : $"open read cursor {open.Cursor.Index} on {open.TableName} ({open.ColumnCount} cols)"),
+            OpenJoinCursorInstruction openJoin => (
+                openJoin.Cursor.Index,
+                openJoin.Plan.SourceCount,
+                openJoin.Plan.RecordColumnCount,
+                openJoin.Plan.Description,
+                $"materialize {openJoin.Plan.Description} into cursor {openJoin.Cursor.Index} ({openJoin.Plan.RecordColumnCount} cols)"),
             OpenWriteCursorInstruction openWrite => (
                 openWrite.Cursor.Index,
                 0,
@@ -133,6 +139,18 @@ public static class VdbeExplain
                 filterRegisters.Row.Count,
                 null,
                 filterRegisters.Description),
+            ProjectRegistersInstruction project => (
+                project.Input.Start.Index,
+                project.Output.Start.Index,
+                project.Output.Count,
+                null,
+                project.Description),
+            DistinctFilterInstruction distinctFilter => (
+                distinctFilter.Values.Start.Index,
+                distinctFilter.DuplicateTarget.Offset,
+                distinctFilter.DistinctSetIndex,
+                null,
+                $"goto {distinctFilter.DuplicateTarget.Offset} if {FormatRange(distinctFilter.Values)} is in distinct set {distinctFilter.DistinctSetIndex}"),
             NextInstruction next => (
                 next.Cursor.Index,
                 next.LoopTarget.Offset,

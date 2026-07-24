@@ -5283,7 +5283,12 @@ public sealed class EmbeddedDatabase : IDisposable
         // gates onto that base. DISTINCT, computed shapes, outer joins, and compounds keep
         // LIMIT/OFFSET on the evaluator.
         if (select.Limit is not null || select.Offset is not null)
-            return TryCompileLimitedSelect(select, parameters, context, outerRow, out compiled);
+        {
+            if (TryCompileLimitedSelect(select, parameters, context, outerRow, out compiled))
+                return true;
+
+            return TryCompileGeneralJoinSelect(select, parameters, context, outerRow, out compiled);
+        }
 
         // The direct scan / source-less constant projection subset.
         if (TryCompileScanOrConstant(select, parameters, context, outerRow, out compiled))
@@ -5316,13 +5321,18 @@ public sealed class EmbeddedDatabase : IDisposable
         // OpenReadCursor/Rewind/Column/FilterRegisters/JumpIf/ResultRow opcode family instead
         // of the evaluator, delegating the ON/WHERE predicate to the evaluator's own
         // comparison semantics so routed rows stay byte-identical.
-        return TryCompileJoinSelect(
-            select,
-            parameters,
-            context,
-            outerRow,
-            allowPostJoinWhere: false,
-            compiled: out compiled);
+        if (TryCompileJoinSelect(
+                select,
+                parameters,
+                context,
+                outerRow,
+                allowPostJoinWhere: false,
+                compiled: out compiled))
+        {
+            return true;
+        }
+
+        return TryCompileGeneralJoinSelect(select, parameters, context, outerRow, out compiled);
     }
 
     // Generic source-less and direct-scan projections, delegated to the shared
@@ -6017,7 +6027,11 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             if (term is not SelectStatement { Distinct: false } select
                 || !TryCompileSelect(select, parameters, context, outerRow, out var compiledTerm)
-                || compiledTerm.ParameterIndices is { Count: > 0 })
+                || compiledTerm.ParameterIndices is { Count: > 0 }
+                || compiledTerm.Program.Instructions.Any(instruction => instruction is
+                    OpenJoinCursorInstruction
+                    or ProjectRegistersInstruction
+                    or DistinctFilterInstruction))
             {
                 return false;
             }
@@ -6204,15 +6218,14 @@ public sealed class EmbeddedDatabase : IDisposable
         // The comparer wraps each scanned row and defers to the evaluator's CompareRows so
         // direction (ASC/DESC), NULL ordering, collation, and multi-key precedence match the
         // evaluator byte-for-byte; the sorter itself guarantees stable (scan-order) ties.
-        var columns = target.Columns;
-        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, columns);
         VdbeRowComparer comparer = (leftRow, rightRow) => CompareRows(
-            new SourceRow(columns, leftRow, qualifiedColumns, outerRow),
-            new SourceRow(columns, rightRow, qualifiedColumns, outerRow),
+            CreateScanSourceRow(target, leftRow, context, outerRow),
+            CreateScanSourceRow(target, rightRow, context, outerRow),
             resolvedOrderBy,
             parameters,
             context);
 
+        var columns = target.Columns;
         var program = SortedScanProgramBuilder.Build(
             target.TableName,
             columns.Length,
@@ -6288,15 +6301,15 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    // Lowers a two-table INNER or LEFT OUTER join over base tables into a nested-loop
+    // Lowers the legacy two-table INNER or LEFT OUTER fast path over base tables into a nested-loop
     // VdbeProgram driven by JoinProgramBuilder, or returns false so the evaluator keeps
     // ownership of shapes the join route cannot preserve exactly.
     //
     // Supported (routed to the VDBE):
     //  - select.Source is a single JoinTableSource whose Left and Right are both real base
     //    tables (each resolvable through ResolveScanTarget). A nested JoinTableSource never
-    //    resolves as a base table, so three-or-more-table (N-way) joins decline here.
-    //  - join kind INNER or LEFT OUTER only (RIGHT/FULL stay on the evaluator).
+    //    resolves as a base table, so three-or-more-table (N-way) joins decline this fast path.
+    //  - join kind INNER or LEFT OUTER only (RIGHT/FULL continue to the materializing route).
     //  - an explicit ON condition, or no condition at all (comma/CROSS join). USING/NATURAL
     //    joins coalesce shared output columns, which the raw-concatenating builder cannot
     //    reproduce, so they stay on the evaluator.
@@ -6310,10 +6323,11 @@ public sealed class EmbeddedDatabase : IDisposable
     //    testing "ON AND WHERE" per pair is identical. A bounded caller may additionally opt
     //    into the exact direct LEFT WHERE subset, which runs after null extension.
     //
-    // Deliberately excluded (kept on the evaluator): DISTINCT, GROUP BY/HAVING, ORDER BY,
+    // Deliberately excluded from this fast path: DISTINCT, GROUP BY/HAVING, ORDER BY,
     // LIMIT/OFFSET, aggregate/window projections, computed-expression projections, USING/
     // NATURAL joins, RIGHT/FULL joins, joins of more than two base tables, and LEFT OUTER
-    // joins carrying a WHERE clause outside the bounded exact subset.
+    // joins carrying a WHERE clause outside the bounded exact subset. The general materializing
+    // route below claims the order-safe members of those families; the rest stay on the evaluator.
     private bool TryCompileJoinSelect(
         SelectStatement select,
         SqlValue[] parameters,
@@ -6360,6 +6374,16 @@ public sealed class EmbeddedDatabase : IDisposable
         var rightTarget = ResolveScanTarget(join.Right, context);
         if (leftTarget is null || rightTarget is null)
             return false;
+        if (!HaveStreamingSafeJoinCollations(leftTarget, rightTarget, context)
+            || join.Condition is not null
+                && (!IsDirectJoinWherePredicate(join.Condition, leftTarget, rightTarget)
+                    || ContainsUnsafeCompiledCollation(join.Condition))
+            || select.Where is not null
+                && (!IsDirectJoinWherePredicate(select.Where, leftTarget, rightTarget)
+                    || ContainsUnsafeCompiledCollation(select.Where)))
+        {
+            return false;
+        }
 
         // The builder needs at least one column per side (a base table always has one).
         if (leftTarget.Columns.Length == 0 || rightTarget.Columns.Length == 0)
@@ -6384,6 +6408,21 @@ public sealed class EmbeddedDatabase : IDisposable
             BuildQualifiedColumns(leftTarget.Qualifier, leftColumns),
             BuildQualifiedColumns(rightTarget.Qualifier, rightColumns),
             leftWidth);
+        var leftTable = context.Tables[leftTarget.TableName];
+        var rightTable = context.Tables[rightTarget.TableName];
+        var combinedDefinitions = leftTable.ColumnDefinitions
+            .Select(static column => (EmbeddedColumn?)column)
+            .Concat(rightTable.ColumnDefinitions.Select(static column => (EmbeddedColumn?)column))
+            .ToArray();
+        var combinedQualifiedDefinitions = new Dictionary<string, EmbeddedColumn>(
+            BuildQualifiedColumnDefinitions(leftTarget.Qualifier, leftTable.ColumnDefinitions),
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, definition) in BuildQualifiedColumnDefinitions(
+                     rightTarget.Qualifier,
+                     rightTable.ColumnDefinitions))
+        {
+            combinedQualifiedDefinitions.TryAdd(name, definition);
+        }
         var outputColumns = GetOutputColumns(join, context);
         var rawOutputColumns = GetRawOutputColumns(join, context);
 
@@ -6441,7 +6480,14 @@ public sealed class EmbeddedDatabase : IDisposable
                 predicate = row => IsTrue(Evaluate(
                     condition,
                     parameters,
-                    new SourceRow(combinedColumns, row, combinedQualified, outerRow, outputColumns),
+                    new SourceRow(
+                        combinedColumns,
+                        row,
+                        combinedQualified,
+                        outerRow,
+                        outputColumns,
+                        ColumnDefinitions: combinedDefinitions,
+                        QualifiedColumnDefinitions: combinedQualifiedDefinitions),
                     context));
             }
 
@@ -6450,7 +6496,14 @@ public sealed class EmbeddedDatabase : IDisposable
                 postJoinPredicate = row => IsTrue(Evaluate(
                     whereExpr,
                     parameters,
-                    new SourceRow(combinedColumns, row, combinedQualified, outerRow, outputColumns),
+                    new SourceRow(
+                        combinedColumns,
+                        row,
+                        combinedQualified,
+                        outerRow,
+                        outputColumns,
+                        ColumnDefinitions: combinedDefinitions,
+                        QualifiedColumnDefinitions: combinedQualifiedDefinitions),
                     context));
             }
         }
@@ -6461,7 +6514,14 @@ public sealed class EmbeddedDatabase : IDisposable
             // (ON) and the evaluator's post-join WHERE byte-for-byte.
             predicate = row =>
             {
-                var combined = new SourceRow(combinedColumns, row, combinedQualified, outerRow, outputColumns);
+                var combined = new SourceRow(
+                    combinedColumns,
+                    row,
+                    combinedQualified,
+                    outerRow,
+                    outputColumns,
+                    ColumnDefinitions: combinedDefinitions,
+                    QualifiedColumnDefinitions: combinedQualifiedDefinitions);
                 if (condition is not null && !IsTrue(Evaluate(condition, parameters, combined, context)))
                     return false;
 
@@ -6570,6 +6630,51 @@ public sealed class EmbeddedDatabase : IDisposable
         };
     }
 
+    private static bool HaveStreamingSafeJoinCollations(
+        ScanTarget left,
+        ScanTarget right,
+        QueryContext context)
+    {
+        return context.Tables.TryGetValue(left.TableName, out var leftTable)
+            && context.Tables.TryGetValue(right.TableName, out var rightTable)
+            && leftTable.ColumnDefinitions.All(column =>
+                IsStreamingSafeDistinctCollation(column.Collation))
+            && rightTable.ColumnDefinitions.All(column =>
+                IsStreamingSafeDistinctCollation(column.Collation));
+    }
+
+    private static bool ContainsUnsafeCompiledCollation(Expression expression)
+    {
+        return expression switch
+        {
+            CollationExpression collation => !IsStreamingSafeDistinctCollation(collation.Name)
+                || ContainsUnsafeCompiledCollation(collation.Expression),
+            BinaryExpression binary => ContainsUnsafeCompiledCollation(binary.Left)
+                || ContainsUnsafeCompiledCollation(binary.Right),
+            UnaryExpression unary => ContainsUnsafeCompiledCollation(unary.Operand),
+            FunctionExpression function => function.Arguments.Any(ContainsUnsafeCompiledCollation)
+                || function.Filter is not null && ContainsUnsafeCompiledCollation(function.Filter),
+            CastExpression cast => ContainsUnsafeCompiledCollation(cast.Expression),
+            CaseExpression @case => @case.Operand is not null
+                    && ContainsUnsafeCompiledCollation(@case.Operand)
+                || @case.Clauses.Any(clause =>
+                    ContainsUnsafeCompiledCollation(clause.When)
+                    || ContainsUnsafeCompiledCollation(clause.Then))
+                || @case.Else is not null && ContainsUnsafeCompiledCollation(@case.Else),
+            LikeExpression like => ContainsUnsafeCompiledCollation(like.Value)
+                || ContainsUnsafeCompiledCollation(like.Pattern)
+                || like.Escape is not null && ContainsUnsafeCompiledCollation(like.Escape),
+            InExpression @in => ContainsUnsafeCompiledCollation(@in.Value)
+                || @in.Values.Any(ContainsUnsafeCompiledCollation),
+            BetweenExpression between => ContainsUnsafeCompiledCollation(between.Value)
+                || ContainsUnsafeCompiledCollation(between.Lower)
+                || ContainsUnsafeCompiledCollation(between.Upper),
+            GlobExpression glob => ContainsUnsafeCompiledCollation(glob.Value)
+                || ContainsUnsafeCompiledCollation(glob.Pattern),
+            _ => false,
+        };
+    }
+
     // Resolves a (possibly qualified) column reference to its ordinal in the combined
     // (left ++ right) row, mirroring SourceRow.GetValue for a non-coalesced join: a qualified
     // name hits the combined qualified map, and a bare name takes the first matching declared
@@ -6590,6 +6695,839 @@ public sealed class EmbeddedDatabase : IDisposable
         }
 
         return null;
+    }
+
+    // General join lowering uses a materializing join cursor. The cursor recursively completes each
+    // left/right input before evaluating its parent join, then applies WHERE to the complete joined row
+    // set before projection. That reproduces the evaluator's observable source, error, and callback order
+    // while allowing ordinary VDBE sorter, aggregate, DISTINCT, LIMIT, and result opcodes to own later phases.
+    private bool TryCompileGeneralJoinSelect(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+        if (select.Source is not JoinTableSource || select.Projections.Count == 0)
+            return false;
+
+        if (!TryResolveGeneralJoinLimit(select, parameters, context, outerRow, out var limit, out var offset))
+            return false;
+
+        if (limit == 0)
+            return false;
+        if (limit is < 0)
+            limit = null;
+
+        var hasAggregate = select.Projections.Any(projection => ContainsAggregate(projection.Expression))
+            || select.GroupBy.Count != 0
+            || select.Having is not null && ContainsAggregate(select.Having);
+        if (hasAggregate)
+        {
+            return TryCompileGeneralJoinAggregate(
+                select,
+                parameters,
+                context,
+                outerRow,
+                limit,
+                offset,
+                out compiled);
+        }
+
+        if (select.Having is not null
+            || select.GroupBy.Count != 0
+            || select.Projections.Any(projection =>
+                ContainsWindowFunction(projection.Expression)
+                || projection.Expression is not (StarExpression or QualifiedStarExpression)
+                    && !IsScanPredicate(projection.Expression))
+            || select.Where is not null
+                && (ContainsAggregate(select.Where)
+                    || ContainsWindowFunction(select.Where)
+                    || !IsScanPredicate(select.Where)))
+        {
+            return false;
+        }
+
+        if (!TryBuildCompiledJoinSource(
+                select.Source,
+                parameters,
+                context,
+                outerRow,
+                out var source))
+        {
+            return false;
+        }
+
+        if (select.Where is not null && !IsSafeCompiledJoinPredicate(select.Where, source))
+            return false;
+        foreach (var projection in select.Projections)
+        {
+            if (projection.Expression is not (StarExpression or QualifiedStarExpression)
+                && !AllCompiledJoinColumnsResolve(projection.Expression, source))
+            {
+                return false;
+            }
+        }
+
+        var resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
+        ValidateOrderByCollations(resolvedOrderBy);
+        foreach (var term in resolvedOrderBy)
+        {
+            if (!IsSafeCompiledJoinOrderTerm(term, source))
+                return false;
+        }
+
+        VdbeJoinedRowPredicate? filter = null;
+        if (select.Where is not null)
+        {
+            filter = row => IsTrue(Evaluate(
+                select.Where,
+                parameters,
+                source.CreateSourceRow(row, outerRow),
+                context));
+        }
+
+        // ExecuteSelect asks GetSourceRows for at most LIMIT rows only in this exact case. Preserve
+        // that early source cut so an ON/projection callback beyond the bound is not invoked.
+        var sourceConsumesLimit = select.Where is null
+            && select.OrderBy.Count == 0
+            && !select.Distinct
+            && offset == 0
+            && limit is >= 0;
+        int? maximumRows = sourceConsumesLimit && limit <= int.MaxValue
+            ? checked((int)limit.Value)
+            : null;
+        var plan = new VdbeJoinPlan(
+            source.Plan,
+            source.Description,
+            filter,
+            maximumRows: maximumRows);
+
+        var outputColumns = source.OutputColumns;
+        var rawOutputColumns = source.RawOutputColumns;
+        var outputCount = GetColumnNames(select.Projections, outputColumns, rawOutputColumns).Length;
+        if (outputCount == 0)
+            return false;
+
+        SqlValue[] Project(SqlValue[] record) => EvaluateProjectionRow(
+            select,
+            source.CreateSourceRow(record, outerRow),
+            parameters,
+            context,
+            outputColumns,
+            rawOutputColumns);
+
+        VdbeRowComparer? orderComparer = null;
+        if (resolvedOrderBy.Count != 0)
+        {
+            orderComparer = (left, right) => CompareRows(
+                source.CreateSourceRow(left, outerRow),
+                source.CreateSourceRow(right, outerRow),
+                resolvedOrderBy,
+                parameters,
+                context);
+        }
+
+        VdbeRowEquality? distinctEquality = null;
+        if (select.Distinct)
+        {
+            var collations = GetDistinctProjectionCollations(
+                select.Projections,
+                outputColumns,
+                rawOutputColumns,
+                select.Source,
+                context);
+            if (collations.Any(collation => !IsStreamingSafeDistinctCollation(collation)))
+                return false;
+            distinctEquality = (left, right) => RowsEqual(left, right, collations);
+        }
+
+        var program = CompiledJoinProgramBuilder.BuildProjection(
+            plan,
+            outputCount,
+            Project,
+            orderComparer,
+            distinctEquality,
+            sourceConsumesLimit ? 0 : offset,
+            sourceConsumesLimit ? null : limit);
+        compiled = new CompiledSelect(program, [new VdbeCursorSource([])]);
+        return true;
+    }
+
+    private bool TryCompileGeneralJoinAggregate(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        long? limit,
+        long offset,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+        if (select.Distinct
+            || select.OrderBy.Count != 0
+            || select.Having is not null
+            || limit is not null
+            || offset != 0
+            || select.Projections.Any(projection => ContainsWindowFunction(projection.Expression))
+            || select.Where is not null
+                && (ContainsAggregate(select.Where)
+                    || ContainsWindowFunction(select.Where)
+                    || !IsScanPredicate(select.Where)))
+        {
+            return false;
+        }
+
+        if (!TryBuildCompiledJoinSource(
+                select.Source!,
+                parameters,
+                context,
+                outerRow,
+                out var source))
+        {
+            return false;
+        }
+
+        if (select.Where is not null && !IsSafeCompiledJoinPredicate(select.Where, source))
+            return false;
+
+        var grouped = select.GroupBy.Count != 0;
+        var groupKeyColumns = new List<int>(select.GroupBy.Count);
+        var groupKeyNames = new List<string>(select.GroupBy.Count);
+        foreach (var expression in select.GroupBy)
+        {
+            if (expression is not ColumnExpression column
+                || source.IsCoalescedColumn(column)
+                || source.ResolveColumnIndex(column.Name) is not { } ordinal)
+            {
+                return false;
+            }
+
+            groupKeyColumns.Add(ordinal);
+            groupKeyNames.Add(column.Name);
+        }
+
+        var aggregates = new List<AggregateFunctionSpec>();
+        var outputs = new List<AggregateOutput>();
+        foreach (var projection in select.Projections)
+        {
+            if (projection.Expression is FunctionExpression function
+                && (IsBuiltInAggregate(function) || IsManagedPercentileAggregate(function.Name))
+                && !function.Arguments.OfType<ColumnExpression>().Any(source.IsCoalescedColumn)
+                && TryClassifyAggregateCall(
+                    function,
+                    source.CreateScanTarget(grouped),
+                    parameters,
+                    context,
+                    outerRow,
+                    aggregates,
+                    out var aggregateOutput))
+            {
+                outputs.Add(aggregateOutput);
+                continue;
+            }
+
+            if (grouped
+                && TryResolveGroupKeyOutput(
+                    projection.Expression,
+                    select.GroupBy,
+                    out var groupKeyOutput))
+            {
+                outputs.Add(groupKeyOutput);
+                continue;
+            }
+
+            if (IsConstantScalarExpression(projection.Expression)
+                && IsAggregateExpression(projection.Expression))
+            {
+                outputs.Add(AggregateOutput.ForConstant(Evaluate(
+                    projection.Expression,
+                    parameters,
+                    null,
+                    context)));
+                continue;
+            }
+
+            return false;
+        }
+
+        if (aggregates.Count == 0)
+            return false;
+
+        VdbeJoinedRowPredicate? filter = null;
+        if (select.Where is not null)
+        {
+            filter = row => IsTrue(Evaluate(
+                select.Where,
+                parameters,
+                source.CreateSourceRow(row, outerRow),
+                context));
+        }
+
+        VdbeJoinGroupKey? groupKey = null;
+        if (grouped)
+        {
+            groupKey = row => GetGroupKey(
+                select.GroupBy,
+                parameters,
+                source.CreateSourceRow(row, outerRow),
+                context);
+        }
+
+        var plan = new VdbeJoinPlan(source.Plan, source.Description, filter, groupKey);
+        var target = source.CreateScanTarget(grouped);
+        VdbeProgram baseProgram;
+        if (grouped)
+        {
+            var rankColumn = plan.RecordColumnCount - 1;
+            VdbeRowComparer orderComparer = (left, right) =>
+                left[rankColumn].AsInteger().CompareTo(right[rankColumn].AsInteger());
+            var keyNames = groupKeyNames.ToArray();
+            VdbeGroupComparer groupComparer = (left, right) =>
+                string.Equals(
+                    GetGroupKey(
+                        select.GroupBy,
+                        parameters,
+                        new SourceRow(keyNames, left, Parent: outerRow),
+                        context),
+                    GetGroupKey(
+                        select.GroupBy,
+                        parameters,
+                        new SourceRow(keyNames, right, Parent: outerRow),
+                        context),
+                    StringComparison.Ordinal);
+            baseProgram = AggregateProgramBuilder.BuildGrouped(
+                source.Description,
+                target.Columns.Length,
+                groupKeyColumns,
+                aggregates,
+                outputs,
+                orderComparer,
+                groupComparer);
+        }
+        else
+        {
+            baseProgram = AggregateProgramBuilder.BuildScalar(
+                source.Description,
+                target.Columns.Length,
+                aggregates,
+                outputs);
+        }
+
+        var program = CompiledJoinProgramBuilder.BindJoinCursor(baseProgram, plan);
+        compiled = new CompiledSelect(program, [new VdbeCursorSource([])]);
+        return true;
+    }
+
+    private bool TryResolveGeneralJoinLimit(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out long? limit,
+        out long offset)
+    {
+        if (select.Limit is null && select.Offset is null)
+        {
+            limit = null;
+            offset = 0;
+            return true;
+        }
+
+        return TryResolveLimitOffset(select, parameters, context, outerRow, out limit, out offset);
+    }
+
+    private static bool IsSafeCompiledJoinOrderTerm(OrderByTerm term, CompiledJoinSource source)
+    {
+        var expression = term.Expression;
+        while (expression is CollationExpression collation)
+        {
+            if (!IsStreamingSafeDistinctCollation(collation.Name))
+                return false;
+            expression = collation.Expression;
+        }
+
+        return expression is ColumnExpression column
+            && source.ResolveColumnIndex(column.Name) is not null;
+    }
+
+    private static bool IsSafeCompiledJoinPredicate(
+        Expression expression,
+        CompiledJoinSource source)
+        => IsSafeCompiledJoinPredicate(
+            expression,
+            source.ResolveColumnIndex,
+            source.ResolveColumnDefinition);
+
+    private static bool IsSafeCompiledJoinPredicate(
+        Expression expression,
+        string[] columns,
+        IReadOnlyDictionary<string, int> qualifiedColumns,
+        IReadOnlyList<EmbeddedColumn?> columnDefinitions,
+        IReadOnlyDictionary<string, EmbeddedColumn> qualifiedColumnDefinitions,
+        IReadOnlyDictionary<string, int> qualifiedRowIdIndices)
+    {
+        int? ResolveIndex(string name)
+        {
+            if (qualifiedColumns.TryGetValue(name, out var qualified))
+                return qualified;
+            for (var index = 0; index < columns.Length; index++)
+            {
+                if (string.Equals(columns[index], name, StringComparison.OrdinalIgnoreCase))
+                    return index;
+            }
+
+            var separator = name.IndexOf('.');
+            return separator >= 0
+                && EmbeddedTable.IsRowidAliasName(name[(separator + 1)..])
+                && qualifiedRowIdIndices.TryGetValue(name[..separator], out var rowIdIndex)
+                    ? columns.Length + rowIdIndex
+                    : null;
+        }
+
+        EmbeddedColumn? ResolveDefinition(Expression candidate)
+        {
+            while (candidate is CollationExpression collation)
+                candidate = collation.Expression;
+            if (candidate is not ColumnExpression column)
+                return null;
+            if (qualifiedColumnDefinitions.TryGetValue(column.Name, out var qualified))
+                return qualified;
+            if (column.Qualifier is not null)
+                return null;
+            for (var index = 0; index < columns.Length && index < columnDefinitions.Count; index++)
+            {
+                if (string.Equals(columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
+                    return columnDefinitions[index];
+            }
+
+            return null;
+        }
+
+        return IsSafeCompiledJoinPredicate(expression, ResolveIndex, ResolveDefinition);
+    }
+
+    private static bool IsSafeCompiledJoinPredicate(
+        Expression expression,
+        Func<string, int?> resolveColumnIndex,
+        Func<Expression, EmbeddedColumn?> resolveColumnDefinition)
+    {
+        if (expression is UnaryExpression { Operator: UnaryOperator.Not } unary)
+        {
+            return IsSafeCompiledJoinPredicate(
+                unary.Operand,
+                resolveColumnIndex,
+                resolveColumnDefinition);
+        }
+
+        if (expression is BinaryExpression
+            {
+                Operator: BinaryOperator.And or BinaryOperator.Or,
+            } logical)
+        {
+            return IsSafeCompiledJoinPredicate(
+                    logical.Left,
+                    resolveColumnIndex,
+                    resolveColumnDefinition)
+                && IsSafeCompiledJoinPredicate(
+                    logical.Right,
+                    resolveColumnIndex,
+                    resolveColumnDefinition);
+        }
+
+        if (expression is not BinaryExpression comparison || !IsComparisonOperator(comparison.Operator))
+            return false;
+        return IsSafeCompiledJoinOperand(
+                comparison.Left,
+                resolveColumnIndex,
+                resolveColumnDefinition)
+            && IsSafeCompiledJoinOperand(
+                comparison.Right,
+                resolveColumnIndex,
+                resolveColumnDefinition);
+    }
+
+    private static bool IsSafeCompiledJoinOperand(
+        Expression expression,
+        Func<string, int?> resolveColumnIndex,
+        Func<Expression, EmbeddedColumn?> resolveColumnDefinition)
+    {
+        while (expression is CollationExpression collation)
+        {
+            if (!IsStreamingSafeDistinctCollation(collation.Name))
+                return false;
+            expression = collation.Expression;
+        }
+
+        if (expression is LiteralExpression or ParameterExpression)
+            return true;
+        if (expression is not ColumnExpression column || resolveColumnIndex(column.Name) is null)
+            return false;
+
+        var declaredCollation = resolveColumnDefinition(column)?.Collation;
+        return IsStreamingSafeDistinctCollation(declaredCollation);
+    }
+
+    private static bool AllCompiledJoinColumnsResolve(
+        Expression expression,
+        CompiledJoinSource source)
+    {
+        return expression switch
+        {
+            LiteralExpression or ParameterExpression or CurrentTimeExpression => true,
+            ColumnExpression column => source.ResolveColumnIndex(column.Name) is not null,
+            FunctionExpression function => function.Arguments.All(argument =>
+                    AllCompiledJoinColumnsResolve(argument, source))
+                && (function.Filter is null || AllCompiledJoinColumnsResolve(function.Filter, source)),
+            CollationExpression collation => AllCompiledJoinColumnsResolve(collation.Expression, source),
+            CastExpression cast => AllCompiledJoinColumnsResolve(cast.Expression, source),
+            CaseExpression @case => (@case.Operand is null
+                    || AllCompiledJoinColumnsResolve(@case.Operand, source))
+                && @case.Clauses.All(clause =>
+                    AllCompiledJoinColumnsResolve(clause.When, source)
+                    && AllCompiledJoinColumnsResolve(clause.Then, source))
+                && (@case.Else is null || AllCompiledJoinColumnsResolve(@case.Else, source)),
+            LikeExpression like => AllCompiledJoinColumnsResolve(like.Value, source)
+                && AllCompiledJoinColumnsResolve(like.Pattern, source)
+                && (like.Escape is null || AllCompiledJoinColumnsResolve(like.Escape, source)),
+            InExpression @in => AllCompiledJoinColumnsResolve(@in.Value, source)
+                && @in.Values.All(value => AllCompiledJoinColumnsResolve(value, source)),
+            BetweenExpression between => AllCompiledJoinColumnsResolve(between.Value, source)
+                && AllCompiledJoinColumnsResolve(between.Lower, source)
+                && AllCompiledJoinColumnsResolve(between.Upper, source),
+            UnaryExpression unary => AllCompiledJoinColumnsResolve(unary.Operand, source),
+            GlobExpression glob => AllCompiledJoinColumnsResolve(glob.Value, source)
+                && AllCompiledJoinColumnsResolve(glob.Pattern, source),
+            BinaryExpression binary => AllCompiledJoinColumnsResolve(binary.Left, source)
+                && AllCompiledJoinColumnsResolve(binary.Right, source),
+            _ => false,
+        };
+    }
+
+    private bool TryBuildCompiledJoinSource(
+        TableSource source,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledJoinSource compiled)
+    {
+        if (source is NamedTableSource)
+        {
+            var target = ResolveScanTarget(source, context);
+            if (target is null || target.Columns.Length == 0)
+            {
+                compiled = null!;
+                return false;
+            }
+
+            var leafRowIdIndices = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            if (target.HasRowId)
+                leafRowIdIndices.Add(target.Qualifier, 0);
+            var table = context.Tables[target.TableName];
+            var leafColumnDefinitions = table.ColumnDefinitions
+                .Select(static column => (EmbeddedColumn?)column)
+                .ToArray();
+            var leafQualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
+                target.Qualifier,
+                table.ColumnDefinitions);
+            compiled = new CompiledJoinSource(
+                new VdbeJoinScanPlan(
+                    target.TableName,
+                    target.Columns.Length,
+                    new VdbeCursorSource(target.Rows, target.RowIds)),
+                target.TableName,
+                target.Columns,
+                BuildQualifiedColumns(target.Qualifier, target.Columns),
+                leafRowIdIndices,
+                leafColumnDefinitions,
+                leafQualifiedColumnDefinitions,
+                BuildOutputColumns(target.Qualifier, target.Columns),
+                BuildOutputColumns(target.Qualifier, target.Columns));
+            return true;
+        }
+
+        if (source is not JoinTableSource join
+            || join.Condition is not null
+                && (ContainsAggregate(join.Condition)
+                    || ContainsWindowFunction(join.Condition)
+                    || !IsScanPredicate(join.Condition))
+            || !TryBuildCompiledJoinSource(
+                join.Left,
+                parameters,
+                context,
+                outerRow,
+                out var left)
+            || !TryBuildCompiledJoinSource(
+                join.Right,
+                parameters,
+                context,
+                outerRow,
+                out var right))
+        {
+            compiled = null!;
+            return false;
+        }
+
+        var columns = left.Columns.Concat(right.Columns).ToArray();
+        var qualifiedColumns = CombineQualifiedColumns(
+            left.QualifiedColumns,
+            right.QualifiedColumns,
+            left.Columns.Length);
+        var qualifiedRowIds = new Dictionary<string, int>(
+            left.QualifiedRowIdIndices,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var (qualifier, index) in right.QualifiedRowIdIndices)
+            qualifiedRowIds.TryAdd(qualifier, left.SourceCount + index);
+        var columnDefinitions = left.ColumnDefinitions.Concat(right.ColumnDefinitions).ToArray();
+        var qualifiedColumnDefinitions = new Dictionary<string, EmbeddedColumn>(
+            left.QualifiedColumnDefinitions,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, definition) in right.QualifiedColumnDefinitions)
+            qualifiedColumnDefinitions.TryAdd(name, definition);
+        var outputColumns = GetOutputColumns(join, context);
+        var rawOutputColumns = GetRawOutputColumns(join, context);
+        var joinPairs = BuildJoinPairs(join, context);
+        if (join.Condition is not null
+            && !IsSafeCompiledJoinPredicate(
+                join.Condition,
+                columns,
+                qualifiedColumns,
+                columnDefinitions,
+                qualifiedColumnDefinitions,
+                qualifiedRowIds))
+        {
+            compiled = null!;
+            return false;
+        }
+
+        SourceRow CombinedRow(VdbeJoinRow row) => CreateCompiledJoinSourceRow(
+            columns,
+            row.Values,
+            qualifiedColumns,
+            qualifiedRowIds,
+            row.RowIds,
+            outputColumns,
+            outerRow,
+            columnDefinitions,
+            qualifiedColumnDefinitions);
+        VdbeJoinCondition condition = (leftRow, rightRow, combinedRow) =>
+        {
+            if (join.Condition is not null)
+                return IsTrue(Evaluate(join.Condition, parameters, CombinedRow(combinedRow), context));
+
+            var leftSourceRow = left.CreateSourceRow(leftRow, outerRow);
+            var rightSourceRow = right.CreateSourceRow(rightRow, outerRow);
+            foreach (var (leftColumn, rightColumn) in joinPairs)
+            {
+                if (!JoinPairMatches(
+                        join,
+                        leftColumn,
+                        rightColumn,
+                        leftSourceRow,
+                        rightSourceRow,
+                        context))
+                    return false;
+            }
+
+            return true;
+        };
+
+        var kind = join.Kind switch
+        {
+            JoinKind.Inner => VdbeJoinKind.Inner,
+            JoinKind.Left => VdbeJoinKind.Left,
+            JoinKind.Right => VdbeJoinKind.Right,
+            JoinKind.Full => VdbeJoinKind.Full,
+            _ => throw new InvalidOperationException($"Unknown join kind {join.Kind}."),
+        };
+        var plan = new VdbeJoinOperatorPlan(
+            left.Plan,
+            right.Plan,
+            kind,
+            join.Condition is null && joinPairs.Count == 0 ? null : condition);
+        compiled = new CompiledJoinSource(
+            plan,
+            $"{plan.SourceCount}-way {kind.ToString().ToUpperInvariant()} join",
+            columns,
+            qualifiedColumns,
+            qualifiedRowIds,
+            columnDefinitions,
+            qualifiedColumnDefinitions,
+            outputColumns,
+            rawOutputColumns);
+        return true;
+    }
+
+    private static SourceRow CreateCompiledJoinSourceRow(
+        string[] columns,
+        SqlValue[] values,
+        IReadOnlyDictionary<string, int> qualifiedColumns,
+        IReadOnlyDictionary<string, int> qualifiedRowIdIndices,
+        IReadOnlyList<long?> rowIds,
+        IReadOnlyList<OutputColumn> outputColumns,
+        SourceRow? outerRow,
+        IReadOnlyList<EmbeddedColumn?> columnDefinitions,
+        IReadOnlyDictionary<string, EmbeddedColumn> qualifiedColumnDefinitions)
+    {
+        var qualifiedRowIds = new Dictionary<string, long?>(
+            qualifiedRowIdIndices.Count,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var (qualifier, index) in qualifiedRowIdIndices)
+            qualifiedRowIds.Add(qualifier, rowIds[index]);
+        return new SourceRow(
+            columns,
+            values,
+            qualifiedColumns,
+            outerRow,
+            outputColumns,
+            QualifiedRowIds: qualifiedRowIds,
+            ColumnDefinitions: columnDefinitions,
+            QualifiedColumnDefinitions: qualifiedColumnDefinitions);
+    }
+
+    private static IReadOnlyDictionary<string, EmbeddedColumn> BuildQualifiedColumnDefinitions(
+        string qualifier,
+        IReadOnlyList<EmbeddedColumn> columns)
+    {
+        var definitions = new Dictionary<string, EmbeddedColumn>(StringComparer.OrdinalIgnoreCase);
+        foreach (var column in columns)
+            definitions.TryAdd($"{qualifier}.{column.Name}", column);
+        return definitions;
+    }
+
+    private sealed class CompiledJoinSource(
+        VdbeJoinPlanNode plan,
+        string description,
+        string[] columns,
+        IReadOnlyDictionary<string, int> qualifiedColumns,
+        IReadOnlyDictionary<string, int> qualifiedRowIdIndices,
+        IReadOnlyList<EmbeddedColumn?> columnDefinitions,
+        IReadOnlyDictionary<string, EmbeddedColumn> qualifiedColumnDefinitions,
+        IReadOnlyList<OutputColumn> outputColumns,
+        IReadOnlyList<OutputColumn> rawOutputColumns)
+    {
+        public VdbeJoinPlanNode Plan { get; } = plan;
+
+        public string Description { get; } = description;
+
+        public string[] Columns { get; } = columns;
+
+        public IReadOnlyDictionary<string, int> QualifiedColumns { get; } = qualifiedColumns;
+
+        public IReadOnlyDictionary<string, int> QualifiedRowIdIndices { get; } = qualifiedRowIdIndices;
+
+        public IReadOnlyList<EmbeddedColumn?> ColumnDefinitions { get; } = columnDefinitions;
+
+        public IReadOnlyDictionary<string, EmbeddedColumn> QualifiedColumnDefinitions { get; } =
+            qualifiedColumnDefinitions;
+
+        public IReadOnlyList<OutputColumn> OutputColumns { get; } = outputColumns;
+
+        public IReadOnlyList<OutputColumn> RawOutputColumns { get; } = rawOutputColumns;
+
+        public int SourceCount => Plan.SourceCount;
+
+        public SourceRow CreateSourceRow(VdbeJoinRow row, SourceRow? outerRow)
+            => CreateCompiledJoinSourceRow(
+                Columns,
+                row.Values,
+                QualifiedColumns,
+                QualifiedRowIdIndices,
+                row.RowIds,
+                OutputColumns,
+                outerRow,
+                ColumnDefinitions,
+                QualifiedColumnDefinitions);
+
+        public SourceRow CreateSourceRow(SqlValue[] record, SourceRow? outerRow)
+        {
+            var values = new SqlValue[Columns.Length];
+            Array.Copy(record, values, values.Length);
+            var rowIds = new long?[SourceCount];
+            for (var index = 0; index < rowIds.Length; index++)
+            {
+                var value = record[Columns.Length + index];
+                rowIds[index] = value.Kind == SqlValueKind.Null ? null : value.AsInteger();
+            }
+
+            return CreateCompiledJoinSourceRow(
+                Columns,
+                values,
+                QualifiedColumns,
+                QualifiedRowIdIndices,
+                rowIds,
+                OutputColumns,
+                outerRow,
+                ColumnDefinitions,
+                QualifiedColumnDefinitions);
+        }
+
+        public int? ResolveColumnIndex(string name)
+        {
+            if (QualifiedColumns.TryGetValue(name, out var qualified))
+                return qualified;
+
+            for (var index = 0; index < Columns.Length; index++)
+            {
+                if (string.Equals(Columns[index], name, StringComparison.OrdinalIgnoreCase))
+                    return index;
+            }
+
+            var separator = name.IndexOf('.');
+            if (separator >= 0
+                && EmbeddedTable.IsRowidAliasName(name[(separator + 1)..])
+                && QualifiedRowIdIndices.TryGetValue(name[..separator], out var rowIdIndex))
+            {
+                return Columns.Length + rowIdIndex;
+            }
+
+            return null;
+        }
+
+        public EmbeddedColumn? ResolveColumnDefinition(Expression expression)
+        {
+            while (expression is CollationExpression collation)
+                expression = collation.Expression;
+            if (expression is not ColumnExpression column)
+                return null;
+            if (QualifiedColumnDefinitions.TryGetValue(column.Name, out var qualified))
+                return qualified;
+            if (column.Qualifier is not null)
+                return null;
+            for (var index = 0; index < Columns.Length && index < ColumnDefinitions.Count; index++)
+            {
+                if (string.Equals(Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
+                    return ColumnDefinitions[index];
+            }
+
+            return null;
+        }
+
+        public bool IsCoalescedColumn(ColumnExpression column)
+        {
+            if (column.Qualifier is not null)
+                return false;
+            return OutputColumns.Any(output =>
+                (output.CoalesceIndex is not null || output.AdditionalCoalesceIndices is { Count: > 0 })
+                && string.Equals(output.Name, column.Name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public ScanTarget CreateScanTarget(bool grouped)
+        {
+            var recordColumns = new string[checked(Columns.Length + SourceCount + (grouped ? 1 : 0))];
+            Array.Copy(Columns, recordColumns, Columns.Length);
+            for (var index = 0; index < SourceCount; index++)
+                recordColumns[Columns.Length + index] = $"__join_rowid_{index}";
+            if (grouped)
+                recordColumns[^1] = "__join_group_ordinal";
+            return new ScanTarget(
+                Description,
+                Description,
+                recordColumns,
+                [],
+                ResolveColumnIndex);
+        }
     }
 
     // Lowers a whole-table (scalar) or GROUP BY aggregation over a single base table into a
@@ -7104,10 +8042,9 @@ public sealed class EmbeddedDatabase : IDisposable
             }
 
             var columns = target.Columns;
-            var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, columns);
             orderComparer = (leftRow, rightRow) => CompareRows(
-                new SourceRow(columns, leftRow, qualifiedColumns, outerRow),
-                new SourceRow(columns, rightRow, qualifiedColumns, outerRow),
+                CreateScanSourceRow(target, leftRow, context, outerRow),
+                CreateScanSourceRow(target, rightRow, context, outerRow),
                 resolvedOrderBy,
                 parameters,
                 context);
@@ -7364,11 +8301,14 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         var columns = target.Columns;
-        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, columns);
         var keyNames = groupKeyNames.ToArray();
 
         string KeyOfRow(SqlValue[] row) =>
-            GetGroupKey(groupBy, parameters, new SourceRow(columns, row, qualifiedColumns, outerRow), context);
+            GetGroupKey(
+                groupBy,
+                parameters,
+                CreateScanSourceRow(target, row, context, outerRow),
+                context);
         string KeyOfSlice(SqlValue[] slice) =>
             GetGroupKey(groupBy, parameters, new SourceRow(keyNames, slice, Parent: outerRow), context);
 
@@ -7479,20 +8419,10 @@ public sealed class EmbeddedDatabase : IDisposable
         if (ReferencesUnbackedRowid(where, target))
             return null;
 
-        var columns = target.Columns;
-        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, columns);
-        var columnDefinitions = context.Tables.TryGetValue(target.TableName, out var table)
-            ? table.ColumnDefinitions
-            : null;
         return row => IsTrue(Evaluate(
             where,
             parameters,
-            new SourceRow(
-                columns,
-                row,
-                qualifiedColumns,
-                outerRow,
-                ColumnDefinitions: columnDefinitions),
+            CreateScanSourceRow(target, row, context, outerRow),
             context));
     }
 
@@ -7509,23 +8439,43 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!target.HasRowId || !IsSimpleRowIdComparison(where, target))
             return null;
 
-        var columns = target.Columns;
-        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, columns);
-        var columnDefinitions = context.Tables.TryGetValue(target.TableName, out var table)
-            ? table.ColumnDefinitions
-            : null;
         return (row, rowId) => IsTrue(Evaluate(
             where,
             parameters,
-            new SourceRow(
-                columns,
+            CreateScanSourceRow(target, row, context, outerRow, rowId),
+            context));
+    }
+
+    private static SourceRow CreateScanSourceRow(
+        ScanTarget target,
+        SqlValue[] row,
+        QueryContext context,
+        SourceRow? outerRow,
+        long? rowId = null)
+    {
+        var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, target.Columns);
+        if (!context.Tables.TryGetValue(target.TableName, out var table))
+        {
+            return new SourceRow(
+                target.Columns,
                 row,
                 qualifiedColumns,
                 outerRow,
                 RowId: rowId,
-                RowIdQualifier: target.Qualifier,
-                ColumnDefinitions: columnDefinitions),
-            context));
+                RowIdQualifier: rowId is null ? null : target.Qualifier);
+        }
+
+        return new SourceRow(
+            target.Columns,
+            row,
+            qualifiedColumns,
+            outerRow,
+            RowId: rowId,
+            RowIdQualifier: rowId is null ? null : target.Qualifier,
+            ColumnDefinitions: table.ColumnDefinitions,
+            QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
+                target.Qualifier,
+                table.ColumnDefinitions));
     }
 
     private static bool IsSimpleRowIdComparison(Expression expression, ScanTarget target)
@@ -8311,6 +9261,7 @@ public sealed class EmbeddedDatabase : IDisposable
             // routed arithmetic projection renders byte-identically to the canonical instruction renderer.
             ArithmeticInstruction => VdbeExplain.Describe(instruction),
             NumericAffinityInstruction => VdbeExplain.Describe(instruction),
+            OpenJoinCursorInstruction => VdbeExplain.Describe(instruction),
             OpenReadCursorInstruction open => (
                 open.Cursor.Index,
                 0,
@@ -8357,6 +9308,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 filterRegisters.Row.Count,
                 null,
                 filterRegisters.Description),
+            ProjectRegistersInstruction => VdbeExplain.Describe(instruction),
+            DistinctFilterInstruction => VdbeExplain.Describe(instruction),
             NextInstruction next => (
                 next.Cursor.Index,
                 next.LoopTarget.Offset,
@@ -8752,45 +9705,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var resultRows = new List<SqlValue[]>();
         foreach (var row in selectedRows)
-        {
-            var values = new List<SqlValue>();
-            foreach (var projection in statement.Projections)
-            {
-                switch (projection.Expression)
-                {
-                    case StarExpression:
-                        if (row is null)
-                            throw new EmbeddedSqlException("SELECT * requires a row source");
-
-                        foreach (var column in outputColumns)
-                            values.Add(GetOutputValue(row, column));
-                        break;
-                    case QualifiedStarExpression qualifiedStar:
-                        if (row is null)
-                            throw new EmbeddedSqlException("SELECT * requires a row source");
-
-                        var rawMatches = GetRawOutputColumns(statement.Source, context)
-                            .Where(column => string.Equals(column.Qualifier, qualifiedStar.Qualifier, StringComparison.OrdinalIgnoreCase))
-                            .ToArray();
-                        if (rawMatches.Length == 0)
-                            throw new EmbeddedSqlException($"no such table: {qualifiedStar.Qualifier}");
-
-                        var matches = rawMatches
-                            .Select(raw => outputColumns.FirstOrDefault(column =>
-                                string.Equals(column.Qualifier, qualifiedStar.Qualifier, StringComparison.OrdinalIgnoreCase)
-                                && column.Index == raw.Index) ?? raw)
-                            .ToArray();
-                        foreach (var column in matches)
-                            values.Add(GetOutputValue(row, column));
-                        break;
-                    default:
-                        values.Add(Evaluate(projection.Expression, parameters, row, context));
-                        break;
-                }
-            }
-
-            resultRows.Add(values.ToArray());
-        }
+            resultRows.Add(EvaluateProjectionRow(statement, row, parameters, context, outputColumns, rawOutputColumns));
 
         return new ExecutionResult(
             columnNames,
@@ -8806,6 +9721,54 @@ public sealed class EmbeddedDatabase : IDisposable
                     statement.Source,
                     context)),
             0);
+    }
+
+    private SqlValue[] EvaluateProjectionRow(
+        SelectStatement statement,
+        SourceRow row,
+        SqlValue[] parameters,
+        QueryContext context,
+        IReadOnlyList<OutputColumn> outputColumns,
+        IReadOnlyList<OutputColumn> rawOutputColumns)
+    {
+        var values = new List<SqlValue>();
+        foreach (var projection in statement.Projections)
+        {
+            switch (projection.Expression)
+            {
+                case StarExpression:
+                    foreach (var column in outputColumns)
+                        values.Add(GetOutputValue(row, column));
+                    break;
+                case QualifiedStarExpression qualifiedStar:
+                    var rawMatches = rawOutputColumns
+                        .Where(column => string.Equals(
+                            column.Qualifier,
+                            qualifiedStar.Qualifier,
+                            StringComparison.OrdinalIgnoreCase))
+                        .ToArray();
+                    if (rawMatches.Length == 0)
+                        throw new EmbeddedSqlException($"no such table: {qualifiedStar.Qualifier}");
+
+                    foreach (var raw in rawMatches)
+                    {
+                        var output = outputColumns.FirstOrDefault(column =>
+                            string.Equals(
+                                column.Qualifier,
+                                qualifiedStar.Qualifier,
+                                StringComparison.OrdinalIgnoreCase)
+                            && column.Index == raw.Index) ?? raw;
+                        values.Add(GetOutputValue(row, output));
+                    }
+
+                    break;
+                default:
+                    values.Add(Evaluate(projection.Expression, parameters, row, context));
+                    break;
+            }
+        }
+
+        return values.ToArray();
     }
 
     private static IReadOnlyList<string?> GetDistinctProjectionCollations(
@@ -8923,6 +9886,41 @@ public sealed class EmbeddedDatabase : IDisposable
                     return column.Index < leftWidth
                         ? GetDeclaredOutputColumnCollation(join.Left, column, context)
                         : GetDeclaredOutputColumnCollation(
+                            join.Right,
+                            column with { Index = column.Index - leftWidth },
+                            context);
+                }
+            default:
+                return null;
+        }
+    }
+
+    private static EmbeddedColumn? GetOutputColumnDefinition(
+        TableSource? source,
+        OutputColumn column,
+        QueryContext context)
+    {
+        switch (source)
+        {
+            case NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table):
+                {
+                    var qualifier = named.Alias ?? named.Name;
+                    if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                        return null;
+                    for (var index = 0; index < table.Columns.Length; index++)
+                    {
+                        if (string.Equals(table.Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
+                            return table.ColumnDefinitions[index];
+                    }
+
+                    return null;
+                }
+            case JoinTableSource join:
+                {
+                    var leftWidth = GetSourceColumns(join.Left, context).Length;
+                    return column.Index < leftWidth
+                        ? GetOutputColumnDefinition(join.Left, column, context)
+                        : GetOutputColumnDefinition(
                             join.Right,
                             column with { Index = column.Index - leftWidth },
                             context);
@@ -10473,6 +11471,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     CoalesceIndex = column.CoalesceIndex is { } coalesceIndex
                         ? coalesceIndex + leftWidth
                         : null,
+                    AdditionalCoalesceIndices = ShiftCoalesceIndices(
+                        column.AdditionalCoalesceIndices,
+                        leftWidth),
                 });
             }
 
@@ -10485,7 +11486,38 @@ public sealed class EmbeddedDatabase : IDisposable
             if (coalescedSet.Contains(column.Name))
             {
                 var match = right.First(candidate => string.Equals(candidate.Name, column.Name, StringComparison.OrdinalIgnoreCase));
-                result.Add(column with { CoalesceIndex = match.Index + leftWidth });
+                var rightIndices = new List<int> { match.Index + leftWidth };
+                if (match.CoalesceIndex is { } matchCoalesce)
+                    rightIndices.Add(matchCoalesce + leftWidth);
+                if (match.AdditionalCoalesceIndices is not null)
+                {
+                    rightIndices.AddRange(match.AdditionalCoalesceIndices.Select(index => index + leftWidth));
+                }
+
+                if (column.CoalesceIndex is null)
+                {
+                    result.Add(column with
+                    {
+                        CoalesceIndex = rightIndices[0],
+                        AdditionalCoalesceIndices = rightIndices.Count == 1
+                            ? column.AdditionalCoalesceIndices
+                            : [
+                                .. column.AdditionalCoalesceIndices ?? [],
+                                .. rightIndices.Skip(1),
+                            ],
+                    });
+                }
+                else
+                {
+                    result.Add(column with
+                    {
+                        AdditionalCoalesceIndices =
+                        [
+                            .. column.AdditionalCoalesceIndices ?? [],
+                            .. rightIndices,
+                        ],
+                    });
+                }
             }
             else
             {
@@ -10503,12 +11535,20 @@ public sealed class EmbeddedDatabase : IDisposable
                     CoalesceIndex = column.CoalesceIndex is { } coalesceIndex
                         ? coalesceIndex + leftWidth
                         : null,
+                    AdditionalCoalesceIndices = ShiftCoalesceIndices(
+                        column.AdditionalCoalesceIndices,
+                        leftWidth),
                 });
             }
         }
 
         return result;
     }
+
+    private static IReadOnlyList<int>? ShiftCoalesceIndices(
+        IReadOnlyList<int>? indices,
+        int offset)
+        => indices is null ? null : indices.Select(index => index + offset).ToArray();
 
     private SourceData GetSourceRows(
         TableSource? source,
@@ -10545,6 +11585,12 @@ public sealed class EmbeddedDatabase : IDisposable
         var right = GetSourceRows(source.Right, parameters, context, maximumRows: null, outerRow);
         var leftQualifiedColumns = GetQualifiedColumns(source.Left, context);
         var rightQualifiedColumns = GetQualifiedColumns(source.Right, context);
+        var leftQualifiedRowIds = GetQualifiedRowIdPlaceholders(source.Left, context);
+        var rightQualifiedRowIds = GetQualifiedRowIdPlaceholders(source.Right, context);
+        var columnDefinitions = GetSourceColumnDefinitions(source.Left, context)
+            .Concat(GetSourceColumnDefinitions(source.Right, context))
+            .ToArray();
+        var qualifiedColumnDefinitions = GetSourceQualifiedColumnDefinitions(source, context);
         var columns = left.Columns.Concat(right.Columns).ToArray();
         var outputColumns = GetOutputColumns(source, context);
         var leftWidth = left.Columns.Length;
@@ -10565,11 +11611,16 @@ public sealed class EmbeddedDatabase : IDisposable
                     CombineQualifiedColumns(leftRow.QualifiedColumns, rightRow.QualifiedColumns, leftWidth),
                     outerRow,
                     outputColumns,
+                    QualifiedRowIds: CombineQualifiedRowIds(
+                        GetQualifiedRowIds(leftRow),
+                        GetQualifiedRowIds(rightRow)),
                     ColumnDefinitions: CombineColumnDefinitions(
                         leftRow,
                         rightRow,
                         left.Columns.Length,
-                        right.Columns.Length));
+                        right.Columns.Length,
+                        columnDefinitions),
+                    QualifiedColumnDefinitions: qualifiedColumnDefinitions);
                 if (!JoinConditionMatches(source, joinPairs, row, leftRow, rightRow, parameters, context))
                     continue;
 
@@ -10591,11 +11642,16 @@ public sealed class EmbeddedDatabase : IDisposable
                     CombineQualifiedColumns(leftRow.QualifiedColumns, rightQualifiedColumns, leftWidth),
                     outerRow,
                     outputColumns,
+                    QualifiedRowIds: CombineQualifiedRowIds(
+                        GetQualifiedRowIds(leftRow),
+                        rightQualifiedRowIds),
                     ColumnDefinitions: CombineColumnDefinitions(
                         leftRow,
                         right.Rows.FirstOrDefault(),
                         left.Columns.Length,
-                        right.Columns.Length)));
+                        right.Columns.Length,
+                        columnDefinitions),
+                    QualifiedColumnDefinitions: qualifiedColumnDefinitions));
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
                     return new SourceData(columns, rows);
             }
@@ -10618,11 +11674,16 @@ public sealed class EmbeddedDatabase : IDisposable
                     CombineQualifiedColumns(leftQualifiedColumns, rightRow.QualifiedColumns, leftWidth),
                     outerRow,
                     outputColumns,
+                    QualifiedRowIds: CombineQualifiedRowIds(
+                        leftQualifiedRowIds,
+                        GetQualifiedRowIds(rightRow)),
                     ColumnDefinitions: CombineColumnDefinitions(
                         left.Rows.FirstOrDefault(),
                         rightRow,
                         left.Columns.Length,
-                        right.Columns.Length)));
+                        right.Columns.Length,
+                        columnDefinitions),
+                    QualifiedColumnDefinitions: qualifiedColumnDefinitions));
                 if (maximumRows is not null && rows.Count >= maximumRows.Value)
                     return new SourceData(columns, rows);
             }
@@ -10636,12 +11697,16 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? left,
         SourceRow? right,
         int leftWidth,
-        int rightWidth)
+        int rightWidth,
+        IReadOnlyList<EmbeddedColumn?>? fallbackDefinitions = null)
     {
         if (left?.ColumnDefinitions is null && right?.ColumnDefinitions is null)
-            return null;
+            return fallbackDefinitions;
 
-        var definitions = new EmbeddedColumn?[leftWidth + rightWidth];
+        var definitions = fallbackDefinitions?.ToArray()
+            ?? new EmbeddedColumn?[leftWidth + rightWidth];
+        if (definitions.Length != leftWidth + rightWidth)
+            throw new InvalidOperationException("Join column metadata width does not match the joined row.");
         if (left?.ColumnDefinitions is not null)
         {
             for (var index = 0; index < left.ColumnDefinitions.Count; index++)
@@ -10720,14 +11785,39 @@ public sealed class EmbeddedDatabase : IDisposable
 
         foreach (var (leftColumn, rightColumn) in joinPairs)
         {
-            if (!IsTrue(EvaluateBinaryValues(
-                    BinaryOperator.Equal,
-                    GetOutputValue(leftRow, leftColumn),
-                    GetOutputValue(rightRow, rightColumn))))
+            if (!JoinPairMatches(
+                    source,
+                    leftColumn,
+                    rightColumn,
+                    leftRow,
+                    rightRow,
+                    context))
+            {
                 return false;
+            }
         }
 
         return true;
+    }
+
+    private bool JoinPairMatches(
+        JoinTableSource source,
+        OutputColumn leftColumn,
+        OutputColumn rightColumn,
+        SourceRow leftRow,
+        SourceRow rightRow,
+        QueryContext context)
+    {
+        var left = GetOutputValue(leftRow, leftColumn);
+        var right = GetOutputValue(rightRow, rightColumn);
+        var leftDefinition = GetOutputColumnDefinition(source.Left, leftColumn, context);
+        var rightDefinition = GetOutputColumnDefinition(source.Right, rightColumn, context);
+        ApplyComparisonAffinities(leftDefinition, rightDefinition, ref left, ref right);
+        return IsTrue(EvaluateBinaryValues(
+            BinaryOperator.Equal,
+            left,
+            right,
+            leftDefinition?.Collation ?? rightDefinition?.Collation));
     }
 
     private static IReadOnlyDictionary<string, int> CombineQualifiedColumns(
@@ -10748,6 +11838,53 @@ public sealed class EmbeddedDatabase : IDisposable
         }
 
         return columns;
+    }
+
+    private static IReadOnlyDictionary<string, long?> CombineQualifiedRowIds(
+        IReadOnlyDictionary<string, long?> left,
+        IReadOnlyDictionary<string, long?> right)
+    {
+        var rowIds = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (qualifier, rowId) in left)
+            rowIds.TryAdd(qualifier, rowId);
+        foreach (var (qualifier, rowId) in right)
+            rowIds.TryAdd(qualifier, rowId);
+        return rowIds;
+    }
+
+    private static IReadOnlyDictionary<string, long?> GetQualifiedRowIds(SourceRow row)
+    {
+        var rowIds = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+        if (row.QualifiedRowIds is not null)
+        {
+            foreach (var (qualifier, rowId) in row.QualifiedRowIds)
+                rowIds.TryAdd(qualifier, rowId);
+        }
+
+        if (row.RowIdQualifier is not null)
+            rowIds.TryAdd(row.RowIdQualifier, row.RowId);
+        return rowIds;
+    }
+
+    private static IReadOnlyDictionary<string, long?> GetQualifiedRowIdPlaceholders(
+        TableSource source,
+        QueryContext context)
+    {
+        switch (source)
+        {
+            case NamedTableSource named
+                when context.Tables.TryGetValue(named.Name, out var table) && table.HasRowid:
+                return new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [named.Alias ?? named.Name] = null,
+                };
+            case JoinTableSource join:
+                return CombineQualifiedRowIds(
+                    GetQualifiedRowIdPlaceholders(join.Left, context),
+                    GetQualifiedRowIdPlaceholders(join.Right, context));
+            default:
+                return new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+        }
     }
 
     private static IReadOnlyDictionary<string, int> GetQualifiedColumns(
@@ -10776,6 +11913,49 @@ public sealed class EmbeddedDatabase : IDisposable
                 GetSourceColumns(join.Left, context).Length),
             _ => throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}."),
         };
+    }
+
+    private static IReadOnlyList<EmbeddedColumn?> GetSourceColumnDefinitions(
+        TableSource source,
+        QueryContext context)
+    {
+        return source switch
+        {
+            NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table)
+                => table.ColumnDefinitions.Select(static definition => (EmbeddedColumn?)definition).ToArray(),
+            JoinTableSource join => GetSourceColumnDefinitions(join.Left, context)
+                .Concat(GetSourceColumnDefinitions(join.Right, context))
+                .ToArray(),
+            _ => Enumerable.Repeat<EmbeddedColumn?>(
+                    null,
+                    GetSourceColumns(source, context).Length)
+                .ToArray(),
+        };
+    }
+
+    private static IReadOnlyDictionary<string, EmbeddedColumn> GetSourceQualifiedColumnDefinitions(
+        TableSource source,
+        QueryContext context)
+    {
+        switch (source)
+        {
+            case NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table):
+                return BuildQualifiedColumnDefinitions(
+                    named.Alias ?? named.Name,
+                    table.ColumnDefinitions);
+            case JoinTableSource join:
+                {
+                    var definitions = new Dictionary<string, EmbeddedColumn>(
+                        StringComparer.OrdinalIgnoreCase);
+                    foreach (var (name, definition) in GetSourceQualifiedColumnDefinitions(join.Left, context))
+                        definitions.TryAdd(name, definition);
+                    foreach (var (name, definition) in GetSourceQualifiedColumnDefinitions(join.Right, context))
+                        definitions.TryAdd(name, definition);
+                    return definitions;
+                }
+            default:
+                return new Dictionary<string, EmbeddedColumn>(StringComparer.OrdinalIgnoreCase);
+        }
     }
 
     private static IReadOnlyDictionary<string, int> BuildQualifiedColumns(
@@ -10813,6 +11993,9 @@ public sealed class EmbeddedDatabase : IDisposable
         var table = GetTable(source, context.Tables);
         var qualifier = source.Alias ?? source.Name;
         var qualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
+        var qualifiedColumnDefinitions = BuildQualifiedColumnDefinitions(
+            qualifier,
+            table.ColumnDefinitions);
         var count = table.Rows.Count;
         if (maximumRows is { } maximum && maximum < count)
             count = (int)maximum;
@@ -10828,7 +12011,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 outerRow,
                 RowId: table.HasRowid ? rowid : null,
                 RowIdQualifier: qualifier,
-                ColumnDefinitions: table.ColumnDefinitions);
+                ColumnDefinitions: table.ColumnDefinitions,
+                QualifiedColumnDefinitions: qualifiedColumnDefinitions);
         }
 
         return new SourceData(table.Columns, sourceRows);
@@ -11284,8 +12468,23 @@ public sealed class EmbeddedDatabase : IDisposable
     private static SqlValue GetOutputValue(SourceRow row, OutputColumn column)
     {
         var value = row.Values[column.Index];
-        if (column.CoalesceIndex is { } coalesceIndex && value.Kind == SqlValueKind.Null)
-            return row.Values[coalesceIndex];
+        if (value.Kind != SqlValueKind.Null)
+            return value;
+        if (column.CoalesceIndex is { } coalesceIndex)
+        {
+            value = row.Values[coalesceIndex];
+            if (value.Kind != SqlValueKind.Null)
+                return value;
+        }
+        if (column.AdditionalCoalesceIndices is not null)
+        {
+            foreach (var additionalIndex in column.AdditionalCoalesceIndices)
+            {
+                value = row.Values[additionalIndex];
+                if (value.Kind != SqlValueKind.Null)
+                    return value;
+            }
+        }
 
         return value;
     }
@@ -11486,11 +12685,18 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var left = Evaluate(expression.Left, parameters, row, context);
         var right = Evaluate(expression.Right, parameters, row, context);
+        var leftColumn = row?.GetColumnDefinition(expression.Left);
+        var rightColumn = row?.GetColumnDefinition(expression.Right);
+        if (IsComparisonOperator(expression.Operator))
+            ApplyComparisonAffinities(leftColumn, rightColumn, ref left, ref right);
         return EvaluateBinaryValues(
             expression.Operator,
             left,
             right,
-            GetCollation(expression.Left) ?? GetCollation(expression.Right));
+            GetCollation(expression.Left)
+                ?? GetCollation(expression.Right)
+                ?? leftColumn?.Collation
+                ?? rightColumn?.Collation);
     }
 
     private SqlValue EvaluateComparison(
@@ -11655,6 +12861,42 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private static Expression GetExpressionElement(Expression expression, int index)
         => expression is RowValueExpression rowValue ? rowValue.Values[index] : expression;
+
+    private static void ApplyComparisonAffinities(
+        EmbeddedColumn? leftColumn,
+        EmbeddedColumn? rightColumn,
+        ref SqlValue left,
+        ref SqlValue right)
+    {
+        var leftAffinity = leftColumn is null
+            ? (ColumnAffinity?)null
+            : EmbeddedTable.GetColumnAffinity(leftColumn);
+        var rightAffinity = rightColumn is null
+            ? (ColumnAffinity?)null
+            : EmbeddedTable.GetColumnAffinity(rightColumn);
+        if (leftAffinity is { } leftNumeric
+            && IsNumericColumnAffinity(leftNumeric)
+            && (rightAffinity is null || !IsNumericColumnAffinity(rightAffinity.Value)))
+        {
+            right = EmbeddedTable.ApplyColumnAffinity(leftNumeric, right);
+        }
+        else if (rightAffinity is { } rightNumeric
+            && IsNumericColumnAffinity(rightNumeric)
+            && (leftAffinity is null || !IsNumericColumnAffinity(leftAffinity.Value)))
+        {
+            left = EmbeddedTable.ApplyColumnAffinity(rightNumeric, left);
+        }
+        else if (leftAffinity == ColumnAffinity.Text && rightAffinity is null)
+        {
+            right = EmbeddedTable.ApplyColumnAffinity(ColumnAffinity.Text, right);
+        }
+        else if (rightAffinity == ColumnAffinity.Text && leftAffinity is null)
+        {
+            left = EmbeddedTable.ApplyColumnAffinity(ColumnAffinity.Text, left);
+        }
+    }
+    private static bool IsNumericColumnAffinity(ColumnAffinity affinity)
+        => affinity is ColumnAffinity.Integer or ColumnAffinity.Real or ColumnAffinity.Numeric;
 
     private SqlValue EvaluateBinaryValues(
         BinaryOperator operation,
@@ -22901,12 +24143,20 @@ internal sealed class EmbeddedTable
     }
 
     private static SqlValue ApplyAffinity(EmbeddedColumn column, SqlValue value)
+        => ApplyAffinity(GetAffinity(column.DeclaredType), value);
+
+    internal static ColumnAffinity GetColumnAffinity(EmbeddedColumn column)
+        => GetAffinity(column.DeclaredType);
+
+    internal static SqlValue ApplyColumnAffinity(ColumnAffinity affinity, SqlValue value)
+        => ApplyAffinity(affinity, value);
+
+    private static SqlValue ApplyAffinity(ColumnAffinity affinity, SqlValue value)
     {
         value = value.WithoutJsonSubtype();
         if (value.Kind is SqlValueKind.Null or SqlValueKind.Blob)
             return value;
 
-        var affinity = GetAffinity(column.DeclaredType);
         if (affinity == ColumnAffinity.Blob)
             return value;
         if (affinity == ColumnAffinity.Text)
@@ -23053,7 +24303,12 @@ internal sealed class BlobMutationLease(EmbeddedDatabase database, BlobMutationI
     }
 }
 
-internal sealed record OutputColumn(string? Qualifier, string Name, int Index, int? CoalesceIndex = null);
+internal sealed record OutputColumn(
+    string? Qualifier,
+    string Name,
+    int Index,
+    int? CoalesceIndex = null,
+    IReadOnlyList<int>? AdditionalCoalesceIndices = null);
 
 internal sealed record SourceRow(
     string[] Columns,
@@ -23063,7 +24318,9 @@ internal sealed record SourceRow(
     IReadOnlyList<OutputColumn>? OutputColumns = null,
     long? RowId = null,
     string? RowIdQualifier = null,
-    IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null)
+    IReadOnlyDictionary<string, long?>? QualifiedRowIds = null,
+    IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null,
+    IReadOnlyDictionary<string, EmbeddedColumn>? QualifiedColumnDefinitions = null)
 {
     public SqlValue GetValue(string name)
         => GetValue(name, allowQualifiedLookup: true);
@@ -23077,6 +24334,15 @@ internal sealed record SourceRow(
             && QualifiedColumns.TryGetValue(column.Name, out var qualifiedIndex))
         {
             return Values[qualifiedIndex];
+        }
+
+        if (QualifiedRowIds is not null
+            && column.Qualifier is not null
+            && column.UnqualifiedName is { } rowIdName
+            && EmbeddedTable.IsRowidAliasName(rowIdName)
+            && QualifiedRowIds.TryGetValue(column.Qualifier, out var qualifiedRowId))
+        {
+            return qualifiedRowId is { } rowId ? SqlValue.Integer(rowId) : SqlValue.Null;
         }
 
         for (var index = 0; index < Columns.Length; index++)
@@ -23100,18 +24366,30 @@ internal sealed record SourceRow(
         throw new EmbeddedSqlException($"no such column: {column.Name}");
     }
 
-    public EmbeddedColumn? GetColumnDefinition(ColumnExpression column)
+    public EmbeddedColumn? GetColumnDefinition(Expression expression)
     {
-        if (ColumnDefinitions is not null)
-        {
-            if (column.Qualifier is not null
-                && QualifiedColumns is not null
-                && QualifiedColumns.TryGetValue(column.Name, out var qualifiedIndex)
-                && qualifiedIndex < ColumnDefinitions.Count)
-            {
-                return ColumnDefinitions[qualifiedIndex];
-            }
+        while (expression is CollationExpression collation)
+            expression = collation.Expression;
+        if (expression is not ColumnExpression column)
+            return null;
 
+        if (QualifiedColumnDefinitions is not null
+            && QualifiedColumnDefinitions.TryGetValue(column.Name, out var qualified))
+        {
+            return qualified;
+        }
+
+        if (column.Qualifier is not null
+            && QualifiedColumns is not null
+            && QualifiedColumns.TryGetValue(column.Name, out var qualifiedIndex)
+            && ColumnDefinitions is not null
+            && qualifiedIndex < ColumnDefinitions.Count)
+        {
+            return ColumnDefinitions[qualifiedIndex];
+        }
+
+        if (column.Qualifier is null && ColumnDefinitions is not null)
+        {
             for (var index = 0; index < Columns.Length && index < ColumnDefinitions.Count; index++)
             {
                 if (string.Equals(Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
@@ -23119,7 +24397,7 @@ internal sealed record SourceRow(
             }
         }
 
-        return Parent?.GetColumnDefinition(column);
+        return Parent?.GetColumnDefinition(expression);
     }
 
     private SqlValue GetValue(string name, bool allowQualifiedLookup)
@@ -23138,11 +24416,30 @@ internal sealed record SourceRow(
         {
             foreach (var output in OutputColumns)
             {
-                if (output.CoalesceIndex is { } coalesceIndex
-                    && string.Equals(output.Name, name, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(output.Name, name, StringComparison.OrdinalIgnoreCase)
+                    && (output.CoalesceIndex is not null
+                        || output.AdditionalCoalesceIndices is { Count: > 0 }))
                 {
-                    var primary = Values[output.Index];
-                    return primary.Kind == SqlValueKind.Null ? Values[coalesceIndex] : primary;
+                    var value = Values[output.Index];
+                    if (value.Kind != SqlValueKind.Null)
+                        return value;
+                    if (output.CoalesceIndex is { } coalesceIndex)
+                    {
+                        value = Values[coalesceIndex];
+                        if (value.Kind != SqlValueKind.Null)
+                            return value;
+                    }
+                    if (output.AdditionalCoalesceIndices is not null)
+                    {
+                        foreach (var additionalIndex in output.AdditionalCoalesceIndices)
+                        {
+                            value = Values[additionalIndex];
+                            if (value.Kind != SqlValueKind.Null)
+                                return value;
+                        }
+                    }
+
+                    return SqlValue.Null;
                 }
             }
         }
