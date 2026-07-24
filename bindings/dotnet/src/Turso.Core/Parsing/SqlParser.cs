@@ -502,13 +502,13 @@ internal sealed class SqlParser
         if (ConsumeKeyword("PRIMARY"))
         {
             ExpectKeyword("KEY");
-            var keyColumns = ParseTableConstraintColumns();
+            var keyColumns = ParseTableConstraintColumns(allowAutoIncrement: true);
             return new PrimaryKeyTableConstraint(constraintName, keyColumns, ParseConflictClause());
         }
 
         if (ConsumeKeyword("UNIQUE"))
         {
-            var keyColumns = ParseTableConstraintColumns();
+            var keyColumns = ParseTableConstraintColumns(allowAutoIncrement: false);
             return new UniqueTableConstraint(constraintName, keyColumns, ParseConflictClause());
         }
 
@@ -529,7 +529,7 @@ internal sealed class SqlParser
         throw Error("Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY after table constraint name.");
     }
 
-    private IReadOnlyList<TablePrimaryKeyColumn> ParseTableConstraintColumns()
+    private IReadOnlyList<TablePrimaryKeyColumn> ParseTableConstraintColumns(bool allowAutoIncrement)
     {
         Expect(TokenKind.LeftParen);
         var columns = new List<TablePrimaryKeyColumn>();
@@ -544,7 +544,8 @@ internal sealed class SqlParser
             if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
                 descending = true;
 
-            columns.Add(new TablePrimaryKeyColumn(columnName, descending, collation));
+            var autoIncrement = allowAutoIncrement && ConsumeKeyword("AUTOINCREMENT");
+            columns.Add(new TablePrimaryKeyColumn(columnName, descending, collation, autoIncrement));
         }
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
@@ -2301,6 +2302,7 @@ internal sealed class SqlParser
 
         var primaryKey = false;
         var primaryKeyDescending = false;
+        var autoIncrement = false;
         var notNull = false;
         var unique = false;
         SqlValue? defaultValue = null;
@@ -2349,11 +2351,11 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("AUTOINCREMENT"))
             {
-                // AUTOINCREMENT requires sqlite_sequence semantics (monotonic rowids that
-                // never reuse a value). The managed engine does not implement that table,
-                // so the keyword is rejected rather than silently downgraded to plain
-                // rowid assignment, which would diverge from SQLite.
-                throw Error("AUTOINCREMENT is not supported: the managed engine does not implement sqlite_sequence semantics");
+                if (!primaryKey || autoIncrement)
+                    throw Error("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+
+                autoIncrement = true;
+                continue;
             }
             if (ConsumeKeyword("NOT"))
             {
@@ -2472,6 +2474,7 @@ internal sealed class SqlParser
             nullConstraintName,
             explicitNull,
             generationAlways,
+            autoIncrement,
             foreignKeys.Skip(1).ToArray());
     }
 
@@ -2567,6 +2570,7 @@ internal sealed class SqlParser
     private static bool IsColumnConstraintKeyword(string keyword)
     {
         return keyword.Equals("AS", StringComparison.OrdinalIgnoreCase)
+            || keyword.Equals("AUTOINCREMENT", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("CHECK", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("COLLATE", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("CONSTRAINT", StringComparison.OrdinalIgnoreCase)

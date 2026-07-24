@@ -228,6 +228,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             indexRootPages.Add(entry.Name, entry.RootPage);
         }
 
+        EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
         ValidateAllocationMap(schemaEntries, tables);
 
         foreach (var entry in schemaEntries)
@@ -1259,6 +1260,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         // Validate first: a reject must leave the existing database untouched.
         foreach (var (name, table) in tables)
             EmbeddedFileStore.ValidateTableRepresentable(name, table);
+        EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
         ValidateSchemaDefinitions(tables, views, triggers);
 
         if (!reclaimTrailingPages

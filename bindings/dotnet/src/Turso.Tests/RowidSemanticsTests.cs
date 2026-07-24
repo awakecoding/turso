@@ -7,9 +7,7 @@ namespace Turso.Tests;
 // Coverage for the managed engine's SQLite rowid and INTEGER PRIMARY KEY semantics.
 // Every behavioural case is cross-checked byte-for-byte against a real SQLite build
 // (Microsoft.Data.Sqlite) so the managed hidden-rowid handling, alias autogeneration,
-// coercion, conflict messages, and last_insert_rowid() stay compatible. The only
-// deliberate divergence — rejecting AUTOINCREMENT rather than faking sqlite_sequence —
-// is pinned by a dedicated managed-only test.
+// coercion, conflict messages, last_insert_rowid(), and AUTOINCREMENT stay compatible.
 public class RowidSemanticsTests
 {
     [Test]
@@ -351,16 +349,18 @@ public class RowidSemanticsTests
     }
 
     [Test]
-    public void AutoIncrementIsRejectedRatherThanFaked()
+    public void AutoIncrementUsesDurableMonotonicSequenceSemantics()
     {
-        // Deliberate divergence from SQLite: AUTOINCREMENT requires monotonic, never-reused
-        // rowids backed by sqlite_sequence, which the managed engine does not implement, so
-        // it is rejected outright instead of being silently downgraded to plain rowids.
-        var database = new EmbeddedDatabase();
-        using var connection = database.Connect();
-
-        var act = () => Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, a TEXT);");
-        act.Should().Throw<EmbeddedSqlException>().WithMessage("*AUTOINCREMENT*");
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, a TEXT)",
+                "INSERT INTO t(a) VALUES ('first')",
+                "INSERT INTO t(id, a) VALUES (10, 'explicit')",
+                "DELETE FROM t WHERE id = 10",
+                "INSERT INTO t(a) VALUES ('after-delete')",
+            ],
+            "SELECT id, a, (SELECT seq FROM sqlite_sequence WHERE name = 't') AS seq "
+            + "FROM t ORDER BY id");
     }
 
     private static void AssertMatchesSqlite(IReadOnlyList<string> setup, string query)
