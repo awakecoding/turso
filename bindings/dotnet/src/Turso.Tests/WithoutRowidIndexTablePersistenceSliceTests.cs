@@ -412,6 +412,55 @@ public sealed class WithoutRowidIndexTablePersistenceSliceTests
     }
 
     [Test]
+    public void RenamePreservesPrimaryKeyReservedAutoindexOrdinalAcrossReopen()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, """
+                    CREATE TABLE entry(
+                        id TEXT PRIMARY KEY,
+                        value TEXT UNIQUE
+                    ) WITHOUT ROWID;
+                    """);
+                Execute(connection, "INSERT INTO entry VALUES ('id', 'value');");
+                Execute(connection, "ALTER TABLE entry RENAME TO renamed;");
+                Scalar(connection, """
+                    SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'index'
+                      AND name = 'sqlite_autoindex_renamed_2'
+                      AND tbl_name = 'renamed';
+                    """).AsInteger().Should().Be(1);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Scalar(connection, "SELECT value FROM renamed WHERE id = 'id';")
+                    .AsText().Should().Be("value");
+                Scalar(connection, """
+                    SELECT COUNT(*) FROM sqlite_schema
+                    WHERE type = 'index' AND name = 'sqlite_autoindex_renamed_2';
+                    """).AsInteger().Should().Be(1);
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+            sqlite.Open();
+            using var integrity = sqlite.CreateCommand();
+            integrity.CommandText = "PRAGMA integrity_check;";
+            integrity.ExecuteScalar().Should().Be("ok");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void WithoutRowidRootLeafRoundTripsOverflowRecords()
     {
         var fileSystem = new InMemoryFileSystem();

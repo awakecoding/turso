@@ -19827,17 +19827,35 @@ internal sealed class EmbeddedTable
 
     public void Rename(string newName)
     {
-        Name = newName;
-        var autoIndex = 0;
+        var autoIndexPrefix = $"sqlite_autoindex_{Name}_";
+        var renamedIndexes = new List<(int Position, string Name)>();
         for (var index = 0; index < Indexes.Count; index++)
         {
             if (Indexes[index].Origin is not (
                 EmbeddedIndexOrigin.UniqueConstraint or EmbeddedIndexOrigin.PrimaryKey))
+            {
                 continue;
+            }
 
-            autoIndex++;
-            Indexes[index] = Indexes[index] with { Name = $"sqlite_autoindex_{newName}_{autoIndex}" };
+            var indexName = Indexes[index].Name;
+            if (!indexName.StartsWith(autoIndexPrefix, StringComparison.OrdinalIgnoreCase)
+                || !int.TryParse(
+                    indexName.AsSpan(autoIndexPrefix.Length),
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var ordinal)
+                || ordinal <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"Constraint index '{indexName}' does not match table '{Name}'.");
+            }
+
+            renamedIndexes.Add((index, $"sqlite_autoindex_{newName}_{ordinal}"));
         }
+
+        Name = newName;
+        foreach (var (position, name) in renamedIndexes)
+            Indexes[position] = Indexes[position] with { Name = name };
     }
 
     public SqlValue[] CreateRowWithDefaults(Func<Expression, SqlValue> evaluate)
