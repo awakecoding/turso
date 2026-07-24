@@ -295,6 +295,79 @@ public sealed class ManagedSchemaOverflowStorageTests
     }
 
     [Test]
+    public void DeleteJournalVacuumMigratesOverflowingConstraintSchema()
+    {
+        var path = CreateDatabasePath("delete-migration");
+        var payload = LargeValue('d', MaximumPageSchemaPayloadLength);
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, BuildLargeConstraintTableSql("metadata", payload));
+                Execute(connection, "INSERT INTO metadata(id) VALUES (1);");
+                ScalarText(connection, "PRAGMA journal_mode=DELETE;").Should().Be("delete");
+                Execute(connection, $"PRAGMA page_size={SqlitePageSize.Minimum};");
+                Execute(connection, "VACUUM;");
+                Execute(connection, BuildLargeViewSql("delete_view", payload));
+                ScalarInteger(connection, "SELECT doubled FROM metadata;").Should().Be(14);
+            }
+
+            var header = ReadHeaderFromMainStore(PhysicalFileSystem.Instance, path);
+            header.PageSize.Should().Be(SqlitePageSize.Minimum);
+            header.WriteVersion.Should().Be(SqliteFileFormatVersion.Legacy);
+            header.ReadVersion.Should().Be(SqliteFileFormatVersion.Legacy);
+            FindSchemaCell(PhysicalFileSystem.Instance, path, "metadata").OverflowPages.Should().NotBeEmpty();
+            FindSchemaCell(PhysicalFileSystem.Instance, path, "delete_view").OverflowPages.Should().NotBeEmpty();
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path, readOnly: true))
+            using (var connection = reopened.Connect())
+            {
+                ScalarText(connection, "PRAGMA journal_mode;").Should().Be("delete");
+                ScalarText(connection, "SELECT value FROM delete_view;").Should().Be(payload);
+                ScalarInteger(connection, "SELECT doubled FROM metadata;").Should().Be(14);
+            }
+
+            VerifyIntegrityWithSqlite(path);
+        }
+        finally
+        {
+            NativeSqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void ReusedPooledHandleRefreshesOverflowingCatalog()
+    {
+        var path = CreateDatabasePath("pool-refresh");
+        var payload = LargeValue('o', MaximumPageSchemaPayloadLength);
+        ManagedSqliteConnection.ClearAllPools();
+        try
+        {
+            using var writer = OpenManagedProvider(path, pooling: true);
+            using var stale = OpenManagedProvider(path, pooling: true);
+            stale.Close();
+
+            Execute(writer, BuildLargeConstraintTableSql("pooled_metadata", payload));
+            Execute(writer, "INSERT INTO pooled_metadata(id) VALUES (1);");
+            writer.Close();
+
+            stale.Open();
+            ScalarInteger(stale, "SELECT doubled FROM pooled_metadata;").Should().Be(14);
+            ScalarInteger(
+                stale,
+                "SELECT length(sql) FROM sqlite_schema WHERE type = 'table' AND name = 'pooled_metadata';")
+                .Should().BeGreaterThan(payload.Length);
+        }
+        finally
+        {
+            ManagedSqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void SqliteDeleteJournalPageSizeMigrationHandsOverflowingSchemaBackToManagedWal()
     {
         const int migratedPageSize = 8192;
@@ -791,10 +864,10 @@ public sealed class ManagedSchemaOverflowStorageTests
         }
     }
 
-    private static ManagedSqliteConnection OpenManagedProvider(string path)
+    private static ManagedSqliteConnection OpenManagedProvider(string path, bool pooling = false)
     {
         var connection = new ManagedSqliteConnection(
-            $"Data Source={path};Pooling=False;Local Provider=Managed");
+            $"Data Source={path};Pooling={pooling};Local Provider=Managed");
         connection.Open();
         return connection;
     }
@@ -837,6 +910,13 @@ public sealed class ManagedSchemaOverflowStorageTests
         return statement.GetValue(0).AsInteger();
     }
 
+    private static long ScalarInteger(ManagedSqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt64(command.ExecuteScalar());
+    }
+
     private static string ScalarText(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);
@@ -853,7 +933,7 @@ public sealed class ManagedSchemaOverflowStorageTests
 
     private static void DeleteDatabase(string path)
     {
-        foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm", "-journal" })
         {
             var candidate = path + suffix;
             if (File.Exists(candidate))
