@@ -92,9 +92,16 @@ public class SqliteCommand : DbCommand
         set
         {
             ThrowIfReaderOpen(nameof(Connection));
+            if (ReferenceEquals(_connection, value))
+                return;
+
+            _statement?.Dispose();
+            _statement = null;
+            _connection?.CommandClosed(this);
             _connection = value;
             if (value is not null)
             {
+                value.CommandOpened(this);
                 _commandTimeout = value.DefaultTimeout;
                 _transaction ??= value.Transaction;
             }
@@ -240,9 +247,18 @@ public class SqliteCommand : DbCommand
         if (disposing)
         {
             _statement?.Dispose();
+            _statement = null;
+            _connection?.CommandClosed(this);
         }
 
         base.Dispose(disposing);
+    }
+
+    internal void ResetFromConnection()
+    {
+        _statement?.Dispose();
+        _statement = null;
+        _hasOpenReader = false;
     }
 
     private SqliteDataReader Execute(

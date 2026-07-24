@@ -281,6 +281,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
     {
         var loadContext = new AssemblyLoadContext("turso-package-validation", isCollectible: true);
         var loadContextReference = new WeakReference(loadContext);
+        var databasePath = Path.Combine(libraryDirectory, $"pool-{Guid.NewGuid():N}.db");
         Func<AssemblyLoadContext, AssemblyName, Assembly?> resolver =
             (_, assemblyName) => LoadPackageAssembly(loadContext, libraryDirectory, assemblyName);
         loadContext.Resolving += resolver;
@@ -290,13 +291,23 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             var connectionType = facadeAssembly.GetType("Turso.Data.Sqlite.SqliteConnection", throwOnError: true)!;
             using var connection = (IDisposable)Activator.CreateInstance(
                 connectionType,
-                "Data Source=:memory:;Local Provider=Managed")!;
+                $"Data Source={databasePath};Pooling=True;Local Provider=Managed")!;
 
             connectionType.GetMethod("Open")!.Invoke(connection, null);
             connectionType.GetMethod("Close")!.Invoke(connection, null);
+            connectionType.GetMethod("Open")!.Invoke(connection, null);
+            connectionType.GetMethod("ClearPool")!.Invoke(null, [connection]);
+            connectionType.GetMethod("Close")!.Invoke(connection, null);
+            connectionType.GetMethod("ClearAllPools")!.Invoke(null, null);
         }
         finally
         {
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                var candidate = databasePath + suffix;
+                if (File.Exists(candidate))
+                    File.Delete(candidate);
+            }
             loadContext.Resolving -= resolver;
             loadContext.Unload();
         }

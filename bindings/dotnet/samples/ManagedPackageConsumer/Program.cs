@@ -2,14 +2,33 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Turso.Data.Sqlite;
 
-using var connection = new SqliteConnection("Data Source=:memory:");
-connection.Open();
+var databasePath = Path.Combine(AppContext.BaseDirectory, $"managed-package-{Guid.NewGuid():N}.db");
+try
+{
+    using var connection = new SqliteConnection(
+        $"Data Source={databasePath};Pooling=True;Local Provider=Managed");
+    connection.Open();
 
-using var command = connection.CreateCommand();
-command.CommandText = "SELECT 1";
+    using var command = connection.CreateCommand();
+    command.CommandText = "SELECT 1";
 
-if (command.ExecuteScalar() is not 1L)
-    throw new InvalidOperationException("The managed Turso package consumer returned an unexpected result.");
+    if (command.ExecuteScalar() is not 1L)
+        throw new InvalidOperationException("The managed Turso package consumer returned an unexpected result.");
+
+    connection.Close();
+    connection.Open();
+    if (command.ExecuteScalar() is not 1L)
+        throw new InvalidOperationException("The managed Turso package pool returned an unexpected result.");
+
+    SqliteConnection.ClearPool(connection);
+    connection.Close();
+    SqliteConnection.ClearAllPools();
+}
+finally
+{
+    SqliteConnection.ClearAllPools();
+    DeleteDatabase(databasePath);
+}
 
 var options = new DbContextOptionsBuilder<ConsumerContext>()
     .UseTurso(connection)
@@ -100,6 +119,16 @@ static bool IsNativeCompanionPackage(string packageIdentity)
        packageIdentity.StartsWith("Turso.Data.Sqlite.Native/", StringComparison.OrdinalIgnoreCase) ||
        packageIdentity.StartsWith("Turso.Data.Sqlite.NativeAot", StringComparison.OrdinalIgnoreCase) ||
        packageIdentity.StartsWith("Turso.Data.Sqlite.Sync/", StringComparison.OrdinalIgnoreCase);
+
+static void DeleteDatabase(string path)
+{
+    foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+    {
+        var candidate = path + suffix;
+        if (File.Exists(candidate))
+            File.Delete(candidate);
+    }
+}
 
 sealed class ConsumerContext(DbContextOptions<ConsumerContext> options) : DbContext(options)
 {

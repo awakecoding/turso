@@ -23,6 +23,7 @@ public class TursoCommand : DbCommand
     public TursoCommand(TursoConnection connection, TursoTransaction? transaction = null)
     {
         _connection = connection;
+        connection.CommandOpened(this);
         _transaction = transaction;
         _commandTimeout = connection.DefaultTimeout;
     }
@@ -30,6 +31,7 @@ public class TursoCommand : DbCommand
     public TursoCommand(TursoConnection connection, string command)
     {
         _connection = connection;
+        connection.CommandOpened(this);
         _transaction = null;
         _commandTimeout = connection.DefaultTimeout;
         CommandText = command;
@@ -67,12 +69,23 @@ public class TursoCommand : DbCommand
         {
             if (value is null)
             {
+                _connection?.CommandClosed(this);
                 _connection = null;
                 return;
             }
 
-            _connection = value as TursoConnection
-                          ?? throw new ArgumentException("Connection must be a TursoConnection.", nameof(value));
+            var connection = value as TursoConnection
+                            ?? throw new ArgumentException("Connection must be a TursoConnection.", nameof(value));
+            if (ReferenceEquals(connection, _connection))
+                return;
+
+            _nativeStatement?.Dispose();
+            _managedStatement?.Dispose();
+            _nativeStatement = null;
+            _managedStatement = null;
+            _connection?.CommandClosed(this);
+            _connection = connection;
+            connection.CommandOpened(this);
             _commandTimeout = _connection.DefaultTimeout;
         }
     }
@@ -108,6 +121,17 @@ public class TursoCommand : DbCommand
         }
 
         base.Dispose(disposing);
+        _nativeStatement = null;
+        _managedStatement = null;
+        _connection?.CommandClosed(this);
+    }
+
+    internal void ResetFromConnection()
+    {
+        _nativeStatement?.Dispose();
+        _managedStatement?.Dispose();
+        _nativeStatement = null;
+        _managedStatement = null;
     }
 
     public override void Cancel() => _cancellation.Cancel();

@@ -34,6 +34,8 @@ public class TursoConnectionOptions
 
     public bool ReadYourWrites => _builder.ReadYourWrites;
 
+    public bool Pooling => _builder.Pooling;
+
     public int SyncInterval => _builder.SyncInterval;
 
     public bool? Tls => _builder.Tls;
@@ -89,9 +91,6 @@ public class TursoConnectionOptions
             throw new NotSupportedException("Foreign Keys is not supported when Local Provider=Managed.");
         if (_builder.GetOption("Recursive Triggers") is not null)
             throw new NotSupportedException("Recursive Triggers is not supported when Local Provider=Managed.");
-        if (_builder.GetOption("Pooling") is { } pooling && Convert.ToBoolean(pooling, CultureInfo.InvariantCulture))
-            throw new NotSupportedException("Pooling=True is not supported when Local Provider=Managed.");
-
         var timeout = DefaultTimeout;
         if (timeout < 0)
             throw new ArgumentOutOfRangeException(nameof(DefaultTimeout), timeout, "Default Timeout cannot be negative.");
@@ -139,6 +138,28 @@ public class TursoConnectionOptions
     public static TursoConnectionOptions Parse(string connectionString)
     {
         return new TursoConnectionOptions(new TursoConnectionStringBuilder(connectionString));
+    }
+
+    internal bool TryGetManagedPoolKey(out ManagedConnectionPoolKey key)
+    {
+        key = default;
+        if (!Pooling || IsRemote || LocalProvider != TursoLocalProvider.Managed)
+            return false;
+
+        var mode = ParseManagedOpenMode(Mode);
+        var dataSource = string.IsNullOrEmpty(DataSource) ? ":memory:" : DataSource;
+        if (mode == ManagedLocalOpenMode.Memory
+            || dataSource.Equals(":memory:", StringComparison.Ordinal)
+            || GetEncryptionCipher().HasValue
+            || _builder.GetOption("Encryption Key") is not null)
+        {
+            return false;
+        }
+
+        key = ManagedConnectionPoolKey.Create(
+            dataSource,
+            mode == ManagedLocalOpenMode.ReadOnly);
+        return true;
     }
 
     private static bool IsRemoteDataSource(string dataSource)

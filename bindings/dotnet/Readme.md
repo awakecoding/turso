@@ -233,7 +233,7 @@ Supported common connection string keywords include:
 | `Local Provider` | `Managed` is the default for local databases. Set `Native` when `Turso.Data.Sqlite.Native` or a RID-specific `Turso.Data.Sqlite.NativeAot.*` companion is referenced. |
 | `Recursive Triggers` | Parsed and preserved for compatibility. |
 | `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
-| `Pooling` | Parsed and preserved for compatibility. |
+| `Pooling` | Defaults to `True` on the SQLite-compatible facade. Managed pooling applies only to ordinary unencrypted file-backed databases. |
 | `Vfs` | Parsed and preserved for compatibility. |
 | `Encryption Cipher` | Turso local encryption cipher. |
 | `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
@@ -246,6 +246,9 @@ Supported common connection string keywords include:
 ## SQLite-compatible facade coverage
 
 - `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, managed fixed-length blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
+- Managed pooling retains at most 32 idle physical connections per canonical file/read-only key and at most 64 keys. `:memory:`, `Mode=Memory`, shared-memory, encrypted, native, remote/replica, and connections with custom functions, aggregates, or collations are not pooled. Returning a pooled connection closes readers and blobs, rolls back transactions, invalidates prepared commands, detaches databases, and resets connection-local pragmas and row-id state before reuse.
+- `SqliteConnection.ClearPool(connection)` retires the file/read-only pool selected by that connection string, and `SqliteConnection.ClearAllPools()` retires every managed pool. Idle handles are disposed immediately; rented handles are disposed instead of being reused when returned, so clearing is safe while connections are open.
+- `TursoConnection` uses the same contract when `Pooling=True` is explicitly selected and exposes corresponding `TursoConnection.ClearPool(connection)` and `TursoConnection.ClearAllPools()` methods.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
 - `PRAGMA read_uncommitted` is tracked as connection-local state for API compatibility, but Turso does not currently implement SQLite shared-cache dirty reads.
 - Managed `BackupDatabase` supports distinct connections and the `main` database only. The destination must be empty, and active readers, transactions, or attachments are rejected before copying.

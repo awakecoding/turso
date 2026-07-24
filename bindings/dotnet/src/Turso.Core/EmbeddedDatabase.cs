@@ -16048,6 +16048,20 @@ public sealed class EmbeddedConnection : IDisposable
         return SqlScript.Split(sql).Select(Prepare).ToArray();
     }
 
+    public void ResetForPooling()
+    {
+        ThrowIfDisposed();
+        ResetTransactionState();
+        _lastInsertRowId = 0;
+        _queryOnly = false;
+        _foreignKeys = false;
+        _recursiveTriggers = false;
+        foreach (var attachment in _attachedDatabases.Values)
+            attachment.Database.Dispose();
+        _attachedDatabases.Clear();
+        _nextAttachedDatabaseSequence = 2;
+    }
+
     public void RegisterScalarFunction(string name, int arity, Func<IReadOnlyList<SqlValue>, SqlValue> function)
     {
         ThrowIfDisposed();

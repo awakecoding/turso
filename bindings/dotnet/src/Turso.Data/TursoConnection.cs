@@ -11,6 +11,7 @@ public class TursoConnection : DbConnection
     private TursoNativeDatabase? _nativeDatabase;
     private TursoReplicaDatabase? _replicaDatabase;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private ManagedConnectionPoolLease? _managedPoolLease;
     private TursoRemoteClient? _remoteClient;
     private TursoConnectionOptions _connectionOptions;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
@@ -20,6 +21,8 @@ public class TursoConnection : DbConnection
     private bool _managedReadOnly;
     private readonly HashSet<TursoDataReader> _openReaders = [];
     private readonly object _readerLock = new();
+    private readonly HashSet<TursoCommand> _openCommands = [];
+    private TursoTransaction? _transaction;
 
     [AllowNull]
     public override string ConnectionString
@@ -89,6 +92,15 @@ public class TursoConnection : DbConnection
             CancellationToken.None);
     }
 
+    public static void ClearAllPools() => ManagedConnectionPool.ClearAll();
+
+    public static void ClearPool(TursoConnection connection)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        if (connection._connectionOptions.TryGetManagedPoolKey(out var key))
+            ManagedConnectionPool.Clear(key);
+    }
+
     public override void Close()
     {
         if (_remoteClient is not null)
@@ -99,16 +111,22 @@ public class TursoConnection : DbConnection
 
         var nativeDatabase = _nativeDatabase;
         var managedDatabase = _managedDatabase;
+        var managedPoolLease = _managedPoolLease;
         var managedEncryptionFileSystem = _managedEncryptionFileSystem;
+        var reusable = false;
         try
         {
             CloseOpenReaders();
+            _transaction?.Dispose();
+            ResetOpenCommands();
+            reusable = true;
         }
         finally
         {
             _nativeDatabase = null;
             _replicaDatabase = null;
             _managedDatabase = null;
+            _managedPoolLease = null;
             _managedEncryptionFileSystem = null;
             try
             {
@@ -118,7 +136,10 @@ public class TursoConnection : DbConnection
             {
                 try
                 {
-                    managedDatabase?.Dispose();
+                    if (managedPoolLease is not null)
+                        managedPoolLease.Release(reusable);
+                    else
+                        managedDatabase?.Dispose();
                 }
                 finally
                 {
@@ -146,7 +167,10 @@ public class TursoConnection : DbConnection
             throw new InvalidOperationException("Turso database is closed.");
         }
 
-        return new TursoTransaction(this, isolationLevel);
+        if (_transaction is not null)
+            throw new InvalidOperationException("Parallel transactions are not supported.");
+
+        return _transaction = new TursoTransaction(this, isolationLevel);
     }
 
     protected override DbCommand CreateDbCommand()
@@ -224,6 +248,16 @@ public class TursoConnection : DbConnection
     {
         lock (_readerLock)
             _openReaders.Remove(reader);
+    }
+
+    internal void CommandOpened(TursoCommand command) => _openCommands.Add(command);
+
+    internal void CommandClosed(TursoCommand command) => _openCommands.Remove(command);
+
+    internal void TransactionCompleted(TursoTransaction transaction)
+    {
+        if (ReferenceEquals(_transaction, transaction))
+            _transaction = null;
     }
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
@@ -496,7 +530,17 @@ public class TursoConnection : DbConnection
 
     private void OpenManagedDatabase(ManagedLocalOpenOptions options)
     {
-        if (options.Encryption is null && !options.ReadOnly)
+        if (_connectionOptions.Pooling
+            && options.Encryption is null
+            && !options.DataSource.Equals(":memory:", StringComparison.Ordinal))
+        {
+            var poolKey = ManagedConnectionPoolKey.Create(options.DataSource, options.ReadOnly);
+            _managedPoolLease = ManagedConnectionPool.Rent(
+                poolKey,
+                () => OpenUnencryptedManagedDatabase(options.DataSource, options.ReadOnly));
+            _managedDatabase = _managedPoolLease.Database;
+        }
+        else if (options.Encryption is null && !options.ReadOnly)
         {
             var managedDatabase = ManagedDatabaseAdapter.Open(options.DataSource);
             try
@@ -510,6 +554,7 @@ public class TursoConnection : DbConnection
                 throw;
             }
         }
+
         else
         {
             TursoEncryptionFileSystem? managedEncryptionFileSystem = null;
@@ -562,6 +607,23 @@ public class TursoConnection : DbConnection
         catch
         {
             Close();
+            throw;
+        }
+    }
+
+    private static IManagedDatabaseAdapter OpenUnencryptedManagedDatabase(string dataSource, bool readOnly)
+    {
+        var managedDatabase = readOnly
+            ? ManagedDatabaseAdapter.OpenFile(dataSource, PhysicalFileSystem.Instance, readOnly: true)
+            : ManagedDatabaseAdapter.Open(dataSource);
+        try
+        {
+            _ = managedDatabase.Connect();
+            return managedDatabase;
+        }
+        catch
+        {
+            managedDatabase.Dispose();
             throw;
         }
     }
@@ -619,5 +681,11 @@ public class TursoConnection : DbConnection
             readers = _openReaders.ToArray();
         foreach (var reader in readers)
             reader.CloseFromConnection();
+    }
+
+    private void ResetOpenCommands()
+    {
+        foreach (var command in _openCommands.ToArray())
+            command.ResetFromConnection();
     }
 }

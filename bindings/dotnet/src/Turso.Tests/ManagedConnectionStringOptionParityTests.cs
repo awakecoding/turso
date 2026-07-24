@@ -126,7 +126,6 @@ public class ManagedConnectionStringOptionParityTests
     [TestCase("Password=secret", "Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.")]
     [TestCase("Encryption Key=0011", "Encryption is not available for the managed engine.")]
     [TestCase("Vfs=win32-longpath", "Vfs is not supported when Local Provider=Managed because the managed engine does not use native SQLite VFS implementations.")]
-    [TestCase("Pooling=True", "Pooling=True is not supported when Local Provider=Managed.")]
     [TestCase("Foreign Keys=True", "Foreign Keys is not supported when Local Provider=Managed.")]
     [TestCase("Recursive Triggers=True", "Recursive Triggers is not supported when Local Provider=Managed.")]
     public void ManagedProviderRejectsConnectionOptionsItCannotEnforce(string option, string message)

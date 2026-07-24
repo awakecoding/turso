@@ -118,6 +118,9 @@ public interface IManagedConnectionAdapter : IDisposable
 {
     IManagedStatementAdapter Prepare(string sql);
 
+    void ResetForPooling()
+        => throw new NotSupportedException("This managed connection adapter does not support pooling.");
+
     IManagedIncrementalBlobAdapter OpenBlob(
         string databaseName,
         string tableName,
@@ -329,6 +332,11 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
     {
         ArgumentNullException.ThrowIfNull(sql);
         return ManagedStatementAdapter.FromPreparedStatement(this, sql, GetConnection().Prepare(sql));
+    }
+
+    public void ResetForPooling()
+    {
+        GetConnection().ResetForPooling();
     }
 
     public IManagedIncrementalBlobAdapter OpenBlob(

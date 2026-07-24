@@ -17,6 +17,7 @@ public partial class SqliteConnection : DbConnection
 
     private TursoNativeDatabase? _database;
     private IManagedDatabaseAdapter? _managedDatabase;
+    private ManagedConnectionPoolLease? _managedPoolLease;
     private SqliteConnectionStringBuilder _connectionOptions = new();
     private bool _disposed;
     private int? _defaultTimeout;
@@ -24,6 +25,7 @@ public partial class SqliteConnection : DbConnection
     private readonly object _readerGate = new();
     private readonly ManualResetEventSlim _noOpenReaders = new(initialState: true);
     private readonly HashSet<SqliteBlob> _openManagedBlobs = [];
+    private readonly HashSet<SqliteCommand> _openCommands = [];
     private string? _dataSource;
     private bool _readOnly;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
@@ -122,12 +124,23 @@ public partial class SqliteConnection : DbConnection
                     throw new NotSupportedException(Properties.Resources.ManagedMemoryEncryptionNotSupported);
                 }
 
-                _managedDatabase = OpenManagedDatabase(
-                    filename,
-                    readOnly,
-                    managedEncryption,
-                    out var managedEncryptionFileSystem);
-                _managedEncryptionFileSystem = managedEncryptionFileSystem;
+                if (CanUseManagedPooling(filename, managedEncryption))
+                {
+                    var poolKey = ManagedConnectionPoolKey.Create(filename, readOnly);
+                    _managedPoolLease = ManagedConnectionPool.Rent(
+                        poolKey,
+                        () => OpenManagedDatabase(filename, readOnly, encryption: null, out _));
+                    _managedDatabase = _managedPoolLease.Database;
+                }
+                else
+                {
+                    _managedDatabase = OpenManagedDatabase(
+                        filename,
+                        readOnly,
+                        managedEncryption,
+                        out var managedEncryptionFileSystem);
+                    _managedEncryptionFileSystem = managedEncryptionFileSystem;
+                }
             }
             else
             {
@@ -199,15 +212,18 @@ public partial class SqliteConnection : DbConnection
             return;
 
         var originalState = State;
+        var reusable = false;
         try
         {
             CloseOpenManagedBlobs();
             CloseOpenReaders();
             Transaction?.Dispose();
+            ResetOpenCommands();
+            reusable = !HasManagedCallbacks;
         }
         finally
         {
-            DisposeDatabaseAndManagedEncryptionFileSystem();
+            DisposeDatabaseAndManagedEncryptionFileSystem(reusable);
             _dataSource = null;
             _readOnly = false;
             _recursiveTriggers = false;
@@ -279,11 +295,14 @@ public partial class SqliteConnection : DbConnection
 
     public static void ClearAllPools()
     {
+        ManagedConnectionPool.ClearAll();
     }
 
     public static void ClearPool(SqliteConnection connection)
     {
         ArgumentNullException.ThrowIfNull(connection);
+        if (connection.TryGetManagedPoolKey(out var key))
+            ManagedConnectionPool.Clear(key);
     }
 
     public new virtual SqliteTransaction BeginTransaction()
@@ -540,6 +559,18 @@ public partial class SqliteConnection : DbConnection
         _openManagedBlobs.Remove(blob);
     }
 
+    internal void CommandOpened(SqliteCommand command)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        _openCommands.Add(command);
+    }
+
+    internal void CommandClosed(SqliteCommand command)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        _openCommands.Remove(command);
+    }
+
     internal void ExecuteNonQuery(string sql)
     {
         using var command = new SqliteCommand(sql, this);
@@ -783,13 +814,15 @@ public partial class SqliteConnection : DbConnection
         }
     }
 
-    private void DisposeDatabaseAndManagedEncryptionFileSystem()
+    private void DisposeDatabaseAndManagedEncryptionFileSystem(bool pooledReusable = false)
     {
         var database = _database;
         var managedDatabase = _managedDatabase;
+        var managedPoolLease = _managedPoolLease;
         var managedEncryptionFileSystem = _managedEncryptionFileSystem;
         _database = null;
         _managedDatabase = null;
+        _managedPoolLease = null;
         _managedEncryptionFileSystem = null;
         try
         {
@@ -799,7 +832,10 @@ public partial class SqliteConnection : DbConnection
         {
             try
             {
-                managedDatabase?.Dispose();
+                if (managedPoolLease is not null)
+                    managedPoolLease.Release(pooledReusable);
+                else
+                    managedDatabase?.Dispose();
             }
             finally
             {
@@ -821,6 +857,12 @@ public partial class SqliteConnection : DbConnection
     {
         foreach (var blob in _openManagedBlobs.ToArray())
             blob.CloseFromConnection();
+    }
+
+    private void ResetOpenCommands()
+    {
+        foreach (var command in _openCommands.ToArray())
+            command.ResetFromConnection();
     }
 
     private static void ValidateRestrictions(string collectionName, string?[]? restrictionValues, int maxRestrictions)
@@ -980,7 +1022,9 @@ public partial class SqliteConnection : DbConnection
     private static bool IsSqlIdentifierPart(char value)
         => char.IsLetterOrDigit(value) || value == '_' || value == '$';
 
-    private static string NormalizeDataSource(SqliteConnectionStringBuilder options)
+    private static string NormalizeDataSource(
+        SqliteConnectionStringBuilder options,
+        bool validateFileExists = true)
     {
         var dataSource = options.DataSource;
         if (string.IsNullOrEmpty(dataSource))
@@ -996,7 +1040,7 @@ public partial class SqliteConnection : DbConnection
                 ? GetSharedMemoryFile(dataSource)
                 : ":memory:";
         if (dataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
-            return NormalizeUriDataSource(dataSource);
+            return NormalizeUriDataSource(dataSource, validateFileExists);
 
         const string dataDirectory = "|DataDirectory|";
         if (dataSource.StartsWith(dataDirectory, StringComparison.OrdinalIgnoreCase))
@@ -1010,13 +1054,15 @@ public partial class SqliteConnection : DbConnection
             ? dataSource
             : Path.Combine(AppContext.BaseDirectory, dataSource);
 
-        if ((options.Mode == SqliteOpenMode.ReadOnly || options.Mode == SqliteOpenMode.ReadWrite) && !File.Exists(filename))
+        if (validateFileExists
+            && (options.Mode == SqliteOpenMode.ReadOnly || options.Mode == SqliteOpenMode.ReadWrite)
+            && !File.Exists(filename))
             throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_CANTOPEN, "unable to open database file"), SQLITE_CANTOPEN);
 
         return filename;
     }
 
-    private static string NormalizeUriDataSource(string dataSource)
+    private static string NormalizeUriDataSource(string dataSource, bool validateFileExists)
     {
         var queryStart = dataSource.IndexOf('?', StringComparison.Ordinal);
         var path = queryStart < 0 ? dataSource[5..] : dataSource[5..queryStart];
@@ -1035,7 +1081,9 @@ public partial class SqliteConnection : DbConnection
                 throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_ERROR, "no such access mode: " + mode), SQLITE_ERROR);
             if (mode.Equals("memory", StringComparison.OrdinalIgnoreCase))
                 return ":memory:";
-            if ((mode.Equals("ro", StringComparison.OrdinalIgnoreCase) || mode.Equals("rw", StringComparison.OrdinalIgnoreCase)) && !File.Exists(path))
+            if (validateFileExists
+                && (mode.Equals("ro", StringComparison.OrdinalIgnoreCase) || mode.Equals("rw", StringComparison.OrdinalIgnoreCase))
+                && !File.Exists(path))
                 throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_CANTOPEN, "unable to open database file"), SQLITE_CANTOPEN);
         }
 
@@ -1062,6 +1110,40 @@ public partial class SqliteConnection : DbConnection
 
     private static bool IsSharedMemory(SqliteConnectionStringBuilder options)
         => options.Mode == SqliteOpenMode.Memory && options.Cache == SqliteCacheMode.Shared && options.DataSource.Length > 0;
+
+    private bool CanUseManagedPooling(string filename, TursoEncryptionOptions? encryption)
+        => _connectionOptions.Pooling
+           && encryption is null
+           && !HasManagedCallbacks
+           && _connectionOptions.Mode != SqliteOpenMode.Memory
+           && !filename.Equals(":memory:", StringComparison.Ordinal);
+
+    private bool TryGetManagedPoolKey(out ManagedConnectionPoolKey key)
+    {
+        key = default;
+        if (_connectionOptions.EffectiveLocalProvider != TursoLocalProvider.Managed
+            || !_connectionOptions.Pooling
+            || _connectionOptions.HasEncryptionOptions
+            || _connectionOptions.Mode == SqliteOpenMode.Memory
+            || _connectionOptions.Cache == SqliteCacheMode.Shared)
+        {
+            return false;
+        }
+
+        var filename = NormalizeDataSource(_connectionOptions, validateFileExists: false);
+        if (filename.Equals(":memory:", StringComparison.Ordinal))
+            return false;
+
+        key = ManagedConnectionPoolKey.Create(
+            filename,
+            _connectionOptions.Mode == SqliteOpenMode.ReadOnly);
+        return true;
+    }
+
+    private bool HasManagedCallbacks
+        => _scalarFunctions.Count != 0
+           || _aggregateFunctions.Count != 0
+           || _collations.Count != 0;
 
     private static string RegisterSharedMemoryFile(string path)
     {
