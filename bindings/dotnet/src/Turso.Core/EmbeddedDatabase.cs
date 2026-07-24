@@ -2812,6 +2812,7 @@ public sealed class EmbeddedDatabase : IDisposable
         List<SqlValue[]> rowsToInsert,
         List<long> insertedRowIds)
     {
+        ValidateRowids(tableName, table, insertedRowIds);
         var allRows = new List<SqlValue[]>(table.Rows.Count + rowsToInsert.Count);
         allRows.AddRange(table.Rows);
         allRows.AddRange(rowsToInsert);
@@ -2827,6 +2828,30 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             foreach (var rowId in insertedRowIds)
                 RecordBlobMutation(tableName, rowId);
+        }
+    }
+
+    private static void ValidateRowids(
+        string tableName,
+        EmbeddedTable table,
+        IReadOnlyList<long> insertedRowIds)
+    {
+        if (!table.HasRowid)
+            return;
+
+        var used = new HashSet<long>(table.RowIds);
+        foreach (var rowId in insertedRowIds)
+        {
+            if (used.Add(rowId))
+                continue;
+
+            var aliasIndex = table.RowidAliasColumnIndex;
+            var conflictColumn = aliasIndex >= 0 ? table.Columns[aliasIndex] : "rowid";
+            throw new EmbeddedSqlException(
+                $"UNIQUE constraint failed: {tableName}.{conflictColumn}",
+                aliasIndex >= 0
+                    ? table.ColumnDefinitions[aliasIndex].PrimaryKeyConflictAlgorithm
+                    : null);
         }
     }
 
@@ -18128,7 +18153,36 @@ internal sealed record SourceRow(
         => GetValue(name, allowQualifiedLookup: true);
 
     public SqlValue GetValue(ColumnExpression column)
-        => GetValue(column.Name, allowQualifiedLookup: column.Qualifier is not null);
+    {
+        if (column.Qualifier is null)
+            return GetValue(column.Name, allowQualifiedLookup: false);
+
+        if (QualifiedColumns is not null
+            && QualifiedColumns.TryGetValue(column.Name, out var qualifiedIndex))
+        {
+            return Values[qualifiedIndex];
+        }
+
+        for (var index = 0; index < Columns.Length; index++)
+        {
+            if (string.Equals(Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
+                return Values[index];
+        }
+
+        if (RowId is { } rowid
+            && RowIdQualifier is not null
+            && string.Equals(column.Qualifier, RowIdQualifier, StringComparison.OrdinalIgnoreCase)
+            && column.UnqualifiedName is { } bareName
+            && EmbeddedTable.IsRowidAliasName(bareName))
+        {
+            return SqlValue.Integer(rowid);
+        }
+
+        if (Parent is not null)
+            return Parent.GetValue(column);
+
+        throw new EmbeddedSqlException($"no such column: {column.Name}");
+    }
 
     private SqlValue GetValue(string name, bool allowQualifiedLookup)
     {
@@ -18164,7 +18218,7 @@ internal sealed record SourceRow(
         // rowid/_rowid_/oid resolve to the hidden rowid only after real columns are
         // consulted, so a user column that happens to be named "oid" shadows the alias,
         // exactly as SQLite does.
-        if (RowId is { } rowid && MatchesRowidPseudoColumn(name))
+        if (RowId is { } rowid && EmbeddedTable.IsRowidAliasName(name))
             return SqlValue.Integer(rowid);
 
         if (Parent is not null)
@@ -18173,20 +18227,6 @@ internal sealed record SourceRow(
         throw new EmbeddedSqlException($"no such column: {name}");
     }
 
-    private bool MatchesRowidPseudoColumn(string name)
-    {
-        var separator = name.IndexOf('.');
-        if (separator < 0)
-            return EmbeddedTable.IsRowidAliasName(name);
-
-        if (RowIdQualifier is null)
-            return false;
-
-        var qualifier = name[..separator];
-        var bare = name[(separator + 1)..];
-        return string.Equals(qualifier, RowIdQualifier, StringComparison.OrdinalIgnoreCase)
-            && EmbeddedTable.IsRowidAliasName(bare);
-    }
 }
 
 internal sealed record SourceData(

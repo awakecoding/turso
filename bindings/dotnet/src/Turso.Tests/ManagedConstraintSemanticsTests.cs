@@ -704,6 +704,118 @@ public sealed class ManagedConstraintSemanticsTests
         }
     }
 
+    [Test]
+    public void UnrelatedUniqueIgnoreDoesNotChangeHiddenRowidConflictPolicy()
+    {
+        const string create = "CREATE TABLE hidden_rowid(code TEXT UNIQUE ON CONFLICT IGNORE);";
+        const string duplicate = "INSERT INTO hidden_rowid(rowid, code) VALUES (1, 'b');";
+        AssertQueryMatchesSqlite(
+            [
+                "CREATE TABLE rowid_ignore(id INTEGER PRIMARY KEY ON CONFLICT IGNORE, code TEXT);",
+                "INSERT INTO rowid_ignore VALUES (1, 'a');",
+                "INSERT INTO rowid_ignore VALUES (1, 'b');",
+            ],
+            "SELECT id, code FROM rowid_ignore;");
+        AssertQueryMatchesSqlite(
+            [
+                "CREATE TABLE rowid_replace(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, code TEXT);",
+                "INSERT INTO rowid_replace VALUES (1, 'a');",
+                "INSERT INTO rowid_replace VALUES (1, 'b');",
+            ],
+            "SELECT id, code FROM rowid_replace;");
+
+        using (var managedDatabase = new EmbeddedDatabase())
+        using (var managed = managedDatabase.Connect())
+        using (var sqlite = new MsData.SqliteConnection("Data Source=:memory:"))
+        {
+            sqlite.Open();
+            Execute(managed, create);
+            Execute(sqlite, create);
+            Execute(managed, "INSERT INTO hidden_rowid(rowid, code) VALUES (1, 'a');");
+            Execute(sqlite, "INSERT INTO hidden_rowid(rowid, code) VALUES (1, 'a');");
+
+            var managedError = Assert.Throws<EmbeddedSqlException>(() => Execute(managed, duplicate));
+            var sqliteError = Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, duplicate));
+            sqliteError.Message.Should().Contain(managedError!.Message);
+            ScalarInteger(managed, "SELECT COUNT(*) FROM hidden_rowid;").Should().Be(1);
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM hidden_rowid;").Should().Be(1);
+        }
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, create);
+                Execute(connection, "INSERT INTO hidden_rowid(rowid, code) VALUES (1, 'a');");
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Action invalid = () => Execute(connection, duplicate);
+                invalid.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("UNIQUE constraint failed: hidden_rowid.rowid");
+                ScalarInteger(connection, "SELECT COUNT(*) FROM hidden_rowid;").Should().Be(1);
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path}");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void QuotedDottedTableQualifierResolvesHiddenRowidCheck()
+    {
+        const string create =
+            """CREATE TABLE "a.b"(value INTEGER, CHECK("a.b".rowid > 0));""";
+        AssertQueryMatchesSqlite(
+            [create, """INSERT INTO "a.b"(rowid, value) VALUES (1, 1);"""],
+            """SELECT rowid, value FROM "a.b";""");
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, create);
+                Execute(connection, """INSERT INTO "a.b"(rowid, value) VALUES (1, 1);""");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path}"))
+            {
+                sqlite.Open();
+                Execute(sqlite, """INSERT INTO "a.b"(rowid, value) VALUES (2, 2);""");
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            }
+
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Execute(reopenedConnection, """INSERT INTO "a.b"(rowid, value) VALUES (3, 3);""");
+            Action invalid = () => Execute(
+                reopenedConnection,
+                """INSERT INTO "a.b"(rowid, value) VALUES (-1, 4);""");
+            invalid.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("""CHECK constraint failed: "a.b".rowid > 0""");
+            ReadRows(reopenedConnection, """SELECT rowid, value FROM "a.b" ORDER BY rowid;""")
+                .Select(row => row[0].AsInteger())
+                .Should().Equal(1, 2, 3);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     private static void AssertQueryMatchesSqlite(IReadOnlyList<string> setup, string query)
     {
         var managed = RunManaged(setup, query);
