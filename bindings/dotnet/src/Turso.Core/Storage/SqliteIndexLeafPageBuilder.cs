@@ -3,7 +3,7 @@ using System.Collections.ObjectModel;
 namespace Turso.Core.Storage;
 
 /// <summary>
-/// Packs a complete SQLite index-leaf page from records in SQLite key order.
+/// Packs a complete SQLite index-leaf page in its configured key order.
 /// </summary>
 /// <remarks>
 /// This builder creates one compact leaf image. It does not descend a B-tree,
@@ -54,7 +54,7 @@ public sealed class SqliteIndexLeafPageBuilder
     /// <summary>The comparator used to validate index record order.</summary>
     public SqliteIndexRecordComparer RecordComparer { get; }
 
-    /// <summary>The appended cells in strict SQLite record order.</summary>
+    /// <summary>The appended cells in strict configured record order.</summary>
     public IReadOnlyList<SqliteIndexLeafCell> Cells
         => new ReadOnlyCollection<SqliteIndexLeafCell>(_cells.Select(entry => entry.Cell).ToArray());
 
@@ -96,7 +96,7 @@ public sealed class SqliteIndexLeafPageBuilder
 
         RecordComparer.Validate(record);
         if (_lastRecord is not null && RecordComparer.Compare(_lastRecord, record) >= 0)
-            throw new ArgumentException("SQLite index records must be strictly increasing in key order.", nameof(record));
+            throw new ArgumentException("SQLite index records must be strictly increasing in configured order.", nameof(record));
         if (_cells.Count == ushort.MaxValue)
             throw new InvalidOperationException("A SQLite index-leaf page cannot contain more than 65535 cells.");
 

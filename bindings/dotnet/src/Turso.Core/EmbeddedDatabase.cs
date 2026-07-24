@@ -1382,7 +1382,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 statement.UniqueConstraints,
                 statement.CheckConstraints,
                 statement.PrimaryKeyConflictAlgorithm,
-                statement.PrimaryKeyConstraintName));
+                statement.PrimaryKeyConstraintName,
+                statement.PrimaryKeyDeclarationOrder));
         return new ExecutionResult([], [], 0, true);
     }
 
@@ -1714,7 +1715,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     InsertExpressions(values);
             }
 
-            var lastInsertRowId = insertedRowIds.Count > 0 ? insertedRowIds[^1] : (long?)null;
+            var lastInsertRowId = table.HasRowid && insertedRowIds.Count > 0
+                ? insertedRowIds[^1]
+                : (long?)null;
             return BuildConflictInsertResult(
                 statement,
                 table,
@@ -1784,7 +1787,11 @@ public sealed class EmbeddedDatabase : IDisposable
                         return;
                     case InsertConflictAlgorithm.Fail:
                         if (insertedRows.Count > 0)
-                            throw new EmbeddedConflictFailException(exception, insertedRowIds[^1]);
+                        {
+                            throw new EmbeddedConflictFailException(
+                                exception,
+                                table.HasRowid ? insertedRowIds[^1] : context.LastInsertRowId);
+                        }
                         throw;
                     case InsertConflictAlgorithm.Rollback:
                         throw new EmbeddedConflictRollbackException(exception);
@@ -1833,11 +1840,6 @@ public sealed class EmbeddedDatabase : IDisposable
         }
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
-        if (table.WithoutRowid)
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSERT OR conflict resolution does not support WITHOUT ROWID tables.");
-        }
         if (algorithm != InsertConflictAlgorithm.Replace
             && GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert).Count > 0)
         {
@@ -1939,7 +1941,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     InsertConflictExpressions(values);
             }
 
-            var lastInsertRowId = insertedRowIds.Count > 0 ? insertedRowIds[^1] : (long?)null;
+            var lastInsertRowId = table.HasRowid && insertedRowIds.Count > 0
+                ? insertedRowIds[^1]
+                : (long?)null;
             return BuildConflictInsertResult(
                 statement,
                 table,
@@ -1953,7 +1957,11 @@ public sealed class EmbeddedDatabase : IDisposable
             algorithm == InsertConflictAlgorithm.Fail && IsConflictAlgorithmConstraint(exception))
         {
             if (insertedRows.Count > 0)
-                throw new EmbeddedConflictFailException(exception, insertedRowIds[^1]);
+            {
+                throw new EmbeddedConflictFailException(
+                    exception,
+                    table.HasRowid ? insertedRowIds[^1] : context.LastInsertRowId);
+            }
 
             throw;
         }
@@ -2033,7 +2041,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     ReplaceExpressions(values);
             }
 
-            var lastInsertRowId = insertedRowIds.Count > 0 ? insertedRowIds[^1] : (long?)null;
+            var lastInsertRowId = table.HasRowid && insertedRowIds.Count > 0
+                ? insertedRowIds[^1]
+                : (long?)null;
             var result = BuildConflictInsertResult(
                 statement,
                 table,
@@ -2138,9 +2148,10 @@ public sealed class EmbeddedDatabase : IDisposable
         IReadOnlyList<TriggerDefinition> insertTriggers)
     {
         var conflicts = FindReplacementConflicts(table, candidate, candidateRowId);
-        var conflictedRowIds = table.HasRowid
-            ? conflicts.OrderBy(index => index).Select(index => table.RowIds[index]).ToArray()
-            : [];
+        var conflictedRowIds = conflicts
+            .OrderBy(index => index)
+            .Select(index => table.RowIds[index])
+            .ToArray();
         var rows = new List<SqlValue[]>(table.Rows.Count - conflicts.Count + 1);
         var rowIds = new List<long>(table.RowIds.Count - conflicts.Count + 1);
         for (var index = 0; index < table.Rows.Count; index++)
@@ -2169,7 +2180,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
             table.Rows.RemoveAt(conflictIndex);
             table.RowIds.RemoveAt(conflictIndex);
-            RecordBlobMutation(tableName, conflictedRowId);
+            if (table.HasRowid)
+                RecordBlobMutation(tableName, conflictedRowId);
             if (deleteTriggers.Count > 0)
                 FireTriggers(deleteTriggers, context);
         }
@@ -2364,7 +2376,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
                 affectedRows.Add(candidate);
                 affectedRowIds.Add(candidateRowId);
-                lastInsertRowId = candidateRowId;
+                if (table.HasRowid)
+                    lastInsertRowId = candidateRowId;
                 if (!mutationEvents.Contains(TriggerEvent.Insert))
                     mutationEvents.Add(TriggerEvent.Insert);
                 continue;
@@ -2818,7 +2831,7 @@ public sealed class EmbeddedDatabase : IDisposable
                     if (row[columnIndex].Kind == SqlValueKind.Null)
                         throw new EmbeddedSqlException(
                             $"NOT NULL constraint failed: {tableName}.{table.Columns[columnIndex]}",
-                            table.TablePrimaryKeyConflictAlgorithm);
+                            table.PrimaryKeyConflictAlgorithm);
                 }
             }
         }
@@ -2860,7 +2873,7 @@ public sealed class EmbeddedDatabase : IDisposable
                     var columns = primaryKey.Select(entry => $"{tableName}.{table.Columns[entry.Index]}");
                     throw new EmbeddedSqlException(
                         $"UNIQUE constraint failed: {string.Join(", ", columns)}",
-                        table.TablePrimaryKeyConflictAlgorithm);
+                        table.PrimaryKeyConflictAlgorithm);
                 }
             }
 
@@ -2877,12 +2890,34 @@ public sealed class EmbeddedDatabase : IDisposable
             return;
 
         var primaryKey = table.PrimaryKeyColumns;
+        var primaryKeySchema = table.PrimaryKeySchema
+            ?? throw new InvalidOperationException("WITHOUT ROWID table is missing primary-key metadata.");
+        SqliteIndexRecordComparer? persistedComparer = null;
+        if (primaryKeySchema.Terms.All(term => term.Collation.IsSupportedByManagedIndexWriter))
+        {
+            persistedComparer = new SqliteIndexRecordComparer(
+                SqliteTextEncoding.Utf8,
+                primaryKeySchema.Terms.Select(term =>
+                    new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+        }
+        var keys = persistedComparer is null
+            ? null
+            : table.Rows.Select(primaryKeySchema.ProjectKey).ToArray();
         var order = Enumerable.Range(0, table.Rows.Count).ToList();
         order.Sort((left, right) =>
         {
-            foreach (var (columnIndex, descending) in primaryKey)
+            if (persistedComparer is not null)
+                return persistedComparer.Compare(keys![left], keys[right]);
+
+            for (var position = 0; position < primaryKey.Count; position++)
             {
-                var comparison = Compare(table.Rows[left][columnIndex], table.Rows[right][columnIndex]);
+                var (columnIndex, descending) = primaryKey[position];
+                var collation = table.TableLevelPrimaryKey?[position].Collation
+                    ?? table.ColumnDefinitions[columnIndex].Collation;
+                var comparison = Compare(
+                    table.Rows[left][columnIndex],
+                    table.Rows[right][columnIndex],
+                    collation);
                 if (comparison != 0)
                     return descending ? -comparison : comparison;
             }
@@ -2945,7 +2980,9 @@ public sealed class EmbeddedDatabase : IDisposable
 
         CommitInserts(context, statement.TableName, table, rowsToInsert, insertedRowIds);
 
-        var lastInsertRowId = insertedRowIds.Count > 0 ? insertedRowIds[^1] : (long?)null;
+        var lastInsertRowId = table.HasRowid && insertedRowIds.Count > 0
+            ? insertedRowIds[^1]
+            : (long?)null;
         if (statement.Returning is not null)
         {
             return BuildReturningResult(
@@ -6789,7 +6826,9 @@ public sealed class EmbeddedDatabase : IDisposable
             Commit = () =>
             {
                 CommitInserts(context, statement.TableName, table, rowsToInsert, insertedRowIds);
-                return insertedRowIds.Count > 0 ? insertedRowIds[^1] : (long?)null;
+                return table.HasRowid && insertedRowIds.Count > 0
+                    ? insertedRowIds[^1]
+                    : (long?)null;
             },
         };
 
@@ -10044,33 +10083,42 @@ public sealed class EmbeddedDatabase : IDisposable
             return definition;
         }).ToList();
 
-        // A table-level PRIMARY KEY(...) is regenerated as its own clause, preserving the
-        // declared column order and each term's COLLATE/ASC/DESC metadata.
+        var tableKeyConstraints = new List<(int DeclarationOrder, int FallbackOrder, string Sql)>();
         if (table.TableLevelPrimaryKey is { } tablePrimaryKey)
         {
             var keyColumns = tablePrimaryKey.Select(keyColumn =>
                 QuoteIdentifier(keyColumn.Name)
                 + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
                 + (keyColumn.Descending ? " DESC" : string.Empty));
-            columns.Add(
+            tableKeyConstraints.Add((
+                table.TablePrimaryKeyDeclarationOrder ?? -1,
+                0,
                 FormatConstraintName(table.TablePrimaryKeyConstraintName).TrimStart()
                 + (table.TablePrimaryKeyConstraintName is null ? string.Empty : " ")
                 + $"PRIMARY KEY ({string.Join(", ", keyColumns)})"
-                + FormatConflictClause(table.TablePrimaryKeyConflictAlgorithm));
+                + FormatConflictClause(table.TablePrimaryKeyConflictAlgorithm)));
         }
 
-        foreach (var unique in table.TableUniqueConstraints)
+        for (var index = 0; index < table.TableUniqueConstraints.Count; index++)
         {
+            var unique = table.TableUniqueConstraints[index];
             var keyColumns = unique.Columns.Select(keyColumn =>
                 QuoteIdentifier(keyColumn.Name)
                 + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
                 + (keyColumn.Descending ? " DESC" : string.Empty));
-            columns.Add(
+            tableKeyConstraints.Add((
+                unique.DeclarationOrder,
+                index + 1,
                 FormatConstraintName(unique.Name).TrimStart()
                 + (unique.Name is null ? string.Empty : " ")
                 + $"UNIQUE ({string.Join(", ", keyColumns)})"
-                + FormatConflictClause(unique.ConflictAlgorithm));
+                + FormatConflictClause(unique.ConflictAlgorithm)));
         }
+
+        columns.AddRange(tableKeyConstraints
+            .OrderBy(constraint => constraint.DeclarationOrder)
+            .ThenBy(constraint => constraint.FallbackOrder)
+            .Select(constraint => constraint.Sql));
 
         foreach (var check in table.CheckConstraints)
             columns.Add(FormatCheckConstraint(check).TrimStart());
@@ -18822,7 +18870,8 @@ internal sealed class EmbeddedTable
         IReadOnlyList<TableUniqueConstraint>? uniqueConstraints = null,
         IReadOnlyList<CheckConstraint>? checkConstraints = null,
         InsertConflictAlgorithm? primaryKeyConflictAlgorithm = null,
-        string? primaryKeyConstraintName = null)
+        string? primaryKeyConstraintName = null,
+        int? primaryKeyDeclarationOrder = null)
     {
         Name = name;
         ColumnDefinitions = columns.ToArray();
@@ -18842,6 +18891,7 @@ internal sealed class EmbeddedTable
         CheckConstraints = Array.AsReadOnly((checkConstraints ?? []).ToArray());
         TablePrimaryKeyConflictAlgorithm = primaryKeyConflictAlgorithm;
         TablePrimaryKeyConstraintName = primaryKeyConstraintName;
+        TablePrimaryKeyDeclarationOrder = primaryKeyDeclarationOrder;
         PrimaryKeyColumns = Array.AsReadOnly(
             ResolvePrimaryKeyColumns(ColumnDefinitions, TableLevelPrimaryKey, _columnIndices).ToArray());
         PrimaryKeySchema = CreatePrimaryKeySchema(ColumnDefinitions, TableLevelPrimaryKey, PrimaryKeyColumns);
@@ -18868,6 +18918,12 @@ internal sealed class EmbeddedTable
 
     private void CreateConstraintIndexes()
     {
+        if (WithoutRowid)
+        {
+            CreateWithoutRowidConstraintIndexes();
+            return;
+        }
+
         var autoIndex = 0;
         for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
         {
@@ -18884,29 +18940,165 @@ internal sealed class EmbeddedTable
                 column.UniqueConflictAlgorithm));
         }
 
-        if (!WithoutRowid && TableLevelPrimaryKey is not null && !HasRowidAlias)
+        foreach (var constraint in GetTableKeyConstraintsInDeclarationOrder())
         {
-            var columns = ResolveConstraintIndexColumns(TableLevelPrimaryKey, "PRIMARY KEY");
+            if (constraint.IsPrimaryKey && HasRowidAlias)
+                continue;
+
             autoIndex++;
             Indexes.Add(new EmbeddedIndex(
                 $"sqlite_autoindex_{Name}_{autoIndex}",
                 Unique: true,
-                columns,
-                EmbeddedIndexOrigin.PrimaryKey,
+                constraint.Columns,
+                constraint.IsPrimaryKey
+                    ? EmbeddedIndexOrigin.PrimaryKey
+                    : EmbeddedIndexOrigin.UniqueConstraint,
+                constraint.ConflictAlgorithm));
+        }
+    }
+
+    private void CreateWithoutRowidConstraintIndexes()
+    {
+        var autoIndex = 0;
+        var groups = new List<(
+            EmbeddedIndexColumn[] Columns,
+            bool IsPrimaryKey,
+            EmbeddedIndex? Index)>();
+
+        for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
+        {
+            var column = ColumnDefinitions[columnIndex];
+            var key = new[]
+            {
+                new EmbeddedIndexColumn(
+                    column.Name,
+                    columnIndex,
+                    column.Collation,
+                    column.PrimaryKeyDescending),
+            };
+            if (column.PrimaryKey)
+            {
+                AddConstraint(
+                    key,
+                    isPrimaryKey: true,
+                    column.PrimaryKeyConflictAlgorithm);
+            }
+            if (column.Unique)
+            {
+                AddConstraint(
+                    key,
+                    isPrimaryKey: false,
+                    column.UniqueConflictAlgorithm);
+            }
+        }
+
+        foreach (var constraint in GetTableKeyConstraintsInDeclarationOrder())
+        {
+            AddConstraint(
+                constraint.Columns,
+                constraint.IsPrimaryKey,
+                constraint.ConflictAlgorithm);
+        }
+
+        void AddConstraint(
+            EmbeddedIndexColumn[] columns,
+            bool isPrimaryKey,
+            InsertConflictAlgorithm? conflictAlgorithm)
+        {
+            var existingPosition = groups.FindIndex(group => SameConstraintKey(group.Columns, columns));
+            if (existingPosition >= 0)
+            {
+                var existing = groups[existingPosition];
+                if (isPrimaryKey && !existing.IsPrimaryKey)
+                {
+                    if (existing.Index is not null)
+                        Indexes.Remove(existing.Index);
+                    groups[existingPosition] = (existing.Columns, IsPrimaryKey: true, Index: null);
+                }
+                return;
+            }
+
+            autoIndex++;
+            EmbeddedIndex? index = null;
+            if (!isPrimaryKey)
+            {
+                index = new EmbeddedIndex(
+                    $"sqlite_autoindex_{Name}_{autoIndex}",
+                    Unique: true,
+                    columns,
+                    EmbeddedIndexOrigin.UniqueConstraint,
+                    conflictAlgorithm);
+                Indexes.Add(index);
+            }
+
+            groups.Add((columns, isPrimaryKey, index));
+        }
+
+        bool SameConstraintKey(
+            IReadOnlyList<EmbeddedIndexColumn> left,
+            IReadOnlyList<EmbeddedIndexColumn> right)
+        {
+            if (left.Count != right.Count)
+                return false;
+
+            for (var index = 0; index < left.Count; index++)
+            {
+                if (left[index].ColumnIndex != right[index].ColumnIndex)
+                    return false;
+                var leftCollation = left[index].Collation
+                    ?? ColumnDefinitions[left[index].ColumnIndex].Collation
+                    ?? "BINARY";
+                var rightCollation = right[index].Collation
+                    ?? ColumnDefinitions[right[index].ColumnIndex].Collation
+                    ?? "BINARY";
+                if (!string.Equals(leftCollation, rightCollation, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            return true;
+        }
+    }
+
+    private IReadOnlyList<(
+        EmbeddedIndexColumn[] Columns,
+        bool IsPrimaryKey,
+        InsertConflictAlgorithm? ConflictAlgorithm)> GetTableKeyConstraintsInDeclarationOrder()
+    {
+        var constraints = new List<(
+            int DeclarationOrder,
+            int FallbackOrder,
+            EmbeddedIndexColumn[] Columns,
+            bool IsPrimaryKey,
+            InsertConflictAlgorithm? ConflictAlgorithm)>();
+        if (TableLevelPrimaryKey is not null)
+        {
+            constraints.Add((
+                TablePrimaryKeyDeclarationOrder ?? -1,
+                0,
+                ResolveConstraintIndexColumns(TableLevelPrimaryKey, "PRIMARY KEY"),
+                IsPrimaryKey: true,
                 TablePrimaryKeyConflictAlgorithm));
         }
 
-        foreach (var constraint in TableUniqueConstraints)
+        for (var index = 0; index < TableUniqueConstraints.Count; index++)
         {
-            var columns = ResolveConstraintIndexColumns(constraint.Columns, "UNIQUE");
-            autoIndex++;
-            Indexes.Add(new EmbeddedIndex(
-                $"sqlite_autoindex_{Name}_{autoIndex}",
-                Unique: true,
-                columns,
-                EmbeddedIndexOrigin.UniqueConstraint,
+            var constraint = TableUniqueConstraints[index];
+            constraints.Add((
+                constraint.DeclarationOrder,
+                index + 1,
+                ResolveConstraintIndexColumns(constraint.Columns, "UNIQUE"),
+                IsPrimaryKey: false,
                 constraint.ConflictAlgorithm));
         }
+
+        return constraints
+            .OrderBy(constraint => constraint.DeclarationOrder)
+            .ThenBy(constraint => constraint.FallbackOrder)
+            .Select(constraint => (
+                constraint.Columns,
+                constraint.IsPrimaryKey,
+                constraint.ConflictAlgorithm))
+            .ToArray();
     }
 
     private EmbeddedIndexColumn[] ResolveConstraintIndexColumns(
@@ -19093,7 +19285,16 @@ internal sealed class EmbeddedTable
 
     public InsertConflictAlgorithm? TablePrimaryKeyConflictAlgorithm { get; }
 
+    public InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm
+        => TableLevelPrimaryKey is not null
+            ? TablePrimaryKeyConflictAlgorithm
+            : PrimaryKeyColumns.Count == 1
+                ? ColumnDefinitions[PrimaryKeyColumns[0].Index].PrimaryKeyConflictAlgorithm
+                : null;
+
     public string? TablePrimaryKeyConstraintName { get; }
+
+    public int? TablePrimaryKeyDeclarationOrder { get; }
 
     // The resolved primary-key columns (index + direction) in key order. Empty when the
     // table has no primary key. Used for WITHOUT ROWID ordering/uniqueness and table_info.
@@ -19580,7 +19781,8 @@ internal sealed class EmbeddedTable
             TableUniqueConstraints,
             CheckConstraints,
             TablePrimaryKeyConflictAlgorithm,
-            TablePrimaryKeyConstraintName);
+            TablePrimaryKeyConstraintName,
+            TablePrimaryKeyDeclarationOrder);
 
         if (column.DefaultExpression is not null && Rows.Count > 0)
             throw new EmbeddedSqlException("Cannot add a column with non-constant default.");
@@ -19604,17 +19806,35 @@ internal sealed class EmbeddedTable
 
     public void Rename(string newName)
     {
-        Name = newName;
-        var autoIndex = 0;
+        var autoIndexPrefix = $"sqlite_autoindex_{Name}_";
+        var renamedIndexes = new List<(int Position, string Name)>();
         for (var index = 0; index < Indexes.Count; index++)
         {
             if (Indexes[index].Origin is not (
                 EmbeddedIndexOrigin.UniqueConstraint or EmbeddedIndexOrigin.PrimaryKey))
+            {
                 continue;
+            }
 
-            autoIndex++;
-            Indexes[index] = Indexes[index] with { Name = $"sqlite_autoindex_{newName}_{autoIndex}" };
+            var indexName = Indexes[index].Name;
+            if (!indexName.StartsWith(autoIndexPrefix, StringComparison.OrdinalIgnoreCase)
+                || !int.TryParse(
+                    indexName.AsSpan(autoIndexPrefix.Length),
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var ordinal)
+                || ordinal <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"Constraint index '{indexName}' does not match table '{Name}'.");
+            }
+
+            renamedIndexes.Add((index, $"sqlite_autoindex_{newName}_{ordinal}"));
         }
+
+        Name = newName;
+        foreach (var (position, name) in renamedIndexes)
+            Indexes[position] = Indexes[position] with { Name = name };
     }
 
     public SqlValue[] CreateRowWithDefaults(Func<Expression, SqlValue> evaluate)
@@ -19672,7 +19892,8 @@ internal sealed class EmbeddedTable
             TableUniqueConstraints,
             CheckConstraints,
             TablePrimaryKeyConflictAlgorithm,
-            TablePrimaryKeyConstraintName);
+            TablePrimaryKeyConstraintName,
+            TablePrimaryKeyDeclarationOrder);
         foreach (var row in Rows)
             clone.Rows.Add(row.ToArray());
 

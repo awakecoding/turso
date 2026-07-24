@@ -189,7 +189,7 @@ public sealed class SqliteIndexInteriorPageBuilder
 
         RecordComparer.Validate(record);
         if (_lastRecord is not null && RecordComparer.Compare(_lastRecord, record) >= 0)
-            throw new ArgumentException("SQLite index-interior records must be strictly increasing in key order.", nameof(record));
+            throw new ArgumentException("SQLite index-interior records must be strictly increasing in configured order.", nameof(record));
         if (_cells.Count == ushort.MaxValue)
             throw new InvalidOperationException("A SQLite index-interior page cannot contain more than 65535 cells.");
 
@@ -462,7 +462,7 @@ public sealed class SqliteIndexInteriorPageView
                 : overflowReader!.ReadPayload(pageCell.Cell.Key);
             comparer.Validate(record);
             if (previousRecord is not null && comparer.Compare(previousRecord, record) >= 0)
-                throw new InvalidDataException("SQLite index-interior records are not in strictly increasing key order.");
+                throw new InvalidDataException("SQLite index-interior records are not in strictly increasing configured order.");
 
             previousRecord = record;
             records[index] = record;

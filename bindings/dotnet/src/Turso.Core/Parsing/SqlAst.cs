@@ -15,7 +15,8 @@ internal sealed record CreateTableStatement(
     IReadOnlyList<TableUniqueConstraint>? UniqueConstraints = null,
     IReadOnlyList<CheckConstraint>? CheckConstraints = null,
     InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm = null,
-    string? PrimaryKeyConstraintName = null) : ParsedStatement;
+    string? PrimaryKeyConstraintName = null,
+    int? PrimaryKeyDeclarationOrder = null) : ParsedStatement;
 
 internal sealed record DropTableStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -374,7 +375,8 @@ internal sealed record TablePrimaryKeyColumn(string Name, bool Descending, strin
 internal sealed record TableUniqueConstraint(
     string? Name,
     IReadOnlyList<TablePrimaryKeyColumn> Columns,
-    InsertConflictAlgorithm? ConflictAlgorithm = null);
+    InsertConflictAlgorithm? ConflictAlgorithm = null,
+    int DeclarationOrder = int.MaxValue);
 
 internal sealed record CheckConstraint(
     string? Name,

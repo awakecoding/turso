@@ -87,7 +87,32 @@ public class WithoutRowidKeySchemaPrerequisiteTests
     }
 
     [Test]
-    public void WithoutRowidBinaryAscendingPrimaryKeyPersistsAndUnsupportedTermsRejectBeforeWalWrite()
+    public void SchemaAwareIndexComparerHonorsCollationAndDescendingTerms()
+    {
+        var comparer = new SqliteIndexRecordComparer(
+            SqliteTextEncoding.Utf8,
+            [
+                new SqliteIndexComparisonTerm(SqliteKeySortOrder.Ascending, SqliteKeyCollation.FromName("NOCASE")),
+                new SqliteIndexComparisonTerm(SqliteKeySortOrder.Descending, SqliteKeyCollation.Binary),
+            ]);
+
+        comparer.Compare(
+                [SqlValue.Text("tenant-0"), SqlValue.Integer(4)],
+                [SqlValue.Text("TENANT-0"), SqlValue.Integer(0)])
+            .Should().BeLessThan(0);
+        comparer.Compare(
+                [SqlValue.Text("tenant-0"), SqlValue.Integer(0)],
+                [SqlValue.Text("tenant-1"), SqlValue.Integer(99)])
+            .Should().BeLessThan(0);
+
+        var rtrim = new SqliteIndexRecordComparer(
+            SqliteTextEncoding.Utf8,
+            [new SqliteIndexComparisonTerm(SqliteKeySortOrder.Ascending, SqliteKeyCollation.FromName("RTRIM"))]);
+        rtrim.Compare([SqlValue.Text("key")], [SqlValue.Text("key   ")]).Should().Be(0);
+    }
+
+    [Test]
+    public void WithoutRowidBuiltInCollationPersistsAndApplicationDefinedCollationRejectsBeforeWalWrite()
     {
         const string path = "without-rowid-key-schema-prerequisite.db";
         var faults = new DeterministicFaultInjector();
@@ -108,10 +133,10 @@ public class WithoutRowidKeySchemaPrerequisiteTests
 
             var act = () => Execute(
                 connection,
-                "CREATE TABLE rejected(k TEXT COLLATE NOCASE, value TEXT, PRIMARY KEY(k COLLATE NOCASE ASC)) WITHOUT ROWID;");
+                "CREATE TABLE rejected(k TEXT, value TEXT, PRIMARY KEY(k COLLATE custom_collation ASC)) WITHOUT ROWID;");
 
             var exception = act.Should().Throw<EmbeddedSqlException>().Which;
-            exception.Message.Should().Contain("uses NOCASE collation");
+            exception.Message.Should().Contain("application-defined collation CUSTOM_COLLATION");
             faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeReject);
             Scalar(connection, "SELECT value FROM retained WHERE id = 1;").AsText().Should().Be("durable");
             Scalar(connection, "SELECT value FROM supported WHERE k = 'key';").AsText().Should().Be("persisted");
