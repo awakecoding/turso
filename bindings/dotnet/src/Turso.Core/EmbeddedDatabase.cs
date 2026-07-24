@@ -1123,7 +1123,12 @@ public sealed class EmbeddedDatabase : IDisposable
                 SqlValue.Integer(seq),
                 SqlValue.Text(index.Name),
                 SqlValue.Integer(index.Unique ? 1 : 0),
-                SqlValue.Text(index.Origin == EmbeddedIndexOrigin.Explicit ? "c" : "u"),
+                SqlValue.Text(index.Origin switch
+                {
+                    EmbeddedIndexOrigin.Explicit => "c",
+                    EmbeddedIndexOrigin.PrimaryKey => "pk",
+                    _ => "u",
+                }),
                 SqlValue.Integer(0),
             ];
         }
@@ -2555,7 +2560,8 @@ public sealed class EmbeddedDatabase : IDisposable
         string tableName,
         SqlValue[] row,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        bool virtualOnly = false)
     {
         if (!table.HasGeneratedColumns)
             return;
@@ -2564,6 +2570,9 @@ public sealed class EmbeddedDatabase : IDisposable
         foreach (var columnIndex in table.GeneratedColumnOrder)
         {
             var column = table.ColumnDefinitions[columnIndex];
+            if (virtualOnly && column.GeneratedStored)
+                continue;
+
             var value = EmbeddedTable.ApplyColumnAffinity(
                 column,
                 Evaluate(column.GenerationExpression!, parameters, source, context));
@@ -2575,6 +2584,29 @@ public sealed class EmbeddedDatabase : IDisposable
                     column.NotNullConflictAlgorithm);
             }
         }
+    }
+
+    internal static void RecomputeVirtualGeneratedColumns(
+        EmbeddedTable table,
+        string tableName,
+        SqlValue[] row)
+    {
+        if (!table.HasGeneratedColumns)
+            return;
+
+        var evaluator = new EmbeddedDatabase();
+        evaluator.ComputeGeneratedColumns(
+            table,
+            tableName,
+            row,
+            [],
+            new QueryContext(
+                new Dictionary<string, EmbeddedTable>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [tableName] = table,
+                },
+                new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase)),
+            virtualOnly: true);
     }
 
     // Enforces primary-key integrity that a rowid alias cannot cover: WITHOUT ROWID keys are
@@ -2881,7 +2913,7 @@ public sealed class EmbeddedDatabase : IDisposable
                     throw new EmbeddedSqlException(
                         $"UNIQUE constraint failed: {statement.TableName}.{conflictColumn}",
                         plan.AliasIndex >= 0
-                            ? table.ColumnDefinitions[plan.AliasIndex].PrimaryKeyConflictAlgorithm
+                            ? table.RowidAliasConflictAlgorithm
                             : null);
                 }
             }
@@ -2954,7 +2986,7 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException(
                 $"UNIQUE constraint failed: {tableName}.{conflictColumn}",
                 aliasIndex >= 0
-                    ? table.ColumnDefinitions[aliasIndex].PrimaryKeyConflictAlgorithm
+                    ? table.RowidAliasConflictAlgorithm
                     : null);
         }
     }
@@ -3567,7 +3599,7 @@ public sealed class EmbeddedDatabase : IDisposable
             {
                 var column = aliasIndex >= 0 ? table.Columns[aliasIndex] : "rowid";
                 var conflictAlgorithm = aliasIndex >= 0
-                    ? table.ColumnDefinitions[aliasIndex].PrimaryKeyConflictAlgorithm
+                    ? table.RowidAliasConflictAlgorithm
                     : null;
                 throw new EmbeddedSqlException(
                     $"UNIQUE constraint failed: {tableName}.{column}",
@@ -9498,18 +9530,29 @@ public sealed class EmbeddedDatabase : IDisposable
             if (!string.IsNullOrEmpty(column.DeclaredType))
                 definition += " " + column.DeclaredType;
             if (column.Collation is { } collation)
-                definition += " COLLATE " + collation;
+            {
+                definition += FormatConstraintName(column.CollationConstraintName)
+                    + " COLLATE "
+                    + collation;
+            }
 
             // A generated column carries its expression instead of PRIMARY KEY / DEFAULT
             // markers (which SQLite forbids on generated columns); NOT NULL and UNIQUE still apply.
             if (column.IsGenerated)
             {
-                definition += $" AS ({column.GenerationSql}) " + (column.GeneratedStored ? "STORED" : "VIRTUAL");
+                definition += FormatConstraintName(column.GenerationConstraintName)
+                    + (column.GenerationAlways ? " GENERATED ALWAYS" : string.Empty)
+                    + $" AS ({column.GenerationSql}) "
+                    + (column.GeneratedStored ? "STORED" : "VIRTUAL");
                 if (column.NotNull)
                 {
                     definition += FormatConstraintName(column.NotNullConstraintName)
                         + " NOT NULL"
                         + FormatConflictClause(column.NotNullConflictAlgorithm);
+                }
+                if (column.ExplicitNull)
+                {
+                    definition += FormatConstraintName(column.NullConstraintName) + " NULL";
                 }
                 if (column.Unique)
                 {
@@ -9534,6 +9577,10 @@ public sealed class EmbeddedDatabase : IDisposable
                     + " NOT NULL"
                     + FormatConflictClause(column.NotNullConflictAlgorithm);
             }
+            if (column.ExplicitNull)
+            {
+                definition += FormatConstraintName(column.NullConstraintName) + " NULL";
+            }
             if (column.Unique)
             {
                 definition += FormatConstraintName(column.UniqueConstraintName)
@@ -9542,14 +9589,16 @@ public sealed class EmbeddedDatabase : IDisposable
             }
             if (column.HasDefault)
             {
-                definition += " DEFAULT "
+                definition += FormatConstraintName(column.DefaultConstraintName)
+                    + " DEFAULT "
                     + (column.DefaultSql
                         ?? FormatSqlLiteral(column.DefaultValue
                             ?? throw new InvalidOperationException("Default metadata is incomplete.")));
             }
             if (column.ForeignKey is { } foreignKey)
             {
-                definition += $" REFERENCES {QuoteIdentifier(foreignKey.ParentTable)}"
+                definition += FormatConstraintName(column.ForeignKeyConstraintName)
+                    + $" REFERENCES {QuoteIdentifier(foreignKey.ParentTable)}"
                     + $" ({QuoteIdentifier(foreignKey.ParentColumn)})";
             }
             foreach (var check in column.CheckConstraints)
@@ -9596,7 +9645,9 @@ public sealed class EmbeddedDatabase : IDisposable
         => name is null ? string.Empty : " CONSTRAINT " + QuoteIdentifier(name);
 
     private static string FormatCheckConstraint(CheckConstraint check)
-        => FormatConstraintName(check.Name) + $" CHECK ({check.Sql})";
+        => FormatConstraintName(check.Name)
+            + $" CHECK ({check.Sql})"
+            + FormatConflictClause(check.ConflictAlgorithm);
 
     private static string FormatConflictClause(InsertConflictAlgorithm? algorithm)
         => algorithm is null ? string.Empty : " ON CONFLICT " + algorithm.Value.ToString().ToUpperInvariant();
@@ -17288,7 +17339,12 @@ internal sealed class EmbeddedTable
 
         // A WITHOUT ROWID table has no rowid, so no column can alias one; a rowid table
         // keeps SQLite's single-column INTEGER PRIMARY KEY alias rule.
-        RowidAliasColumnIndex = withoutRowid ? -1 : ComputeRowidAliasColumnIndex(ColumnDefinitions);
+        RowidAliasColumnIndex = withoutRowid
+            ? -1
+            : ComputeRowidAliasColumnIndex(
+                ColumnDefinitions,
+                TableLevelPrimaryKey,
+                PrimaryKeyColumns);
 
         GeneratedColumnOrder = ValidateAndOrderGeneratedColumns(ColumnDefinitions, PrimaryKeyColumns, _columnIndices);
         ForeignKeys = Array.AsReadOnly(
@@ -17297,11 +17353,11 @@ internal sealed class EmbeddedTable
                 .Select(column => column.ForeignKey!)
                 .ToArray());
 
-        CreateUniqueConstraintIndexes();
+        CreateConstraintIndexes();
         ValidateSchemaExpressions();
     }
 
-    private void CreateUniqueConstraintIndexes()
+    private void CreateConstraintIndexes()
     {
         var autoIndex = 0;
         for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
@@ -17319,28 +17375,21 @@ internal sealed class EmbeddedTable
                 column.UniqueConflictAlgorithm));
         }
 
+        if (!WithoutRowid && TableLevelPrimaryKey is not null && !HasRowidAlias)
+        {
+            var columns = ResolveConstraintIndexColumns(TableLevelPrimaryKey, "PRIMARY KEY");
+            autoIndex++;
+            Indexes.Add(new EmbeddedIndex(
+                $"sqlite_autoindex_{Name}_{autoIndex}",
+                Unique: true,
+                columns,
+                EmbeddedIndexOrigin.PrimaryKey,
+                TablePrimaryKeyConflictAlgorithm));
+        }
+
         foreach (var constraint in TableUniqueConstraints)
         {
-            if (constraint.Columns.Count == 0)
-                throw new EmbeddedSqlException("UNIQUE constraint must contain at least one column");
-
-            var columns = new EmbeddedIndexColumn[constraint.Columns.Count];
-            var seen = new HashSet<int>();
-            for (var position = 0; position < constraint.Columns.Count; position++)
-            {
-                var term = constraint.Columns[position];
-                if (!_columnIndices.TryGetValue(term.Name, out var columnIndex))
-                    throw new EmbeddedSqlException($"no such column: {term.Name}");
-                if (!seen.Add(columnIndex))
-                    throw new EmbeddedSqlException($"duplicate column name: {term.Name}");
-
-                columns[position] = new EmbeddedIndexColumn(
-                    ColumnDefinitions[columnIndex].Name,
-                    columnIndex,
-                    term.Collation ?? ColumnDefinitions[columnIndex].Collation,
-                    term.Descending);
-            }
-
+            var columns = ResolveConstraintIndexColumns(constraint.Columns, "UNIQUE");
             autoIndex++;
             Indexes.Add(new EmbeddedIndex(
                 $"sqlite_autoindex_{Name}_{autoIndex}",
@@ -17349,6 +17398,33 @@ internal sealed class EmbeddedTable
                 EmbeddedIndexOrigin.UniqueConstraint,
                 constraint.ConflictAlgorithm));
         }
+    }
+
+    private EmbeddedIndexColumn[] ResolveConstraintIndexColumns(
+        IReadOnlyList<TablePrimaryKeyColumn> terms,
+        string constraint)
+    {
+        if (terms.Count == 0)
+            throw new EmbeddedSqlException($"{constraint} constraint must contain at least one column");
+
+        var columns = new EmbeddedIndexColumn[terms.Count];
+        var seen = new HashSet<int>();
+        for (var position = 0; position < terms.Count; position++)
+        {
+            var term = terms[position];
+            if (!_columnIndices.TryGetValue(term.Name, out var columnIndex))
+                throw new EmbeddedSqlException($"no such column: {term.Name}");
+            if (!seen.Add(columnIndex))
+                throw new EmbeddedSqlException($"duplicate column name: {term.Name}");
+
+            columns[position] = new EmbeddedIndexColumn(
+                ColumnDefinitions[columnIndex].Name,
+                columnIndex,
+                term.Collation ?? ColumnDefinitions[columnIndex].Collation,
+                term.Descending);
+        }
+
+        return columns;
     }
 
     private void ValidateSchemaExpressions()
@@ -17485,6 +17561,13 @@ internal sealed class EmbeddedTable
 
     public bool HasRowidAlias => RowidAliasColumnIndex >= 0;
 
+    public InsertConflictAlgorithm? RowidAliasConflictAlgorithm
+        => !HasRowidAlias
+            ? null
+            : TableLevelPrimaryKey is not null
+                ? TablePrimaryKeyConflictAlgorithm
+                : ColumnDefinitions[RowidAliasColumnIndex].PrimaryKeyConflictAlgorithm;
+
     // True for an ordinary rowid table; false for a WITHOUT ROWID table, which has no
     // hidden rowid and therefore rejects rowid/_rowid_/oid references.
     public bool HasRowid => !WithoutRowid;
@@ -17518,6 +17601,9 @@ internal sealed class EmbeddedTable
     public IReadOnlyList<int> GeneratedColumnOrder { get; }
 
     public bool HasGeneratedColumns => GeneratedColumnOrder.Count > 0;
+
+    public bool HasVirtualGeneratedColumns => ColumnDefinitions.Any(
+        column => column.IsGenerated && !column.GeneratedStored);
 
     public bool HasCheckConstraints => CheckConstraints.Count > 0
         || ColumnDefinitions.Any(column => column.CheckConstraints.Count > 0);
@@ -17586,8 +17672,22 @@ internal sealed class EmbeddedTable
         => declaredType is not null
             && string.Equals(declaredType.Trim(), "INTEGER", StringComparison.OrdinalIgnoreCase);
 
-    private static int ComputeRowidAliasColumnIndex(IReadOnlyList<EmbeddedColumn> columns)
+    private static int ComputeRowidAliasColumnIndex(
+        IReadOnlyList<EmbeddedColumn> columns,
+        IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey,
+        IReadOnlyList<(int Index, bool Descending)> primaryKeyColumns)
     {
+        if (tablePrimaryKey is not null)
+        {
+            if (primaryKeyColumns.Count != 1)
+                return -1;
+
+            var tableCandidate = primaryKeyColumns[0].Index;
+            return IsIntegerDeclaredType(columns[tableCandidate].DeclaredType)
+                ? tableCandidate
+                : -1;
+        }
+
         var primaryKeyCount = 0;
         var candidate = -1;
         for (var index = 0; index < columns.Count; index++)
@@ -17999,7 +18099,8 @@ internal sealed class EmbeddedTable
         var autoIndex = 0;
         for (var index = 0; index < Indexes.Count; index++)
         {
-            if (Indexes[index].Origin != EmbeddedIndexOrigin.UniqueConstraint)
+            if (Indexes[index].Origin is not (
+                EmbeddedIndexOrigin.UniqueConstraint or EmbeddedIndexOrigin.PrimaryKey))
                 continue;
 
             autoIndex++;

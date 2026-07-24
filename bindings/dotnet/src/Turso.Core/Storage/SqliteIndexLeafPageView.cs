@@ -50,12 +50,12 @@ public sealed class SqliteIndexLeafPageView
     /// </summary>
     /// <remarks>
     /// When a page has overflowing cells, pass an overflow reader to
-    /// <see cref="Parse(ReadOnlySpan{byte}, int, SqliteTextEncoding, bool, SqliteOverflowChainReader?)"/>
+    /// <see cref="Parse"/>
     /// to validate logical key order as well as physical page layout.
     /// </remarks>
     public bool HasVerifiedRecordOrdering => _records is not null;
 
-    /// <summary>The BINARY record comparator used while validating this page.</summary>
+    /// <summary>The record comparator used while validating this page.</summary>
     public SqliteIndexRecordComparer RecordComparer => _recordComparer;
 
     /// <summary>
@@ -67,7 +67,8 @@ public sealed class SqliteIndexLeafPageView
         int usableSpace,
         SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8,
         bool isFirstPage = false,
-        SqliteOverflowChainReader? overflowReader = null)
+        SqliteOverflowChainReader? overflowReader = null,
+        SqliteIndexRecordComparer? recordComparer = null)
     {
         if (isFirstPage)
         {
@@ -107,7 +108,7 @@ public sealed class SqliteIndexLeafPageView
             header,
             ranges,
             "index-leaf");
-        var recordComparer = new SqliteIndexRecordComparer(textEncoding);
+        recordComparer ??= new SqliteIndexRecordComparer(textEncoding);
         var records = ReadAndValidateRecords(cells, recordComparer, overflowReader);
         return new SqliteIndexLeafPageView(
             page.Length,

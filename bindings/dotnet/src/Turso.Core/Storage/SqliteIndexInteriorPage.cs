@@ -332,7 +332,7 @@ public sealed class SqliteIndexInteriorPageView
     /// <summary>Whether every complete record was available for BINARY-order validation.</summary>
     public bool HasVerifiedRecordOrdering => _records is not null;
 
-    /// <summary>The BINARY record comparator used while validating this page.</summary>
+    /// <summary>The record comparator used while validating this page.</summary>
     public SqliteIndexRecordComparer RecordComparer => _recordComparer;
 
     /// <summary>Parses and validates an index-interior page snapshot.</summary>
@@ -341,7 +341,8 @@ public sealed class SqliteIndexInteriorPageView
         int usableSpace,
         SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8,
         bool isFirstPage = false,
-        SqliteOverflowChainReader? overflowReader = null)
+        SqliteOverflowChainReader? overflowReader = null,
+        SqliteIndexRecordComparer? recordComparer = null)
     {
         if (isFirstPage)
         {
@@ -393,7 +394,7 @@ public sealed class SqliteIndexInteriorPageView
             ranges,
             "index-interior");
 
-        var recordComparer = new SqliteIndexRecordComparer(textEncoding);
+        recordComparer ??= new SqliteIndexRecordComparer(textEncoding);
         var records = ReadAndValidateRecords(cells, recordComparer, overflowReader);
         return new SqliteIndexInteriorPageView(
             page.Length,

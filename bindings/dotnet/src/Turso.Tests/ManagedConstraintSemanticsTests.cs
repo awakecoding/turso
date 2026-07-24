@@ -311,6 +311,144 @@ public sealed class ManagedConstraintSemanticsTests
     }
 
     [Test]
+    public void CompositePrimaryKeyOrderConflictAndConstraintMetadataRoundTripThroughFileCatalog()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE keyed(
+                        tenant TEXT,
+                        sequence INTEGER,
+                        payload TEXT CONSTRAINT payload_default DEFAULT 'ready',
+                        CONSTRAINT positive_sequence CHECK (sequence > 0) ON CONFLICT FAIL,
+                        CONSTRAINT keyed_pk PRIMARY KEY(sequence DESC, tenant ASC) ON CONFLICT IGNORE
+                    );
+                    """);
+                Execute(connection, "INSERT INTO keyed(tenant, sequence) VALUES ('a', 1), ('a', 1), ('b', 2);");
+                ScalarInteger(connection, "SELECT COUNT(*) FROM keyed;").Should().Be(2);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Execute(connection, "INSERT INTO keyed(tenant, sequence) VALUES ('c', 3), ('c', 3);");
+                ScalarInteger(connection, "SELECT COUNT(*) FROM keyed;").Should().Be(3);
+                ReadRows(connection, "PRAGMA index_list(keyed);").Single()[3].AsText().Should().Be("pk");
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarText(sqlite, "SELECT origin FROM pragma_index_list('keyed');").Should().Be("pk");
+            var primaryKeyIndex = ScalarText(
+                sqlite,
+                "SELECT name FROM pragma_index_list('keyed') WHERE origin = 'pk';");
+            ScalarInteger(sqlite, $"SELECT desc FROM pragma_index_xinfo('{primaryKeyIndex}') WHERE seqno = 0;")
+                .Should().Be(1);
+            ScalarInteger(sqlite, $"SELECT desc FROM pragma_index_xinfo('{primaryKeyIndex}') WHERE seqno = 1;")
+                .Should().Be(0);
+            var schemaSql = ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'keyed';");
+            schemaSql.Should().Contain("CONSTRAINT \"payload_default\" DEFAULT 'ready'")
+                .And.Contain("CONSTRAINT \"positive_sequence\" CHECK (sequence > 0) ON CONFLICT FAIL")
+                .And.Contain("CONSTRAINT \"keyed_pk\" PRIMARY KEY (\"sequence\" DESC, \"tenant\") ON CONFLICT IGNORE");
+            Execute(sqlite, "INSERT INTO keyed(tenant, sequence) VALUES ('d', 4), ('d', 4);");
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM keyed;").Should().Be(4);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void TableIntegerPrimaryKeyIsAConflictAwareRowidAliasWithoutAnAutoindex()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    "CREATE TABLE keyed(id INTEGER, payload TEXT, PRIMARY KEY(id DESC) ON CONFLICT IGNORE);");
+                Execute(connection, "INSERT INTO keyed VALUES (5, 'first'), (5, 'ignored');");
+                Execute(connection, "UPDATE keyed SET rowid = 99 WHERE id = 5;");
+                var row = ReadRows(connection, "SELECT rowid, id, payload FROM keyed;").Single();
+                row.Should().Equal(SqlValue.Integer(99), SqlValue.Integer(99), SqlValue.Text("first"));
+                ReadRows(connection, "PRAGMA index_list(keyed);").Should().BeEmpty();
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarInteger(sqlite, "SELECT rowid FROM keyed;").Should().Be(99);
+            ScalarInteger(sqlite, "SELECT id FROM keyed;").Should().Be(99);
+            ScalarInteger(sqlite, "SELECT COUNT(*) FROM pragma_index_list('keyed');").Should().Be(0);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void NamedColumnConstraintKindsRoundTripThroughFileCatalog()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE TABLE parent(id INTEGER PRIMARY KEY);");
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE detail(
+                        value TEXT
+                            CONSTRAINT named_null NULL
+                            CONSTRAINT named_collation COLLATE NOCASE
+                            CONSTRAINT named_default DEFAULT 'ready',
+                        parent_id INTEGER
+                            CONSTRAINT named_reference REFERENCES parent(id)
+                    );
+                    """);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Execute(connection, "INSERT INTO parent VALUES (1);");
+                Execute(connection, "INSERT INTO detail(parent_id) VALUES (1);");
+                ReadRows(connection, "SELECT value FROM detail;").Single()[0].AsText().Should().Be("ready");
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'detail';")
+                .Should().Contain("CONSTRAINT \"named_null\" NULL")
+                .And.Contain("CONSTRAINT \"named_collation\" COLLATE NOCASE")
+                .And.Contain("CONSTRAINT \"named_default\" DEFAULT 'ready'")
+                .And.Contain("CONSTRAINT \"named_reference\" REFERENCES \"parent\" (\"id\")");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void TableQualifiedChecksMatchSqliteAndSurviveReopen()
     {
         const string create = "CREATE TABLE qualified(value INTEGER, CHECK(qualified.value > 0));";

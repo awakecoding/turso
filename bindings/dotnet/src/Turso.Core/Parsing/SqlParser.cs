@@ -399,7 +399,11 @@ internal sealed class SqlParser
                             unique.ConflictAlgorithm));
                         break;
                     case CheckTableConstraint check:
-                        checkConstraints.Add(new CheckConstraint(check.Name, check.Expression, check.Sql));
+                        checkConstraints.Add(new CheckConstraint(
+                            check.Name,
+                            check.Expression,
+                            check.Sql,
+                            check.ConflictAlgorithm));
                         break;
                 }
 
@@ -448,7 +452,11 @@ internal sealed class SqlParser
         IReadOnlyList<TablePrimaryKeyColumn> Columns,
         InsertConflictAlgorithm? ConflictAlgorithm) : TableConstraint;
 
-    private sealed record CheckTableConstraint(string? Name, Expression Expression, string Sql) : TableConstraint;
+    private sealed record CheckTableConstraint(
+        string? Name,
+        Expression Expression,
+        string Sql,
+        InsertConflictAlgorithm? ConflictAlgorithm) : TableConstraint;
 
     private TableConstraint ParseTableConstraint()
     {
@@ -484,8 +492,7 @@ internal sealed class SqlParser
         if (ConsumeKeyword("CHECK"))
         {
             var (expression, sql) = ParseParenthesizedSchemaExpression("CHECK");
-            _ = ParseConflictClause();
-            return new CheckTableConstraint(constraintName, expression, sql);
+            return new CheckTableConstraint(constraintName, expression, sql, ParseConflictClause());
         }
 
         throw Error("Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY after table constraint name.");
@@ -1888,6 +1895,13 @@ internal sealed class SqlParser
         string? primaryKeyConstraintName = null;
         string? notNullConstraintName = null;
         string? uniqueConstraintName = null;
+        string? defaultConstraintName = null;
+        string? collationConstraintName = null;
+        string? generationConstraintName = null;
+        string? foreignKeyConstraintName = null;
+        string? nullConstraintName = null;
+        var explicitNull = false;
+        var generationAlways = false;
         string? pendingConstraintName = null;
         while (_lexer.Current.Kind == TokenKind.Identifier)
         {
@@ -1930,6 +1944,8 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("NULL"))
             {
+                explicitNull = true;
+                nullConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
                 continue;
             }
@@ -1944,6 +1960,8 @@ internal sealed class SqlParser
             if (ConsumeKeyword("COLLATE"))
             {
                 collation = ExpectIdentifier();
+                collationConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
                 continue;
             }
             if (ConsumeKeyword("DEFAULT"))
@@ -1958,6 +1976,7 @@ internal sealed class SqlParser
                     defaultValue = literalValue;
                 else
                     defaultExpression = expression;
+                defaultConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
                 continue;
             }
@@ -1969,11 +1988,16 @@ internal sealed class SqlParser
                 ExpectKeyword("ALWAYS");
                 ExpectKeyword("AS");
                 (generationExpression, generationSql, generatedStored) = ParseGenerationClause();
+                generationAlways = true;
+                generationConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
                 continue;
             }
             if (ConsumeKeyword("AS"))
             {
                 (generationExpression, generationSql, generatedStored) = ParseGenerationClause();
+                generationConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
                 continue;
             }
             if (ConsumeKeyword("REFERENCES"))
@@ -1982,6 +2006,7 @@ internal sealed class SqlParser
                     throw Error($"multiple foreign key constraints on column {name} are not supported");
 
                 foreignKey = ParseForeignKeyReference(name);
+                foreignKeyConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
                 continue;
             }
@@ -2022,7 +2047,14 @@ internal sealed class SqlParser
             uniqueConflictAlgorithm,
             primaryKeyConstraintName,
             notNullConstraintName,
-            uniqueConstraintName);
+            uniqueConstraintName,
+            defaultConstraintName,
+            collationConstraintName,
+            generationConstraintName,
+            foreignKeyConstraintName,
+            nullConstraintName,
+            explicitNull,
+            generationAlways);
     }
 
     private string? ParseDeclaredType()
