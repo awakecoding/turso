@@ -22,9 +22,24 @@ public class EmbeddedSqlException : Exception
     {
     }
 
+    internal EmbeddedSqlException(string message, InsertConflictAlgorithm conflictAlgorithm) : base(message)
+    {
+        ConflictAlgorithm = conflictAlgorithm;
+    }
+
+    internal EmbeddedSqlException(
+        string message,
+        InsertConflictAlgorithm? conflictAlgorithm,
+        bool constraintViolation = true) : base(message)
+    {
+        ConflictAlgorithm = conflictAlgorithm ?? InsertConflictAlgorithm.Abort;
+    }
+
     public EmbeddedSqlException(string message, Exception innerException) : base(message, innerException)
     {
     }
+
+    internal InsertConflictAlgorithm? ConflictAlgorithm { get; }
 }
 
 internal readonly record struct PragmaHeaderMetadata(
@@ -833,7 +848,7 @@ public sealed class EmbeddedDatabase : IDisposable
             DropViewStatement dropView => ExecuteDropView(dropView, catalog),
             CreateTriggerStatement createTrigger => ExecuteCreateTrigger(createTrigger, catalog),
             DropTriggerStatement dropTrigger => ExecuteDropTrigger(dropTrigger, catalog),
-            AlterTableAddColumnStatement addColumn => ExecuteAlterTableAddColumn(addColumn, tables),
+            AlterTableAddColumnStatement addColumn => ExecuteAlterTableAddColumn(addColumn, parameters, context),
             AlterTableRenameStatement rename => ExecuteAlterTableRename(rename, tables),
             AlterTableRenameColumnStatement renameColumn => ExecuteAlterTableRenameColumn(renameColumn, tables),
             InsertStatement insert => ExecuteInsert(insert, parameters, context),
@@ -906,7 +921,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 SqlValue.Text(column.Name),
                 SqlValue.Text(column.DeclaredType ?? string.Empty),
                 SqlValue.Integer(notNull ? 1 : 0),
-                GetPragmaDefaultValue(column.DefaultValue),
+                GetPragmaDefaultValue(column),
                 SqlValue.Integer(primaryKeyPosition),
             };
             if (includeGeneratedColumns)
@@ -920,12 +935,18 @@ public sealed class EmbeddedDatabase : IDisposable
         return rows.ToArray();
     }
 
-    private static SqlValue GetPragmaDefaultValue(SqlValue? value)
+    private static SqlValue GetPragmaDefaultValue(EmbeddedColumn column)
     {
-        if (value is not { } defaultValue)
-            return SqlValue.Null;
+        if (column.DefaultSql is { } sql)
+        {
+            if (sql.Length >= 2 && sql[0] == '(' && sql[^1] == ')')
+                sql = sql[1..^1].Trim();
+            return SqlValue.Text(sql);
+        }
+        if (column.DefaultValue is { } defaultValue)
+            return SqlValue.Text(FormatSqlLiteral(defaultValue));
 
-        return SqlValue.Text(FormatSqlLiteral(defaultValue));
+        return SqlValue.Null;
     }
 
     private static ExecutionResult ExecutePragmaTableList(SchemaCatalog catalog)
@@ -1006,7 +1027,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 SqlValue.Integer(seq),
                 SqlValue.Text(index.Name),
                 SqlValue.Integer(index.Unique ? 1 : 0),
-                SqlValue.Text("c"),
+                SqlValue.Text(index.Origin == EmbeddedIndexOrigin.Explicit ? "c" : "u"),
                 SqlValue.Integer(0),
             ];
         }
@@ -1065,7 +1086,15 @@ public sealed class EmbeddedDatabase : IDisposable
 
         tables.Add(
             statement.Name,
-            new EmbeddedTable(statement.Columns, statement.WithoutRowid, statement.PrimaryKeyColumns));
+            new EmbeddedTable(
+                statement.Name,
+                statement.Columns,
+                statement.WithoutRowid,
+                statement.PrimaryKeyColumns,
+                statement.UniqueConstraints,
+                statement.CheckConstraints,
+                statement.PrimaryKeyConflictAlgorithm,
+                statement.PrimaryKeyConstraintName));
         return new ExecutionResult([], [], 0, true);
     }
 
@@ -1151,6 +1180,12 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (TryFindIndex(tables, statement.Name, out var table, out var index))
         {
+            if (index.Origin != EmbeddedIndexOrigin.Explicit)
+            {
+                throw new EmbeddedSqlException(
+                    $"index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped: {statement.Name}");
+            }
+
             table.Indexes.Remove(index);
             return new ExecutionResult([], [], 0, true);
         }
@@ -1277,13 +1312,27 @@ public sealed class EmbeddedDatabase : IDisposable
         throw new EmbeddedSqlException($"no such trigger: {statement.Name}");
     }
 
-    private static ExecutionResult ExecuteAlterTableAddColumn(
+    private ExecutionResult ExecuteAlterTableAddColumn(
         AlterTableAddColumnStatement statement,
-        Dictionary<string, EmbeddedTable> tables)
+        SqlValue[] parameters,
+        QueryContext context)
     {
-        if (!tables.TryGetValue(statement.TableName, out var table))
+        if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
+        var candidate = table.Clone();
+        candidate.AddColumn(statement.Column);
+        for (var position = 0; position < candidate.Rows.Count; position++)
+        {
+            var rowid = position < candidate.RowIds.Count ? candidate.RowIds[position] : position + 1;
+            ValidateCheckConstraints(
+                statement.TableName,
+                candidate,
+                candidate.Rows[position],
+                rowid,
+                parameters,
+                context);
+        }
         table.AddColumn(statement.Column);
         return new ExecutionResult([], [], 0, true);
     }
@@ -1299,6 +1348,7 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!tables.Remove(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
+        table.Rename(statement.NewName);
         tables.Add(statement.NewName, table);
         return new ExecutionResult([], [], 0, true);
     }
@@ -1320,12 +1370,151 @@ public sealed class EmbeddedDatabase : IDisposable
             return ExecuteConflictResolvedInsert(statement, algorithm, parameters, context);
         if (statement.Upsert is not null)
             return ExecuteUpsert(statement, parameters, context);
+        if (context.Tables.TryGetValue(statement.TableName, out var table)
+            && table.HasNonDefaultConflictAlgorithms)
+        {
+            return ExecuteWithTriggers(
+                statement.TableName,
+                TriggerEvent.Insert,
+                context,
+                () => ExecuteConstraintResolvedInsert(statement, table, parameters, context));
+        }
 
         return ExecuteWithTriggers(
             statement.TableName,
             TriggerEvent.Insert,
             context,
             () => PerformInsert(statement, parameters, context));
+    }
+
+    private ExecutionResult ExecuteConstraintResolvedInsert(
+        InsertStatement statement,
+        EmbeddedTable table,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (context.CommonTableExpressions.Count != 0)
+        {
+            throw new EmbeddedSqlException(
+                "Managed constraint-level conflict resolution does not support CTE sources.");
+        }
+
+        var sourceRows = statement.Source is null
+            ? null
+            : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
+        var backup = CloneTables(context.Tables);
+        var insertedRows = new List<SqlValue[]>();
+        var insertedRowIds = new List<long>();
+        try
+        {
+            if (sourceRows is not null)
+            {
+                foreach (var values in sourceRows)
+                    InsertValues(values);
+            }
+            else
+            {
+                foreach (var values in statement.Rows)
+                    InsertExpressions(values);
+            }
+
+            var lastInsertRowId = insertedRowIds.Count > 0 ? insertedRowIds[^1] : (long?)null;
+            return BuildConflictInsertResult(
+                statement,
+                table,
+                insertedRows,
+                insertedRowIds,
+                parameters,
+                context,
+                lastInsertRowId);
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
+        }
+        catch (EmbeddedConflictRollbackException)
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+        catch
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+
+        void InsertExpressions(Expression[] values)
+        {
+            var plan = PrepareInsert(statement, table);
+            var (row, rowId) = BuildInsertRow(
+                statement,
+                table,
+                plan,
+                values,
+                parameters,
+                context,
+                allowExistingRowid: true);
+            CommitCandidate(row, rowId);
+        }
+
+        void InsertValues(IReadOnlyList<SqlValue> values)
+        {
+            var plan = PrepareInsert(statement, table);
+            var (row, rowId) = BuildInsertRow(
+                statement,
+                table,
+                plan,
+                values,
+                parameters,
+                context,
+                allowExistingRowid: true);
+            CommitCandidate(row, rowId);
+        }
+
+        void CommitCandidate(SqlValue[] row, long rowId)
+        {
+            try
+            {
+                CommitInserts(context, statement.TableName, table, [row], [rowId]);
+                insertedRows.Add(row);
+                insertedRowIds.Add(rowId);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                switch (exception.ConflictAlgorithm)
+                {
+                    case InsertConflictAlgorithm.Ignore:
+                        return;
+                    case InsertConflictAlgorithm.Fail:
+                        if (insertedRows.Count > 0)
+                            throw new EmbeddedConflictFailException(exception, insertedRowIds[^1]);
+                        throw;
+                    case InsertConflictAlgorithm.Rollback:
+                        throw new EmbeddedConflictRollbackException(exception);
+                    case InsertConflictAlgorithm.Replace
+                        when exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal):
+                        if (HasForeignKeyParticipation(context, statement.TableName, table))
+                        {
+                            throw new EmbeddedSqlException(
+                                "Managed constraint-level ON CONFLICT REPLACE does not support tables participating in FOREIGN KEY constraints when foreign_keys is enabled.");
+                        }
+
+                        CommitReplacement(
+                            context,
+                            statement.TableName,
+                            table,
+                            row,
+                            rowId,
+                            deleteTriggers: [],
+                            insertTriggers: []);
+                        insertedRows.Add(row);
+                        insertedRowIds.Add(rowId);
+                        return;
+                    default:
+                        throw;
+                }
+            }
+        }
     }
 
     private ExecutionResult ExecuteConflictResolvedInsert(
@@ -1350,11 +1539,6 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             throw new EmbeddedSqlException(
                 "Managed INSERT OR conflict resolution does not support WITHOUT ROWID tables.");
-        }
-        if (table.HasCheckConstraints)
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSERT OR conflict resolution does not support CHECK constraints.");
         }
         if (algorithm != InsertConflictAlgorithm.Replace
             && GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert).Count > 0)
@@ -1522,11 +1706,6 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (context.CommonTableExpressions.Count != 0)
             throw new EmbeddedSqlException("Managed INSERT OR REPLACE does not support CTE sources.");
-        if (table.ColumnDefinitions.Any(column => column.NotNull))
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSERT OR REPLACE does not support NOT NULL constraints.");
-        }
         if (HasForeignKeyParticipation(context, statement.TableName, table))
         {
             throw new EmbeddedSqlException(
@@ -1678,7 +1857,7 @@ public sealed class EmbeddedDatabase : IDisposable
         rows.Add(candidate);
         rowIds.Add(candidateRowId);
         ValidateRowIdsUnique(tableName, table, rowIds, table.RowidAliasColumnIndex);
-        table.ValidateRows(rows);
+        table.ValidateRows(tableName, rows);
         ValidateColumnUniqueConstraints(table, rows);
         ValidatePrimaryKey(tableName, table, rows);
         ValidateUniqueIndexes(tableName, table, rows);
@@ -1711,7 +1890,7 @@ public sealed class EmbeddedDatabase : IDisposable
         for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
         {
             var column = table.ColumnDefinitions[columnIndex];
-            if (column.PrimaryKey || column.Unique)
+            if (column.PrimaryKey)
                 constraints.Add([new UpsertConflictColumn(column.Name, columnIndex, column.Collation)]);
         }
 
@@ -1766,7 +1945,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private static bool IsConflictAlgorithmConstraint(EmbeddedSqlException exception)
         => exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal)
-            || exception.Message.StartsWith("NOT NULL constraint failed:", StringComparison.Ordinal);
+            || exception.Message.StartsWith("NOT NULL constraint failed:", StringComparison.Ordinal)
+            || exception.Message.StartsWith("CHECK constraint failed:", StringComparison.Ordinal);
 
     private static bool HasForeignKeyParticipation(
         QueryContext context,
@@ -1856,7 +2036,7 @@ public sealed class EmbeddedDatabase : IDisposable
             rowIds.Add(candidateRowId);
 
             ValidateRowIdsUnique(statement.TableName, table, rowIds, table.RowidAliasColumnIndex);
-            table.ValidateRows(rows);
+            table.ValidateRows(statement.TableName, rows);
             ValidateColumnUniqueConstraints(table, rows);
             ValidatePrimaryKey(statement.TableName, table, rows);
             ValidateUniqueIndexes(statement.TableName, table, rows);
@@ -1922,7 +2102,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var updatedRowIds = new List<long>(table.RowIds);
 
         ValidateRowIdsUnique(statement.TableName, table, updatedRowIds, updatePlan.AliasIndex);
-        table.ValidateRows(updatedRows);
+        table.ValidateRows(statement.TableName, updatedRows);
         ValidateColumnUniqueConstraints(table, updatedRows);
         ValidatePrimaryKey(statement.TableName, table, updatedRows);
         ValidateUniqueIndexes(statement.TableName, table, updatedRows);
@@ -2030,19 +2210,6 @@ public sealed class EmbeddedDatabase : IDisposable
                 .ToArray();
             if (UpsertTargetMatches(target, columns))
                 matches.Add(new UpsertConflictTarget(columns));
-        }
-
-        for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
-        {
-            var column = table.ColumnDefinitions[columnIndex];
-            if (column.Unique
-                && UpsertTargetMatches(
-                    target,
-                    [new UpsertConflictColumn(column.Name, columnIndex, column.Collation)]))
-            {
-                matches.Add(new UpsertConflictTarget(
-                    [new UpsertConflictColumn(column.Name, columnIndex, column.Collation)]));
-            }
         }
 
         return matches.Count switch
@@ -2288,7 +2455,11 @@ public sealed class EmbeddedDatabase : IDisposable
                 Evaluate(column.GenerationExpression!, parameters, source, context));
             row[columnIndex] = value;
             if (column.NotNull && value.Kind == SqlValueKind.Null)
-                throw new EmbeddedSqlException($"NOT NULL constraint failed: {tableName}.{column.Name}");
+            {
+                throw new EmbeddedSqlException(
+                    $"NOT NULL constraint failed: {tableName}.{column.Name}",
+                    column.NotNullConflictAlgorithm);
+            }
         }
     }
 
@@ -2313,7 +2484,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 {
                     if (row[columnIndex].Kind == SqlValueKind.Null)
                         throw new EmbeddedSqlException(
-                            $"NOT NULL constraint failed: {tableName}.{table.Columns[columnIndex]}");
+                            $"NOT NULL constraint failed: {tableName}.{table.Columns[columnIndex]}",
+                            table.TablePrimaryKeyConflictAlgorithm);
                 }
             }
         }
@@ -2353,7 +2525,9 @@ public sealed class EmbeddedDatabase : IDisposable
                 if (conflict)
                 {
                     var columns = primaryKey.Select(entry => $"{tableName}.{table.Columns[entry.Index]}");
-                    throw new EmbeddedSqlException($"UNIQUE constraint failed: {string.Join(", ", columns)}");
+                    throw new EmbeddedSqlException(
+                        $"UNIQUE constraint failed: {string.Join(", ", columns)}",
+                        table.TablePrimaryKeyConflictAlgorithm);
                 }
             }
 
@@ -2537,7 +2711,8 @@ public sealed class EmbeddedDatabase : IDisposable
         if (values.Count != plan.TargetIndices.Length)
             throw new EmbeddedSqlException("table has a different number of columns");
 
-        var row = table.CreateRowWithDefaults();
+        var row = table.CreateRowWithDefaults(
+            expression => Evaluate(expression, EmptyParameters, row: null, context));
         var assignedColumns = new HashSet<int>();
         SqlValue explicitRowidValue = SqlValue.Null;
         for (var index = 0; index < values.Count; index++)
@@ -2547,6 +2722,24 @@ public sealed class EmbeddedDatabase : IDisposable
                 explicitRowidValue = value; // rowid pseudo-column: last write wins.
             else if (assignedColumns.Add(plan.TargetIndices[index]))
                 row[plan.TargetIndices[index]] = value;
+        }
+
+        for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
+        {
+            var column = table.ColumnDefinitions[columnIndex];
+            var conflictAlgorithm = statement.ConflictAlgorithm ?? column.NotNullConflictAlgorithm;
+            if (!column.NotNull
+                || row[columnIndex].Kind != SqlValueKind.Null
+                || conflictAlgorithm != InsertConflictAlgorithm.Replace
+                || !column.HasDefault)
+            {
+                continue;
+            }
+
+            row[columnIndex] = column.DefaultExpression is { } expression
+                ? Evaluate(expression, EmptyParameters, row: null, context)
+                : column.DefaultValue
+                    ?? throw new InvalidOperationException("Default metadata is incomplete.");
         }
 
         table.ApplyAffinities(row);
@@ -2572,7 +2765,10 @@ public sealed class EmbeddedDatabase : IDisposable
                 {
                     var conflictColumn = plan.AliasIndex >= 0 ? table.Columns[plan.AliasIndex] : "rowid";
                     throw new EmbeddedSqlException(
-                        $"UNIQUE constraint failed: {statement.TableName}.{conflictColumn}");
+                        $"UNIQUE constraint failed: {statement.TableName}.{conflictColumn}",
+                        plan.AliasIndex >= 0
+                            ? table.ColumnDefinitions[plan.AliasIndex].PrimaryKeyConflictAlgorithm
+                            : null);
                 }
             }
         }
@@ -2592,6 +2788,7 @@ public sealed class EmbeddedDatabase : IDisposable
         // Generated columns are computed after the base columns (and any rowid alias)
         // are final, so they can reference every stored column value.
         ComputeGeneratedColumns(table, statement.TableName, row, parameters, context);
+        ValidateCheckConstraints(statement.TableName, table, row, rowid, parameters, context);
 
         return (row, rowid);
     }
@@ -2608,7 +2805,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var allRows = new List<SqlValue[]>(table.Rows.Count + rowsToInsert.Count);
         allRows.AddRange(table.Rows);
         allRows.AddRange(rowsToInsert);
-        table.ValidateRows(allRows);
+        table.ValidateRows(tableName, allRows);
         ValidateColumnUniqueConstraints(table, allRows);
         ValidatePrimaryKey(tableName, table, allRows);
         ValidateUniqueIndexes(tableName, table, allRows);
@@ -2660,18 +2857,24 @@ public sealed class EmbeddedDatabase : IDisposable
         UpdateStatement statement,
         SqlValue[] parameters,
         QueryContext context)
-        => ExecuteWithTriggers(
+    {
+        return ExecuteWithTriggers(
             statement.TableName,
             TriggerEvent.Update,
             context,
             () => PerformUpdate(statement, parameters, context));
+    }
 
     private ExecutionResult PerformUpdate(
         UpdateStatement statement,
         SqlValue[] parameters,
         QueryContext context)
     {
-        if (CanCompileDml(context)
+        var requiresRowwiseConstraintValidation =
+            context.Tables.TryGetValue(statement.TableName, out var table)
+            && (table.PrimaryKeyColumns.Count > 0 || table.Indexes.Any(index => index.Unique));
+        if (!requiresRowwiseConstraintValidation
+            && CanCompileDml(context)
             && TryCompileUpdate(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning);
 
@@ -2687,8 +2890,10 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         var plan = PrepareUpdate(statement, table);
-        var rows = new List<SqlValue[]>(table.Rows.Count);
-        var rowIds = new List<long>(table.Rows.Count);
+        var rows = table.Rows.Select(row => row.ToArray()).ToList();
+        var rowIds = table.RowIds.Count == table.Rows.Count
+            ? table.RowIds.ToList()
+            : Enumerable.Range(1, table.Rows.Count).Select(position => (long)position).ToList();
         var updatedRows = statement.Returning is null ? null : new List<SqlValue[]>();
         var updatedRowIds = statement.Returning is null ? null : new List<long>();
         var updatedPositions = new List<int>();
@@ -2705,16 +2910,37 @@ public sealed class EmbeddedDatabase : IDisposable
                     RowId: table.HasRowid ? rowid : null,
                     RowIdQualifier: statement.TableName);
                 if (!IsTrue(Evaluate(statement.Where, parameters, source, context)))
-                {
-                    rows.Add(row);
-                    rowIds.Add(rowid);
                     continue;
-                }
             }
 
             var (updated, newRowid) = BuildUpdatedRow(statement, table, plan, row, rowid, parameters, context);
-            rows.Add(updated);
-            rowIds.Add(newRowid);
+            rows[position] = updated;
+            rowIds[position] = newRowid;
+            try
+            {
+                ValidateRowIdsUnique(statement.TableName, table, rowIds, plan.AliasIndex);
+                table.ValidateRows(statement.TableName, rows);
+                ValidateColumnUniqueConstraints(table, rows);
+                ValidatePrimaryKey(statement.TableName, table, rows);
+                ValidateUniqueIndexes(statement.TableName, table, rows);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                rows[position] = row;
+                rowIds[position] = rowid;
+                if (exception.ConflictAlgorithm == InsertConflictAlgorithm.Ignore)
+                    continue;
+                if (exception.ConflictAlgorithm is InsertConflictAlgorithm.Fail
+                    or InsertConflictAlgorithm.Rollback
+                    or InsertConflictAlgorithm.Replace)
+                {
+                    throw new EmbeddedSqlException(
+                        "Managed UPDATE cannot apply schema-level ON CONFLICT "
+                        + $"{exception.ConflictAlgorithm.Value.ToString().ToUpperInvariant()} until the pending "
+                        + "row-update engine supports partial publication, transaction rollback, and replacement.");
+                }
+                throw;
+            }
             updatedRows?.Add(updated);
             updatedRowIds?.Add(newRowid);
             updatedPositions.Add(position);
@@ -2810,8 +3036,45 @@ public sealed class EmbeddedDatabase : IDisposable
         // Recompute generated columns from the freshly updated base values so a change
         // to any source column is reflected in the stored generated value.
         ComputeGeneratedColumns(table, statement.TableName, updated, parameters, context);
+        ValidateCheckConstraints(statement.TableName, table, updated, newRowid, parameters, context);
 
         return (updated, newRowid);
+    }
+
+    private void ValidateCheckConstraints(
+        string tableName,
+        EmbeddedTable table,
+        SqlValue[] row,
+        long rowid,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (!table.HasCheckConstraints)
+            return;
+
+        var source = new SourceRow(
+            table.Columns,
+            row,
+            RowId: table.HasRowid ? rowid : null,
+            RowIdQualifier: tableName);
+        foreach (var column in table.ColumnDefinitions)
+        {
+            foreach (var check in column.CheckConstraints)
+                Validate(check);
+        }
+        foreach (var check in table.CheckConstraints)
+            Validate(check);
+
+        void Validate(CheckConstraint check)
+        {
+            var value = Evaluate(check.Expression, parameters, source, context);
+            if (value.Kind != SqlValueKind.Null && !IsTrue(value))
+            {
+                throw new EmbeddedSqlException(
+                    $"CHECK constraint failed: {check.Name ?? check.Sql}",
+                    InsertConflictAlgorithm.Abort);
+            }
+        }
     }
 
     // Validates the fully assembled post-update rows, then swaps them in and restores
@@ -2827,7 +3090,7 @@ public sealed class EmbeddedDatabase : IDisposable
         IReadOnlyList<int> updatedPositions)
     {
         ValidateRowIdsUnique(tableName, table, rowIds, plan.AliasIndex);
-        table.ValidateRows(rows);
+        table.ValidateRows(tableName, rows);
         ValidateColumnUniqueConstraints(table, rows);
         ValidatePrimaryKey(tableName, table, rows);
         ValidateUniqueIndexes(tableName, table, rows);
@@ -3149,7 +3412,12 @@ public sealed class EmbeddedDatabase : IDisposable
             if (!seen.Add(rowid))
             {
                 var column = aliasIndex >= 0 ? table.Columns[aliasIndex] : "rowid";
-                throw new EmbeddedSqlException($"UNIQUE constraint failed: {tableName}.{column}");
+                var conflictAlgorithm = aliasIndex >= 0
+                    ? table.ColumnDefinitions[aliasIndex].PrimaryKeyConflictAlgorithm
+                    : null;
+                throw new EmbeddedSqlException(
+                    $"UNIQUE constraint failed: {tableName}.{column}",
+                    conflictAlgorithm);
             }
         }
     }
@@ -3168,7 +3436,7 @@ public sealed class EmbeddedDatabase : IDisposable
             }
 
             var column = table.ColumnDefinitions[columnIndex];
-            if (!column.PrimaryKey && !column.Unique)
+            if (!column.PrimaryKey)
                 continue;
 
             var values = new List<SqlValue>();
@@ -3179,7 +3447,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     continue;
 
                 if (values.Any(existing => Compare(existing, value, column.Collation) == 0))
-                    throw new EmbeddedSqlException($"UNIQUE constraint failed: {column.Name}");
+                    throw new EmbeddedSqlException(
+                        $"UNIQUE constraint failed: {table.Name}.{column.Name}",
+                        column.PrimaryKeyConflictAlgorithm);
 
                 values.Add(value);
             }
@@ -3231,7 +3501,9 @@ public sealed class EmbeddedDatabase : IDisposable
                 if (conflict)
                 {
                     var qualified = index.Columns.Select(column => $"{tableName}.{column.Name}");
-                    throw new EmbeddedSqlException($"UNIQUE constraint failed: {string.Join(", ", qualified)}");
+                    throw new EmbeddedSqlException(
+                        $"UNIQUE constraint failed: {string.Join(", ", qualified)}",
+                        index.ConflictAlgorithm);
                 }
             }
 
@@ -7473,61 +7745,61 @@ public sealed class EmbeddedDatabase : IDisposable
         switch (source)
         {
             case NamedTableSource named when context.CommonTableExpressions.TryGetValue(named.Name, out var commonTableExpression):
-            {
-                var qualifier = named.Alias ?? named.Name;
-                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
-                    return null;
-
-                return column.Index < commonTableExpression.Columns.Length
-                    ? commonTableExpression.Collations?.ElementAtOrDefault(column.Index)
-                    : null;
-            }
-            case NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table):
-            {
-                var qualifier = named.Alias ?? named.Name;
-                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
-                    return null;
-
-                for (var index = 0; index < table.Columns.Length; index++)
                 {
-                    if (string.Equals(table.Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
-                        return table.ColumnDefinitions[index].Collation;
+                    var qualifier = named.Alias ?? named.Name;
+                    if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                        return null;
+
+                    return column.Index < commonTableExpression.Columns.Length
+                        ? commonTableExpression.Collations?.ElementAtOrDefault(column.Index)
+                        : null;
                 }
+            case NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table):
+                {
+                    var qualifier = named.Alias ?? named.Name;
+                    if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                        return null;
 
-                return null;
-            }
+                    for (var index = 0; index < table.Columns.Length; index++)
+                    {
+                        if (string.Equals(table.Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
+                            return table.ColumnDefinitions[index].Collation;
+                    }
+
+                    return null;
+                }
             case NamedTableSource named when TryGetView(context, named.Name, out var view):
-            {
-                var qualifier = named.Alias ?? view.Name;
-                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
-                    return null;
+                {
+                    var qualifier = named.Alias ?? view.Name;
+                    if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                        return null;
 
-                var viewContext = EnterView(context, view.Name);
-                var columns = ResolveViewColumns(view, viewContext);
-                return column.Index >= columns.Length
-                    ? null
-                    : GetQueryOutputCollations(view.Query, viewContext).ElementAtOrDefault(column.Index);
-            }
+                    var viewContext = EnterView(context, view.Name);
+                    var columns = ResolveViewColumns(view, viewContext);
+                    return column.Index >= columns.Length
+                        ? null
+                        : GetQueryOutputCollations(view.Query, viewContext).ElementAtOrDefault(column.Index);
+                }
             case DerivedTableSource derived:
-            {
-                if (!string.Equals(column.Qualifier, derived.Alias, StringComparison.OrdinalIgnoreCase))
-                    return null;
+                {
+                    if (!string.Equals(column.Qualifier, derived.Alias, StringComparison.OrdinalIgnoreCase))
+                        return null;
 
-                var columns = DescribeQuery(derived.Query, context);
-                return column.Index >= columns.Length
-                    ? null
-                    : GetQueryOutputCollations(derived.Query, context).ElementAtOrDefault(column.Index);
-            }
+                    var columns = DescribeQuery(derived.Query, context);
+                    return column.Index >= columns.Length
+                        ? null
+                        : GetQueryOutputCollations(derived.Query, context).ElementAtOrDefault(column.Index);
+                }
             case JoinTableSource join:
-            {
-                var leftWidth = GetSourceColumns(join.Left, context).Length;
-                return column.Index < leftWidth
-                    ? GetDeclaredOutputColumnCollation(join.Left, column, context)
-                    : GetDeclaredOutputColumnCollation(
-                        join.Right,
-                        column with { Index = column.Index - leftWidth },
-                        context);
-            }
+                {
+                    var leftWidth = GetSourceColumns(join.Left, context).Length;
+                    return column.Index < leftWidth
+                        ? GetDeclaredOutputColumnCollation(join.Left, column, context)
+                        : GetDeclaredOutputColumnCollation(
+                            join.Right,
+                            column with { Index = column.Index - leftWidth },
+                            context);
+                }
             default:
                 return null;
         }
@@ -9389,7 +9661,9 @@ public sealed class EmbeddedDatabase : IDisposable
                         SqlValue.Text(index.Name),
                         SqlValue.Text(entry.Key),
                         SqlValue.Integer(0),
-                        SqlValue.Text(BuildCreateIndexSql(entry.Key, index)),
+                        index.Origin == EmbeddedIndexOrigin.Explicit
+                            ? SqlValue.Text(BuildCreateIndexSql(entry.Key, index))
+                            : SqlValue.Null,
                     ],
                     qualifiedColumns,
                     outerRow));
@@ -9567,23 +9841,48 @@ public sealed class EmbeddedDatabase : IDisposable
             {
                 definition += $" AS ({column.GenerationSql}) " + (column.GeneratedStored ? "STORED" : "VIRTUAL");
                 if (column.NotNull)
-                    definition += " NOT NULL";
+                {
+                    definition += FormatConstraintName(column.NotNullConstraintName)
+                        + " NOT NULL"
+                        + FormatConflictClause(column.NotNullConflictAlgorithm);
+                }
+                foreach (var check in column.CheckConstraints)
+                    definition += FormatCheckConstraint(check);
                 return definition;
             }
 
             if (column.PrimaryKey)
-                definition += column.PrimaryKeyDescending ? " PRIMARY KEY DESC" : " PRIMARY KEY";
+            {
+                definition += FormatConstraintName(column.PrimaryKeyConstraintName)
+                    + (column.PrimaryKeyDescending ? " PRIMARY KEY DESC" : " PRIMARY KEY")
+                    + FormatConflictClause(column.PrimaryKeyConflictAlgorithm);
+            }
             if (column.NotNull)
-                definition += " NOT NULL";
+            {
+                definition += FormatConstraintName(column.NotNullConstraintName)
+                    + " NOT NULL"
+                    + FormatConflictClause(column.NotNullConflictAlgorithm);
+            }
             if (column.Unique)
-                definition += " UNIQUE";
-            if (column.DefaultValue is { } defaultValue)
-                definition += " DEFAULT " + FormatSqlLiteral(defaultValue);
+            {
+                definition += FormatConstraintName(column.UniqueConstraintName)
+                    + " UNIQUE"
+                    + FormatConflictClause(column.UniqueConflictAlgorithm);
+            }
+            if (column.HasDefault)
+            {
+                definition += " DEFAULT "
+                    + (column.DefaultSql
+                        ?? FormatSqlLiteral(column.DefaultValue
+                            ?? throw new InvalidOperationException("Default metadata is incomplete.")));
+            }
             if (column.ForeignKey is { } foreignKey)
             {
                 definition += $" REFERENCES {QuoteIdentifier(foreignKey.ParentTable)}"
                     + $" ({QuoteIdentifier(foreignKey.ParentColumn)})";
             }
+            foreach (var check in column.CheckConstraints)
+                definition += FormatCheckConstraint(check);
             return definition;
         }).ToList();
 
@@ -9595,12 +9894,41 @@ public sealed class EmbeddedDatabase : IDisposable
                 QuoteIdentifier(keyColumn.Name)
                 + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
                 + (keyColumn.Descending ? " DESC" : string.Empty));
-            columns.Add($"PRIMARY KEY ({string.Join(", ", keyColumns)})");
+            columns.Add(
+                FormatConstraintName(table.TablePrimaryKeyConstraintName).TrimStart()
+                + (table.TablePrimaryKeyConstraintName is null ? string.Empty : " ")
+                + $"PRIMARY KEY ({string.Join(", ", keyColumns)})"
+                + FormatConflictClause(table.TablePrimaryKeyConflictAlgorithm));
         }
+
+        foreach (var unique in table.TableUniqueConstraints)
+        {
+            var keyColumns = unique.Columns.Select(keyColumn =>
+                QuoteIdentifier(keyColumn.Name)
+                + (keyColumn.Collation is { } collation ? " COLLATE " + collation : string.Empty)
+                + (keyColumn.Descending ? " DESC" : string.Empty));
+            columns.Add(
+                FormatConstraintName(unique.Name).TrimStart()
+                + (unique.Name is null ? string.Empty : " ")
+                + $"UNIQUE ({string.Join(", ", keyColumns)})"
+                + FormatConflictClause(unique.ConflictAlgorithm));
+        }
+
+        foreach (var check in table.CheckConstraints)
+            columns.Add(FormatCheckConstraint(check).TrimStart());
 
         var withoutRowid = table.WithoutRowid ? " WITHOUT ROWID" : string.Empty;
         return $"CREATE TABLE {QuoteIdentifier(name)} ({string.Join(", ", columns)}){withoutRowid}";
     }
+
+    private static string FormatConstraintName(string? name)
+        => name is null ? string.Empty : " CONSTRAINT " + QuoteIdentifier(name);
+
+    private static string FormatCheckConstraint(CheckConstraint check)
+        => FormatConstraintName(check.Name) + $" CHECK ({check.Sql})";
+
+    private static string FormatConflictClause(InsertConflictAlgorithm? algorithm)
+        => algorithm is null ? string.Empty : " ON CONFLICT " + algorithm.Value.ToString().ToUpperInvariant();
 
     private static string BuildCreateIndexSql(string tableName, EmbeddedIndex index)
     {
@@ -9784,6 +10112,13 @@ public sealed class EmbeddedDatabase : IDisposable
         return expression switch
         {
             LiteralExpression literal => literal.Value,
+            CurrentTimeExpression current => current.Kind switch
+            {
+                CurrentTimeKind.Date => SqliteDateTime.Execute([], SqliteDateTime.Func.Date),
+                CurrentTimeKind.Time => SqliteDateTime.Execute([], SqliteDateTime.Func.Time),
+                CurrentTimeKind.Timestamp => SqliteDateTime.Execute([], SqliteDateTime.Func.DateTime),
+                _ => throw new InvalidOperationException($"Unknown current-time kind {current.Kind}."),
+            },
             ParameterExpression parameter => ReadParameter(parameters, parameter.Index),
             ColumnExpression column => row?.GetValue(column.Name)
                 ?? throw new EmbeddedSqlException($"no such column: {column.Name}"),
@@ -16734,10 +17069,16 @@ internal sealed class EmbeddedTable
     private readonly Dictionary<string, int> _columnIndices;
 
     public EmbeddedTable(
+        string name,
         IReadOnlyList<EmbeddedColumn> columns,
         bool withoutRowid = false,
-        IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null)
+        IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null,
+        IReadOnlyList<TableUniqueConstraint>? uniqueConstraints = null,
+        IReadOnlyList<CheckConstraint>? checkConstraints = null,
+        InsertConflictAlgorithm? primaryKeyConflictAlgorithm = null,
+        string? primaryKeyConstraintName = null)
     {
+        Name = name;
         ColumnDefinitions = columns.ToArray();
         Columns = ColumnDefinitions.Select(column => column.Name).ToArray();
         _columnIndices = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -16751,6 +17092,10 @@ internal sealed class EmbeddedTable
         TableLevelPrimaryKey = tablePrimaryKey is null
             ? null
             : Array.AsReadOnly(tablePrimaryKey.ToArray());
+        TableUniqueConstraints = Array.AsReadOnly((uniqueConstraints ?? []).ToArray());
+        CheckConstraints = Array.AsReadOnly((checkConstraints ?? []).ToArray());
+        TablePrimaryKeyConflictAlgorithm = primaryKeyConflictAlgorithm;
+        TablePrimaryKeyConstraintName = primaryKeyConstraintName;
         PrimaryKeyColumns = Array.AsReadOnly(
             ResolvePrimaryKeyColumns(ColumnDefinitions, TableLevelPrimaryKey, _columnIndices).ToArray());
         PrimaryKeySchema = CreatePrimaryKeySchema(ColumnDefinitions, TableLevelPrimaryKey, PrimaryKeyColumns);
@@ -16765,7 +17110,152 @@ internal sealed class EmbeddedTable
                 .Where(column => column.ForeignKey is not null)
                 .Select(column => column.ForeignKey!)
                 .ToArray());
+
+        CreateUniqueConstraintIndexes();
+        ValidateSchemaExpressions();
     }
+
+    private void CreateUniqueConstraintIndexes()
+    {
+        var autoIndex = 0;
+        for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
+        {
+            var column = ColumnDefinitions[columnIndex];
+            if (!column.Unique)
+                continue;
+
+            autoIndex++;
+            Indexes.Add(new EmbeddedIndex(
+                $"sqlite_autoindex_{Name}_{autoIndex}",
+                Unique: true,
+                [new EmbeddedIndexColumn(column.Name, columnIndex, column.Collation, Descending: false)],
+                EmbeddedIndexOrigin.UniqueConstraint,
+                column.UniqueConflictAlgorithm));
+        }
+
+        foreach (var constraint in TableUniqueConstraints)
+        {
+            if (constraint.Columns.Count == 0)
+                throw new EmbeddedSqlException("UNIQUE constraint must contain at least one column");
+
+            var columns = new EmbeddedIndexColumn[constraint.Columns.Count];
+            var seen = new HashSet<int>();
+            for (var position = 0; position < constraint.Columns.Count; position++)
+            {
+                var term = constraint.Columns[position];
+                if (!_columnIndices.TryGetValue(term.Name, out var columnIndex))
+                    throw new EmbeddedSqlException($"no such column: {term.Name}");
+                if (!seen.Add(columnIndex))
+                    throw new EmbeddedSqlException($"duplicate column name: {term.Name}");
+
+                columns[position] = new EmbeddedIndexColumn(
+                    ColumnDefinitions[columnIndex].Name,
+                    columnIndex,
+                    term.Collation ?? ColumnDefinitions[columnIndex].Collation,
+                    term.Descending);
+            }
+
+            autoIndex++;
+            Indexes.Add(new EmbeddedIndex(
+                $"sqlite_autoindex_{Name}_{autoIndex}",
+                Unique: true,
+                columns,
+                EmbeddedIndexOrigin.UniqueConstraint,
+                constraint.ConflictAlgorithm));
+        }
+    }
+
+    private void ValidateSchemaExpressions()
+    {
+        foreach (var column in ColumnDefinitions)
+        {
+            if (column.DefaultExpression is not null)
+                ValidateConstraintExpression(column.DefaultExpression, allowColumns: false, "default value");
+            foreach (var check in column.CheckConstraints)
+                ValidateConstraintExpression(check.Expression, allowColumns: true, "CHECK constraint");
+        }
+
+        foreach (var check in CheckConstraints)
+            ValidateConstraintExpression(check.Expression, allowColumns: true, "CHECK constraint");
+    }
+
+    private void ValidateConstraintExpression(Expression expression, bool allowColumns, string context)
+    {
+        switch (expression)
+        {
+            case LiteralExpression:
+            case CurrentTimeExpression:
+                return;
+            case ColumnExpression column:
+                if (!allowColumns)
+                    throw new EmbeddedSqlException($"default value of column is not constant: {column.Name}");
+                if (!_columnIndices.ContainsKey(column.Name))
+                    throw new EmbeddedSqlException($"no such column: {column.Name}");
+                return;
+            case ParameterExpression:
+                throw new EmbeddedSqlException($"parameters are prohibited in {context}s");
+            case ScalarSubqueryExpression or ExistsExpression or InSubqueryExpression:
+                throw new EmbeddedSqlException($"subqueries are prohibited in {context}s");
+            case StarExpression or QualifiedStarExpression:
+                throw new EmbeddedSqlException($"cannot use '*' in a {context}");
+            case FunctionExpression function:
+                if (function.Window is not null || function.Filter is not null || function.CountStar || function.Distinct)
+                    throw new EmbeddedSqlException($"aggregate and window functions are prohibited in {context}s");
+                if (!IsAllowedConstraintFunction(function.Name))
+                    throw new EmbeddedSqlException($"function {function.Name.ToLowerInvariant()}() is not allowed in a {context}");
+                foreach (var argument in function.Arguments)
+                    ValidateConstraintExpression(argument, allowColumns, context);
+                return;
+            case CollationExpression collation:
+                ValidateConstraintExpression(collation.Expression, allowColumns, context);
+                return;
+            case CastExpression cast:
+                ValidateConstraintExpression(cast.Expression, allowColumns, context);
+                return;
+            case CaseExpression @case:
+                if (@case.Operand is not null)
+                    ValidateConstraintExpression(@case.Operand, allowColumns, context);
+                foreach (var clause in @case.Clauses)
+                {
+                    ValidateConstraintExpression(clause.When, allowColumns, context);
+                    ValidateConstraintExpression(clause.Then, allowColumns, context);
+                }
+                if (@case.Else is not null)
+                    ValidateConstraintExpression(@case.Else, allowColumns, context);
+                return;
+            case LikeExpression like:
+                ValidateConstraintExpression(like.Value, allowColumns, context);
+                ValidateConstraintExpression(like.Pattern, allowColumns, context);
+                if (like.Escape is not null)
+                    ValidateConstraintExpression(like.Escape, allowColumns, context);
+                return;
+            case GlobExpression glob:
+                ValidateConstraintExpression(glob.Value, allowColumns, context);
+                ValidateConstraintExpression(glob.Pattern, allowColumns, context);
+                return;
+            case InExpression @in:
+                ValidateConstraintExpression(@in.Value, allowColumns, context);
+                foreach (var value in @in.Values)
+                    ValidateConstraintExpression(value, allowColumns, context);
+                return;
+            case BetweenExpression between:
+                ValidateConstraintExpression(between.Value, allowColumns, context);
+                ValidateConstraintExpression(between.Lower, allowColumns, context);
+                ValidateConstraintExpression(between.Upper, allowColumns, context);
+                return;
+            case UnaryExpression unary:
+                ValidateConstraintExpression(unary.Operand, allowColumns, context);
+                return;
+            case BinaryExpression binary:
+                ValidateConstraintExpression(binary.Left, allowColumns, context);
+                ValidateConstraintExpression(binary.Right, allowColumns, context);
+                return;
+            default:
+                throw new EmbeddedSqlException($"expression is not allowed in a {context}");
+        }
+    }
+
+    public string Name { get; private set; }
 
     public string[] Columns { get; private set; }
 
@@ -16794,6 +17284,14 @@ internal sealed class EmbeddedTable
     // regenerated verbatim; null when the primary key (if any) is column-level.
     public IReadOnlyList<TablePrimaryKeyColumn>? TableLevelPrimaryKey { get; }
 
+    public IReadOnlyList<TableUniqueConstraint> TableUniqueConstraints { get; }
+
+    public IReadOnlyList<CheckConstraint> CheckConstraints { get; }
+
+    public InsertConflictAlgorithm? TablePrimaryKeyConflictAlgorithm { get; }
+
+    public string? TablePrimaryKeyConstraintName { get; }
+
     // The resolved primary-key columns (index + direction) in key order. Empty when the
     // table has no primary key. Used for WITHOUT ROWID ordering/uniqueness and table_info.
     public IReadOnlyList<(int Index, bool Descending)> PrimaryKeyColumns { get; }
@@ -16810,7 +17308,15 @@ internal sealed class EmbeddedTable
 
     public bool HasGeneratedColumns => GeneratedColumnOrder.Count > 0;
 
-    public bool HasCheckConstraints => ColumnDefinitions.Any(column => column.HasCheckConstraint);
+    public bool HasCheckConstraints => CheckConstraints.Count > 0
+        || ColumnDefinitions.Any(column => column.CheckConstraints.Count > 0);
+
+    public bool HasNonDefaultConflictAlgorithms => TablePrimaryKeyConflictAlgorithm is not null
+        || TableUniqueConstraints.Any(constraint => constraint.ConflictAlgorithm is not null)
+        || ColumnDefinitions.Any(column =>
+            column.PrimaryKeyConflictAlgorithm is not null
+            || column.NotNullConflictAlgorithm is not null
+            || column.UniqueConflictAlgorithm is not null);
 
     public IReadOnlyList<ForeignKeyDefinition> ForeignKeys { get; }
 
@@ -16972,7 +17478,7 @@ internal sealed class EmbeddedTable
 
         foreach (var index in generated)
         {
-            if (columns[index].DefaultValue.HasValue)
+            if (columns[index].HasDefault)
                 throw new EmbeddedSqlException("cannot use DEFAULT on a generated column");
         }
 
@@ -17128,6 +17634,13 @@ internal sealed class EmbeddedTable
         };
     }
 
+    private static bool IsAllowedConstraintFunction(string name)
+    {
+        return IsAllowedGeneratedFunction(name)
+            || name.ToUpperInvariant() is "DATE" or "DATETIME" or "INSTR" or "JULIANDAY"
+                or "PRINTF" or "FORMAT" or "STRFTIME" or "TIME" or "UNIXEPOCH";
+    }
+
     private static void CollectColumnReferences(Expression expression, HashSet<string> names)
     {
         switch (expression)
@@ -17243,6 +17756,9 @@ internal sealed class EmbeddedTable
         if (column.PrimaryKey || column.Unique)
             throw new EmbeddedSqlException("Cannot add a PRIMARY KEY or UNIQUE column.");
 
+        if (column.DefaultExpression is not null && Rows.Count > 0)
+            throw new EmbeddedSqlException("Cannot add a column with non-constant default.");
+
         var defaultValue = ApplyAffinity(column, column.DefaultValue ?? SqlValue.Null);
         if (column.NotNull && Rows.Count > 0 && defaultValue.Kind == SqlValueKind.Null)
             throw new EmbeddedSqlException("Cannot add a NOT NULL column without a default value.");
@@ -17260,10 +17776,28 @@ internal sealed class EmbeddedTable
         }
     }
 
-    public SqlValue[] CreateRowWithDefaults()
+    public void Rename(string newName)
+    {
+        Name = newName;
+        var autoIndex = 0;
+        for (var index = 0; index < Indexes.Count; index++)
+        {
+            if (Indexes[index].Origin != EmbeddedIndexOrigin.UniqueConstraint)
+                continue;
+
+            autoIndex++;
+            Indexes[index] = Indexes[index] with { Name = $"sqlite_autoindex_{newName}_{autoIndex}" };
+        }
+    }
+
+    public SqlValue[] CreateRowWithDefaults(Func<Expression, SqlValue> evaluate)
     {
         return ColumnDefinitions
-            .Select(column => ApplyAffinity(column, column.DefaultValue ?? SqlValue.Null))
+            .Select(column => ApplyAffinity(
+                column,
+                column.DefaultExpression is { } expression
+                    ? evaluate(expression)
+                    : column.DefaultValue ?? SqlValue.Null))
             .ToArray();
     }
 
@@ -17272,6 +17806,16 @@ internal sealed class EmbeddedTable
         var index = GetColumnIndex(name);
         if (_columnIndices.ContainsKey(newName))
             throw new EmbeddedSqlException($"duplicate column name: {newName}");
+        if (HasCheckConstraints
+            || HasGeneratedColumns
+            || TableLevelPrimaryKey is not null
+            || TableUniqueConstraints.Count > 0
+            || ColumnDefinitions[index].ForeignKey is not null)
+        {
+            throw new EmbeddedSqlException(
+                "ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, "
+                + "or foreign-key schema expressions until managed schema token rewriting is implemented.");
+        }
 
         Columns[index] = newName;
         ColumnDefinitions[index] = ColumnDefinitions[index] with { Name = newName };
@@ -17293,12 +17837,21 @@ internal sealed class EmbeddedTable
 
     public EmbeddedTable Clone()
     {
-        var clone = new EmbeddedTable(ColumnDefinitions, WithoutRowid, TableLevelPrimaryKey);
+        var clone = new EmbeddedTable(
+            Name,
+            ColumnDefinitions,
+            WithoutRowid,
+            TableLevelPrimaryKey,
+            TableUniqueConstraints,
+            CheckConstraints,
+            TablePrimaryKeyConflictAlgorithm,
+            TablePrimaryKeyConstraintName);
         foreach (var row in Rows)
             clone.Rows.Add(row.ToArray());
 
         clone.RowIds.AddRange(RowIds);
-        clone.Indexes.AddRange(Indexes);
+        clone.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
+        clone.Indexes.AddRange(Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
         return clone;
     }
 
@@ -17308,7 +17861,7 @@ internal sealed class EmbeddedTable
             row[columnIndex] = ApplyAffinity(ColumnDefinitions[columnIndex], row[columnIndex]);
     }
 
-    public void ValidateRows(IReadOnlyList<SqlValue[]> rows)
+    public void ValidateRows(string tableName, IReadOnlyList<SqlValue[]> rows)
     {
         for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
         {
@@ -17320,9 +17873,13 @@ internal sealed class EmbeddedTable
 
             var column = ColumnDefinitions[columnIndex];
             if (column.NotNull && rows.Any(row => row[columnIndex].Kind == SqlValueKind.Null))
-                throw new EmbeddedSqlException($"NOT NULL constraint failed: {column.Name}");
+            {
+                throw new EmbeddedSqlException(
+                    $"NOT NULL constraint failed: {tableName}.{column.Name}",
+                    column.NotNullConflictAlgorithm);
+            }
 
-            if (!column.PrimaryKey && !column.Unique)
+            if (!column.PrimaryKey)
                 continue;
 
             var values = new HashSet<SqlValue>();
@@ -17332,7 +17889,11 @@ internal sealed class EmbeddedTable
                 if (value.Kind == SqlValueKind.Null)
                     continue;
                 if (!values.Add(value))
-                    throw new EmbeddedSqlException($"UNIQUE constraint failed: {column.Name}");
+                {
+                    throw new EmbeddedSqlException(
+                        $"UNIQUE constraint failed: {tableName}.{column.Name}",
+                        column.PrimaryKeyConflictAlgorithm);
+                }
             }
         }
     }
@@ -17570,7 +18131,11 @@ internal sealed record CreateTableStatement(
     IReadOnlyList<EmbeddedColumn> Columns,
     bool IfNotExists,
     bool WithoutRowid = false,
-    IReadOnlyList<TablePrimaryKeyColumn>? PrimaryKeyColumns = null) : ParsedStatement;
+    IReadOnlyList<TablePrimaryKeyColumn>? PrimaryKeyColumns = null,
+    IReadOnlyList<TableUniqueConstraint>? UniqueConstraints = null,
+    IReadOnlyList<CheckConstraint>? CheckConstraints = null,
+    InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm = null,
+    string? PrimaryKeyConstraintName = null) : ParsedStatement;
 
 internal sealed record DropTableStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -17861,12 +18426,25 @@ internal sealed record EmbeddedColumn(
     string? GenerationSql = null,
     string? Collation = null,
     ForeignKeyDefinition? ForeignKey = null,
-    bool HasCheckConstraint = false)
+    IReadOnlyList<CheckConstraint>? Checks = null,
+    Expression? DefaultExpression = null,
+    string? DefaultSql = null,
+    InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm = null,
+    InsertConflictAlgorithm? NotNullConflictAlgorithm = null,
+    InsertConflictAlgorithm? UniqueConflictAlgorithm = null,
+    string? PrimaryKeyConstraintName = null,
+    string? NotNullConstraintName = null,
+    string? UniqueConstraintName = null)
 {
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether
     // the value may be persisted (STORED) or must be recomputed (VIRTUAL).
     public bool IsGenerated => GenerationExpression is not null;
+
+    public IReadOnlyList<CheckConstraint> CheckConstraints { get; } =
+        Array.AsReadOnly((Checks ?? []).ToArray());
+
+    public bool HasDefault => DefaultValue.HasValue || DefaultExpression is not null;
 }
 
 // A column participating in a table-level PRIMARY KEY(...) clause, preserving the
@@ -17874,15 +18452,42 @@ internal sealed record EmbeddedColumn(
 // lose SQLite's comparison semantics.
 internal sealed record TablePrimaryKeyColumn(string Name, bool Descending, string? Collation = null);
 
+internal sealed record TableUniqueConstraint(
+    string? Name,
+    IReadOnlyList<TablePrimaryKeyColumn> Columns,
+    InsertConflictAlgorithm? ConflictAlgorithm = null);
+
+internal sealed record CheckConstraint(string? Name, Expression Expression, string Sql);
+
 internal sealed record ForeignKeyDefinition(string ChildColumn, string ParentTable, string ParentColumn);
 
 internal sealed record EmbeddedIndexColumn(string Name, int ColumnIndex, string? Collation, bool Descending);
 
-internal sealed record EmbeddedIndex(string Name, bool Unique, IReadOnlyList<EmbeddedIndexColumn> Columns);
+internal enum EmbeddedIndexOrigin
+{
+    Explicit,
+    UniqueConstraint,
+}
+
+internal sealed record EmbeddedIndex(
+    string Name,
+    bool Unique,
+    IReadOnlyList<EmbeddedIndexColumn> Columns,
+    EmbeddedIndexOrigin Origin = EmbeddedIndexOrigin.Explicit,
+    InsertConflictAlgorithm? ConflictAlgorithm = null);
 
 internal abstract record Expression;
 
 internal sealed record LiteralExpression(SqlValue Value) : Expression;
+
+internal enum CurrentTimeKind
+{
+    Date,
+    Time,
+    Timestamp,
+}
+
+internal sealed record CurrentTimeExpression(CurrentTimeKind Kind) : Expression;
 
 internal sealed record ParameterExpression(int Index) : Expression;
 
@@ -18318,7 +18923,10 @@ internal sealed class SqlParser
         Expect(TokenKind.LeftParen);
         var columns = new List<EmbeddedColumn>();
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null;
-        var hasCheckConstraint = false;
+        InsertConflictAlgorithm? tablePrimaryKeyConflictAlgorithm = null;
+        string? tablePrimaryKeyConstraintName = null;
+        var uniqueConstraints = new List<TableUniqueConstraint>();
+        var checkConstraints = new List<CheckConstraint>();
         do
         {
             if (IsTableConstraintStart())
@@ -18331,12 +18939,20 @@ internal sealed class SqlParser
                             throw Error("table has more than one primary key");
 
                         tablePrimaryKey = primaryKey.Columns;
+                        tablePrimaryKeyConflictAlgorithm = primaryKey.ConflictAlgorithm;
+                        tablePrimaryKeyConstraintName = primaryKey.Name;
                         break;
                     case ForeignKeyTableConstraint foreignKey:
                         AttachTableForeignKey(columns, foreignKey.Definition);
                         break;
-                    case CheckTableConstraint:
-                        hasCheckConstraint = true;
+                    case UniqueTableConstraint unique:
+                        uniqueConstraints.Add(new TableUniqueConstraint(
+                            unique.Name,
+                            unique.Columns,
+                            unique.ConflictAlgorithm));
+                        break;
+                    case CheckTableConstraint check:
+                        checkConstraints.Add(new CheckConstraint(check.Name, check.Expression, check.Sql));
                         break;
                 }
 
@@ -18359,48 +18975,51 @@ internal sealed class SqlParser
             withoutRowid = true;
         }
 
-        if (hasCheckConstraint && columns.Count > 0)
-            columns[0] = columns[0] with { HasCheckConstraint = true };
-
-        return new CreateTableStatement(name, columns, ifNotExists, withoutRowid, tablePrimaryKey);
+        return new CreateTableStatement(
+            name,
+            columns,
+            ifNotExists,
+            withoutRowid,
+            tablePrimaryKey,
+            uniqueConstraints,
+            checkConstraints,
+            tablePrimaryKeyConflictAlgorithm,
+            tablePrimaryKeyConstraintName);
     }
 
     private abstract record TableConstraint;
 
-    private sealed record PrimaryKeyTableConstraint(IReadOnlyList<TablePrimaryKeyColumn> Columns) : TableConstraint;
+    private sealed record PrimaryKeyTableConstraint(
+        string? Name,
+        IReadOnlyList<TablePrimaryKeyColumn> Columns,
+        InsertConflictAlgorithm? ConflictAlgorithm) : TableConstraint;
 
     private sealed record ForeignKeyTableConstraint(ForeignKeyDefinition Definition) : TableConstraint;
 
-    private sealed record CheckTableConstraint : TableConstraint;
+    private sealed record UniqueTableConstraint(
+        string? Name,
+        IReadOnlyList<TablePrimaryKeyColumn> Columns,
+        InsertConflictAlgorithm? ConflictAlgorithm) : TableConstraint;
 
-    // Parses the single-column table constraints the managed FK slice can preserve. Other
-    // pre-existing unsupported table constraints retain the parser's skip behavior.
+    private sealed record CheckTableConstraint(string? Name, Expression Expression, string Sql) : TableConstraint;
+
     private TableConstraint? ParseTableConstraint()
     {
+        string? constraintName = null;
         if (ConsumeKeyword("CONSTRAINT"))
-            ExpectIdentifier();
+            constraintName = ExpectIdentifier();
 
         if (ConsumeKeyword("PRIMARY"))
         {
             ExpectKeyword("KEY");
-            Expect(TokenKind.LeftParen);
-            var keyColumns = new List<TablePrimaryKeyColumn>();
-            do
-            {
-                var columnName = ExpectIdentifier();
-                string? collation = null;
-                if (ConsumeKeyword("COLLATE"))
-                    collation = ExpectIdentifier();
+            var keyColumns = ParseTableConstraintColumns();
+            return new PrimaryKeyTableConstraint(constraintName, keyColumns, ParseConflictClause());
+        }
 
-                var descending = false;
-                if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
-                    descending = true;
-
-                keyColumns.Add(new TablePrimaryKeyColumn(columnName, descending, collation));
-            }
-            while (Consume(TokenKind.Comma));
-            Expect(TokenKind.RightParen);
-            return new PrimaryKeyTableConstraint(keyColumns);
+        if (ConsumeKeyword("UNIQUE"))
+        {
+            var keyColumns = ParseTableConstraintColumns();
+            return new UniqueTableConstraint(constraintName, keyColumns, ParseConflictClause());
         }
 
         if (ConsumeKeyword("FOREIGN"))
@@ -18417,12 +19036,34 @@ internal sealed class SqlParser
 
         if (ConsumeKeyword("CHECK"))
         {
-            SkipParenthesized();
-            return new CheckTableConstraint();
+            var (expression, sql) = ParseParenthesizedSchemaExpression("CHECK");
+            _ = ParseConflictClause();
+            return new CheckTableConstraint(constraintName, expression, sql);
         }
 
-        SkipColumnDefinitionRemainder();
-        return null;
+        throw Error("Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY after table constraint name.");
+    }
+
+    private IReadOnlyList<TablePrimaryKeyColumn> ParseTableConstraintColumns()
+    {
+        Expect(TokenKind.LeftParen);
+        var columns = new List<TablePrimaryKeyColumn>();
+        do
+        {
+            var columnName = ExpectIdentifier();
+            string? collation = null;
+            if (ConsumeKeyword("COLLATE"))
+                collation = ExpectIdentifier();
+
+            var descending = false;
+            if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
+                descending = true;
+
+            columns.Add(new TablePrimaryKeyColumn(columnName, descending, collation));
+        }
+        while (Consume(TokenKind.Comma));
+        Expect(TokenKind.RightParen);
+        return columns;
     }
 
     private static void AttachTableForeignKey(List<EmbeddedColumn> columns, ForeignKeyDefinition foreignKey)
@@ -19590,6 +20231,12 @@ internal sealed class SqlParser
                     return new ColumnExpression(token.Text + "." + ExpectIdentifier());
                 if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
                     return new LiteralExpression(SqlValue.Null);
+                if (string.Equals(token.Text, "CURRENT_DATE", StringComparison.OrdinalIgnoreCase))
+                    return new CurrentTimeExpression(CurrentTimeKind.Date);
+                if (string.Equals(token.Text, "CURRENT_TIME", StringComparison.OrdinalIgnoreCase))
+                    return new CurrentTimeExpression(CurrentTimeKind.Time);
+                if (string.Equals(token.Text, "CURRENT_TIMESTAMP", StringComparison.OrdinalIgnoreCase))
+                    return new CurrentTimeExpression(CurrentTimeKind.Timestamp);
                 if (string.Equals(token.Text, "CASE", StringComparison.OrdinalIgnoreCase))
                     return ParseCaseExpression();
                 if (string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) && Consume(TokenKind.LeftParen))
@@ -19750,39 +20397,48 @@ internal sealed class SqlParser
     private EmbeddedColumn ParseColumnDefinition()
     {
         var name = ExpectIdentifier();
-        string? declaredType = null;
-        if (_lexer.Current.Kind == TokenKind.Identifier && !IsColumnConstraintKeyword(_lexer.Current.Text))
-        {
-            declaredType = _lexer.Current.Text;
-            _lexer.Next();
-        }
-
-        if (_lexer.Current.Kind == TokenKind.LeftParen)
-            SkipParenthesized();
+        var declaredType = ParseDeclaredType();
 
         var primaryKey = false;
         var primaryKeyDescending = false;
         var notNull = false;
         var unique = false;
         SqlValue? defaultValue = null;
+        Expression? defaultExpression = null;
+        string? defaultSql = null;
         string? collation = null;
         Expression? generationExpression = null;
         var generatedStored = false;
         string? generationSql = null;
         ForeignKeyDefinition? foreignKey = null;
-        var hasCheckConstraint = false;
+        var checks = new List<CheckConstraint>();
+        InsertConflictAlgorithm? primaryKeyConflictAlgorithm = null;
+        InsertConflictAlgorithm? notNullConflictAlgorithm = null;
+        InsertConflictAlgorithm? uniqueConflictAlgorithm = null;
+        string? primaryKeyConstraintName = null;
+        string? notNullConstraintName = null;
+        string? uniqueConstraintName = null;
+        string? pendingConstraintName = null;
         while (_lexer.Current.Kind == TokenKind.Identifier)
         {
+            if (ConsumeKeyword("CONSTRAINT"))
+            {
+                pendingConstraintName = ExpectIdentifier();
+                continue;
+            }
             if (ConsumeKeyword("PRIMARY"))
             {
                 ExpectKeyword("KEY");
                 primaryKey = true;
+                primaryKeyConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
 
                 // A trailing ASC keeps the rowid-alias behavior; DESC disqualifies the
                 // column from aliasing the rowid, matching SQLite.
                 if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
                     primaryKeyDescending = true;
 
+                primaryKeyConflictAlgorithm = ParseConflictClause();
                 continue;
             }
             if (ConsumeKeyword("AUTOINCREMENT"))
@@ -19797,11 +20453,22 @@ internal sealed class SqlParser
             {
                 ExpectKeyword("NULL");
                 notNull = true;
+                notNullConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
+                notNullConflictAlgorithm = ParseConflictClause();
+                continue;
+            }
+            if (ConsumeKeyword("NULL"))
+            {
+                pendingConstraintName = null;
                 continue;
             }
             if (ConsumeKeyword("UNIQUE"))
             {
                 unique = true;
+                uniqueConstraintName = pendingConstraintName;
+                pendingConstraintName = null;
+                uniqueConflictAlgorithm = ParseConflictClause();
                 continue;
             }
             if (ConsumeKeyword("COLLATE"))
@@ -19811,11 +20478,17 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("DEFAULT"))
             {
-                var expression = ParseExpression();
-                if (expression is not LiteralExpression literal)
-                    throw Error("Only constant DEFAULT values are supported.");
-
-                defaultValue = literal.Value;
+                var startOffset = _lexer.Current.Offset;
+                var expression = _lexer.Current.Kind == TokenKind.LeftParen
+                    ? ParseExpression()
+                    : ParsePrimary();
+                var endOffset = _lexer.Current.Offset;
+                defaultSql = _sql[startOffset..endOffset].Trim();
+                if (TryGetLiteralDefault(expression, out var literalValue))
+                    defaultValue = literalValue;
+                else
+                    defaultExpression = expression;
+                pendingConstraintName = null;
                 continue;
             }
             // GENERATED ALWAYS AS (expr) and the bare AS (expr) shorthand both declare a
@@ -19839,25 +20512,24 @@ internal sealed class SqlParser
                     throw Error($"multiple foreign key constraints on column {name} are not supported");
 
                 foreignKey = ParseForeignKeyReference(name);
+                pendingConstraintName = null;
                 continue;
             }
             if (ConsumeKeyword("FOREIGN"))
                 throw Error("FOREIGN KEY constraints must be table-level.");
             if (ConsumeKeyword("CHECK"))
             {
-                SkipParenthesized();
-                hasCheckConstraint = true;
-                continue;
-            }
-            if (ConsumeKeyword("CONSTRAINT"))
-            {
-                ExpectIdentifier();
+                var (expression, sql) = ParseParenthesizedSchemaExpression("CHECK");
+                checks.Add(new CheckConstraint(pendingConstraintName, expression, sql));
+                pendingConstraintName = null;
                 continue;
             }
 
-            SkipColumnDefinitionRemainder();
-            break;
+            throw Error($"Unsupported column constraint '{_lexer.Current.Text}'.");
         }
+
+        if (pendingConstraintName is not null)
+            throw Error($"Expected a constraint after CONSTRAINT {pendingConstraintName}.");
 
         return new EmbeddedColumn(
             name,
@@ -19872,7 +20544,77 @@ internal sealed class SqlParser
             generationSql,
             collation,
             foreignKey,
-            hasCheckConstraint);
+            checks,
+            defaultExpression,
+            defaultSql,
+            primaryKeyConflictAlgorithm,
+            notNullConflictAlgorithm,
+            uniqueConflictAlgorithm,
+            primaryKeyConstraintName,
+            notNullConstraintName,
+            uniqueConstraintName);
+    }
+
+    private string? ParseDeclaredType()
+    {
+        if (_lexer.Current.Kind is TokenKind.Comma or TokenKind.RightParen)
+            return null;
+        if (_lexer.Current.Kind == TokenKind.Identifier && IsColumnConstraintKeyword(_lexer.Current.Text))
+            return null;
+
+        var startOffset = _lexer.Current.Offset;
+        var depth = 0;
+        while (_lexer.Current.Kind != TokenKind.End)
+        {
+            if (depth == 0)
+            {
+                if (_lexer.Current.Kind is TokenKind.Comma or TokenKind.RightParen)
+                    break;
+                if (_lexer.Current.Kind == TokenKind.Identifier && IsColumnConstraintKeyword(_lexer.Current.Text))
+                    break;
+            }
+
+            if (_lexer.Current.Kind == TokenKind.LeftParen)
+                depth++;
+            else if (_lexer.Current.Kind == TokenKind.RightParen)
+                depth--;
+            _lexer.Next();
+        }
+
+        return _sql[startOffset.._lexer.Current.Offset].Trim();
+    }
+
+    private (Expression Expression, string Sql) ParseParenthesizedSchemaExpression(string constraint)
+    {
+        Expect(TokenKind.LeftParen);
+        var startOffset = _lexer.Current.Offset;
+        var expression = ParseExpression();
+        var endOffset = _lexer.Current.Offset;
+        Expect(TokenKind.RightParen);
+        var sql = _sql[startOffset..endOffset].Trim();
+        if (sql.Length == 0)
+            throw Error($"{constraint} constraint requires an expression.");
+        return (expression, sql);
+    }
+
+    private InsertConflictAlgorithm? ParseConflictClause()
+    {
+        if (!ConsumeKeyword("ON"))
+            return null;
+
+        ExpectKeyword("CONFLICT");
+        if (ConsumeKeyword("ROLLBACK"))
+            return InsertConflictAlgorithm.Rollback;
+        if (ConsumeKeyword("ABORT"))
+            return InsertConflictAlgorithm.Abort;
+        if (ConsumeKeyword("FAIL"))
+            return InsertConflictAlgorithm.Fail;
+        if (ConsumeKeyword("IGNORE"))
+            return InsertConflictAlgorithm.Ignore;
+        if (ConsumeKeyword("REPLACE"))
+            return InsertConflictAlgorithm.Replace;
+
+        throw Error("Expected ROLLBACK, ABORT, FAIL, IGNORE, or REPLACE after ON CONFLICT.");
     }
 
     // Parses the "(expr) [STORED|VIRTUAL]" body shared by GENERATED ALWAYS AS and the bare
@@ -19912,9 +20654,39 @@ internal sealed class SqlParser
             || keyword.Equals("FOREIGN", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("GENERATED", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("NOT", StringComparison.OrdinalIgnoreCase)
+            || keyword.Equals("NULL", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("PRIMARY", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("REFERENCES", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("UNIQUE", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryGetLiteralDefault(Expression expression, out SqlValue value)
+    {
+        if (expression is LiteralExpression literal)
+        {
+            value = literal.Value;
+            return true;
+        }
+
+        if (expression is BinaryExpression
+            {
+                Left: LiteralExpression { Value.Kind: SqlValueKind.Integer } zero,
+                Operator: BinaryOperator.Subtract,
+                Right: LiteralExpression right,
+            }
+            && zero.Value.AsInteger() == 0)
+        {
+            value = right.Value.Kind switch
+            {
+                SqlValueKind.Integer => SqlValue.Integer(-right.Value.AsInteger()),
+                SqlValueKind.Real => SqlValue.Real(-right.Value.AsReal()),
+                _ => default,
+            };
+            return right.Value.Kind is SqlValueKind.Integer or SqlValueKind.Real;
+        }
+
+        value = default;
+        return false;
     }
 
     private void SkipColumnDefinitionRemainder()

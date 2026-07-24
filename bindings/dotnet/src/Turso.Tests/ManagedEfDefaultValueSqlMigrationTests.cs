@@ -7,7 +7,7 @@ namespace Turso.Tests;
 public class ManagedEfDefaultValueSqlMigrationTests
 {
     [Test]
-    public async Task EnsureCreatedRejectsDefaultValueSqlBeforeSchemaMutation()
+    public async Task EnsureCreatedPersistsDefaultValueSql()
     {
         await using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         await connection.OpenAsync();
@@ -17,15 +17,13 @@ public class ManagedEfDefaultValueSqlMigrationTests
             .Options;
         await using var context = new DefaultValueSqlContext(options);
 
-        var ensureCreated = async () => await context.Database.EnsureCreatedAsync();
-
-        await ensureCreated.Should().ThrowAsync<NotSupportedException>()
-            .WithMessage("*default SQL expressions*");
+        (await context.Database.EnsureCreatedAsync()).Should().BeTrue();
 
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM \"sqlite_master\" WHERE \"type\" = 'table';";
+        command.CommandText = "SELECT \"sql\" FROM \"sqlite_master\" WHERE \"name\" = 'Items';";
 
-        (await command.ExecuteScalarAsync()).Should().Be(0L);
+        (await command.ExecuteScalarAsync()).Should().BeOfType<string>()
+            .Which.Should().Contain("DEFAULT (CURRENT_TIMESTAMP)");
     }
 
     private sealed class DefaultValueSqlContext(DbContextOptions<DefaultValueSqlContext> options) : DbContext(options)
