@@ -42,8 +42,21 @@ internal static class ManagedConnectionPool
             }
 
             evictedPool?.Clear();
-            if (pool.TryRent(out var database))
-                return new ManagedConnectionPoolLease(pool, database ?? factory());
+            if (!pool.TryRent(out var database))
+                continue;
+            if (database is null)
+                return new ManagedConnectionPoolLease(pool, factory());
+
+            try
+            {
+                database.Connection.ResetForPooling();
+                return new ManagedConnectionPoolLease(pool, database);
+            }
+            catch
+            {
+                database.Dispose();
+                throw;
+            }
         }
     }
 

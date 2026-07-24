@@ -66,6 +66,34 @@ public sealed class ManagedConnectionPoolingTests
     }
 
     [Test]
+    public void PooledHandleRefreshesCatalogAfterAnotherPhysicalHandleCommits()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using var writer = Open(path);
+            using var stale = Open(path);
+            var stalePhysical = stale.ManagedConnection;
+
+            stale.Close();
+            writer.ExecuteNonQuery("CREATE TABLE data(value INTEGER); INSERT INTO data VALUES (1);");
+            writer.Close();
+
+            using var current = Open(path);
+            current.ExecuteScalar<long>("SELECT value FROM data;").Should().Be(1);
+            stale.Open();
+            stale.ManagedConnection.Should().BeSameAs(stalePhysical);
+            stale.ExecuteScalar<long>("SELECT value FROM data;").Should().Be(1);
+            stale.ExecuteNonQuery("INSERT INTO data VALUES (2);");
+            stale.ExecuteScalar<long>("SELECT COUNT(*) FROM data;").Should().Be(2);
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void ClearPoolInvalidatesIdleAndRentedGenerations()
     {
         var path = CreateDatabasePath();
@@ -325,6 +353,159 @@ public sealed class ManagedConnectionPoolingTests
     }
 
     [Test]
+    public void RelativePoolKeyIsRetainedForOpenAndClear()
+    {
+        var firstDirectory = CreateDatabaseDirectory();
+        var secondDirectory = CreateDatabaseDirectory();
+        var originalDirectory = Directory.GetCurrentDirectory();
+        var relativePath = $"relative-{Guid.NewGuid():N}.db";
+        var firstPath = Path.Combine(firstDirectory, relativePath);
+        var secondPath = Path.Combine(secondDirectory, relativePath);
+        try
+        {
+            Directory.SetCurrentDirectory(firstDirectory);
+            using var connection = new TursoConnection(
+                $"Data Source={relativePath};Pooling=True;Local Provider=Managed");
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE first_database(value INTEGER);");
+            connection.Close();
+
+            Directory.SetCurrentDirectory(secondDirectory);
+            TursoConnection.ClearPool(connection);
+            DeleteDatabase(firstPath);
+
+            Directory.SetCurrentDirectory(firstDirectory);
+            connection.Open();
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText =
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'first_database';";
+                command.ExecuteScalar().Should().Be(0L);
+            }
+            connection.Close();
+
+            Directory.SetCurrentDirectory(secondDirectory);
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE second_database(value INTEGER);");
+            connection.Close();
+
+            File.Exists(secondPath).Should().BeTrue();
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(originalDirectory);
+            DeleteDatabase(firstPath);
+            DeleteDatabase(secondPath);
+            Directory.Delete(firstDirectory, recursive: true);
+            Directory.Delete(secondDirectory, recursive: true);
+        }
+    }
+
+    [TestCase("COMMIT")]
+    [TestCase("ROLLBACK")]
+    [TestCase("-- transaction completion\nCOMMIT")]
+    [TestCase("/* transaction completion */ ROLLBACK")]
+    public void RawTransactionControlUnregistersTrackedTransactions(string sql)
+    {
+        var sqlitePath = CreateDatabasePath();
+        var tursoPath = CreateDatabasePath();
+        try
+        {
+            using (var connection = Open(sqlitePath))
+            {
+                using var transaction = connection.BeginTransaction();
+                connection.ExecuteNonQuery(sql);
+                transaction.Connection.Should().BeNull();
+
+                using var subsequent = connection.BeginTransaction();
+                subsequent.Rollback();
+                connection.Close();
+            }
+
+            using (var connection = new TursoConnection(
+                       $"Data Source={tursoPath};Pooling=True;Local Provider=Managed"))
+            {
+                connection.Open();
+                using var transaction = connection.BeginTransaction();
+                connection.ExecuteNonQuery(sql);
+                transaction.Connection.Should().BeNull();
+
+                using var subsequent = connection.BeginTransaction();
+                subsequent.Rollback();
+                connection.Close();
+            }
+        }
+        finally
+        {
+            DeleteDatabase(sqlitePath);
+            DeleteDatabase(tursoPath);
+        }
+    }
+
+    [Test]
+    public void RollbackToSavepointKeepsTrackedTransactionsRegistered()
+    {
+        var sqlitePath = CreateDatabasePath();
+        var tursoPath = CreateDatabasePath();
+        try
+        {
+            using (var connection = Open(sqlitePath))
+            {
+                using var transaction = connection.BeginTransaction();
+                transaction.Save("point");
+                connection.ExecuteNonQuery("ROLLBACK TRANSACTION TO SAVEPOINT point;");
+                transaction.Connection.Should().BeSameAs(connection);
+                transaction.Rollback();
+            }
+
+            using (var connection = new TursoConnection(
+                       $"Data Source={tursoPath};Pooling=True;Local Provider=Managed"))
+            {
+                connection.Open();
+                using var transaction = connection.BeginTransaction();
+                connection.ExecuteNonQuery("SAVEPOINT point;");
+                connection.ExecuteNonQuery("ROLLBACK TRANSACTION TO SAVEPOINT point;");
+                transaction.Connection.Should().BeSameAs(connection);
+                transaction.Rollback();
+            }
+        }
+        finally
+        {
+            DeleteDatabase(sqlitePath);
+            DeleteDatabase(tursoPath);
+        }
+    }
+
+    [Test]
+    public void ReaderSnapshotsTransactionCompletionBeforeCommandMutation()
+    {
+        using var connection = new TursoConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+
+        using (var transaction = connection.BeginTransaction())
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "COMMIT;";
+            using var reader = command.ExecuteReader();
+            command.CommandText = "SELECT 1;";
+            reader.Read().Should().BeFalse();
+            transaction.Connection.Should().BeNull();
+        }
+
+        using (var transaction = connection.BeginTransaction())
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT 1;";
+            using var reader = command.ExecuteReader();
+            command.CommandText = "COMMIT;";
+            reader.Read().Should().BeTrue();
+            reader.Read().Should().BeFalse();
+            transaction.Connection.Should().BeSameAs(connection);
+            transaction.Rollback();
+        }
+    }
+
+    [Test]
     public void SqliteFacadePoolsEligibleFilesByDefault()
     {
         new SqliteConnectionStringBuilder().Pooling.Should().BeTrue();
@@ -373,6 +554,16 @@ public sealed class ManagedConnectionPoolingTests
         var directory = Path.Combine(AppContext.BaseDirectory, "managed-pooling-tests");
         Directory.CreateDirectory(directory);
         return Path.Combine(directory, $"pool-{Guid.NewGuid():N}.db");
+    }
+
+    private static string CreateDatabaseDirectory()
+    {
+        var directory = Path.Combine(
+            AppContext.BaseDirectory,
+            "managed-pooling-tests",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        return directory;
     }
 
     private static void DeleteDatabase(string path)

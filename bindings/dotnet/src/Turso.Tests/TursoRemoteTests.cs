@@ -260,6 +260,233 @@ public class TursoRemoteTests
     }
 
     [Test]
+    public void TestRemoteCloseUnregistersTrackedTransactionBeforeReopen()
+    {
+        const string beginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+        const string closeTransactionResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                },
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+        const string reopenedBeginResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(
+            beginResponseJson,
+            closeTransactionResponseJson,
+            reopenedBeginResponseJson,
+            closeTransactionResponseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        using var first = connection.BeginTransaction();
+
+        connection.Close();
+        first.Connection.Should().BeNull();
+        connection.Open();
+
+        using var second = connection.BeginTransaction();
+        connection.Close();
+        second.Connection.Should().BeNull();
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void TestRemoteRawTransactionCompletionClosesStatelessSessionAndAllowsNextTransaction(
+        bool useBatch)
+    {
+        const string firstBeginResponseJson = """
+            {
+              "baton": "stream.1",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [],
+                    "rows": [],
+                    "affected_row_count": 0,
+                    "last_insert_rowid": null
+                  }
+                }
+              }]
+            }
+            """;
+        const string commitResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [],
+                    "rows": [],
+                    "affected_row_count": 0,
+                    "last_insert_rowid": null
+                  }
+                }
+              }]
+            }
+            """;
+        const string batchCommitResponseJson = """
+            {
+              "baton": "stream.2",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "batch",
+                  "result": {
+                    "step_results": [{
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }],
+                    "step_errors": [null]
+                  }
+                }
+              }]
+            }
+            """;
+        const string closeResponseJson = """
+            {
+              "results": [{
+                "type": "ok",
+                "response": { "type": "close" }
+              }]
+            }
+            """;
+        const string secondBeginResponseJson = """
+            {
+              "baton": "stream.3",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [],
+                    "rows": [],
+                    "affected_row_count": 0,
+                    "last_insert_rowid": null
+                  }
+                }
+              }]
+            }
+            """;
+        const string rollbackAndCloseResponseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [],
+                      "rows": [],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                },
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(
+            firstBeginResponseJson,
+            useBatch ? batchCommitResponseJson : commitResponseJson,
+            closeResponseJson,
+            secondBeginResponseJson,
+            rollbackAndCloseResponseJson);
+        using var connection = new TursoConnection(
+            $"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+        using var first = connection.BeginTransaction();
+
+        if (useBatch)
+        {
+            using var batch = (TursoBatch)connection.CreateBatch();
+            batch.Transaction = first;
+            var commit = (TursoBatchCommand)batch.CreateBatchCommand();
+            commit.CommandText = "COMMIT";
+            batch.BatchCommands.Add(commit);
+            batch.ExecuteNonQuery().Should().Be(0);
+        }
+        else
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = first;
+            command.CommandText = "COMMIT";
+            command.ExecuteNonQuery().Should().Be(0);
+        }
+
+        first.Connection.Should().BeNull();
+        using var second = connection.BeginTransaction();
+        connection.Close();
+        second.Connection.Should().BeNull();
+
+        using var closeDocument = JsonDocument.Parse(server.RequestBodies[2]);
+        closeDocument.RootElement.GetProperty("requests")[0].GetProperty("type")
+            .GetString().Should().Be("close");
+    }
+
+    [Test]
     public void TestRemoteCommandSerializesParametersAndReadsRows()
     {
         const string responseJson = """

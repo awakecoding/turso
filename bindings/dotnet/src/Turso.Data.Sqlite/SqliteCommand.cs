@@ -546,31 +546,10 @@ public class SqliteCommand : DbCommand
     }
 
     private static bool IsTransactionControlCommand(string commandText)
-    {
-        var trimmed = commandText.TrimStart();
-        return IsRollbackCommand(trimmed) || IsCommitCommand(trimmed);
-    }
+        => SqlTransactionControl.GetCompletion(commandText) != SqlTransactionCompletion.None;
 
     private static bool IsRollbackCommand(string commandText)
-    {
-        var tail = GetCommandTail(commandText, "ROLLBACK");
-        return tail is not null
-               && !tail.StartsWith("TO", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsCommitCommand(string commandText)
-        => GetCommandTail(commandText, "COMMIT") is not null;
-
-    private static string? GetCommandTail(string commandText, string command)
-    {
-        var trimmed = commandText.TrimStart();
-        if (!trimmed.StartsWith(command, StringComparison.OrdinalIgnoreCase))
-            return null;
-        if (trimmed.Length > command.Length && char.IsLetterOrDigit(trimmed[command.Length]))
-            return null;
-
-        return trimmed[command.Length..].TrimStart();
-    }
+        => SqlTransactionControl.GetCompletion(commandText) == SqlTransactionCompletion.Rollback;
 
     private static bool IsWriteCommand(string commandText)
         => SplitStatements(commandText).Any(IsWriteStatement);

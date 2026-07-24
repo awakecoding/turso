@@ -82,7 +82,7 @@ public sealed class EmbeddedDatabase : IDisposable
     private readonly Dictionary<(string Name, int Arity), Func<IReadOnlyList<SqlValue>, SqlValue>> _scalarFunctions = new();
     private readonly Dictionary<(string Name, int Arity), ManagedAggregateFunction> _aggregateFunctions = new();
     private readonly Dictionary<string, Func<string, string, int>> _collations = new(StringComparer.OrdinalIgnoreCase);
-    private readonly EmbeddedFileStore? _fileStore;
+    private EmbeddedFileStore? _fileStore;
     private readonly string _databasePath = string.Empty;
     private readonly IFileSystem? _fileSystem;
     private readonly object? _fileCatalogWriteLock;
@@ -732,6 +732,52 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException(
                 "database is busy: the managed file catalog changed since this connection's snapshot; "
                 + "dispose and reopen before retrying the write.");
+        }
+    }
+
+    internal void RefreshFileCatalogForPooling()
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null)
+                return;
+            if (_fileSystem is null || _fileCatalogWriteLock is null)
+                throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+
+            lock (_fileCatalogWriteLock)
+            {
+                using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
+                var durableVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
+                if (durableVersion == _fileCatalogVersion)
+                    return;
+
+                var replacement = EmbeddedFileStore.Open(
+                    _databasePath,
+                    _fileSystem,
+                    out var catalog,
+                    readOnly: _readOnly);
+                try
+                {
+                    var loadedVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
+                    if (loadedVersion != durableVersion)
+                    {
+                        throw new EmbeddedSqlException(
+                            "database is busy: the managed file catalog changed while refreshing a pooled connection.");
+                    }
+
+                    var previous = _fileStore;
+                    _fileStore = replacement;
+                    replacement = null;
+                    PublishCatalog(
+                        new SchemaCatalog(catalog.Tables, catalog.Views, catalog.Triggers),
+                        loadedVersion);
+                    previous.Dispose();
+                }
+                finally
+                {
+                    replacement?.Dispose();
+                }
+            }
         }
     }
 
@@ -16060,6 +16106,7 @@ public sealed class EmbeddedConnection : IDisposable
             attachment.Database.Dispose();
         _attachedDatabases.Clear();
         _nextAttachedDatabaseSequence = 2;
+        _database.RefreshFileCatalogForPooling();
     }
 
     public void RegisterScalarFunction(string name, int arity, Func<IReadOnlyList<SqlValue>, SqlValue> function)

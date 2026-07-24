@@ -14,6 +14,7 @@ public class TursoDataReader : DbDataReader
     private readonly TursoNativeStatement? _nativeStatement;
     private readonly IManagedStatementAdapter? _managedStatement;
     private readonly CommandBehavior _behavior;
+    private readonly bool _completesTransaction;
     private bool _isClosed;
     private bool _hasCurrentRow;
 
@@ -93,6 +94,8 @@ public class TursoDataReader : DbDataReader
         _nativeStatement = nativeStatement;
         _managedStatement = managedStatement;
         _behavior = behavior;
+        _completesTransaction =
+            SqlTransactionControl.GetCompletion(command.CommandText) != SqlTransactionCompletion.None;
         _connection.ReaderOpened(this);
     }
 
@@ -303,6 +306,7 @@ public class TursoDataReader : DbDataReader
         {
         }
 
+        MarkTransactionCompletedExternally();
         _hasCurrentRow = false;
         return false;
     }
@@ -329,6 +333,8 @@ public class TursoDataReader : DbDataReader
     {
         EnsureOpen();
         _hasCurrentRow = Step(cancellationToken);
+        if (!_hasCurrentRow)
+            MarkTransactionCompletedExternally();
         return _hasCurrentRow;
     }
 
@@ -532,5 +538,11 @@ public class TursoDataReader : DbDataReader
             if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
                 _connection.Close();
         }
+    }
+
+    private void MarkTransactionCompletedExternally()
+    {
+        if (_completesTransaction)
+            _connection.TransactionCompletedExternally();
     }
 }

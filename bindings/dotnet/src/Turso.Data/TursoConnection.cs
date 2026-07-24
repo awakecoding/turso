@@ -12,6 +12,7 @@ public class TursoConnection : DbConnection
     private TursoReplicaDatabase? _replicaDatabase;
     private IManagedDatabaseAdapter? _managedDatabase;
     private ManagedConnectionPoolLease? _managedPoolLease;
+    private ManagedConnectionPoolKey? _managedPoolKey;
     private TursoRemoteClient? _remoteClient;
     private TursoConnectionOptions _connectionOptions;
     private TursoEncryptionFileSystem? _managedEncryptionFileSystem;
@@ -34,6 +35,7 @@ public class TursoConnection : DbConnection
                 throw new InvalidOperationException("ConnectionString cannot be set while the connection is open.");
 
             _connectionOptions = TursoConnectionOptions.Parse(value ?? string.Empty);
+            _managedPoolKey = null;
         }
     }
 
@@ -97,8 +99,11 @@ public class TursoConnection : DbConnection
     public static void ClearPool(TursoConnection connection)
     {
         ArgumentNullException.ThrowIfNull(connection);
-        if (connection._connectionOptions.TryGetManagedPoolKey(out var key))
+        if (connection._managedPoolKey is { } key
+            || connection._connectionOptions.TryGetManagedPoolKey(out key))
+        {
             ManagedConnectionPool.Clear(key);
+        }
     }
 
     public override void Close()
@@ -258,6 +263,13 @@ public class TursoConnection : DbConnection
     {
         if (ReferenceEquals(_transaction, transaction))
             _transaction = null;
+    }
+
+    internal void TransactionCompletedExternally()
+    {
+        _remoteTransactionActive = false;
+        _transaction?.MarkCompletedExternally();
+        CloseRemoteSessionIfStateless();
     }
 
     internal async Task<RemoteStatementResult> ExecuteRemoteAsync(
@@ -537,8 +549,9 @@ public class TursoConnection : DbConnection
             var poolKey = ManagedConnectionPoolKey.Create(options.DataSource, options.ReadOnly);
             _managedPoolLease = ManagedConnectionPool.Rent(
                 poolKey,
-                () => OpenUnencryptedManagedDatabase(options.DataSource, options.ReadOnly));
+                () => OpenUnencryptedManagedDatabase(poolKey.DataSource, options.ReadOnly));
             _managedDatabase = _managedPoolLease.Database;
+            _managedPoolKey = poolKey;
         }
         else if (options.Encryption is null && !options.ReadOnly)
         {
@@ -637,6 +650,8 @@ public class TursoConnection : DbConnection
         Exception? closeError = null;
         try
         {
+            CloseOpenReaders();
+            ResetOpenCommands();
             if (_remoteTransactionActive)
             {
                 remoteClient
@@ -660,6 +675,7 @@ public class TursoConnection : DbConnection
             _remoteTransactionActive = false;
             _readUncommitted = false;
             _managedReadOnly = false;
+            _transaction?.Dispose();
         }
 
         if (closeError is not null)

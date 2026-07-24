@@ -326,12 +326,16 @@ public class SqliteFacadeTests
 
         var rolledBack = connection.BeginTransaction();
         connection.ExecuteNonQuery("ROLLBACK;");
-        rolledBack.Rollback();
+        connection.Transaction.Should().BeNull();
+        rolledBack.Connection.Should().BeNull();
         Assert.Throws<InvalidOperationException>(() => rolledBack.Rollback());
+
+        using var subsequent = connection.BeginTransaction();
+        subsequent.Rollback();
     }
 
     [Test]
-    public void ExternalRollbackPreventsUsingAmbientTransaction()
+    public void ExternalRollbackDetachesAmbientTransaction()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
@@ -339,9 +343,14 @@ public class SqliteFacadeTests
         using var transaction = connection.BeginTransaction();
         connection.ExecuteNonQuery("ROLLBACK;");
 
-        Assert.Throws<InvalidOperationException>(() => connection.ExecuteNonQuery("SELECT 1;"))!
+        connection.Transaction.Should().BeNull();
+        transaction.Connection.Should().BeNull();
+        Assert.Throws<InvalidOperationException>(() => transaction.Rollback())!
             .Message.Should().Be(Data.Sqlite.Properties.Resources.TransactionCompleted);
-        transaction.Rollback();
+        connection.ExecuteScalar<long>("SELECT 1;").Should().Be(1);
+
+        using var subsequent = connection.BeginTransaction();
+        subsequent.Rollback();
     }
 
     [Test]

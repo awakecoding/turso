@@ -126,10 +126,7 @@ public class SqliteTransaction : DbTransaction
     internal void MarkCompletedExternally(bool rolledBack)
     {
         if (rolledBack)
-        {
             _externalRollback = true;
-            return;
-        }
 
         Complete();
     }

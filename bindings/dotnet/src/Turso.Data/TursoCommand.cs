@@ -174,17 +174,19 @@ public class TursoCommand : DbCommand
     public override object? ExecuteScalar()
     {
         using var reader = _cancellation.Run(token => Execute(CommandBehavior.Default, token));
-        return reader.Read()
+        var result = reader.Read()
             ? reader.GetValue(0)
             : null;
+        return result;
     }
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
         await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
-        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+        var result = await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
             ? reader.GetValue(0)
             : null;
+        return result;
     }
 
     public override void Prepare()
@@ -429,10 +431,12 @@ public class TursoCommand : DbCommand
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
         var sql = RewriteFacadePragmas(CommandText, _connection);
         var result = await _connection
             .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: true, CommandTimeout, cancellationToken)
             .ConfigureAwait(false);
+        MarkTransactionCompletedExternally(transactionCompletion);
         return new TursoRemoteDataReader(this, result, behavior);
     }
 
@@ -446,11 +450,19 @@ public class TursoCommand : DbCommand
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
         var sql = RewriteFacadePragmas(CommandText, _connection);
         var result = await _connection
             .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: false, CommandTimeout, cancellationToken)
             .ConfigureAwait(false);
+        MarkTransactionCompletedExternally(transactionCompletion);
         return checked((int)result.AffectedRowCount);
+    }
+
+    private void MarkTransactionCompletedExternally(SqlTransactionCompletion completion)
+    {
+        if (completion != SqlTransactionCompletion.None)
+            _connection?.TransactionCompletedExternally();
     }
 
     private void ValidateTransaction()
