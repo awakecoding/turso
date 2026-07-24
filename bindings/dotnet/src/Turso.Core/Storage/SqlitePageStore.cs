@@ -12,8 +12,8 @@ namespace Turso.Core.Storage;
 /// <remarks>
 /// This is the durable-storage foundation only. A single <see cref="WritePage"/>
 /// is one aligned, page-sized write — the atomic unit of the store — but
-/// crash-atomic multi-page transactions require the WAL/rollback-journal layers,
-/// which are intentionally not implemented here.
+/// crash-atomic multi-page transactions require the pager's WAL or rollback
+/// journal layer.
 /// </remarks>
 public sealed class SqlitePageStore : IDisposable
 {
@@ -32,6 +32,8 @@ public sealed class SqlitePageStore : IDisposable
 
     /// <summary>Page size in bytes; fixed for the life of the store.</summary>
     public int PageSize { get; }
+
+    internal string Path { get; private init; } = string.Empty;
 
     /// <summary>Whether the underlying file was opened read-only.</summary>
     public bool IsReadOnly => _file.IsReadOnly;
@@ -146,7 +148,7 @@ public sealed class SqlitePageStore : IDisposable
 
             ValidateFileLayout(length, header, allowTrailingPages);
 
-            return new SqlitePageStore(file, header, pageEncryption);
+            return new SqlitePageStore(file, header, pageEncryption) { Path = path };
         }
         catch
         {
@@ -206,7 +208,7 @@ public sealed class SqlitePageStore : IDisposable
             file.Write(0, pageEncryption is null ? firstPage : pageEncryption.EncryptPage(firstPage, 1));
             file.SetLength(pageSize);
             file.FlushToDisk();
-            return new SqlitePageStore(file, effectiveHeader, pageEncryption);
+            return new SqlitePageStore(file, effectiveHeader, pageEncryption) { Path = path };
         }
         catch
         {
@@ -289,6 +291,60 @@ public sealed class SqlitePageStore : IDisposable
         var page = new byte[PageSize];
         ReadPage(pageNumber, page);
         return page;
+    }
+
+    internal byte[] ReadRawPage(uint pageNumber)
+    {
+        ThrowIfDisposed();
+        var count = PageCount;
+        if (pageNumber < 1 || pageNumber > count)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(pageNumber),
+                pageNumber,
+                $"Page number is out of range for a database of {count} page(s).");
+        }
+
+        var page = new byte[PageSize];
+        var read = _file.Read(PageOffset(pageNumber), page);
+        if (read != PageSize)
+            throw new InvalidDataException($"Short raw read on page {pageNumber}: expected {PageSize} bytes, got {read}.");
+        return page;
+    }
+
+    internal void RefreshHeader()
+    {
+        ThrowIfDisposed();
+        var firstPage = ReadPage(1);
+        var header = SqliteDatabaseHeader.Parse(firstPage);
+        if (header.PageSize != PageSize)
+            throw new InvalidDataException("SQLite database page size changed; dispose and reopen this pager.");
+        _header = header;
+        ValidateFileLayout(_file.Length, header, allowTrailingPages: false);
+    }
+
+    internal void ReplaceRawContent(IFile source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+
+        var sourceLength = source.Length;
+        var buffer = new byte[64 * 1024];
+        _file.SetLength(0);
+        var offset = 0L;
+        while (offset < sourceLength)
+        {
+            var count = checked((int)Math.Min(buffer.Length, sourceLength - offset));
+            var read = source.Read(offset, buffer.AsSpan(0, count));
+            if (read != count)
+                throw new InvalidDataException("Replacement SQLite database file was truncated while being copied.");
+            _file.Write(offset, buffer.AsSpan(0, count));
+            offset += count;
+        }
+
+        _file.SetLength(sourceLength);
+        _file.FlushToDisk();
     }
 
     /// <summary>

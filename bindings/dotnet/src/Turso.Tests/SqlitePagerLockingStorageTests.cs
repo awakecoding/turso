@@ -75,6 +75,61 @@ public class SqlitePagerLockingStorageTests
     }
 
     [Test]
+    public void TransactionRetriesWithExclusiveLeaseWhenModeChangesDuringLockAcquisition()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        var locks = new SqlitePagerLockManager();
+        using var pager = CreatePager(fileSystem, locks);
+        var reader = pager.BeginReadTransaction();
+        var transition = Task.Run(
+            () => pager.SwitchJournalMode(SqliteJournalMode.Delete, TimeSpan.FromSeconds(5)));
+        SpinWait.SpinUntil(
+                () => locks.WaitingCheckpointCount == 1,
+                TimeSpan.FromSeconds(2))
+            .Should()
+            .BeTrue("the mode transition must be waiting for the read snapshot");
+
+        SqlitePagerTransaction? transaction = null;
+        Exception? transactionFailure = null;
+        var transactionThread = new Thread(() =>
+        {
+            try
+            {
+                transaction = pager.BeginTransaction(
+                    targetDatabaseSizeInPages: 1,
+                    busyTimeout: TimeSpan.FromSeconds(5));
+            }
+            catch (Exception exception)
+            {
+                transactionFailure = exception;
+            }
+        });
+        transactionThread.Start();
+        SpinWait.SpinUntil(
+                () => transactionThread.ThreadState.HasFlag(System.Threading.ThreadState.WaitSleepJoin),
+                TimeSpan.FromSeconds(2))
+            .Should()
+            .BeTrue("the transaction must select and wait for the WAL writer lease");
+
+        try
+        {
+            reader.Dispose();
+            transition.GetAwaiter().GetResult().Should().Be(SqliteJournalMode.Delete);
+            transactionThread.Join(TimeSpan.FromSeconds(2)).Should().BeTrue();
+            transactionFailure.Should().BeNull();
+            transaction.Should().NotBeNull();
+            locks.State.Should().Be(SqlitePagerLockState.Checkpoint);
+            Assert.Throws<SqlitePagerBusyException>(() => pager.BeginReadTransaction());
+        }
+        finally
+        {
+            reader.Dispose();
+            transaction?.Dispose();
+            transactionThread.Join(TimeSpan.FromSeconds(2));
+        }
+    }
+
+    [Test]
     public void CheckpointFaultReleasesExclusiveLockForLaterOperations()
     {
         var faults = new DeterministicFaultInjector();
@@ -173,12 +228,19 @@ public class SqlitePagerLockingStorageTests
             {
             }
 
-            Assert.Throws<FileNotFoundException>(() => SqlitePager.Open(
+            using (var invalidWal = PhysicalFileSystem.Instance.OpenFile(walPath, FileOpenMode.CreateNew))
+            {
+                invalidWal.Write(0, [0x01]);
+                invalidWal.FlushToDisk();
+            }
+
+            Assert.Throws<InvalidDataException>(() => SqlitePager.Open(
                 PhysicalFileSystem.Instance,
                 databasePath,
                 walPath,
                 busyTimeout: TimeSpan.Zero));
 
+            PhysicalFileSystem.Instance.DeleteFile(walPath);
             using (SqliteWalFile.Create(PhysicalFileSystem.Instance, walPath, header))
             {
             }

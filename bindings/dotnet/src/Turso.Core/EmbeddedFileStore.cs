@@ -38,12 +38,12 @@ internal sealed class EmbeddedFileStore : IDisposable
     private readonly IFileSystem _fileSystem;
     private readonly string _databasePath;
     private readonly string _walPath;
-    private readonly int _pageSize;
-    private readonly int _usableSpace;
+    private int _pageSize;
+    private int _usableSpace;
     private SqliteDatabaseHeader _header;
-    private readonly SqliteTextEncoding _textEncoding;
+    private SqliteTextEncoding _textEncoding;
 
-    private readonly SqlitePager _pager;
+    private SqlitePager _pager;
     private Dictionary<string, uint> _tableRootPages = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, uint> _indexRootPages = new(StringComparer.OrdinalIgnoreCase);
     private string _lastSchemaSignature = string.Empty;
@@ -73,7 +73,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         IFileSystem fileSystem,
         out EmbeddedFileCatalog catalog,
         TursoEncryptionOptions? encryption = null,
-        bool readOnly = false)
+        bool readOnly = false,
+        int? initialPageSize = null,
+        SqliteTextEncoding? initialTextEncoding = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(fileSystem);
@@ -81,6 +83,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         var walPath = path + "-wal";
         var databaseExists = fileSystem.FileExists(path);
         var walExists = fileSystem.FileExists(walPath);
+        if (initialPageSize is { } requestedPageSize)
+            _ = SqlitePageSize.Encode(requestedPageSize);
 
         SqlitePager pager;
         if (!databaseExists && !walExists)
@@ -91,28 +95,30 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"Cannot open managed database '{path}' read-only because neither its database file nor write-ahead log exists.");
             }
 
-            var header = SqliteDatabaseHeader.CreateDefault();
+            var header = SqliteDatabaseHeader.CreateDefault() with
+            {
+                PageSize = initialPageSize ?? SqlitePageSize.Default,
+                TextEncoding = initialTextEncoding ?? SqliteTextEncoding.Utf8,
+            };
             var walHeader = SqliteWalHeader.Create(
                 header.PageSize,
                 unchecked((uint)Random.Shared.Next()),
                 unchecked((uint)Random.Shared.Next()));
             pager = SqlitePager.Create(fileSystem, path, walPath, walHeader, header, encryption: encryption);
         }
-        else if (databaseExists && walExists)
+        else if (databaseExists)
         {
+            if (initialPageSize is not null || initialTextEncoding is not null)
+            {
+                throw new InvalidOperationException(
+                    "Initial page size and text encoding can be specified only when creating a database.");
+            }
             pager = SqlitePager.Open(fileSystem, path, walPath, readOnly, encryption: encryption);
         }
         else
         {
-            if (readOnly)
-            {
-                throw new EmbeddedSqlException(
-                    $"Cannot open managed database '{path}' read-only because its database file and write-ahead log must both exist. "
-                    + "Creating or recovering the missing companion file would mutate storage.");
-            }
-
             throw new EmbeddedSqlException(
-                $"The managed file database '{path}' is missing its companion write-ahead log; the managed file engine only reopens databases it created.");
+                $"The managed file database '{path}' is missing its main database file.");
         }
 
         try
@@ -1034,15 +1040,113 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// <summary>
     /// Rebuilds the current managed catalog into the smallest complete page image
     /// the managed writer can represent, then checkpoints and physically removes
-    /// its retired suffix. It is intentionally not wired to SQL <c>VACUUM</c>:
-    /// this limited writer has not implemented VACUUM's full SQL and transaction
-    /// semantics.
+    /// its retired suffix.
     /// </summary>
     internal void Compact()
     {
         ThrowIfDisposed();
         var catalog = Load();
         PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true);
+    }
+
+    internal SqliteJournalMode JournalMode => _pager.JournalMode;
+
+    internal SqliteJournalMode SwitchJournalMode(SqliteJournalMode journalMode)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        var result = _pager.SwitchJournalMode(journalMode);
+        _header = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
+        return result;
+    }
+
+    internal void MigratePageSize(
+        int pageSize,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        _ = SqlitePageSize.Encode(pageSize);
+        if (pageSize == _pageSize)
+            return;
+        if (_pager.JournalMode != SqliteJournalMode.Delete)
+        {
+            throw new EmbeddedSqlException(
+                "cannot change page size while in WAL mode; set PRAGMA journal_mode=DELETE first");
+        }
+
+        var temporaryPath = _databasePath + $".page-size-{Guid.NewGuid():N}.tmp";
+        var temporaryWalPath = temporaryPath + "-wal";
+        var temporaryJournalPath = temporaryPath + "-journal";
+        try
+        {
+            using (var replacement = Open(
+                       temporaryPath,
+                       _fileSystem,
+                       out _,
+                       initialPageSize: pageSize,
+                       initialTextEncoding: _textEncoding))
+            {
+                replacement.Persist(tables, views, triggers);
+                replacement.SwitchJournalMode(SqliteJournalMode.Delete);
+                replacement.RewriteMigrationHeader(_header);
+            }
+
+            _pager.ReplaceDatabaseFile(temporaryPath);
+            _pager.Dispose();
+            _pager = SqlitePager.Open(_fileSystem, _databasePath, _walPath);
+            _header = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
+            _pageSize = _header.PageSize;
+            _usableSpace = _header.UsableSpace;
+            _textEncoding = _header.TextEncoding == SqliteTextEncoding.Unset
+                ? SqliteTextEncoding.Utf8
+                : _header.TextEncoding;
+            _ = Load();
+        }
+        finally
+        {
+            TryDeleteArtifact(temporaryJournalPath);
+            TryDeleteArtifact(temporaryWalPath);
+            TryDeleteArtifact(temporaryPath);
+        }
+    }
+
+    private void RewriteMigrationHeader(SqliteDatabaseHeader sourceHeader)
+    {
+        var pageOne = _pager.ReadCommittedPage(SchemaRootPage);
+        var current = SqliteDatabaseHeader.Parse(pageOne);
+        var changeCounter = unchecked(sourceHeader.ChangeCounter + 1);
+        var migrated = current with
+        {
+            ChangeCounter = changeCounter,
+            VersionValidFor = changeCounter,
+            DatabaseSizeInPages = _pager.CommittedPageCount,
+            SchemaCookie = sourceHeader.SchemaCookie,
+            DefaultPageCacheSize = sourceHeader.DefaultPageCacheSize,
+            TextEncoding = sourceHeader.TextEncoding,
+            UserVersion = sourceHeader.UserVersion,
+            ApplicationId = sourceHeader.ApplicationId,
+            SqliteVersion = sourceHeader.SqliteVersion,
+        };
+        migrated.WriteTo(pageOne);
+        using var transaction = _pager.BeginTransaction(_pager.CommittedPageCount);
+        transaction.WritePage(SchemaRootPage, pageOne);
+        transaction.Commit();
+        _header = migrated;
+    }
+
+    private void TryDeleteArtifact(string path)
+    {
+        try
+        {
+            _fileSystem.DeleteFile(path);
+        }
+        catch
+        {
+            // Migration is already committed; stale temporary artifacts are non-authoritative.
+        }
     }
 
     private void PersistCore(
