@@ -22,18 +22,14 @@ public sealed record CompoundTerm(VdbeProgram Program, IReadOnlyList<VdbeCursorS
 /// <see cref="VdbeProgram"/>, lowering compound SELECT execution — <c>UNION ALL</c>,
 /// <c>UNION</c>/<c>DISTINCT</c>, <c>INTERSECT</c>, and <c>EXCEPT</c> — onto the resumable state machine
 /// rather than a tree-walking evaluator or an AST-only wrapper. <c>UNION</c> variants run each term to
-/// exhaustion in order, emitting its rows, then fall through to the next; the set operations build every
-/// non-primary term into a probe set first, then stream the primary term, emitting only the rows that
-/// satisfy the operation's membership condition.
+/// exhaustion in order, emitting its rows, then fall through to the next; set operations run every term
+/// in source order into row sets, then iterate the first set against the remaining membership sets.
 /// </summary>
 /// <remarks>
 /// The builder owns only the mechanical splice: it relocates each term's registers, cursors, sorters,
 /// accumulators, distinct sets, parameter slots, and jump targets into disjoint ranges, drops every
 /// non-final term's trailing <c>Halt</c> so control falls through to the next term, concatenates the
-/// terms' cursor sources, and validates that every term projects the same number of result columns. It
-/// re-uses the full existing opcode set unchanged for <c>UNION ALL</c>; the only compound-specific
-/// primitive is <see cref="DistinctResultRowInstruction"/>, which <see cref="BuildUnionDistinct"/>
-/// substitutes for each term's <c>ResultRow</c> against one shared distinct set.
+/// terms' cursor sources, and validates that every term projects the same number of result columns.
 /// <para>
 /// Row-value semantics stay with the caller, exactly as the scan, join, sorted-scan, and aggregate
 /// builders delegate theirs: <c>UNION</c>/<c>DISTINCT</c> de-duplication is driven by a caller-supplied
@@ -43,10 +39,8 @@ public sealed record CompoundTerm(VdbeProgram Program, IReadOnlyList<VdbeCursorS
 /// <para>
 /// <c>UNION ALL</c> preserves any de-duplication a term already performs internally (its
 /// <c>DistinctResultRow</c> opcodes and distinct sets are relocated intact), so a distinct sub-query can
-/// appear as a <c>UNION ALL</c> term. <see cref="BuildUnionDistinct"/> layers one outer distinct set over
-/// terms that do not already de-duplicate; because same-operator <c>UNION</c> chains are associative and
-/// idempotent, a router should flatten them into a single <see cref="BuildUnionDistinct"/> call over all
-/// terms rather than nesting distinct compounds.
+/// appear as a <c>UNION ALL</c> term. <see cref="BuildUnionDistinct"/> appends its outer distinct guard
+/// after each term's existing output guards, retaining nested de-duplication and membership semantics.
 /// </para>
 /// </remarks>
 public static class CompoundProgramBuilder
@@ -63,9 +57,7 @@ public static class CompoundProgramBuilder
     /// Sequences <paramref name="terms"/> with <c>UNION</c>/<c>DISTINCT</c> semantics: each distinct row
     /// is emitted once, at its first occurrence across all terms, in arrival order.
     /// De-duplication uses <paramref name="rowEquality"/>, so the caller owns the exact row-equality
-    /// contract. Requires at least two terms, all projecting the same number of columns, and none of
-    /// which already de-duplicates internally (flatten same-operator chains into one call instead of
-    /// nesting distinct compounds).
+    /// contract. Requires at least two terms, all projecting the same number of columns.
     /// </summary>
     public static CompoundTerm BuildUnionDistinct(IReadOnlyList<CompoundTerm> terms, VdbeRowEquality rowEquality)
     {
@@ -78,8 +70,7 @@ public static class CompoundProgramBuilder
     /// in <em>every</em> term is emitted once, in the first-term first-occurrence order the primary term's
     /// cursors supply. Membership and de-duplication use <paramref name="rowEquality"/>, so the caller owns
     /// the exact row-equality contract. Requires at least two terms, all projecting the same number of
-    /// columns, and none of which already uses row sets internally (flatten same-operator chains into one
-    /// call instead of nesting set-operation compounds).
+    /// columns.
     /// </summary>
     public static CompoundTerm BuildIntersect(IReadOnlyList<CompoundTerm> terms, VdbeRowEquality rowEquality)
     {
@@ -93,8 +84,7 @@ public static class CompoundProgramBuilder
     /// their union — <c>A EXCEPT B EXCEPT C</c> is <c>A</c> minus <c>(B ∪ C)</c>) is emitted once, in the
     /// first-term first-occurrence order the primary term's cursors supply. Membership and de-duplication
     /// use <paramref name="rowEquality"/>, so the caller owns the exact row-equality contract. Requires at
-    /// least two terms, all projecting the same number of columns, and none of which already uses row sets
-    /// internally.
+    /// least two terms, all projecting the same number of columns.
     /// </summary>
     public static CompoundTerm BuildExcept(IReadOnlyList<CompoundTerm> terms, VdbeRowEquality rowEquality)
     {
@@ -120,13 +110,6 @@ public static class CompoundProgramBuilder
             {
                 throw new ArgumentException(
                     $"Compound term {i} supplies {term.CursorSources.Count} cursor sources for a {term.Program.CursorCount}-cursor program.",
-                    nameof(terms));
-            }
-
-            if (distinctEquality is not null && term.Program.DistinctSetCount != 0)
-            {
-                throw new ArgumentException(
-                    $"Compound term {i} already de-duplicates internally; flatten same-operator UNION chains into one BuildUnionDistinct call instead of nesting distinct compounds.",
                     nameof(terms));
             }
 
@@ -221,12 +204,10 @@ public static class CompoundProgramBuilder
         return new CompoundTerm(combined, cursorSources);
     }
 
-    // Lowers a homogeneous INTERSECT or EXCEPT chain. Every non-primary term is emitted first, each
-    // materialized into its own probe set by rewriting its ResultRow into RowSetInsert; the primary
-    // term (term 0) is emitted last, its ResultRow rewritten into a CompoundResultRow that tests each
-    // streamed row against the fully built probe sets and de-duplicates its output. Because the primary
-    // term runs last and unchanged apart from the emit rewrite, the output preserves first-term
-    // first-occurrence order exactly as the primary term's cursors supply it.
+    // Lowers a homogeneous INTERSECT or EXCEPT chain without reordering its inputs. Every term runs in
+    // SQL source order and captures its result into a distinct row set. Once all terms have completed,
+    // the program rewinds the first term's set and emits rows that satisfy membership against the
+    // remaining sets. This preserves both left-to-right callback/error order and first-term result order.
     private static CompoundTerm BuildSetOperation(
         IReadOnlyList<CompoundTerm> terms,
         VdbeRowEquality rowEquality,
@@ -251,13 +232,6 @@ public static class CompoundProgramBuilder
                     nameof(terms));
             }
 
-            if (term.Program.DistinctSetCount != 0)
-            {
-                throw new ArgumentException(
-                    $"Compound term {i} already uses row sets internally; flatten same-operator INTERSECT/EXCEPT chains into one call instead of nesting set-operation compounds.",
-                    nameof(terms));
-            }
-
             var termColumns = ResultColumnCount(term.Program, i);
             if (columnCount < 0)
                 columnCount = termColumns;
@@ -269,99 +243,101 @@ public static class CompoundProgramBuilder
             }
         }
 
-        // Emit the non-primary terms (indices 1..n-1) first, then the primary term (index 0) last, so the
-        // primary can test membership against fully built probe sets while streaming in its own order.
-        var emissionOrder = new int[count];
-        for (var slot = 0; slot < count - 1; slot++)
-            emissionOrder[slot] = slot + 1;
-        emissionOrder[count - 1] = 0;
-
-        // Registers, cursors, sorters, accumulators, and jump targets are internal to the combined program,
-        // so their bases are indexed by emission slot to land in disjoint ranges in emission order. Terms
-        // carry no row sets of their own (validated above).
+        // Each term retains its own resources, including nested row sets, in source order.
         var registerBase = new int[count];
         var cursorBase = new int[count];
         var sorterBase = new int[count];
         var accumulatorBase = new int[count];
+        var distinctBase = new int[count];
         var instructionBase = new int[count];
+        var parameterSlotBase = new int[count];
 
         var totalRegisters = 0;
         var totalCursors = 0;
         var totalSorters = 0;
         var totalAccumulators = 0;
+        var totalDistinctSets = 0;
         var totalInstructions = 0;
-        for (var slot = 0; slot < count; slot++)
+        var totalParameterSlots = 0;
+        for (var termIndex = 0; termIndex < count; termIndex++)
         {
-            var program = terms[emissionOrder[slot]].Program;
-            registerBase[slot] = totalRegisters;
-            cursorBase[slot] = totalCursors;
-            sorterBase[slot] = totalSorters;
-            accumulatorBase[slot] = totalAccumulators;
-            instructionBase[slot] = totalInstructions;
+            var program = terms[termIndex].Program;
+            registerBase[termIndex] = totalRegisters;
+            cursorBase[termIndex] = totalCursors;
+            sorterBase[termIndex] = totalSorters;
+            accumulatorBase[termIndex] = totalAccumulators;
+            distinctBase[termIndex] = totalDistinctSets;
+            instructionBase[termIndex] = totalInstructions;
+            parameterSlotBase[termIndex] = totalParameterSlots;
 
             totalRegisters += program.RegisterCount;
             totalCursors += program.CursorCount;
             totalSorters += program.SorterCount;
             totalAccumulators += program.AccumulatorCount;
-            totalInstructions += KeptInstructionCount(program, isLast: slot == count - 1);
+            totalDistinctSets += program.DistinctSetCount;
+            totalInstructions += KeptInstructionCount(program, isLast: false);
+            totalParameterSlots += program.ParameterSlotCount;
         }
 
-        // Parameter slots are the combined program's external binding interface: a caller binds by
-        // input-term order (term 0's slots, then term 1's, …), so their bases must be allocated by term
-        // identity, independent of the emission order that runs the primary term (term 0) last. Indexing by
-        // term index keeps the combined slot space identical to the UNION path (Build lays parameters out
-        // the same way), so input binding [A, B] maps A EXCEPT B to A minus B rather than B minus A.
-        var parameterSlotBaseByTerm = new int[count];
-        var totalParameterSlots = 0;
-        for (var term = 0; term < count; term++)
-        {
-            parameterSlotBaseByTerm[term] = totalParameterSlots;
-            totalParameterSlots += terms[term].Program.ParameterSlotCount;
-        }
+        var captureSets = new int[count];
+        for (var termIndex = 0; termIndex < count; termIndex++)
+            captureSets[termIndex] = totalDistinctSets + termIndex;
+        var outputSet = totalDistinctSets + count;
+        var combinedDistinctSets = outputSet + 1;
 
-        // Row-set layout: each of the n-1 probe sets is owned by its aux emission slot; the primary term's
-        // output de-duplication set follows them.
-        var membershipSets = new int[count - 1];
-        for (var slot = 0; slot < count - 1; slot++)
-            membershipSets[slot] = slot;
-        var outputSet = count - 1;
-        var totalRowSets = count;
-
-        var instructions = new List<VdbeInstruction>(totalInstructions);
+        var output = new RegisterRange(new Register(totalRegisters), columnCount);
+        var rewindAddress = totalInstructions;
+        var resultAddress = rewindAddress + 1;
+        var haltAddress = rewindAddress + 3;
+        var instructions = new List<VdbeInstruction>(haltAddress + 1);
         var cursorSources = new List<VdbeCursorSource>(totalCursors);
-        for (var slot = 0; slot < count; slot++)
+        for (var termIndex = 0; termIndex < count; termIndex++)
         {
-            var term = terms[emissionOrder[slot]];
+            var term = terms[termIndex];
             var program = term.Program;
-            var isPrimary = slot == count - 1;
-            var kept = KeptInstructionCount(program, isLast: isPrimary);
+            var kept = KeptInstructionCount(program, isLast: false);
             for (var j = 0; j < kept; j++)
             {
                 instructions.Add(RelocateSetOperation(
                     program.Instructions[j],
-                    registerBase[slot],
-                    cursorBase[slot],
-                    sorterBase[slot],
-                    accumulatorBase[slot],
-                    instructionBase[slot],
-                    parameterSlotBaseByTerm[emissionOrder[slot]],
+                    registerBase[termIndex],
+                    cursorBase[termIndex],
+                    sorterBase[termIndex],
+                    accumulatorBase[termIndex],
+                    distinctBase[termIndex],
+                    instructionBase[termIndex],
+                    parameterSlotBase[termIndex],
                     rowEquality,
-                    isPrimary,
-                    isPrimary ? outputSet : membershipSets[slot],
-                    membershipSets,
-                    mode));
+                    captureSets[termIndex]));
             }
 
             cursorSources.AddRange(term.CursorSources);
         }
 
+        var membershipSets = captureSets.Skip(1).ToArray();
+        instructions.Add(new RowSetRewindInstruction(
+            captureSets[0],
+            output,
+            new ProgramCounter(haltAddress)));
+        instructions.Add(new CompoundResultRowInstruction(
+            output,
+            rowEquality,
+            outputSet,
+            membershipSets,
+            mode));
+        instructions.Add(new RowSetNextInstruction(
+            captureSets[0],
+            output,
+            new ProgramCounter(resultAddress)));
+        instructions.Add(new HaltInstruction());
+
         var combinedSetOp = new VdbeProgram(
-            totalRegisters,
+            totalRegisters + columnCount,
             totalCursors,
             instructions,
             totalSorters,
             totalAccumulators,
-            totalRowSets,
+            combinedDistinctSets,
             totalParameterSlots);
         return new CompoundTerm(combinedSetOp, cursorSources);
     }
@@ -383,6 +359,7 @@ public static class CompoundProgramBuilder
                 ResultRowInstruction result => (int?)result.Values.Count,
                 DistinctResultRowInstruction distinct => distinct.Values.Count,
                 CompoundResultRowInstruction compound => compound.Values.Count,
+                GuardedRowInstruction { Destination: ResultRowDestination } guarded => guarded.Values.Count,
                 _ => null,
             };
 
@@ -405,11 +382,8 @@ public static class CompoundProgramBuilder
                 nameof(program));
     }
 
-    // Rebuilds one instruction with its register/cursor/sorter/accumulator/distinct-set indices and jump
-    // targets shifted into the term's disjoint range. When a distinct equality is supplied, plain result
-    // rows become distinct result rows against the shared outer set; existing distinct result rows keep
-    // their own equality and have their set index relocated. Set-operation opcodes carried by a nested
-    // sub-term keep their equality and mode and have their row-set indices relocated.
+    // Rebuilds one instruction with its resources shifted into the term's disjoint ranges. An outer
+    // distinct guard is appended after any nested output guards rather than replacing them.
     private static VdbeInstruction Relocate(
         VdbeInstruction instruction,
         int registerBase,
@@ -422,7 +396,15 @@ public static class CompoundProgramBuilder
         VdbeRowEquality? distinctEquality,
         int outerDistinctSet)
     {
-        if (RelocateStructural(instruction, registerBase, cursorBase, sorterBase, accumulatorBase, instructionBase, parameterSlotBase)
+        if (RelocateStructural(
+                instruction,
+                registerBase,
+                cursorBase,
+                sorterBase,
+                accumulatorBase,
+                distinctBase,
+                instructionBase,
+                parameterSlotBase)
             is { } structural)
         {
             return structural;
@@ -433,14 +415,44 @@ public static class CompoundProgramBuilder
 
         return instruction switch
         {
-            DistinctResultRowInstruction x => new DistinctResultRowInstruction(Range(x.Values), x.Equality, x.DistinctSetIndex + distinctBase),
-            RowSetInsertInstruction x => new RowSetInsertInstruction(Range(x.Values), x.Equality, x.RowSetIndex + distinctBase),
-            CompoundResultRowInstruction x => new CompoundResultRowInstruction(
+            DistinctResultRowInstruction x when distinctEquality is null
+                => new DistinctResultRowInstruction(
+                    Range(x.Values),
+                    x.Equality,
+                    x.DistinctSetIndex + distinctBase),
+            DistinctResultRowInstruction x => new GuardedRowInstruction(
                 Range(x.Values),
-                x.Equality,
-                x.OutputSetIndex + distinctBase,
-                RelocateSetIndices(x.MembershipSetIndices, distinctBase),
-                x.Mode),
+                [
+                    new DistinctRowGuard(x.Equality, x.DistinctSetIndex + distinctBase),
+                    new DistinctRowGuard(distinctEquality, outerDistinctSet),
+                ],
+                new ResultRowDestination()),
+            CompoundResultRowInstruction x when distinctEquality is null
+                => new CompoundResultRowInstruction(
+                    Range(x.Values),
+                    x.Equality,
+                    x.OutputSetIndex + distinctBase,
+                    RelocateSetIndices(x.MembershipSetIndices, distinctBase),
+                    x.Mode),
+            CompoundResultRowInstruction x => new GuardedRowInstruction(
+                Range(x.Values),
+                [
+                    new MembershipRowGuard(
+                        x.Equality,
+                        RelocateSetIndices(x.MembershipSetIndices, distinctBase),
+                        x.Mode),
+                    new DistinctRowGuard(x.Equality, x.OutputSetIndex + distinctBase),
+                    new DistinctRowGuard(distinctEquality, outerDistinctSet),
+                ],
+                new ResultRowDestination()),
+            GuardedRowInstruction { Destination: ResultRowDestination } x
+                => new GuardedRowInstruction(
+                    Range(x.Values),
+                    AppendDistinctGuard(
+                        RelocateGuards(x.Guards, distinctBase),
+                        distinctEquality,
+                        outerDistinctSet),
+                    new ResultRowDestination()),
             ResultRowInstruction x => distinctEquality is null
                 ? new ResultRowInstruction(Range(x.Values))
                 : new DistinctResultRowInstruction(Range(x.Values), distinctEquality, outerDistinctSet),
@@ -449,26 +461,29 @@ public static class CompoundProgramBuilder
         };
     }
 
-    // Rebuilds one instruction of a set-operation term. Structural opcodes are relocated in common; the
-    // term's ResultRow is rewritten into the compound-specific emit: the primary term's becomes a
-    // CompoundResultRow that filters by membership against the probe sets and de-duplicates output, while
-    // each auxiliary term's becomes a RowSetInsert that materializes its probe set. Set-operation terms
-    // carry no row sets of their own, so no other emit-family opcode can appear.
+    // Rebuilds one instruction of a set-operation term. Every result-producing opcode is redirected into
+    // the term's capture set while retaining any nested distinct or membership guards.
     private static VdbeInstruction RelocateSetOperation(
         VdbeInstruction instruction,
         int registerBase,
         int cursorBase,
         int sorterBase,
         int accumulatorBase,
+        int distinctBase,
         int instructionBase,
         int parameterSlotBase,
         VdbeRowEquality equality,
-        bool isPrimary,
-        int outputOrProbeSet,
-        IReadOnlyList<int> membershipSets,
-        CompoundMembershipMode mode)
+        int captureSet)
     {
-        if (RelocateStructural(instruction, registerBase, cursorBase, sorterBase, accumulatorBase, instructionBase, parameterSlotBase)
+        if (RelocateStructural(
+                instruction,
+                registerBase,
+                cursorBase,
+                sorterBase,
+                accumulatorBase,
+                distinctBase,
+                instructionBase,
+                parameterSlotBase)
             is { } structural)
         {
             return structural;
@@ -479,23 +494,41 @@ public static class CompoundProgramBuilder
 
         return instruction switch
         {
-            ResultRowInstruction x => isPrimary
-                ? new CompoundResultRowInstruction(Range(x.Values), equality, outputOrProbeSet, membershipSets, mode)
-                : new RowSetInsertInstruction(Range(x.Values), equality, outputOrProbeSet),
+            ResultRowInstruction x
+                => new RowSetInsertInstruction(Range(x.Values), equality, captureSet),
+            DistinctResultRowInstruction x => new GuardedRowInstruction(
+                Range(x.Values),
+                [new DistinctRowGuard(x.Equality, x.DistinctSetIndex + distinctBase)],
+                new RowSetDestination(equality, captureSet)),
+            CompoundResultRowInstruction x => new GuardedRowInstruction(
+                Range(x.Values),
+                [
+                    new MembershipRowGuard(
+                        x.Equality,
+                        RelocateSetIndices(x.MembershipSetIndices, distinctBase),
+                        x.Mode),
+                    new DistinctRowGuard(x.Equality, x.OutputSetIndex + distinctBase),
+                ],
+                new RowSetDestination(equality, captureSet)),
+            GuardedRowInstruction { Destination: ResultRowDestination } x
+                => new GuardedRowInstruction(
+                    Range(x.Values),
+                    RelocateGuards(x.Guards, distinctBase),
+                    new RowSetDestination(equality, captureSet)),
             _ => throw new StatementCompilationException(
-                $"Cannot sequence unsupported opcode {instruction.Opcode} into a {(isPrimary ? "primary" : "auxiliary")} set-operation term."),
+                $"Cannot sequence unsupported opcode {instruction.Opcode} into a set-operation term."),
         };
     }
 
-    // Relocates the register/cursor/sorter/accumulator/parameter-slot indices and jump targets shared by
-    // every non emit-family opcode, returning null for the emit family (ResultRow, DistinctResultRow,
-    // RowSetInsert, CompoundResultRow) so each caller rewrites it according to its own compound semantics.
+    // Relocates every non-output opcode, returning null for result destinations so each caller can
+    // preserve, de-duplicate, or capture output according to the outer compound semantics.
     private static VdbeInstruction? RelocateStructural(
         VdbeInstruction instruction,
         int registerBase,
         int cursorBase,
         int sorterBase,
         int accumulatorBase,
+        int distinctBase,
         int instructionBase,
         int parameterSlotBase)
     {
@@ -530,6 +563,25 @@ public static class CompoundProgramBuilder
             AggStepInstruction x => new AggStepInstruction(Acc(x.Accumulator), x.Aggregate, Range(x.Arguments)),
             AggFinalizeInstruction x => new AggFinalizeInstruction(Acc(x.Accumulator), x.Aggregate, Reg(x.Destination)),
             SameGroupInstruction x => new SameGroupInstruction(Range(x.CurrentKey), Range(x.SavedKey), x.Comparer, Pc(x.SameGroupTarget)),
+            RowSetInsertInstruction x => new RowSetInsertInstruction(
+                Range(x.Values),
+                x.Equality,
+                x.RowSetIndex + distinctBase),
+            RowSetRewindInstruction x => new RowSetRewindInstruction(
+                x.RowSetIndex + distinctBase,
+                Range(x.Destination),
+                Pc(x.EmptyTarget)),
+            RowSetNextInstruction x => new RowSetNextInstruction(
+                x.RowSetIndex + distinctBase,
+                Range(x.Destination),
+                Pc(x.LoopTarget)),
+            GuardedRowInstruction { Destination: RowSetDestination destination } x
+                => new GuardedRowInstruction(
+                    Range(x.Values),
+                    RelocateGuards(x.Guards, distinctBase),
+                    new RowSetDestination(
+                        destination.Equality,
+                        destination.RowSetIndex + distinctBase)),
             RewindCursorInstruction x => new RewindCursorInstruction(Cur(x.Cursor), Pc(x.EmptyTarget)),
             ColumnInstruction x => new ColumnInstruction(Cur(x.Cursor), x.ColumnIndex, Reg(x.Destination)),
             RowIdInstruction x => new RowIdInstruction(Cur(x.Cursor), Reg(x.Destination)),
@@ -545,11 +597,50 @@ public static class CompoundProgramBuilder
             HaltInstruction => instruction,
             ResultRowInstruction => null,
             DistinctResultRowInstruction => null,
-            RowSetInsertInstruction => null,
             CompoundResultRowInstruction => null,
+            GuardedRowInstruction => null,
             _ => throw new StatementCompilationException(
                 $"Cannot sequence unsupported opcode {instruction.Opcode} into a compound program."),
         };
+    }
+
+    private static IReadOnlyList<VdbeRowGuard> RelocateGuards(
+        IReadOnlyList<VdbeRowGuard> guards,
+        int distinctBase)
+    {
+        var relocated = new VdbeRowGuard[guards.Count];
+        for (var index = 0; index < guards.Count; index++)
+        {
+            relocated[index] = guards[index] switch
+            {
+                DistinctRowGuard distinct
+                    => new DistinctRowGuard(distinct.Equality, distinct.RowSetIndex + distinctBase),
+                MembershipRowGuard membership
+                    => new MembershipRowGuard(
+                        membership.Equality,
+                        RelocateSetIndices(membership.RowSetIndices, distinctBase),
+                        membership.Mode),
+                _ => throw new StatementCompilationException(
+                    $"Cannot relocate unsupported row guard {guards[index].GetType().Name}."),
+            };
+        }
+
+        return relocated;
+    }
+
+    private static IReadOnlyList<VdbeRowGuard> AppendDistinctGuard(
+        IReadOnlyList<VdbeRowGuard> guards,
+        VdbeRowEquality? equality,
+        int rowSetIndex)
+    {
+        if (equality is null)
+            return guards;
+
+        var appended = new VdbeRowGuard[guards.Count + 1];
+        for (var index = 0; index < guards.Count; index++)
+            appended[index] = guards[index];
+        appended[^1] = new DistinctRowGuard(equality, rowSetIndex);
+        return appended;
     }
 
     private static int[] RelocateSetIndices(IReadOnlyList<int> indices, int distinctBase)

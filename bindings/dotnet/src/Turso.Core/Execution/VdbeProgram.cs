@@ -166,7 +166,10 @@ public enum VdbeOpcode
     ResultRow,
     DistinctResultRow,
     RowSetInsert,
+    RowSetRewind,
+    RowSetNext,
     CompoundResultRow,
+    GuardedRow,
     OffsetGate,
     LimitGate,
     BeginTransaction,
@@ -179,6 +182,7 @@ public enum VdbeOpcode
     SeedWorkTable,
     WorkTableStep,
     WorkTableExpand,
+    WorkTableExpandGeneration,
     CloseWorkTable,
     Halt,
 }
@@ -294,6 +298,13 @@ public delegate SqlValue[] VdbeRowTransform(SqlValue[] row);
 /// a row whose width differs from the worktable's column count is a hard error.
 /// </remarks>
 public delegate IReadOnlyList<SqlValue[]> VdbeRecursiveTransform(SqlValue[] frontierRow);
+
+/// <summary>
+/// Expands one complete recursive-worktable generation into the next generation. Joined and DISTINCT
+/// recursive terms use this contract so they execute once over the evaluator's full working set.
+/// </summary>
+public delegate IReadOnlyList<SqlValue[]> VdbeRecursiveGenerationTransform(
+    IReadOnlyList<SqlValue[]> frontierRows);
 
 /// <summary>
 /// A single aggregate function expressed as the three lifecycle operations the
@@ -1144,6 +1155,31 @@ public sealed record RowSetInsertInstruction(
 }
 
 /// <summary>
+/// Positions a row set at its first stored row and copies that row into <paramref name="Destination"/>.
+/// Empty sets jump to <paramref name="EmptyTarget"/>. Row sets preserve first-insertion order, so this
+/// begins the output pass of an <c>INTERSECT</c>/<c>EXCEPT</c> after every source term has run.
+/// </summary>
+public sealed record RowSetRewindInstruction(
+    int RowSetIndex,
+    RegisterRange Destination,
+    ProgramCounter EmptyTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RowSetRewind;
+}
+
+/// <summary>
+/// Advances a row-set iteration, copies the next row into <paramref name="Destination"/>, and jumps to
+/// <paramref name="LoopTarget"/> while another row exists. It falls through when the set is exhausted.
+/// </summary>
+public sealed record RowSetNextInstruction(
+    int RowSetIndex,
+    RegisterRange Destination,
+    ProgramCounter LoopTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RowSetNext;
+}
+
+/// <summary>
 /// Emits the tuple held in the register block <paramref name="Values"/> as a result row for a compound
 /// set operation, but only the first time an equal tuple both satisfies the membership condition
 /// <paramref name="Mode"/> against the probe sets <paramref name="MembershipSetIndices"/> and is novel to
@@ -1172,6 +1208,39 @@ public sealed record CompoundResultRowInstruction(
 {
     public override VdbeOpcode Opcode => VdbeOpcode.CompoundResultRow;
 }
+
+/// <summary>
+/// A composable result-row pipeline used when a compound program is embedded as another compound term.
+/// Guards run in order, preserving the nested program's de-duplication and membership checks. A surviving
+/// row is either emitted or inserted into another row set, allowing an outer operation to add its own
+/// semantics without flattening or bypassing the inner operation.
+/// </summary>
+public sealed record GuardedRowInstruction(
+    RegisterRange Values,
+    IReadOnlyList<VdbeRowGuard> Guards,
+    VdbeRowDestination Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.GuardedRow;
+}
+
+public abstract record VdbeRowGuard;
+
+public sealed record DistinctRowGuard(
+    VdbeRowEquality Equality,
+    int RowSetIndex) : VdbeRowGuard;
+
+public sealed record MembershipRowGuard(
+    VdbeRowEquality Equality,
+    IReadOnlyList<int> RowSetIndices,
+    CompoundMembershipMode Mode) : VdbeRowGuard;
+
+public abstract record VdbeRowDestination;
+
+public sealed record ResultRowDestination : VdbeRowDestination;
+
+public sealed record RowSetDestination(
+    VdbeRowEquality Equality,
+    int RowSetIndex) : VdbeRowDestination;
 
 /// <summary>
 /// Skips the first N candidate result rows of a LIMIT/OFFSET pipeline. When <paramref name="Counter"/>
@@ -1354,6 +1423,18 @@ public sealed record WorkTableExpandInstruction(
     RegisterRange Source) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.WorkTableExpand;
+}
+
+/// <summary>
+/// Collects the current frontier row and invokes <paramref name="Transform"/> after the final row at the
+/// same depth, admitting the returned rows as the next generation.
+/// </summary>
+public sealed record WorkTableExpandGenerationInstruction(
+    WorkTable WorkTable,
+    VdbeRecursiveGenerationTransform Transform,
+    RegisterRange Source) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.WorkTableExpandGeneration;
 }
 
 /// <summary>Releases worktable <paramref name="WorkTable"/>'s frontier and de-duplication buffers.</summary>
@@ -1814,6 +1895,16 @@ public sealed class VdbeProgram
 
                     ValidateDistinctSet(rowSetInsert.RowSetIndex, instructionIndex);
                     break;
+                case RowSetRewindInstruction rowSetRewind:
+                    ValidateDistinctSet(rowSetRewind.RowSetIndex, instructionIndex);
+                    ValidateRegisterRange(rowSetRewind.Destination, instructionIndex);
+                    ValidateJumpTarget(rowSetRewind.EmptyTarget, instructionIndex);
+                    break;
+                case RowSetNextInstruction rowSetNext:
+                    ValidateDistinctSet(rowSetNext.RowSetIndex, instructionIndex);
+                    ValidateRegisterRange(rowSetNext.Destination, instructionIndex);
+                    ValidateJumpTarget(rowSetNext.LoopTarget, instructionIndex);
+                    break;
                 case CompoundResultRowInstruction compoundRow:
                     ValidateRegisterRange(compoundRow.Values, instructionIndex);
                     if (compoundRow.Equality is null)
@@ -1843,6 +1934,80 @@ public sealed class VdbeProgram
                             throw new VdbeProgramValidationException(
                                 $"VDBE instruction {instructionIndex} emits a compound row whose output set {compoundRow.OutputSetIndex} is also a membership set.");
                         }
+                    }
+
+                    break;
+                case GuardedRowInstruction guardedRow:
+                    ValidateRegisterRange(guardedRow.Values, instructionIndex);
+                    if (guardedRow.Guards is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has a null guarded-row condition list.");
+                    }
+
+                    foreach (var guard in guardedRow.Guards)
+                    {
+                        switch (guard)
+                        {
+                            case DistinctRowGuard distinctGuard:
+                                if (distinctGuard.Equality is null)
+                                {
+                                    throw new VdbeProgramValidationException(
+                                        $"VDBE instruction {instructionIndex} has a distinct row guard with a null equality.");
+                                }
+
+                                ValidateDistinctSet(distinctGuard.RowSetIndex, instructionIndex);
+                                break;
+                            case MembershipRowGuard membershipGuard:
+                                if (membershipGuard.Equality is null)
+                                {
+                                    throw new VdbeProgramValidationException(
+                                        $"VDBE instruction {instructionIndex} has a membership row guard with a null equality.");
+                                }
+
+                                if (membershipGuard.RowSetIndices is null)
+                                {
+                                    throw new VdbeProgramValidationException(
+                                        $"VDBE instruction {instructionIndex} has a null membership row-set list.");
+                                }
+
+                                if (!Enum.IsDefined(membershipGuard.Mode))
+                                {
+                                    throw new VdbeProgramValidationException(
+                                        $"VDBE instruction {instructionIndex} has an undefined membership mode.");
+                                }
+
+                                foreach (var rowSetIndex in membershipGuard.RowSetIndices)
+                                    ValidateDistinctSet(rowSetIndex, instructionIndex);
+                                break;
+                            case null:
+                                throw new VdbeProgramValidationException(
+                                    $"VDBE instruction {instructionIndex} has a null row guard.");
+                            default:
+                                throw new VdbeProgramValidationException(
+                                    $"VDBE instruction {instructionIndex} has unsupported row guard {guard.GetType().Name}.");
+                        }
+                    }
+
+                    switch (guardedRow.Destination)
+                    {
+                        case ResultRowDestination:
+                            break;
+                        case RowSetDestination rowSetDestination:
+                            if (rowSetDestination.Equality is null)
+                            {
+                                throw new VdbeProgramValidationException(
+                                    $"VDBE instruction {instructionIndex} has a row-set destination with a null equality.");
+                            }
+
+                            ValidateDistinctSet(rowSetDestination.RowSetIndex, instructionIndex);
+                            break;
+                        case null:
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} has a null row destination.");
+                        default:
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} has unsupported row destination {guardedRow.Destination.GetType().Name}.");
                     }
 
                     break;
@@ -1948,6 +2113,21 @@ public sealed class VdbeProgram
                         expand.WorkTable,
                         expand.Source,
                         workTableColumnCounts[expand.WorkTable.Index],
+                        instructionIndex);
+                    break;
+                case WorkTableExpandGenerationInstruction expandGeneration:
+                    ValidateOpenWorkTable(expandGeneration.WorkTable, openWorkTables, instructionIndex);
+                    if (expandGeneration.Transform is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} expands work table {expandGeneration.WorkTable.Index} with a null generation transform.");
+                    }
+
+                    ValidateRegisterRange(expandGeneration.Source, instructionIndex);
+                    ValidateWorkTableRecordWidth(
+                        expandGeneration.WorkTable,
+                        expandGeneration.Source,
+                        workTableColumnCounts[expandGeneration.WorkTable.Index],
                         instructionIndex);
                     break;
                 case CloseWorkTableInstruction closeWorkTable:

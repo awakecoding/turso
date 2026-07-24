@@ -306,16 +306,18 @@ public class CompoundProgramBuilderTests
     }
 
     [Test]
-    public void BuildUnionDistinctRejectsTermsThatAlreadyDeduplicate()
+    public void BuildUnionDistinctComposesTermsThatAlreadyDeduplicate()
     {
         var alreadyDistinct = CompoundProgramBuilder.BuildUnionDistinct(
-            [ConstantTerm(1), ConstantTerm(2)],
+            [ConstantTerm(1), ConstantTerm(1)],
             ByteExactRows);
 
-        Assert.Throws<ArgumentException>(
-            () => CompoundProgramBuilder.BuildUnionDistinct(
-                [alreadyDistinct, ConstantTerm(3)],
-                ByteExactRows));
+        var nested = CompoundProgramBuilder.BuildUnionDistinct(
+            [alreadyDistinct, ConstantTerm(1), ConstantTerm(2)],
+            ByteExactRows);
+
+        Integers(Run(nested)).Should().Equal(1, 2);
+        nested.Program.Instructions.OfType<GuardedRowInstruction>().Should().NotBeEmpty();
     }
 
     // A constant projection term: loads each value into successive registers, emits them as one result
