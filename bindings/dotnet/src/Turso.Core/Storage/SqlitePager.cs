@@ -48,8 +48,8 @@ public sealed record SqliteCheckpointResult(
 /// WAL-index, so ordinary SQLite clients and other managed processes must not
 /// access the database until every pager in the owner process is disposed.
 /// Other platforms fail ownership acquisition rather than silently using only
-/// process-local locks. Only the flushed WAL commit marker makes a transaction
-/// visible; main-file writes are not claimed to be multi-page atomic.
+/// process-local locks. WAL commits become visible at their flushed commit
+/// marker; DELETE-mode main-file writes are protected by a hot rollback journal.
 /// </remarks>
 public sealed class SqlitePager : IDisposable
 {
@@ -60,8 +60,12 @@ public sealed class SqlitePager : IDisposable
     public const int DefaultPageCacheCapacity = 64;
 
     private readonly object _gate = new();
+    private readonly IFileSystem _fileSystem;
+    private readonly string _databasePath;
+    private readonly string _walPath;
+    private readonly string _journalPath;
     private readonly SqlitePageStore _pageStore;
-    private readonly SqliteWalFile _wal;
+    private SqliteWalFile? _wal;
     private readonly SqlitePagerLockManager _lockManager;
     private IDisposable? _clientOwnership;
     private readonly Dictionary<uint, byte[]> _walPageOverlay = [];
@@ -73,21 +77,44 @@ public sealed class SqlitePager : IDisposable
     private uint _committedPageCount;
     private long _committedFrameCount;
     private long _lockGeneration;
+    private SqliteJournalMode _journalMode;
     private SqlitePagerState _state;
     private TimeSpan _busyTimeout;
 
     private SqlitePager(
+        IFileSystem fileSystem,
+        string databasePath,
+        string walPath,
         SqlitePageStore pageStore,
-        SqliteWalFile wal,
+        SqliteWalFile? wal,
+        SqliteJournalMode journalMode,
         SqlitePagerLockManager lockManager,
         int pageCacheCapacity)
     {
+        _fileSystem = fileSystem;
+        _databasePath = databasePath;
+        _walPath = walPath;
+        _journalPath = databasePath + "-journal";
         _pageStore = pageStore;
         _wal = wal;
+        _journalMode = journalMode;
         _lockManager = lockManager;
         _pageCache = new SqlitePagerReadCache(pageCacheCapacity);
         _recoveryInfo = CreateEmptyRecoveryInfo();
         _visibleRecoveryInfo = CreateEmptyRecoveryInfo();
+    }
+
+    /// <summary>The durable transaction format currently used by this pager.</summary>
+    public SqliteJournalMode JournalMode
+    {
+        get
+        {
+            lock (_gate)
+            {
+                ThrowIfDisposed();
+                return _journalMode;
+            }
+        }
     }
 
     /// <summary>The fixed SQLite page size shared by the main store and WAL.</summary>
@@ -156,7 +183,7 @@ public sealed class SqlitePager : IDisposable
             lock (_gate)
             {
                 ThrowIfDisposed();
-                return _pageStore.IsReadOnly || _wal.IsReadOnly;
+                return _pageStore.IsReadOnly || (_wal?.IsReadOnly ?? false);
             }
         }
     }
@@ -281,8 +308,12 @@ public sealed class SqlitePager : IDisposable
             walCreated = true;
 
             var pager = new SqlitePager(
+                storageFileSystem,
+                databasePath,
+                walPath,
                 pageStore,
                 wal,
+                SqliteJournalMode.Wal,
                 effectiveLockManager,
                 pageCacheCapacity);
             pager.InitializeCommittedView(wal.ScanRecovery());
@@ -376,38 +407,96 @@ public sealed class SqlitePager : IDisposable
                 : effectiveLockManager.EnterRecoveryLock(
                     SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
                     configuredBusyTimeout);
+            SqliteRollbackJournal.RecoverIfPresent(
+                storageFileSystem,
+                databasePath,
+                databasePath + "-journal",
+                readOnly);
             var pageStore = SqlitePageStore.OpenForPager(storageFileSystem, databasePath, readOnly, encryption);
             try
             {
-                var wal = SqliteWalFile.Open(storageFileSystem, walPath, readOnly, encryption);
+                var header = pageStore.Header;
+                if (header.WriteVersion != header.ReadVersion)
+                {
+                    throw new InvalidDataException(
+                        "SQLite database read and write format versions must match for managed storage.");
+                }
+
+                var journalMode = header.WriteVersion switch
+                {
+                    SqliteFileFormatVersion.Legacy => SqliteJournalMode.Delete,
+                    SqliteFileFormatVersion.Wal => SqliteJournalMode.Wal,
+                    _ => throw new InvalidDataException(
+                        $"Managed storage does not support SQLite file format version {header.WriteVersion}."),
+                };
+                SqliteWalFile? wal = null;
                 try
                 {
-                    var pager = new SqlitePager(
-                        pageStore,
-                        wal,
-                        effectiveLockManager,
-                        pageCacheCapacity);
-                    var recovery = wal.ScanRecovery();
-                    try
+                    if (journalMode == SqliteJournalMode.Wal)
                     {
-                        pager.InitializeCommittedView(recovery);
-                    }
-                    catch (InvalidDataException exception) when (readOnly)
-                    {
-                        throw new InvalidDataException(
-                            "Cannot safely open the SQLite database read-only because its WAL cannot establish a non-mutating committed snapshot. "
-                            + "Open it writable to recover the WAL.",
-                            exception);
-                    }
-                    if (!readOnly)
-                    {
-                        var repairRecovery = wal.RecoverToLastCommittedFrame();
-                        if (repairRecovery != recovery)
+                        if (storageFileSystem.FileExists(walPath))
                         {
-                            throw new InvalidDataException(
-                                "SQLite WAL changed between authenticated recovery scanning and tail repair.");
+                            wal = SqliteWalFile.Open(storageFileSystem, walPath, readOnly, encryption);
+                        }
+                        else if (!readOnly)
+                        {
+                            wal = SqliteWalFile.Create(
+                                storageFileSystem,
+                                walPath,
+                                SqliteWalHeader.Create(
+                                    pageStore.PageSize,
+                                    unchecked((uint)Random.Shared.NextInt64()),
+                                    unchecked((uint)Random.Shared.NextInt64())),
+                                encryption);
                         }
                     }
+                    else if (!readOnly && storageFileSystem.FileExists(walPath))
+                    {
+                        TryDeleteCreatedArtifact(storageFileSystem, walPath);
+                    }
+
+                    var pager = new SqlitePager(
+                        storageFileSystem,
+                        databasePath,
+                        walPath,
+                        pageStore,
+                        wal,
+                        journalMode,
+                        effectiveLockManager,
+                        pageCacheCapacity);
+                    if (journalMode == SqliteJournalMode.Wal && wal is not null)
+                    {
+                        var recovery = wal.ScanRecovery();
+                        try
+                        {
+                            pager.InitializeCommittedView(recovery);
+                        }
+                        catch (InvalidDataException exception) when (readOnly)
+                        {
+                            throw new InvalidDataException(
+                                "Cannot safely open the SQLite database read-only because its WAL cannot establish a non-mutating committed snapshot. "
+                                + "Open it writable to recover the WAL.",
+                                exception);
+                        }
+                        if (!readOnly)
+                        {
+                            var repairRecovery = wal.RecoverToLastCommittedFrame();
+                            if (repairRecovery != recovery)
+                            {
+                                throw new InvalidDataException(
+                                    "SQLite WAL changed between authenticated recovery scanning and tail repair.");
+                            }
+                        }
+                    }
+                    else if (journalMode == SqliteJournalMode.Delete)
+                    {
+                        pager.InitializeRollbackView();
+                    }
+                    else
+                    {
+                        pager.InitializeCleanWalView();
+                    }
+
                     pager._lockGeneration = readOnly
                         ? effectiveLockManager.Generation
                         : openLock.PublishStorageChange();
@@ -419,7 +508,7 @@ public sealed class SqlitePager : IDisposable
                 }
                 catch
                 {
-                    wal.Dispose();
+                    wal?.Dispose();
                     throw;
                 }
             }
@@ -529,45 +618,69 @@ public sealed class SqlitePager : IDisposable
         var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
             ? null
             : Stopwatch.StartNew();
-        var writerLock = _lockManager.EnterWriter(configuredBusyTimeout);
-        try
+        while (true)
         {
-            lock (_gate)
+            var requireExclusiveReaders = JournalMode == SqliteJournalMode.Delete;
+            var remaining = SqlitePagerLockManager.RemainingFileLockTimeout(
+                configuredBusyTimeout,
+                lockStopwatch);
+            var transactionLock = requireExclusiveReaders
+                ? _lockManager.EnterCheckpoint(remaining)
+                : _lockManager.EnterWriter(remaining);
+            var retry = false;
+            try
             {
-                ThrowIfDisposed();
-                ThrowIfReadOnly();
-                SynchronizeCommittedView();
-                if (_lockManager.UsesFileBackedWalLocks
-                    && HasUncommittedOrInvalidTail(_recoveryInfo))
+                lock (_gate)
                 {
-                    var recoveryLock = _lockManager.EnterRecoveryLock(
-                        SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
-                        configuredBusyTimeout);
-                    try
+                    ThrowIfDisposed();
+                    ThrowIfReadOnly();
+                    SynchronizeCommittedView();
+                    if ((_journalMode == SqliteJournalMode.Delete) != requireExclusiveReaders)
                     {
-                        using (recoveryLock)
-                            RecoverUncommittedTailUnderWriterLock(writerLock);
+                        retry = true;
                     }
-                    catch
+                    else
                     {
-                        TransitionToFaulted();
-                        throw;
+                        if (_lockManager.UsesFileBackedWalLocks
+                            && HasUncommittedOrInvalidTail(_recoveryInfo))
+                        {
+                            var recoveryLock = _lockManager.EnterRecoveryLock(
+                                SqlitePagerLockManager.RemainingFileLockTimeout(configuredBusyTimeout, lockStopwatch),
+                                configuredBusyTimeout);
+                            try
+                            {
+                                using (recoveryLock)
+                                    RecoverUncommittedTailUnderWriterLock(transactionLock);
+                            }
+                            catch
+                            {
+                                TransitionToFaulted();
+                                throw;
+                            }
+                        }
+                        if (_state != SqlitePagerState.Ready)
+                        {
+                            throw new InvalidOperationException(
+                                $"Cannot begin a SQLite pager transaction while the pager is {_state}.");
+                        }
+                        ArgumentOutOfRangeException.ThrowIfZero(targetDatabaseSizeInPages);
+
+                        var transaction = new SqlitePagerTransaction(this, targetDatabaseSizeInPages, transactionLock);
+                        _activeTransaction = transaction;
+                        _state = SqlitePagerState.TransactionActive;
+                        return transaction;
                     }
                 }
-                if (_state != SqlitePagerState.Ready)
-                    throw new InvalidOperationException($"Cannot begin a SQLite pager transaction while the pager is {_state}.");
-                ArgumentOutOfRangeException.ThrowIfZero(targetDatabaseSizeInPages);
-
-                var transaction = new SqlitePagerTransaction(this, targetDatabaseSizeInPages, writerLock);
-                _activeTransaction = transaction;
-                _state = SqlitePagerState.TransactionActive;
-                return transaction;
             }
-        }
-        catch
-        {
-            writerLock.Dispose();
-            throw;
+            catch
+            {
+                transactionLock.Dispose();
+                throw;
+            }
+
+            transactionLock.Dispose();
+            if (!retry)
+                throw new InvalidOperationException("SQLite transaction lock selection did not produce a transaction.");
         }
     }
 
@@ -580,6 +693,9 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     public void RecoverUncommittedWalTail(TimeSpan? busyTimeout = null)
     {
+        if (JournalMode != SqliteJournalMode.Wal)
+            throw new InvalidOperationException("Rollback-journal mode does not have a WAL tail to recover.");
+
         var configuredBusyTimeout = ResolveBusyTimeout(busyTimeout);
         var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
             ? null
@@ -599,14 +715,15 @@ public sealed class SqlitePager : IDisposable
 
                 try
                 {
-                    var recovery = _wal.ScanRecovery();
+                    var wal = RequireWal();
+                    var recovery = wal.ScanRecovery();
                     InitializeCommittedView(recovery);
                     _lockGeneration = _lockManager.Generation;
                     if (!HasUncommittedOrInvalidTail(recovery))
                         return;
 
-                    _wal.RecoverToLastCommittedFrame();
-                    recovery = _wal.ScanRecovery();
+                    wal.RecoverToLastCommittedFrame();
+                    recovery = wal.ScanRecovery();
                     if (HasUncommittedOrInvalidTail(recovery))
                         throw new InvalidDataException("SQLite WAL recovery did not remove its uncommitted or invalid tail.");
 
@@ -685,16 +802,172 @@ public sealed class SqlitePager : IDisposable
     public SqliteCheckpointResult CheckpointToMainStoreAndResetWal(TimeSpan? busyTimeout = null)
         => CheckpointToMainStoreCore(busyTimeout, resetCommittedWal: true);
 
-    private SqliteCheckpointResult CheckpointToMainStoreCore(
-        TimeSpan? busyTimeout,
-        bool resetCommittedWal)
+    /// <summary>
+    /// Changes between WAL and DELETE mode only after the current committed view
+    /// is durable in the main file. The header transition itself is protected by
+    /// a rollback journal, so interruption preserves either complete format.
+    /// </summary>
+    public SqliteJournalMode SwitchJournalMode(
+        SqliteJournalMode journalMode,
+        TimeSpan? busyTimeout = null)
     {
+        if (JournalMode == journalMode)
+            return journalMode;
+
+        using var checkpointLock = _lockManager.EnterCheckpoint(ResolveBusyTimeout(busyTimeout));
+        if (journalMode == SqliteJournalMode.Delete)
+            CheckpointToMainStoreUnderLock(checkpointLock, resetCommittedWal: true);
+
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            ThrowIfReadOnly();
+            SynchronizeCommittedView();
+            if (_journalMode == journalMode)
+                return journalMode;
+            if (_state != SqlitePagerState.Ready)
+                throw new InvalidOperationException($"Cannot change journal mode while the SQLite pager is {_state}.");
+
+            var pageOne = _pageStore.ReadPage(1);
+            var currentHeader = SqliteDatabaseHeader.Parse(pageOne);
+            var nextCounter = unchecked(currentHeader.ChangeCounter + 1);
+            var formatVersion = journalMode == SqliteJournalMode.Wal
+                ? SqliteFileFormatVersion.Wal
+                : SqliteFileFormatVersion.Legacy;
+            var nextHeader = currentHeader with
+            {
+                WriteVersion = formatVersion,
+                ReadVersion = formatVersion,
+                ChangeCounter = nextCounter,
+                VersionValidFor = nextCounter,
+                DatabaseSizeInPages = _committedPageCount,
+            };
+            nextHeader.WriteTo(pageOne);
+
+            SqliteWalFile? createdWal = null;
+            try
+            {
+                if (journalMode == SqliteJournalMode.Wal)
+                {
+                    if (_fileSystem.FileExists(_walPath))
+                        TryDeleteCreatedArtifact(_fileSystem, _walPath);
+                    createdWal = SqliteWalFile.Create(
+                        _fileSystem,
+                        _walPath,
+                        SqliteWalHeader.Create(
+                            _pageStore.PageSize,
+                            unchecked((uint)Random.Shared.NextInt64()),
+                            unchecked((uint)Random.Shared.NextInt64())),
+                        GetFileSystemEncryption(_fileSystem));
+                }
+
+                SqliteRollbackJournal.Commit(
+                    _fileSystem,
+                    _journalPath,
+                    _pageStore,
+                    [1],
+                    () =>
+                    {
+                        _pageStore.WritePage(1, pageOne);
+                        _pageStore.Flush();
+                    });
+
+                _journalMode = journalMode;
+                if (journalMode == SqliteJournalMode.Wal)
+                {
+                    _wal = createdWal;
+                    createdWal = null;
+                    _recoveryInfo = RequireWal().ScanRecovery();
+                    _visibleRecoveryInfo = _recoveryInfo;
+                }
+                else
+                {
+                    _wal?.Dispose();
+                    _wal = null;
+                    _recoveryInfo = CreateEmptyRecoveryInfo();
+                    _visibleRecoveryInfo = _recoveryInfo;
+                    TryDeleteCreatedArtifact(_fileSystem, _walPath);
+                }
+
+                _walPageOverlay.Clear();
+                _pageCache.Clear();
+                _committedFrameCount = 0;
+                _lockGeneration = checkpointLock.PublishStorageChange();
+                return _journalMode;
+            }
+            catch
+            {
+                createdWal?.Dispose();
+                if (_journalMode == SqliteJournalMode.Delete)
+                    TryDeleteCreatedArtifact(_fileSystem, _walPath);
+                _lockGeneration = checkpointLock.PublishStorageChange();
+                TransitionToFaulted();
+                throw;
+            }
+        }
+    }
+
+    internal void ReplaceDatabaseFile(string replacementPath, TimeSpan? busyTimeout = null)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(replacementPath);
         using var checkpointLock = _lockManager.EnterCheckpoint(ResolveBusyTimeout(busyTimeout));
         lock (_gate)
         {
             ThrowIfDisposed();
             ThrowIfReadOnly();
             SynchronizeCommittedView();
+            if (_journalMode != SqliteJournalMode.Delete)
+                throw new InvalidOperationException("SQLite database replacement requires DELETE journal mode.");
+            if (_state != SqlitePagerState.Ready)
+                throw new InvalidOperationException($"Cannot replace the SQLite database while the pager is {_state}.");
+
+            using var replacement = _fileSystem.OpenFile(replacementPath, FileOpenMode.OpenExisting, readOnly: true);
+            var pages = Enumerable.Range(1, checked((int)_pageStore.PageCount))
+                .Select(pageNumber => checked((uint)pageNumber))
+                .ToArray();
+            try
+            {
+                SqliteRollbackJournal.Commit(
+                    _fileSystem,
+                    _journalPath,
+                    _pageStore,
+                    pages,
+                    () => _pageStore.ReplaceRawContent(replacement));
+                _lockGeneration = checkpointLock.PublishStorageChange();
+                TransitionToFaulted();
+            }
+            catch
+            {
+                _lockGeneration = checkpointLock.PublishStorageChange();
+                TransitionToFaulted();
+                throw;
+            }
+        }
+    }
+
+    private SqliteCheckpointResult CheckpointToMainStoreCore(
+        TimeSpan? busyTimeout,
+        bool resetCommittedWal)
+    {
+        using var checkpointLock = _lockManager.EnterCheckpoint(ResolveBusyTimeout(busyTimeout));
+        return CheckpointToMainStoreUnderLock(checkpointLock, resetCommittedWal);
+    }
+
+    private SqliteCheckpointResult CheckpointToMainStoreUnderLock(
+        SqlitePagerLockLease checkpointLock,
+        bool resetCommittedWal)
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            ThrowIfReadOnly();
+            SynchronizeCommittedView();
+            if (_journalMode == SqliteJournalMode.Delete)
+            {
+                if (_state != SqlitePagerState.Ready)
+                    throw new InvalidOperationException($"Cannot checkpoint while the SQLite pager is {_state}.");
+                return new SqliteCheckpointResult(_committedPageCount, 0, 0);
+            }
             if (HasUncommittedOrInvalidTail(_recoveryInfo))
             {
                 throw new InvalidOperationException(
@@ -766,7 +1039,7 @@ public sealed class SqlitePager : IDisposable
                     // writers, but validate again before a destructive reset so a
                     // bypassing writer cannot lose frames it appended meanwhile.
                     ValidateWalHasNotChanged();
-                    _wal.ResetAfterDurableCheckpoint(CanPublishCheckpointedRecoveryMarker());
+                    RequireWal().ResetAfterDurableCheckpoint(CanPublishCheckpointedRecoveryMarker());
                     _walPageOverlay.Clear();
                     _committedFrameCount = 0;
                     _recoveryInfo = CreateEmptyRecoveryInfo();
@@ -807,7 +1080,7 @@ public sealed class SqlitePager : IDisposable
                 _activeTransaction = null;
                 _activeReadTransactions.Clear();
                 _state = SqlitePagerState.Disposed;
-                _wal.Dispose();
+                _wal?.Dispose();
                 _pageStore.Dispose();
             }
         }
@@ -834,6 +1107,17 @@ public sealed class SqlitePager : IDisposable
 
             try
             {
+                if (_journalMode == SqliteJournalMode.Delete)
+                {
+                    CommitRollbackTransaction(transaction);
+                    _lockGeneration = transaction.PublishStorageChange();
+                    _activeTransaction = null;
+                    _state = SqlitePagerState.Ready;
+                    transaction.ReleaseWriterLock();
+                    return;
+                }
+
+                var wal = RequireWal();
                 ValidateWalHasNotChanged();
                 for (var index = 0; index < transaction.WriteOrder.Count; index++)
                 {
@@ -841,11 +1125,11 @@ public sealed class SqlitePager : IDisposable
                     var databaseSizeInPages = index == transaction.WriteOrder.Count - 1
                         ? transaction.TargetDatabaseSizeInPages
                         : 0;
-                    _wal.AppendFrame(pageNumber, transaction.GetPageImage(pageNumber), databaseSizeInPages);
+                    wal.AppendFrame(pageNumber, transaction.GetPageImage(pageNumber), databaseSizeInPages);
                 }
 
-                _wal.Flush();
-                var recovery = _wal.ScanRecovery();
+                wal.Flush();
+                var recovery = wal.ScanRecovery();
                 if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
                     || recovery.LastCommittedFrameNumber != recovery.LastValidFrameNumber
                     || recovery.LastCommittedDatabaseSizeInPages != transaction.TargetDatabaseSizeInPages)
@@ -861,11 +1145,76 @@ public sealed class SqlitePager : IDisposable
             }
             catch
             {
+                _lockGeneration = transaction.PublishStorageChange();
                 TransitionToFaulted();
                 transaction.ReleaseWriterLock();
                 throw;
             }
         }
+    }
+
+    private void CommitRollbackTransaction(SqlitePagerTransaction transaction)
+    {
+        var originalPageCount = _committedPageCount;
+        var pagesToJournal = new HashSet<uint>(
+            transaction.WriteOrder.Where(pageNumber => pageNumber <= originalPageCount));
+        if (transaction.TargetDatabaseSizeInPages > originalPageCount)
+            pagesToJournal.Add(1);
+        if (transaction.TargetDatabaseSizeInPages < originalPageCount)
+        {
+            for (var pageNumber = transaction.TargetDatabaseSizeInPages + 1;
+                 pageNumber <= originalPageCount;
+                 pageNumber++)
+            {
+                pagesToJournal.Add(pageNumber);
+                if (pageNumber == uint.MaxValue)
+                    break;
+            }
+        }
+
+        SqliteRollbackJournal.Commit(
+            _fileSystem,
+            _journalPath,
+            _pageStore,
+            pagesToJournal,
+            () =>
+            {
+                foreach (var pageNumber in transaction.WriteOrder
+                             .Where(pageNumber => pageNumber != 1 && pageNumber <= originalPageCount)
+                             .OrderBy(pageNumber => pageNumber))
+                {
+                    _pageStore.WritePage(pageNumber, transaction.GetPageImage(pageNumber));
+                }
+
+                foreach (var pageNumber in transaction.WriteOrder
+                             .Where(pageNumber => pageNumber > originalPageCount)
+                             .OrderBy(pageNumber => pageNumber))
+                {
+                    _pageStore.WritePage(pageNumber, transaction.GetPageImage(pageNumber));
+                }
+
+                if (transaction.PageImages.TryGetValue(1, out var pageOne))
+                {
+                    if (transaction.TargetDatabaseSizeInPages < originalPageCount)
+                        _pageStore.WriteShrinkCheckpointPageOne(pageOne);
+                    else
+                        _pageStore.WritePage(1, pageOne);
+                }
+
+                _pageStore.Flush();
+                if (transaction.TargetDatabaseSizeInPages < originalPageCount)
+                {
+                    _pageStore.TruncateToPageCount(transaction.TargetDatabaseSizeInPages);
+                    _pageStore.Flush();
+                }
+            });
+
+        _committedPageCount = transaction.TargetDatabaseSizeInPages;
+        _committedFrameCount = 0;
+        _recoveryInfo = CreateEmptyRecoveryInfo();
+        _visibleRecoveryInfo = _recoveryInfo;
+        _walPageOverlay.Clear();
+        _pageCache.Clear();
     }
 
     internal void RollbackTransaction(SqlitePagerTransaction transaction)
@@ -951,8 +1300,34 @@ public sealed class SqlitePager : IDisposable
             var generation = _lockManager.Generation;
             if (_lockGeneration == generation && !_lockManager.UsesFileBackedWalLocks)
                 return;
+            if (SqliteRollbackJournal.IsHot(_fileSystem, _journalPath))
+            {
+                throw new InvalidDataException(
+                    "SQLite database has a hot rollback journal; dispose and reopen it writable to recover.");
+            }
+            if (_lockGeneration != generation)
+                ValidateMainFileFormat();
 
-            var recovery = _wal.ScanRecovery();
+            if (_journalMode == SqliteJournalMode.Delete)
+            {
+                _pageStore.RefreshHeader();
+                _committedPageCount = _pageStore.PageCount;
+                _walPageOverlay.Clear();
+                _pageCache.Clear();
+                _recoveryInfo = CreateEmptyRecoveryInfo();
+                _visibleRecoveryInfo = _recoveryInfo;
+                _lockGeneration = generation;
+                return;
+            }
+            if (_wal is null)
+            {
+                _pageStore.RefreshHeader();
+                InitializeCleanWalView();
+                _lockGeneration = generation;
+                return;
+            }
+
+            var recovery = RequireWal().ScanRecovery();
             if (!_lockManager.UsesFileBackedWalLocks
                 && HasUncommittedOrInvalidTail(recovery))
             {
@@ -970,13 +1345,58 @@ public sealed class SqlitePager : IDisposable
         }
     }
 
+    private void ValidateMainFileFormat()
+    {
+        var header = SqliteDatabaseHeader.Parse(_pageStore.ReadPage(1));
+        if (header.PageSize != _pageStore.PageSize)
+        {
+            throw new InvalidDataException(
+                "SQLite database page size changed while this pager was open; dispose and reopen it.");
+        }
+
+        var expectedVersion = _journalMode == SqliteJournalMode.Wal
+            ? SqliteFileFormatVersion.Wal
+            : SqliteFileFormatVersion.Legacy;
+        if (header.WriteVersion != expectedVersion || header.ReadVersion != expectedVersion)
+        {
+            throw new InvalidDataException(
+                "SQLite journal mode changed while this pager was open; dispose and reopen it.");
+        }
+        if (_journalMode == SqliteJournalMode.Wal)
+            ValidateWalIncarnation();
+    }
+
+    private void ValidateWalIncarnation()
+    {
+        if (_wal is null || !_fileSystem.FileExists(_walPath))
+        {
+            throw new InvalidDataException(
+                "SQLite WAL storage changed while this pager was open; dispose and reopen it.");
+        }
+
+        using var currentWal = SqliteWalFile.Open(
+            _fileSystem,
+            _walPath,
+            readOnly: true,
+            GetFileSystemEncryption(_fileSystem));
+        if (currentWal.Header.Salt1 != _wal.Header.Salt1
+            || currentWal.Header.Salt2 != _wal.Header.Salt2)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL storage changed while this pager was open; dispose and reopen it.");
+        }
+    }
+
     private void RecoverUncommittedTailUnderWriterLock(SqlitePagerLockLease writerLock)
     {
+        if (_journalMode != SqliteJournalMode.Wal)
+            return;
         if (!_lockManager.UsesFileBackedWalLocks || !HasUncommittedOrInvalidTail(_recoveryInfo))
             return;
 
-        _wal.RecoverToLastCommittedFrame();
-        var recovery = _wal.ScanRecovery();
+        var wal = RequireWal();
+        wal.RecoverToLastCommittedFrame();
+        var recovery = wal.ScanRecovery();
         if (HasUncommittedOrInvalidTail(recovery))
             throw new InvalidDataException("SQLite WAL recovery did not remove its uncommitted or invalid tail.");
 
@@ -1019,8 +1439,57 @@ public sealed class SqlitePager : IDisposable
             LastCommittedByteLength: SqliteWalHeader.Size,
             StopReason: SqliteWalRecoveryStopReason.EndOfFile);
 
+    private void InitializeRollbackView()
+    {
+        var header = _pageStore.Header;
+        if (header.WriteVersion != SqliteFileFormatVersion.Legacy
+            || header.ReadVersion != SqliteFileFormatVersion.Legacy)
+        {
+            throw new InvalidDataException(
+                "A SQLite rollback-journal pager requires legacy read and write format versions.");
+        }
+        if (header.VersionValidFor == header.ChangeCounter
+            && header.DatabaseSizeInPages != 0
+            && header.DatabaseSizeInPages != _pageStore.PageCount)
+        {
+            throw new InvalidDataException(
+                "SQLite rollback-journal database header page count does not match the main file.");
+        }
+
+        _committedPageCount = _pageStore.PageCount;
+        _committedFrameCount = 0;
+        _walPageOverlay.Clear();
+        _pageCache.Clear();
+        _recoveryInfo = CreateEmptyRecoveryInfo();
+        _visibleRecoveryInfo = _recoveryInfo;
+    }
+
+    private void InitializeCleanWalView()
+    {
+        var header = _pageStore.Header;
+        if (header.WriteVersion != SqliteFileFormatVersion.Wal
+            || header.ReadVersion != SqliteFileFormatVersion.Wal)
+        {
+            throw new InvalidDataException("A clean SQLite WAL view requires WAL read and write format versions.");
+        }
+        if (header.VersionValidFor != header.ChangeCounter
+            || header.DatabaseSizeInPages != _pageStore.PageCount)
+        {
+            throw new InvalidDataException(
+                "A SQLite WAL database without a WAL file must have an authoritative main-database header.");
+        }
+
+        _committedPageCount = _pageStore.PageCount;
+        _committedFrameCount = 0;
+        _walPageOverlay.Clear();
+        _pageCache.Clear();
+        _recoveryInfo = CreateEmptyRecoveryInfo();
+        _visibleRecoveryInfo = _recoveryInfo;
+    }
+
     private void InitializeCommittedView(SqliteWalRecoveryInfo recovery)
     {
+        var wal = RequireWal();
         ValidateStoragePair();
         _recoveryInfo = recovery;
         _committedFrameCount = recovery.LastCommittedFrameNumber;
@@ -1032,7 +1501,7 @@ public sealed class SqlitePager : IDisposable
         var finalTransactionHasPageOne = false;
         for (var frameNumber = 1L; frameNumber <= recovery.LastCommittedFrameNumber; frameNumber++)
         {
-            var frame = _wal.ReadFrame(frameNumber);
+            var frame = wal.ReadFrame(frameNumber);
             transactionPages[frame.Header.PageNumber] = frame.PageData;
             if (!frame.Header.IsCommit)
                 continue;
@@ -1056,7 +1525,7 @@ public sealed class SqlitePager : IDisposable
         if (recovery.LastValidFrameNumber != 0
             || recovery.LastCommittedFrameNumber != 0
             || recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
-            || !_wal.HasCheckpointedRecoveryMarker)
+            || !RequireWal().HasCheckpointedRecoveryMarker)
         {
             return recovery;
         }
@@ -1089,7 +1558,8 @@ public sealed class SqlitePager : IDisposable
 
     private void ValidateStoragePair()
     {
-        if (_pageStore.PageSize != _wal.PageSize)
+        var wal = RequireWal();
+        if (_pageStore.PageSize != wal.PageSize)
             throw new InvalidDataException("SQLite database and WAL page sizes do not match.");
         if (_pageStore.Header.WriteVersion != SqliteFileFormatVersion.Wal
             || _pageStore.Header.ReadVersion != SqliteFileFormatVersion.Wal)
@@ -1197,6 +1667,14 @@ public sealed class SqlitePager : IDisposable
         var header = SqliteDatabaseHeader.Parse(pageOne);
         if (header.PageSize != _pageStore.PageSize)
             throw new InvalidDataException("SQLite WAL page 1 changes the database page size.");
+        var expectedVersion = _journalMode == SqliteJournalMode.Wal
+            ? SqliteFileFormatVersion.Wal
+            : SqliteFileFormatVersion.Legacy;
+        if (header.WriteVersion != expectedVersion || header.ReadVersion != expectedVersion)
+        {
+            throw new InvalidDataException(
+                $"SQLite transaction page 1 does not match the active {_journalMode} journal mode.");
+        }
         if (header.VersionValidFor == header.ChangeCounter
             && header.DatabaseSizeInPages != 0
             && header.DatabaseSizeInPages != targetDatabaseSizeInPages)
@@ -1308,7 +1786,7 @@ public sealed class SqlitePager : IDisposable
 
     private void ValidateWalHasNotChanged()
     {
-        var recovery = _wal.ScanRecovery();
+        var recovery = RequireWal().ScanRecovery();
         if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
             || recovery.LastValidFrameNumber != _committedFrameCount
             || recovery.LastCommittedFrameNumber != _committedFrameCount
@@ -1400,6 +1878,9 @@ public sealed class SqlitePager : IDisposable
         if (_state == SqlitePagerState.Disposed)
             throw new ObjectDisposedException(nameof(SqlitePager));
     }
+
+    private SqliteWalFile RequireWal()
+        => _wal ?? throw new InvalidOperationException("The SQLite pager does not have an open WAL.");
 }
 
 /// <summary>

@@ -6,14 +6,12 @@ namespace Turso.Tests;
 public sealed class ManagedAdvancedFeatureBoundaryTests
 {
     [Test]
-    public void ManagedEngineRejectsMvccJournalModeAndVectorFunctions()
+    public void ManagedEngineRetainsMemoryModeForMvccRequestAndRejectsVectorFunctions()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
 
-        var mvcc = () => Execute(connection, "PRAGMA journal_mode = mvcc;");
-        mvcc.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Managed PRAGMA journal_mode only supports the fixed MEMORY mode.");
+        ReadValue(connection, "PRAGMA journal_mode = mvcc;").Should().Be(SqlValue.Text("memory"));
 
         var vector = () => ReadValue(connection, "SELECT vector32('[1.0, 2.0]');");
         vector.Should().Throw<EmbeddedSqlException>()

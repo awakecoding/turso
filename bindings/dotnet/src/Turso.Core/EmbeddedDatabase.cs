@@ -136,6 +136,7 @@ public sealed class EmbeddedDatabase : IDisposable
     private FileCatalogVersion _fileCatalogVersion;
     private PragmaHeaderMetadata _inMemoryPragmaHeader;
     private long _version;
+    private int _activeTransactions;
     private readonly Dictionary<BlobMutationIdentity, int> _activeBlobMutations = new();
     private readonly Dictionary<BlobMutationIdentity, long> _blobMutationGenerations = new();
     private long _nextBlobMutationGeneration;
@@ -580,8 +581,10 @@ public sealed class EmbeddedDatabase : IDisposable
                     unchecked((int)_fileCatalogVersion.SchemaCookie),
                     _fileCatalogVersion.UserVersion,
                     _fileCatalogVersion.ApplicationId);
+            var catalog = new SchemaCatalog(_tables, _views, _triggers).Clone();
+            _activeTransactions = checked(_activeTransactions + 1);
             return new TransactionSnapshot(
-                new SchemaCatalog(_tables, _views, _triggers).Clone(),
+                catalog,
                 _version,
                 pragmaHeader);
         }
@@ -601,6 +604,16 @@ public sealed class EmbeddedDatabase : IDisposable
                     _views,
                     _triggers,
                     LastInsertRowId: lastInsertRowId));
+        }
+    }
+
+    internal void EndTransaction()
+    {
+        lock (_gate)
+        {
+            if (_activeTransactions == 0)
+                throw new InvalidOperationException("Managed transaction count underflow.");
+            _activeTransactions--;
         }
     }
 
@@ -795,6 +808,68 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         lock (_gate)
             return _fileStore is null ? SqlitePageSize.Default : _fileCatalogVersion.PageSize;
+    }
+
+    internal SqliteJournalMode GetJournalMode()
+    {
+        lock (_gate)
+            return _fileStore is null ? SqliteJournalMode.Delete : _fileStore.JournalMode;
+    }
+
+    internal SqliteJournalMode SwitchJournalMode(SqliteJournalMode journalMode)
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null)
+                throw new EmbeddedSqlException("In-memory databases support only MEMORY journal mode.");
+            if (_readOnly)
+                throw new EmbeddedSqlException("attempt to write a readonly database");
+            if (_activeTransactions != 0)
+                throw new EmbeddedSqlException("cannot change journal mode while a transaction is active");
+            if (_activeBlobMutations.Count != 0)
+                throw new EmbeddedSqlException("cannot change journal mode while a blob handle is active");
+            if (_fileSystem is null || _fileCatalogWriteLock is null)
+                throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+
+            lock (_fileCatalogWriteLock)
+            {
+                using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
+                EnsureFileCatalogVersionCurrent();
+                var result = _fileStore.SwitchJournalMode(journalMode);
+                _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
+                _version++;
+                return result;
+            }
+        }
+    }
+
+    internal void MigratePageSize(int pageSize)
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null)
+                throw new EmbeddedSqlException("In-memory databases have a fixed managed page size.");
+            if (_readOnly)
+                throw new EmbeddedSqlException("attempt to write a readonly database");
+            if (_activeTransactions != 0)
+                throw new EmbeddedSqlException("cannot VACUUM while a transaction is active");
+            if (_activeBlobMutations.Count != 0)
+                throw new EmbeddedSqlException("cannot VACUUM while a blob handle is active");
+            if (_fileSystem is null || _fileCatalogWriteLock is null)
+                throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+
+            lock (_fileCatalogWriteLock)
+            {
+                using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
+                EnsureFileCatalogVersionCurrent();
+                if (pageSize == _fileCatalogVersion.PageSize)
+                    _fileStore.Compact();
+                else
+                    _fileStore.MigratePageSize(pageSize, _tables, _views, _triggers);
+                _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
+                _version++;
+            }
+        }
     }
 
     internal void SetInMemoryPragmaHeaderMetadata(PragmaHeaderMetadata metadata)
@@ -16098,6 +16173,7 @@ public sealed class EmbeddedConnection : IDisposable
     private bool _queryOnly;
     private bool _foreignKeys;
     private bool _recursiveTriggers;
+    private int? _pendingPageSize;
     private bool _disposed;
 
     private sealed class AttachedDatabase : IDisposable
@@ -16247,6 +16323,7 @@ public sealed class EmbeddedConnection : IDisposable
         _queryOnly = false;
         _foreignKeys = false;
         _recursiveTriggers = false;
+        _pendingPageSize = null;
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
@@ -16350,11 +16427,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public void Dispose()
     {
-        _transactionDatabases = null;
-        _transactionWriteDatabase = null;
-        _transactionMutationDatabase = null;
-        _transactionOpenedBySavepoint = false;
-        _savepoints.Clear();
+        ResetTransactionState();
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
@@ -16430,6 +16503,8 @@ public sealed class EmbeddedConnection : IDisposable
                 return ExecutePragmaJournalMode(journalMode);
             case PragmaPageSizeStatement pageSize:
                 return ExecutePragmaPageSize(pageSize);
+            case VacuumStatement:
+                return ExecuteVacuum();
             default:
                 if (_queryOnly && EmbeddedDatabase.MayMutate(statement))
                     throw new EmbeddedSqlException("attempt to write a readonly database");
@@ -17709,13 +17784,22 @@ public sealed class EmbeddedConnection : IDisposable
             .Select(attachment => attachment.Database)
             .Prepend(_database);
         var states = new Dictionary<EmbeddedDatabase, TransactionDatabaseState>();
-        foreach (var database in databases)
+        try
         {
-            var snapshot = database.CreateTransactionSnapshot();
-            states.Add(database, new TransactionDatabaseState(
-                snapshot.Catalog,
-                snapshot.Version,
-                snapshot.PragmaHeader));
+            foreach (var database in databases)
+            {
+                var snapshot = database.CreateTransactionSnapshot();
+                states.Add(database, new TransactionDatabaseState(
+                    snapshot.Catalog,
+                    snapshot.Version,
+                    snapshot.PragmaHeader));
+            }
+        }
+        catch
+        {
+            foreach (var database in states.Keys)
+                database.EndTransaction();
+            throw;
         }
 
         _transactionDatabases = states;
@@ -17930,17 +18014,30 @@ public sealed class EmbeddedConnection : IDisposable
 
     private ExecutionResult ExecutePragmaJournalMode(PragmaJournalModeStatement statement)
     {
-        var current = _database.IsFileBacked ? "wal" : "memory";
+        var current = _database.IsFileBacked
+            ? _database.GetJournalMode().ToString().ToLowerInvariant()
+            : "memory";
         if (statement.Mode is null)
             return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
 
-        if (!statement.Mode.Equals(current, StringComparison.OrdinalIgnoreCase))
+        if (!_database.IsFileBacked)
+            return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
+        if (!Enum.TryParse<SqliteJournalMode>(statement.Mode, ignoreCase: true, out var requested))
+            return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
+        if (requested == _database.GetJournalMode())
+            return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
+        if (_queryOnly || _database.IsReadOnly)
+            return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
+        if (_transactionDatabases is not null)
+            throw new EmbeddedSqlException("cannot change journal mode while a transaction is active");
+        if (_attachedDatabases.Count != 0)
         {
             throw new EmbeddedSqlException(
-                $"Managed PRAGMA journal_mode only supports the fixed {current.ToUpperInvariant()} mode.");
+                "Managed journal-mode transitions require all attached databases to be detached.");
         }
 
-        return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
+        var result = _database.SwitchJournalMode(requested).ToString().ToLowerInvariant();
+        return new ExecutionResult(["journal_mode"], [[SqlValue.Text(result)]], 0);
     }
 
     private ExecutionResult ExecutePragmaPageSize(PragmaPageSizeStatement statement)
@@ -17949,14 +18046,38 @@ public sealed class EmbeddedConnection : IDisposable
         if (statement.Value is null)
             return new ExecutionResult(["page_size"], [[SqlValue.Integer(current)]], 0);
 
-        if (statement.Value.Value == current)
+        if (_queryOnly || _database.IsReadOnly)
             return ExecutionResult.Empty;
 
-        if (_database.IsReadOnly)
-            throw new EmbeddedSqlException("attempt to write a readonly database");
+        var requested = statement.Value.Value;
+        if (requested < SqlitePageSize.Minimum
+            || requested > SqlitePageSize.Maximum
+            || (requested & (requested - 1)) != 0)
+        {
+            return ExecutionResult.Empty;
+        }
 
-        throw new EmbeddedSqlException(
-            $"Managed PRAGMA page_size only supports the fixed {current}-byte page size.");
+        _pendingPageSize = _database.IsFileBacked ? requested : null;
+        return ExecutionResult.Empty;
+    }
+
+    private ExecutionResult ExecuteVacuum()
+    {
+        if (_queryOnly || _database.IsReadOnly)
+            throw new EmbeddedSqlException("attempt to write a readonly database");
+        if (_transactionDatabases is not null)
+            throw new EmbeddedSqlException("cannot VACUUM from within a transaction");
+        if (_attachedDatabases.Count != 0)
+            throw new EmbeddedSqlException("Managed VACUUM requires all attached databases to be detached.");
+        if (!_database.IsFileBacked)
+            return ExecutionResult.Empty;
+
+        var targetPageSize = _database.GetJournalMode() == SqliteJournalMode.Wal
+            ? _database.GetPageSize()
+            : _pendingPageSize ?? _database.GetPageSize();
+        _database.MigratePageSize(targetPageSize);
+        _pendingPageSize = null;
+        return ExecutionResult.Empty;
     }
 
     /// <summary>
@@ -18105,11 +18226,17 @@ public sealed class EmbeddedConnection : IDisposable
 
     private void ResetTransactionState()
     {
+        var transactionDatabases = _transactionDatabases;
         _transactionDatabases = null;
         _transactionWriteDatabase = null;
         _transactionMutationDatabase = null;
         _transactionOpenedBySavepoint = false;
         _savepoints.Clear();
+        if (transactionDatabases is not null)
+        {
+            foreach (var database in transactionDatabases.Keys)
+                database.EndTransaction();
+        }
     }
 
     private sealed record SavepointEntry(

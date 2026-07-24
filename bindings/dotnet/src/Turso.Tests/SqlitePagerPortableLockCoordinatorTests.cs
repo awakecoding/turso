@@ -241,9 +241,9 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
 
             File.Exists(databasePath + "-wal").Should().BeFalse(
                 "ordinary SQLite owns its companion-file lifecycle after handoff");
-            var reopen = Assert.Throws<EmbeddedSqlException>(
-                () => EmbeddedDatabase.OpenFile(databasePath));
-            reopen!.Message.Should().Contain("missing its companion write-ahead log");
+            using var reopened = EmbeddedDatabase.OpenFile(databasePath);
+            using var connection = reopened.Connect();
+            ReadScalar(connection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("wal"));
         }
         finally
         {
@@ -501,6 +501,13 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
         {
             UnlockMainFileOwnershipRange(stream);
         }
+    }
+
+    private static SqlValue ReadScalar(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        return statement.GetValue(0);
     }
 
     private static SqliteWalHeader CreateWalHeader()

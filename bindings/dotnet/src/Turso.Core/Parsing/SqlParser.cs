@@ -65,6 +65,8 @@ internal sealed class SqlParser
             return ParseAttach();
         if (ConsumeKeyword("DETACH"))
             return ParseDetach();
+        if (ConsumeKeyword("VACUUM"))
+            return ParseVacuum();
         if (IsQueryStart())
             return ParseQuery();
         if (ConsumeKeyword("BEGIN"))
@@ -117,6 +119,17 @@ internal sealed class SqlParser
     {
         ConsumeKeyword("DATABASE");
         return new DetachDatabaseStatement(ExpectIdentifier());
+    }
+
+    private ParsedStatement ParseVacuum()
+    {
+        if (_lexer.Current.Kind is TokenKind.Semicolon or TokenKind.End)
+            return new VacuumStatement(null);
+
+        var schema = ExpectIdentifier();
+        if (!schema.Equals("main", StringComparison.OrdinalIgnoreCase))
+            throw Error($"Unsupported VACUUM database {schema}.");
+        return new VacuumStatement(schema);
     }
 
     private ParsedStatement ParsePragma()

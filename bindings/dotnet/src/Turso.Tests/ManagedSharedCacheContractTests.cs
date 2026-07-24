@@ -72,6 +72,30 @@ public sealed class ManagedSharedCacheContractTests
     }
 
     [Test]
+    public void PoolingTrueIsFacadeCompatibilityOnlyForSharedMemory()
+    {
+        var name = "managed-shared-pooling-" + Guid.NewGuid().ToString("N");
+        var connectionString =
+            $"Data Source={name};Mode=Memory;Cache=Shared;Pooling=True;Local Provider=Managed";
+        using (var sqlite = new SqliteConnection(connectionString))
+        {
+            sqlite.Open();
+            sqlite.ExecuteNonQuery("CREATE TABLE data(value INTEGER);");
+        }
+
+        using (var replacement = new SqliteConnection(connectionString))
+        {
+            replacement.Open();
+            CountTable(replacement, "data").Should().Be(0);
+        }
+
+        using var turso = new TursoConnection(connectionString);
+        turso.Invoking(static connection => connection.Open())
+            .Should().Throw<NotSupportedException>()
+            .WithMessage("Pooling=True is supported only for unencrypted managed local file databases.");
+    }
+
+    [Test]
     public void PrivateNamedMemoryConnectionsRemainIsolated()
     {
         var name = "managed-private-memory-" + Guid.NewGuid().ToString("N");
