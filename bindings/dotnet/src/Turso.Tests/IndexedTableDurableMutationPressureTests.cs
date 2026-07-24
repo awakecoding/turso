@@ -96,7 +96,7 @@ public class IndexedTableDurableMutationPressureTests
     }
 
     [Test]
-    public void RejectsUnsupportedIndexMutationsAndCorruptRebuiltIndexOnReopen()
+    public void PersistsRichIndexMutationsAndRejectsCorruptRebuiltIndexOnReopen()
     {
         var fileSystem = new InMemoryFileSystem();
         SqliteDatabaseHeader header;
@@ -110,16 +110,12 @@ public class IndexedTableDurableMutationPressureTests
             Execute(connection, "UPDATE work SET category = 'reindexed' WHERE id <= 30;");
             Execute(connection, "DELETE FROM work WHERE id > 50;");
 
-            var descending = () => Execute(connection, "CREATE INDEX work_desc ON work(payload DESC);");
-            descending.Should().Throw<EmbeddedSqlException>().WithMessage("*descending*");
-            var nonBinary = () => Execute(connection, "CREATE INDEX work_nocase ON work(payload COLLATE NOCASE);");
-            nonBinary.Should().Throw<EmbeddedSqlException>().WithMessage("*not BINARY*");
+            Execute(connection, "CREATE INDEX work_desc ON work(payload DESC);");
+            Execute(connection, "CREATE INDEX work_nocase ON work(payload COLLATE NOCASE);");
             Query(connection, "PRAGMA index_list(work);")
                 .Select(row => row[1].AsText())
                 .Should()
-                .ContainSingle()
-                .Which.Should()
-                .Be("work_category_payload");
+                .BeEquivalentTo(["work_category_payload", "work_desc", "work_nocase"]);
         }
 
         using (var pager = SqlitePager.Open(

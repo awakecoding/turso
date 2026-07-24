@@ -16,7 +16,7 @@ internal sealed record EmbeddedFileCatalog(
 /// Bridges the managed <see cref="EmbeddedDatabase"/> catalog to durable,
 /// SQLite-format storage. It persists the schema on page 1 as a real
 /// <c>sqlite_schema</c> table b-tree and stores each ordinary user table's
-/// rows and BINARY ascending secondary indexes in recursively constructed
+/// rows and metadata-ordered secondary indexes in recursively constructed
 /// SQLite b-trees. The supported WITHOUT ROWID subset uses recursively
 /// constructed SQLite index b-trees. Table and index records may use standard
 /// SQLite overflow pages. All bytes are genuine SQLite page, cell, and record encodings;
@@ -7185,7 +7185,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         try
         {
             if (allowDescending)
-                primaryKeySchema.EnsureSupportedByBinaryIndexWriter();
+                primaryKeySchema.EnsureSupportedByPersistedIndexWriter();
             else
                 primaryKeySchema.EnsureSupportedByBinaryAscendingIndexWriter();
         }
@@ -7199,8 +7199,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             throw new EmbeddedSqlException(
                 $"The managed file engine cannot persist {primaryKeyKind} table '{tableName}' because {exception.Message} "
-                + "The managed primary-key index writer supports only BINARY terms"
-                + (allowDescending ? "." : " in ascending order."),
+                + (allowDescending
+                    ? "The managed primary-key index writer supports ASC/DESC terms with BINARY, NOCASE, or RTRIM collation."
+                    : "The managed primary-key index writer supports only ascending BINARY terms."),
                 exception);
         }
     }
@@ -7962,15 +7963,21 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
         }
 
-        var separators = new List<byte[]>(children.Count - 1);
+        var plannedChildren = children.ToArray();
+        var separators = new List<byte[]>(plannedChildren.Length - 1);
         try
         {
-            for (var childIndex = 0; childIndex < children.Count - 1; childIndex++)
+            for (var childIndex = 0; childIndex < plannedChildren.Length - 1; childIndex++)
             {
                 separators.Add(PromoteIndexTreeSeparator(
-                    children[childIndex],
-                    children[childIndex + 1],
-                    indexName));
+                    plannedChildren[childIndex],
+                    plannedChildren[childIndex + 1],
+                    indexName,
+                    comparer,
+                    out var left,
+                    out var right));
+                plannedChildren[childIndex] = left;
+                plannedChildren[childIndex + 1] = right;
             }
         }
         catch (EmbeddedSqlException) when (!throwOnPromotionFailure)
@@ -7983,20 +7990,20 @@ internal sealed class EmbeddedFileStore : IDisposable
             var builder = new SqliteIndexInteriorPageBuilder(
                 _pageSize,
                 _usableSpace,
-                children[^1].PageNumber,
+                plannedChildren[^1].PageNumber,
                 comparer);
             for (var childIndex = 0; childIndex < separators.Count; childIndex++)
             {
                 var separator = separators[childIndex];
                 builder.Append(
                     SqliteIndexInteriorCell.Create(
-                        children[childIndex].PageNumber,
+                        plannedChildren[childIndex].PageNumber,
                         CreateIndexLeafPlanningCell(separator)),
                     separator);
             }
 
             _ = builder.Build();
-            return new IndexInteriorPlan(children, separators);
+            return new IndexInteriorPlan(plannedChildren, separators);
         }
         catch (InvalidOperationException)
         {
@@ -8041,7 +8048,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (bestCount == 0)
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist {treeDescription} because promoting its index separators would require rebalancing, which this storage layer does not implement.");
+                    $"The managed file engine cannot persist {treeDescription} because its index records cannot be partitioned into non-empty equal-height child trees.");
             }
 
             groups.Add(new IndexInteriorGroupRange(start, bestCount));
@@ -8053,7 +8060,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (groups.Count < 2 || groups[^2].Count < 3)
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist {treeDescription} because promoting its index separators would require rebalancing, which this storage layer does not implement.");
+                    $"The managed file engine cannot persist {treeDescription} because its index records cannot be partitioned into non-empty equal-height child trees.");
             }
 
             var previous = groups[^2];
@@ -8082,29 +8089,316 @@ internal sealed class EmbeddedFileStore : IDisposable
         return plans;
     }
 
-    private static byte[] PromoteIndexTreeSeparator(
+    private byte[] PromoteIndexTreeSeparator(
         IndexTreeNode left,
         IndexTreeNode right,
-        string treeDescription)
+        string treeDescription,
+        SqliteIndexRecordComparer comparer,
+        out IndexTreeNode plannedLeft,
+        out IndexTreeNode plannedRight)
     {
-        var leftLeaf = FindRightmostIndexLeaf(left);
-        if (leftLeaf.Records.Count >= 2)
+        if (TryExtractMaximumIndexRecord(left, comparer, out var separator, out plannedLeft))
         {
-            var separator = leftLeaf.Records[^1];
-            leftLeaf.Records.RemoveAt(leftLeaf.Records.Count - 1);
+            plannedRight = right;
             return separator;
         }
 
-        var rightLeaf = FindLeftmostIndexLeaf(right);
-        if (rightLeaf.Records.Count >= 2)
+        if (TryExtractMinimumIndexRecord(right, comparer, out separator, out plannedRight))
         {
-            var separator = rightLeaf.Records[0];
-            rightLeaf.Records.RemoveAt(0);
+            plannedLeft = left;
             return separator;
         }
 
         throw new EmbeddedSqlException(
-            $"The managed file engine cannot persist {treeDescription} because promoting index separators would require rebalancing, which this storage layer does not implement.");
+            $"The managed file engine cannot persist {treeDescription} because no separator can be promoted while retaining non-empty equal-height child trees.");
+    }
+
+    private bool TryExtractMaximumIndexRecord(
+        IndexTreeNode node,
+        SqliteIndexRecordComparer comparer,
+        out byte[] record,
+        out IndexTreeNode remainder)
+    {
+        if (node.IsLeaf)
+        {
+            if (node.Records.Count < 2)
+            {
+                record = null!;
+                remainder = null!;
+                return false;
+            }
+
+            var records = new List<byte[]>(node.Records);
+            record = records[^1];
+            records.RemoveAt(records.Count - 1);
+            remainder = IndexTreeNode.CreateLeaf(node.PageNumber, records);
+            return true;
+        }
+
+        var plan = node.InteriorPlan
+            ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan.");
+        var lastChildIndex = plan.Children.Count - 1;
+        if (TryExtractMaximumIndexRecord(
+                plan.Children[lastChildIndex],
+                comparer,
+                out record,
+                out var lastRemainder))
+        {
+            var children = plan.Children.ToArray();
+            children[lastChildIndex] = lastRemainder;
+            return TryCreateIndexInteriorNode(
+                node.PageNumber,
+                children,
+                plan.Separators,
+                comparer,
+                out remainder);
+        }
+
+        var previousChildIndex = lastChildIndex - 1;
+        if (!TryExtractMaximumIndexRecord(
+                plan.Children[previousChildIndex],
+                comparer,
+                out var replacementSeparator,
+                out var previousRemainder)
+            || !TryInsertMinimumIndexRecord(
+                plan.Children[lastChildIndex],
+                plan.Separators[^1],
+                comparer,
+                out var expandedLast)
+            || !TryExtractMaximumIndexRecord(
+                expandedLast,
+                comparer,
+                out record,
+                out lastRemainder))
+        {
+            record = null!;
+            remainder = null!;
+            return false;
+        }
+
+        var rebalancedChildren = plan.Children.ToArray();
+        rebalancedChildren[previousChildIndex] = previousRemainder;
+        rebalancedChildren[lastChildIndex] = lastRemainder;
+        var rebalancedSeparators = plan.Separators.Select(value => value.ToArray()).ToArray();
+        rebalancedSeparators[^1] = replacementSeparator;
+        return TryCreateIndexInteriorNode(
+            node.PageNumber,
+            rebalancedChildren,
+            rebalancedSeparators,
+            comparer,
+            out remainder);
+    }
+
+    private bool TryExtractMinimumIndexRecord(
+        IndexTreeNode node,
+        SqliteIndexRecordComparer comparer,
+        out byte[] record,
+        out IndexTreeNode remainder)
+    {
+        if (node.IsLeaf)
+        {
+            if (node.Records.Count < 2)
+            {
+                record = null!;
+                remainder = null!;
+                return false;
+            }
+
+            var records = new List<byte[]>(node.Records);
+            record = records[0];
+            records.RemoveAt(0);
+            remainder = IndexTreeNode.CreateLeaf(node.PageNumber, records);
+            return true;
+        }
+
+        var plan = node.InteriorPlan
+            ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan.");
+        if (TryExtractMinimumIndexRecord(
+                plan.Children[0],
+                comparer,
+                out record,
+                out var firstRemainder))
+        {
+            var children = plan.Children.ToArray();
+            children[0] = firstRemainder;
+            return TryCreateIndexInteriorNode(
+                node.PageNumber,
+                children,
+                plan.Separators,
+                comparer,
+                out remainder);
+        }
+
+        if (!TryExtractMinimumIndexRecord(
+                plan.Children[1],
+                comparer,
+                out var replacementSeparator,
+                out var secondRemainder)
+            || !TryInsertMaximumIndexRecord(
+                plan.Children[0],
+                plan.Separators[0],
+                comparer,
+                out var expandedFirst)
+            || !TryExtractMinimumIndexRecord(
+                expandedFirst,
+                comparer,
+                out record,
+                out firstRemainder))
+        {
+            record = null!;
+            remainder = null!;
+            return false;
+        }
+
+        var rebalancedChildren = plan.Children.ToArray();
+        rebalancedChildren[0] = firstRemainder;
+        rebalancedChildren[1] = secondRemainder;
+        var rebalancedSeparators = plan.Separators.Select(value => value.ToArray()).ToArray();
+        rebalancedSeparators[0] = replacementSeparator;
+        return TryCreateIndexInteriorNode(
+            node.PageNumber,
+            rebalancedChildren,
+            rebalancedSeparators,
+            comparer,
+            out remainder);
+    }
+
+    private bool TryInsertMinimumIndexRecord(
+        IndexTreeNode node,
+        byte[] record,
+        SqliteIndexRecordComparer comparer,
+        out IndexTreeNode expanded)
+    {
+        if (node.IsLeaf)
+        {
+            var records = new List<byte[]>(node.Records.Count + 1) { record };
+            records.AddRange(node.Records);
+            if (!CanBuildIndexLeafPage(records, comparer))
+            {
+                expanded = null!;
+                return false;
+            }
+
+            expanded = IndexTreeNode.CreateLeaf(node.PageNumber, records);
+            return true;
+        }
+
+        var plan = node.InteriorPlan
+            ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan.");
+        if (!TryInsertMinimumIndexRecord(plan.Children[0], record, comparer, out var firstChild))
+        {
+            expanded = null!;
+            return false;
+        }
+
+        var children = plan.Children.ToArray();
+        children[0] = firstChild;
+        return TryCreateIndexInteriorNode(
+            node.PageNumber,
+            children,
+            plan.Separators,
+            comparer,
+            out expanded);
+    }
+
+    private bool TryInsertMaximumIndexRecord(
+        IndexTreeNode node,
+        byte[] record,
+        SqliteIndexRecordComparer comparer,
+        out IndexTreeNode expanded)
+    {
+        if (node.IsLeaf)
+        {
+            var records = new List<byte[]>(node.Records.Count + 1);
+            records.AddRange(node.Records);
+            records.Add(record);
+            if (!CanBuildIndexLeafPage(records, comparer))
+            {
+                expanded = null!;
+                return false;
+            }
+
+            expanded = IndexTreeNode.CreateLeaf(node.PageNumber, records);
+            return true;
+        }
+
+        var plan = node.InteriorPlan
+            ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan.");
+        var lastChildIndex = plan.Children.Count - 1;
+        if (!TryInsertMaximumIndexRecord(
+                plan.Children[lastChildIndex],
+                record,
+                comparer,
+                out var lastChild))
+        {
+            expanded = null!;
+            return false;
+        }
+
+        var children = plan.Children.ToArray();
+        children[lastChildIndex] = lastChild;
+        return TryCreateIndexInteriorNode(
+            node.PageNumber,
+            children,
+            plan.Separators,
+            comparer,
+            out expanded);
+    }
+
+    private bool TryCreateIndexInteriorNode(
+        uint pageNumber,
+        IReadOnlyList<IndexTreeNode> children,
+        IReadOnlyList<byte[]> separators,
+        SqliteIndexRecordComparer comparer,
+        out IndexTreeNode node)
+    {
+        try
+        {
+            var builder = new SqliteIndexInteriorPageBuilder(
+                _pageSize,
+                _usableSpace,
+                children[^1].PageNumber,
+                comparer);
+            for (var index = 0; index < separators.Count; index++)
+            {
+                builder.Append(
+                    SqliteIndexInteriorCell.Create(
+                        children[index].PageNumber,
+                        CreateIndexLeafPlanningCell(separators[index])),
+                    separators[index]);
+            }
+
+            _ = builder.Build();
+            node = IndexTreeNode.CreateInterior(
+                pageNumber,
+                new IndexInteriorPlan(
+                    children.ToArray(),
+                    separators.Select(value => value.ToArray()).ToArray()));
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            node = null!;
+            return false;
+        }
+    }
+
+    private bool CanBuildIndexLeafPage(
+        IReadOnlyList<byte[]> records,
+        SqliteIndexRecordComparer comparer)
+    {
+        try
+        {
+            var builder = new SqliteIndexLeafPageBuilder(_pageSize, _usableSpace, comparer);
+            foreach (var record in records)
+                builder.Append(CreateIndexLeafPlanningCell(record), record);
+            _ = builder.Build();
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
     }
 
     private byte[] BuildIndexInteriorPage(
@@ -8164,28 +8458,6 @@ internal sealed class EmbeddedFileStore : IDisposable
                 child.PageNumber,
                 BuildIndexInteriorPage(plan, comparer, allocator, overflowPages)));
         }
-    }
-
-    private static IndexTreeNode FindLeftmostIndexLeaf(IndexTreeNode node)
-    {
-        while (!node.IsLeaf)
-            node = (node.InteriorPlan
-                ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan."))
-                .Children[0];
-        return node;
-    }
-
-    private static IndexTreeNode FindRightmostIndexLeaf(IndexTreeNode node)
-    {
-        while (!node.IsLeaf)
-        {
-            var children = (node.InteriorPlan
-                ?? throw new InvalidOperationException("SQLite index tree node is missing its interior plan."))
-                .Children;
-            node = children[^1];
-        }
-
-        return node;
     }
 
     private static int GetIndexTreeHeight(IndexTreeNode node)
@@ -8610,7 +8882,8 @@ internal sealed class EmbeddedFileStore : IDisposable
     private SqliteIndexRecordComparer CreateIndexComparer(EmbeddedIndex index)
         => new(
             _textEncoding,
-            index.Columns.Select(column => column.Descending).ToArray());
+            index.Columns.Select(column => column.Descending).ToArray(),
+            index.Columns.Select(column => column.Collation).ToArray());
 
     private PreparedSchemaTree BuildSchemaTree(
         IReadOnlyList<SchemaEntry> entries,
@@ -8887,16 +9160,10 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new EmbeddedSqlException(
                     $"The managed file engine cannot persist index '{index.Name}' because its column metadata is inconsistent.");
             }
-            if (column.Descending && index.Origin != EmbeddedIndexOrigin.PrimaryKey)
+            if (!SqliteIndexRecordComparer.IsSupportedCollation(column.Collation))
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist index '{index.Name}' because descending index terms are not yet supported for file-backed databases.");
-            }
-            if (column.Collation is not null
-                && !string.Equals(column.Collation, "BINARY", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist index '{index.Name}' because collation '{column.Collation}' is not BINARY.");
+                    $"The managed file engine cannot persist index '{index.Name}' because collation '{column.Collation}' is not a supported SQLite built-in collation.");
             }
         }
     }
@@ -8925,7 +9192,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             columns[index] = new EmbeddedIndexColumn(
                 table.Columns[columnIndex],
                 columnIndex,
-                column.Collation,
+                column.Collation ?? table.ColumnDefinitions[columnIndex].Collation,
                 column.Descending);
         }
 
@@ -9191,7 +9458,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (previousRecord is not null && comparer.Compare(previousRecord, value) >= 0)
         {
             throw new InvalidDataException(
-                $"Stored index '{indexName}' {level} are not globally ordered by their complete BINARY keys.");
+                $"Stored index '{indexName}' {level} are not globally ordered by their complete keys.");
         }
 
         records.Add(value);

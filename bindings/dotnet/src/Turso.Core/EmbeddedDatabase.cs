@@ -12817,9 +12817,9 @@ public sealed class EmbeddedDatabase : IDisposable
             if (collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase))
                 return string.CompareOrdinal(left.AsText(), right.AsText());
             if (string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase))
-                return CompareSqliteNoCase(left.AsText(), right.AsText());
+                return SqliteIndexRecordComparer.CompareNoCaseText(left.AsText(), right.AsText());
             if (string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase))
-                return string.CompareOrdinal(left.AsText().TrimEnd(' '), right.AsText().TrimEnd(' '));
+                return SqliteIndexRecordComparer.CompareRTrimText(left.AsText(), right.AsText());
             if (_collations.TryGetValue(collation, out var compare))
                 return compare(left.AsText(), right.AsText());
 
@@ -12830,27 +12830,6 @@ public sealed class EmbeddedDatabase : IDisposable
 
         return left.Kind.CompareTo(right.Kind);
     }
-
-    private static int CompareSqliteNoCase(string left, string right)
-    {
-        var leftBytes = System.Text.Encoding.UTF8.GetBytes(left);
-        var rightBytes = System.Text.Encoding.UTF8.GetBytes(right);
-        var count = Math.Min(leftBytes.Length, rightBytes.Length);
-        for (var index = 0; index < count; index++)
-        {
-            var leftByte = FoldAscii(leftBytes[index]);
-            var rightByte = FoldAscii(rightBytes[index]);
-            if (leftByte != rightByte)
-                return leftByte.CompareTo(rightByte);
-        }
-
-        return leftBytes.Length.CompareTo(rightBytes.Length);
-    }
-
-    private static byte FoldAscii(byte value)
-        => value is >= (byte)'A' and <= (byte)'Z'
-            ? (byte)(value + ((byte)'a' - (byte)'A'))
-            : value;
 
     private static int CompareIntegerAndReal(long integer, double real)
     {

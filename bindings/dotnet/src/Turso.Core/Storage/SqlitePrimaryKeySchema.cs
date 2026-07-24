@@ -70,9 +70,9 @@ public sealed record SqlitePrimaryKeyTerm(
 /// writable.
 /// </para>
 /// <para>
-/// The current managed index-page primitives support only BINARY ascending key
-/// comparisons. Call <see cref="EnsureSupportedByBinaryAscendingIndexWriter"/>
-/// before using a schema with those primitives.
+/// The bounded and WITHOUT ROWID index paths support narrower key shapes than
+/// the full persisted-index writer. Call the matching validation method before
+/// selecting one of those paths.
 /// </para>
 /// </remarks>
 public sealed class SqlitePrimaryKeySchema
@@ -182,6 +182,31 @@ public sealed class SqlitePrimaryKeySchema
         var failures = new List<string>();
         foreach (var term in _terms)
             AddBinaryCollationFailure(term, failures);
+
+        if (failures.Count != 0)
+            throw new NotSupportedException(string.Join("; ", failures) + ".");
+    }
+
+    /// <summary>
+    /// Rejects schema terms whose collation cannot be reproduced by the
+    /// persisted managed index writer. ASC and DESC are both accepted.
+    /// </summary>
+    public void EnsureSupportedByPersistedIndexWriter()
+    {
+        var failures = new List<string>();
+        foreach (var term in _terms)
+        {
+            if (!term.Collation.IsAvailable)
+            {
+                failures.Add(
+                    $"primary-key term '{term.ColumnName}' has unavailable collation metadata");
+            }
+            else if (!SqliteIndexRecordComparer.IsSupportedCollation(term.Collation.Name))
+            {
+                failures.Add(
+                    $"primary-key term '{term.ColumnName}' uses unsupported persisted collation {term.Collation.Name}");
+            }
+        }
 
         if (failures.Count != 0)
             throw new NotSupportedException(string.Join("; ", failures) + ".");

@@ -235,12 +235,6 @@ public sealed class TursoManagedSqliteMigrationsSqlGenerator(
                 $"The managed local provider does not support filtered indexes ('{operation.Name}' on '{operation.Table}').");
         }
 
-        if (operation.IsDescending is { } sortOrders
-            && (sortOrders.Length == 0 || sortOrders.Any(static descending => descending)))
-        {
-            throw new NotSupportedException(
-                $"The managed local provider does not support descending indexes on file-backed databases ('{operation.Name}' on '{operation.Table}').");
-        }
     }
 
     private static void ValidateComputedColumn(ColumnOperation operation)
