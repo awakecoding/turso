@@ -99,6 +99,18 @@ internal static class NativeAbiContract
             interop.Assembly.GetType("Turso.Data.Sync.SyncFullWriteRequest", true)!,
             "Path",
             "Content");
+        ValidateStruct(
+            interop,
+            10,
+            interop.Assembly.GetType("Turso.Data.Sync.SyncStats", true)!,
+            "CdcOperations",
+            "MainWalSize",
+            "RevertWalSize",
+            "LastPullUnixTime",
+            "LastPushUnixTime",
+            "NetworkSentBytes",
+            "NetworkReceivedBytes",
+            "Revision");
     }
 
     private static void ValidateEnum(Type interop, uint nativeType, Type managedType)

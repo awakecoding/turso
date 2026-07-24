@@ -248,7 +248,7 @@ public sealed class ManagedBoundedUpsertRuntimeSliceTests
             INSERT INTO items VALUES (3, 'three', 3), (4, 'one', 4)
             ON CONFLICT(id) DO UPDATE SET value = excluded.value;
             """);
-        conflict.Should().Throw<EmbeddedSqlException>().WithMessage("UNIQUE constraint failed: code");
+        conflict.Should().Throw<EmbeddedSqlException>().WithMessage("UNIQUE constraint failed: items.code");
         AssertRows(
             ReadRows(connection, "SELECT id, code, value FROM items ORDER BY id;"),
             [SqlValue.Integer(1), SqlValue.Text("one"), SqlValue.Integer(1)],
@@ -269,7 +269,7 @@ public sealed class ManagedBoundedUpsertRuntimeSliceTests
             INSERT INTO items VALUES (1, 'two', 'changed')
             ON CONFLICT(id) DO UPDATE SET code = excluded.code, payload = excluded.payload;
             """);
-        conflict.Should().Throw<EmbeddedSqlException>().WithMessage("UNIQUE constraint failed: code");
+        conflict.Should().Throw<EmbeddedSqlException>().WithMessage("UNIQUE constraint failed: items.code");
 
         AssertRows(
             ReadRows(connection, "SELECT id, code, payload FROM items ORDER BY id;"),

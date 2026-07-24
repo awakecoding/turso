@@ -120,6 +120,19 @@ internal struct SyncFullWriteRequest
     public SyncSlice Content;
 }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct SyncStats
+{
+    public long CdcOperations;
+    public long MainWalSize;
+    public long RevertWalSize;
+    public long LastPullUnixTime;
+    public long LastPushUnixTime;
+    public long NetworkSentBytes;
+    public long NetworkReceivedBytes;
+    public SyncSlice Revision;
+}
+
 internal sealed class SyncDatabaseHandle : SafeHandleZeroOrMinusOneIsInvalid
 {
     private SyncDatabaseHandle() : base(ownsHandle: true)
@@ -301,6 +314,12 @@ internal static class SyncInterop
         out IntPtr operation,
         out IntPtr error);
 
+    [DllImport(DllName, EntryPoint = "turso_sync_database_stats", CallingConvention = CallingConvention.Cdecl)]
+    public static extern SyncStatusCode DatabaseStats(
+        SyncDatabaseHandle database,
+        out IntPtr operation,
+        out IntPtr error);
+
     [DllImport(DllName, EntryPoint = "turso_sync_database_push_changes", CallingConvention = CallingConvention.Cdecl)]
     public static extern SyncStatusCode DatabasePushChanges(
         SyncDatabaseHandle database,
@@ -331,6 +350,9 @@ internal static class SyncInterop
 
     [DllImport(DllName, EntryPoint = "turso_sync_operation_result_extract_changes", CallingConvention = CallingConvention.Cdecl)]
     public static extern SyncStatusCode OperationExtractChanges(SyncOperationHandle operation, out IntPtr changes);
+
+    [DllImport(DllName, EntryPoint = "turso_sync_operation_result_extract_stats", CallingConvention = CallingConvention.Cdecl)]
+    public static extern SyncStatusCode OperationExtractStats(SyncOperationHandle operation, out SyncStats stats);
 
     [DllImport(DllName, EntryPoint = "turso_sync_database_io_take_item", CallingConvention = CallingConvention.Cdecl)]
     public static extern SyncStatusCode DatabaseTakeIoItem(

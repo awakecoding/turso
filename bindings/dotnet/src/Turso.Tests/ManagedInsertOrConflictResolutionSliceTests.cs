@@ -279,6 +279,10 @@ public sealed class ManagedInsertOrConflictResolutionSliceTests
             .WithMessage("*does not support tables with FOREIGN KEY constraints*");
         ReadRows(connection, "SELECT parent_id FROM child_items;").Should().BeEmpty();
 
+        Execute(connection, "CREATE TABLE checked_items(id INTEGER UNIQUE, value INTEGER CHECK (value > 0));");
+        Execute(connection, "INSERT OR IGNORE INTO checked_items VALUES (1, 1), (2, -1);");
+        AssertRows(ReadRows(connection, "SELECT id FROM checked_items;"), [SqlValue.Integer(1)]);
+
         Execute(connection, "CREATE TABLE triggered_items(id INTEGER PRIMARY KEY);");
         Execute(connection, "CREATE TABLE audit_items(value INTEGER);");
         Execute(
@@ -291,10 +295,8 @@ public sealed class ManagedInsertOrConflictResolutionSliceTests
         ReadRows(connection, "SELECT value FROM audit_items;").Should().BeEmpty();
 
         Execute(connection, "CREATE TABLE required_items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);");
-        Action replaceNotNull = () => Execute(connection, "INSERT OR REPLACE INTO required_items VALUES (1, 'value');");
-        replaceNotNull.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*does not support NOT NULL constraints*");
-        ReadRows(connection, "SELECT id FROM required_items;").Should().BeEmpty();
+        Execute(connection, "INSERT OR REPLACE INTO required_items VALUES (1, 'value');");
+        AssertRows(ReadRows(connection, "SELECT id FROM required_items;"), [SqlValue.Integer(1)]);
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

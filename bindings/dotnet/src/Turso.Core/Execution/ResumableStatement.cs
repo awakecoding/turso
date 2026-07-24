@@ -38,8 +38,8 @@ public sealed class ResumableStatement : IDisposable
     private readonly bool[] _accumulatorInitialized;
     private readonly List<SqlValue[]>?[] _distinctSets;
     private readonly WorkTableRuntime?[] _workTables;
-    private readonly IReadOnlyList<VdbeCursorSource>? _cursorSources;
-    private readonly IReadOnlyList<VdbeWriteTarget>? _writeTargets;
+    private readonly IReadOnlyList<VdbeCursorSource?>? _cursorSources;
+    private readonly IReadOnlyList<VdbeWriteTarget?>? _writeTargets;
     private readonly VdbeTransactionContext _transaction = new();
     private VdbeParameterBinding? _binding;
     private ProgramCounter _instructionPointer;
@@ -48,8 +48,8 @@ public sealed class ResumableStatement : IDisposable
 
     public ResumableStatement(
         VdbeProgram program,
-        IReadOnlyList<VdbeCursorSource>? cursorSources = null,
-        IReadOnlyList<VdbeWriteTarget>? writeTargets = null,
+        IReadOnlyList<VdbeCursorSource?>? cursorSources = null,
+        IReadOnlyList<VdbeWriteTarget?>? writeTargets = null,
         VdbeParameterBinding? parameterBinding = null)
     {
         ArgumentNullException.ThrowIfNull(program);
@@ -183,6 +183,13 @@ public sealed class ResumableStatement : IDisposable
                         var operands = ReadRegisters(arithmetic.Operands);
                         _registers[arithmetic.Destination.Index] =
                             VdbeArithmetic.Evaluate(arithmetic.Operator, operands);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case NumericAffinityInstruction numericAffinity:
+                    {
+                        var value = _registers[numericAffinity.Value.Index];
+                        _registers[numericAffinity.Value.Index] = numericAffinity.Affinity.Apply(value);
                         AdvanceInstructionPointer();
                         break;
                     }

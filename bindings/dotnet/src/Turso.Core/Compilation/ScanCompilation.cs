@@ -33,4 +33,5 @@ internal sealed record ScanTarget(
 /// </summary>
 internal sealed record CompiledSelect(
     VdbeProgram Program,
-    IReadOnlyList<VdbeCursorSource> CursorSources);
+    IReadOnlyList<VdbeCursorSource> CursorSources,
+    IReadOnlyList<int>? ParameterIndices = null);

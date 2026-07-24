@@ -56,6 +56,29 @@ public class TursoConnectionOptions
     {
         var mode = ParseManagedOpenMode(Mode);
         var dataSource = string.IsNullOrEmpty(DataSource) ? ":memory:" : DataSource;
+        var cache = Cache;
+        var sharedMemoryName = default(string);
+        if (!string.IsNullOrWhiteSpace(cache)
+            && !cache.Equals("Default", StringComparison.OrdinalIgnoreCase)
+            && !cache.Equals("Private", StringComparison.OrdinalIgnoreCase))
+        {
+            if (cache.Equals("Shared", StringComparison.OrdinalIgnoreCase))
+            {
+                if (mode != ManagedLocalOpenMode.Memory
+                    || string.IsNullOrWhiteSpace(DataSource)
+                    || DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new NotSupportedException(ManagedSharedCacheContract.UnsupportedConfigurationMessage);
+                }
+
+                sharedMemoryName = DataSource;
+            }
+            else
+            {
+                throw new ArgumentException($"Invalid Cache value for Local Provider=Managed: {cache}.", nameof(Cache));
+            }
+        }
+
         if (mode is ManagedLocalOpenMode.ReadOnly or ManagedLocalOpenMode.ReadWrite
             && dataSource == ":memory:")
         {
@@ -64,20 +87,6 @@ public class TursoConnectionOptions
 
         if (mode is ManagedLocalOpenMode.ReadOnly or ManagedLocalOpenMode.ReadWrite && !File.Exists(dataSource))
             throw new InvalidOperationException($"Mode={Mode} requires an existing database file when Local Provider=Managed.");
-
-        var cache = Cache;
-        if (!string.IsNullOrWhiteSpace(cache)
-            && !cache.Equals("Default", StringComparison.OrdinalIgnoreCase)
-            && !cache.Equals("Private", StringComparison.OrdinalIgnoreCase))
-        {
-            if (cache.Equals("Shared", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new NotSupportedException(
-                    "Cache=Shared is not supported when Local Provider=Managed because managed connections do not share page caches.");
-            }
-
-            throw new ArgumentException($"Invalid Cache value for Local Provider=Managed: {cache}.", nameof(Cache));
-        }
 
         if (!string.IsNullOrWhiteSpace(_builder.GetOption("Password")))
             throw new NotSupportedException("Password is not supported when Local Provider=Managed because the managed engine does not provide encryption.");
@@ -99,7 +108,8 @@ public class TursoConnectionOptions
         return new ManagedLocalOpenOptions(
             managedDataSource,
             mode == ManagedLocalOpenMode.ReadOnly,
-            CreateManagedEncryptionOptions(mode, managedDataSource));
+            CreateManagedEncryptionOptions(mode, managedDataSource),
+            sharedMemoryName);
     }
 
     public Uri GetRemoteUri()
@@ -160,6 +170,20 @@ public class TursoConnectionOptions
             dataSource,
             mode == ManagedLocalOpenMode.ReadOnly);
         return true;
+    }
+
+    internal static TursoConnectionOptions FromReplica(TursoReplicaOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var builder = new TursoConnectionStringBuilder
+        {
+            DataSource = options.RemoteUri.AbsoluteUri,
+            ReplicaPath = options.Path,
+            LocalProvider = TursoLocalProvider.Native,
+        };
+        if (!string.IsNullOrWhiteSpace(options.AuthToken))
+            builder.AuthToken = options.AuthToken;
+        return new TursoConnectionOptions(builder);
     }
 
     private static bool IsRemoteDataSource(string dataSource)
@@ -255,9 +279,19 @@ public class TursoConnectionOptions
 internal readonly record struct ManagedLocalOpenOptions(
     string DataSource,
     bool ReadOnly,
-    ManagedEncryptionOptions? Encryption) : IDisposable
+    ManagedEncryptionOptions? Encryption,
+    string? SharedMemoryName) : IDisposable
 {
     public void Dispose() => Encryption?.Dispose();
+}
+
+internal static class ManagedSharedCacheContract
+{
+    public const string UnsupportedConfigurationMessage =
+        "Cache=Shared with Local Provider=Managed is supported only for named in-memory databases using Mode=Memory and a non-empty Data Source other than :memory:; file-backed and anonymous in-memory shared caches are not supported.";
+
+    public const string ReadUncommittedNotSupportedMessage =
+        "PRAGMA read_uncommitted and IsolationLevel.ReadUncommitted are not supported for managed shared-memory databases because the managed engine preserves transaction isolation and does not expose dirty reads.";
 }
 
 internal enum ManagedLocalOpenMode

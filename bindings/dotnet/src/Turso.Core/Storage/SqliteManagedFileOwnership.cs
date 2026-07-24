@@ -55,7 +55,7 @@ internal sealed class SqliteManagedFileOwnership
     internal SqliteManagedFileOwnership(string databasePath)
         => _databasePath = databasePath;
 
-    internal IDisposable Acquire(bool createNew, TimeSpan timeout)
+    internal IDisposable Acquire(bool createNew, bool readOnly, TimeSpan timeout)
     {
         var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
         while (true)
@@ -102,7 +102,7 @@ internal sealed class SqliteManagedFileOwnership
             stream = new FileStream(
                 _databasePath,
                 mode,
-                FileAccess.ReadWrite,
+                OperatingSystem.IsWindows() && readOnly ? FileAccess.Read : FileAccess.ReadWrite,
                 FileShare.ReadWrite | FileShare.Delete,
                 bufferSize: 1,
                 FileOptions.None);
@@ -370,6 +370,7 @@ internal static class SqliteManagedFileOwnershipRegistry
         IFileSystem fileSystem,
         string databasePath,
         bool createNew,
+        bool readOnly,
         TimeSpan timeout)
     {
         fileSystem = TursoEncryptionFileSystem.Unwrap(fileSystem);
@@ -388,6 +389,6 @@ internal static class SqliteManagedFileOwnershipRegistry
             }
         }
 
-        return owner.Acquire(createNew, timeout);
+        return owner.Acquire(createNew, readOnly, timeout);
     }
 }

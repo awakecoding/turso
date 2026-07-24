@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using Turso.Core;
 
 namespace Turso;
@@ -196,6 +197,7 @@ public class TursoCommand : DbCommand
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText must be set before preparing a command.");
         ValidateTransaction();
+        _connection.ValidateCommandCapabilities(CommandText);
         if (_connection.IsManagedReadOnly)
             ManagedReadOnlySqlGuard.ThrowIfQueryOnlyIsDisabled(CommandText);
         if (_connection.IsRemote)
@@ -329,18 +331,63 @@ public class TursoCommand : DbCommand
             connection.ReadUncommitted = ParsePragmaEnabled(value[1..].Trim());
             return "SELECT 1 WHERE 0";
         }
+        if (connection.IsManaged
+            && value.StartsWith("(", StringComparison.Ordinal)
+            && value.EndsWith(")", StringComparison.Ordinal))
+        {
+            connection.ReadUncommitted = ParsePragmaEnabled(value[1..^1].Trim());
+            return "SELECT 1 WHERE 0";
+        }
 
         return sql;
     }
 
-    private static bool ParsePragmaEnabled(string value)
+    internal static bool ParsePragmaEnabled(string value)
     {
-        value = value.Trim('\'', '"');
-        return long.TryParse(value, out var number)
-            ? number != 0
-            : value.Equals("ON", StringComparison.OrdinalIgnoreCase)
-              || value.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
-              || value.Equals("YES", StringComparison.OrdinalIgnoreCase);
+        var quoted = value.Length >= 2
+                     && ((value[0] == '\'' && value[^1] == '\'')
+                         || (value[0] == '"' && value[^1] == '"'));
+        if (quoted)
+            value = value[1..^1];
+        else if (value.StartsWith("+", StringComparison.Ordinal))
+            value = value[1..];
+        if (value.Length > 0 && char.IsAsciiDigit(value[0]))
+            return ParseSqlitePragmaInteger(value) is { } integer && (byte)integer != 0;
+
+        return value.Equals("ON", StringComparison.OrdinalIgnoreCase)
+               || value.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
+               || value.Equals("YES", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int? ParseSqlitePragmaInteger(string value)
+    {
+        if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            var end = 2;
+            while (end < value.Length && Uri.IsHexDigit(value[end]))
+                end++;
+            if (end == 2)
+                return 0;
+            return uint.TryParse(
+                    value.AsSpan(2, end - 2),
+                    NumberStyles.AllowHexSpecifier,
+                    CultureInfo.InvariantCulture,
+                    out var hexadecimal)
+                   && hexadecimal <= int.MaxValue
+                ? (int)hexadecimal
+                : null;
+        }
+
+        var length = 0;
+        while (length < value.Length && char.IsAsciiDigit(value[length]))
+            length++;
+        return int.TryParse(
+            value.AsSpan(0, length),
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out var decimalInteger)
+            ? decimalInteger
+            : null;
     }
 
     private DbDataReader Execute(
@@ -363,7 +410,13 @@ public class TursoCommand : DbCommand
             throw new InvalidOperationException("Command was not prepared.");
         _nativeStatement = null;
         _managedStatement = null;
-        var reader = new TursoDataReader(this, nativeStatement, managedStatement, behavior);
+        var transactionCompletion = SqlTransactionControl.GetCompletion(CommandText);
+        var reader = new TursoDataReader(
+            this,
+            nativeStatement,
+            managedStatement,
+            behavior,
+            () => MarkTransactionCompletedExternally(transactionCompletion));
         return reader;
     }
 
@@ -428,6 +481,7 @@ public class TursoCommand : DbCommand
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText must be set before executing a command.");
         ValidateTransaction();
+        _connection.ValidateCommandCapabilities(CommandText);
 
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -447,6 +501,7 @@ public class TursoCommand : DbCommand
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText must be set before executing a command.");
         ValidateTransaction();
+        _connection.ValidateCommandCapabilities(CommandText);
 
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -461,8 +516,7 @@ public class TursoCommand : DbCommand
 
     private void MarkTransactionCompletedExternally(SqlTransactionCompletion completion)
     {
-        if (completion != SqlTransactionCompletion.None)
-            _connection?.TransactionCompletedExternally();
+        _connection?.TransactionCompletedExternally(completion);
     }
 
     private void ValidateTransaction()

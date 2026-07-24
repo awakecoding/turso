@@ -146,7 +146,9 @@ typedef struct
     bool partial_bootstrap_prefetch;
     // optional base64-encoded encryption key for remote encrypted databases
     const char *remote_encryption_key;
-    // optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305")
+    // optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305").
+    // retained in the C ABI for callers that preserve the server configuration;
+    // callers must still set reserved_bytes because the C SDK does not derive it.
     const char *remote_encryption_cipher;
     // optional cap on the number of CDC operations packed into a single push HTTP batch.
     // when > 0, push splits on transaction boundaries once the current batch has accumulated

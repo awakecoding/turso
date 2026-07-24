@@ -514,6 +514,7 @@ public static class CompoundProgramBuilder
             CopyInstruction x => new CopyInstruction(Reg(x.Source), Reg(x.Destination)),
             FunctionInstruction x => new FunctionInstruction(Reg(x.Destination), x.Function, Range(x.Arguments)),
             ArithmeticInstruction x => new ArithmeticInstruction(Reg(x.Destination), x.Operator, Range(x.Operands)),
+            NumericAffinityInstruction x => new NumericAffinityInstruction(Reg(x.Value), x.Affinity),
             OpenReadCursorInstruction x => new OpenReadCursorInstruction(Cur(x.Cursor), x.TableName, x.ColumnCount),
             OpenWriteCursorInstruction x => new OpenWriteCursorInstruction(Cur(x.Cursor), x.TableName, x.ColumnCount),
             CloseCursorInstruction x => new CloseCursorInstruction(Cur(x.Cursor)),

@@ -24,7 +24,11 @@ public static class Resources
 
     public static string ManagedExtensionsNotSupported => "SQLite extension loading is not supported when Local Provider=Managed because extensions require the native SQLite loader.";
 
-    public static string ManagedSharedCacheNotSupported => "Cache=Shared is not supported when Local Provider=Managed because managed connections do not share page caches.";
+    public static string ManagedSharedCacheNotSupported => ManagedSharedCacheContract.UnsupportedConfigurationMessage;
+
+    public static string ManagedSharedCacheReadUncommittedNotSupported => ManagedSharedCacheContract.ReadUncommittedNotSupportedMessage;
+
+    public static string ManagedSharedCacheCallbacksNotSupported => "Managed shared-memory databases do not support connection-local functions, aggregates, or collations because the managed catalog is shared across connections.";
 
     public static string ManagedMemoryEncryptionNotSupported => "Encryption is supported only for file-backed databases when Local Provider=Managed.";
 

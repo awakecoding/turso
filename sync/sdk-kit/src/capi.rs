@@ -46,6 +46,7 @@ pub extern "C" fn turso_sync_abi_sizeof(type_: u32) -> usize {
         7 => std::mem::size_of::<c::turso_sync_io_http_header_t>(),
         8 => std::mem::size_of::<c::turso_sync_io_full_read_request_t>(),
         9 => std::mem::size_of::<c::turso_sync_io_full_write_request_t>(),
+        10 => std::mem::size_of::<c::turso_sync_stats_t>(),
         _ => usize::MAX,
     }
 }
@@ -112,6 +113,14 @@ pub extern "C" fn turso_sync_abi_offsetof(type_: u32, field: u32) -> usize {
         (8, 0) => std::mem::offset_of!(c::turso_sync_io_full_read_request_t, path),
         (9, 0) => std::mem::offset_of!(c::turso_sync_io_full_write_request_t, path),
         (9, 1) => std::mem::offset_of!(c::turso_sync_io_full_write_request_t, content),
+        (10, 0) => std::mem::offset_of!(c::turso_sync_stats_t, cdc_operations),
+        (10, 1) => std::mem::offset_of!(c::turso_sync_stats_t, main_wal_size),
+        (10, 2) => std::mem::offset_of!(c::turso_sync_stats_t, revert_wal_size),
+        (10, 3) => std::mem::offset_of!(c::turso_sync_stats_t, last_pull_unix_time),
+        (10, 4) => std::mem::offset_of!(c::turso_sync_stats_t, last_push_unix_time),
+        (10, 5) => std::mem::offset_of!(c::turso_sync_stats_t, network_sent_bytes),
+        (10, 6) => std::mem::offset_of!(c::turso_sync_stats_t, network_received_bytes),
+        (10, 7) => std::mem::offset_of!(c::turso_sync_stats_t, revision),
         _ => usize::MAX,
     }
 }
@@ -591,7 +600,7 @@ mod tests {
         turso_sync_database_io_take_item, turso_sync_database_new, turso_sync_io_http_header_t,
         turso_sync_io_http_request_t, turso_sync_io_request_type_t, turso_sync_operation_deinit,
         turso_sync_operation_result_extract_connection, turso_sync_operation_result_kind,
-        turso_sync_operation_result_type_t, turso_sync_operation_resume,
+        turso_sync_operation_result_type_t, turso_sync_operation_resume, turso_sync_stats_t,
     };
 
     #[test]
@@ -604,6 +613,14 @@ mod tests {
         assert_eq!(
             super::turso_sync_abi_offsetof(6, 4),
             std::mem::offset_of!(turso_sync_io_http_request_t, headers)
+        );
+        assert_eq!(
+            super::turso_sync_abi_sizeof(10),
+            std::mem::size_of::<turso_sync_stats_t>()
+        );
+        assert_eq!(
+            super::turso_sync_abi_offsetof(10, 7),
+            std::mem::offset_of!(turso_sync_stats_t, revision)
         );
         assert_eq!(super::turso_sync_abi_sizeof(u32::MAX), usize::MAX);
         assert_eq!(super::turso_sync_abi_offsetof(5, u32::MAX), usize::MAX);

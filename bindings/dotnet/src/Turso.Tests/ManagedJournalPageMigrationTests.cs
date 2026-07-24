@@ -385,6 +385,77 @@ public sealed class ManagedJournalPageMigrationTests
     }
 
     [Test]
+    [NonParallelizable]
+    public void PooledFacadeMigrationPreservesDurableConstraintCatalog()
+    {
+        var directory = Path.Combine(AppContext.BaseDirectory, "managed-pooled-migration-tests");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, $"{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={path};Pooling=True;Local Provider=Managed";
+        Turso.Data.Sqlite.SqliteConnection.ClearAllPools();
+        try
+        {
+            using (var connection = new Turso.Data.Sqlite.SqliteConnection(connectionString))
+            {
+                connection.Open();
+                using var command = connection.CreateCommand();
+                command.CommandText = """
+                    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                    CREATE TABLE child(
+                        id INTEGER PRIMARY KEY,
+                        parent_id INTEGER REFERENCES parent(id),
+                        code TEXT UNIQUE,
+                        quantity INTEGER DEFAULT (2 + 3),
+                        CONSTRAINT positive CHECK (quantity > 0)
+                    );
+                    INSERT INTO parent VALUES (1);
+                    INSERT INTO child(id, parent_id, code) VALUES (1, 1, 'a');
+                    PRAGMA journal_mode=DELETE;
+                    PRAGMA page_size=8192;
+                    VACUUM;
+                    """;
+                command.ExecuteNonQuery();
+            }
+
+            using var reopened = new Turso.Data.Sqlite.SqliteConnection(connectionString);
+            reopened.Open();
+            using var verification = reopened.CreateCommand();
+            verification.CommandText = "PRAGMA page_size";
+            verification.ExecuteScalar().Should().Be(8192L);
+            verification.CommandText = "SELECT quantity FROM child WHERE id=1";
+            verification.ExecuteScalar().Should().Be(5L);
+            verification.CommandText = "SELECT sql FROM sqlite_schema WHERE name='child'";
+            verification.ExecuteScalar()!.ToString().Should()
+                .Contain("REFERENCES \"parent\" (\"id\")")
+                .And.Contain("UNIQUE")
+                .And.Contain("DEFAULT (2 + 3)")
+                .And.Contain("CONSTRAINT \"positive\" CHECK (quantity > 0)");
+
+            verification.CommandText = "PRAGMA foreign_keys=ON";
+            verification.ExecuteNonQuery();
+            verification.CommandText = "INSERT INTO child(id, parent_id, code) VALUES (2, 99, 'b')";
+            Assert.Throws<Turso.Data.Sqlite.SqliteException>(() => verification.ExecuteNonQuery())!
+                .Message.Should().Contain("FOREIGN KEY constraint failed");
+            verification.CommandText = "INSERT INTO child VALUES (2, 1, 'b', -1)";
+            Assert.Throws<Turso.Data.Sqlite.SqliteException>(() => verification.ExecuteNonQuery())!
+                .Message.Should().Contain("CHECK constraint failed: positive");
+            verification.CommandText = "INSERT INTO child(id, parent_id, code) VALUES (2, 1, 'a')";
+            Assert.Throws<Turso.Data.Sqlite.SqliteException>(() => verification.ExecuteNonQuery())!
+                .Message.Should().Contain("UNIQUE constraint failed");
+        }
+        finally
+        {
+            Turso.Data.Sqlite.SqliteConnection.ClearAllPools();
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm", "-journal" })
+            {
+                var candidate = path + suffix;
+                if (File.Exists(candidate))
+                    File.Delete(candidate);
+            }
+        }
+    }
+
+    [Test]
     public void InterruptedJournalModeTransitionRecoversTheOriginalWalFormat()
     {
         const string path = "interrupted-mode.db";

@@ -89,6 +89,23 @@ public class TursoDataSqlitePackageArtifactReleaseTests
     }
 
     [Test]
+    public void ManagedPackageExposesReplicaOptionsWithoutSyncCompanion()
+    {
+        var packageDirectory = CreatePackageDirectory("turso-managed-replica-options-validation");
+
+        try
+        {
+            var packageVersion = $"0.0.0-managed-replica-options-{Guid.NewGuid():N}";
+            Pack(FindProjectPath(), packageDirectory, packageVersion);
+            RunManagedReplicaOptionsConsumer(packageDirectory, packageVersion);
+        }
+        finally
+        {
+            DeletePackageDirectory(packageDirectory);
+        }
+    }
+
+    [Test]
     public void NativeCompanionPackageRoutesExplicitNativeConnections()
     {
         var packageDirectory = CreatePackageDirectory("turso-native-package-validation");
@@ -611,10 +628,10 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 $"Data Source={path};Local Provider=Managed;Encryption Cipher=AES256GCM;Encryption Key={key}";
             try
             {
-                using (var managed = new SqliteConnection(connectionString))
+                using (var encrypted = new SqliteConnection(connectionString))
                 {
-                    managed.Open();
-                    managed.ExecuteNonQuery("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('encrypted');");
+                    encrypted.Open();
+                    encrypted.ExecuteNonQuery("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('encrypted');");
                 }
 
                 using (var reopened = new SqliteConnection(connectionString))
@@ -714,6 +731,73 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             "--output",
             publishDirectory);
         AssertManagedConsumerPublishOutputHasNoNativeAssets(publishDirectory);
+    }
+
+    private static void RunManagedReplicaOptionsConsumer(string packageDirectory, string packageVersion)
+    {
+        var consumerDirectory = Path.Combine(packageDirectory, "managed-replica-options-consumer");
+        Directory.CreateDirectory(consumerDirectory);
+        var projectPath = Path.Combine(consumerDirectory, "ManagedReplicaOptionsConsumer.csproj");
+        File.WriteAllText(
+            projectPath,
+            $$"""
+              <Project Sdk="Microsoft.NET.Sdk">
+                <PropertyGroup>
+                  <OutputType>Exe</OutputType>
+                  <TargetFramework>net9.0</TargetFramework>
+                  <ImplicitUsings>enable</ImplicitUsings>
+                </PropertyGroup>
+                <ItemGroup>
+                  <PackageReference Include="Turso.Data.Sqlite" Version="{{packageVersion}}" />
+                </ItemGroup>
+              </Project>
+              """);
+        File.WriteAllText(
+            Path.Combine(consumerDirectory, "Program.cs"),
+            """
+            using Turso;
+
+            var options = new TursoReplicaOptions(
+                "replica.db",
+                new Uri("https://example.turso.io"),
+                authToken: null)
+            {
+                LongPollTimeout = TimeSpan.FromSeconds(15),
+                PartialBootstrap = TursoPartialBootstrapOptions.Prefix(64 * 1024),
+                PushOperationsThreshold = 1000,
+                PullBytesThreshold = 1024 * 1024,
+            };
+            using var nullConnection = new TursoConnection(null!);
+            using var defaultConnection = new TursoConnection(default!);
+            using var replica = TursoConnection.CreateReplica(options);
+            try
+            {
+                replica.Open();
+            }
+            catch (NotSupportedException exception) when (
+                exception.Message.Contains("Turso.Data.Sqlite.Sync", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            throw new InvalidOperationException("The managed package unexpectedly activated embedded replica Sync.");
+            """);
+
+        var nugetConfigPath = Path.Combine(consumerDirectory, "NuGet.config");
+        File.WriteAllText(
+            nugetConfigPath,
+            $$"""
+              <?xml version="1.0" encoding="utf-8"?>
+              <configuration>
+                <packageSources>
+                  <clear />
+                  <add key="managed-package" value="{{System.Security.SecurityElement.Escape(packageDirectory)}}" />
+                </packageSources>
+              </configuration>
+              """);
+        RunDotnet(consumerDirectory, "restore", projectPath, "--configfile", nugetConfigPath);
+        AssertManagedConsumerRestoresNoNativeCompanions(consumerDirectory);
+        RunDotnet(consumerDirectory, "run", projectPath, "--no-restore");
     }
 
     private static void AssertManagedConsumerRestoresNoNativeCompanions(string consumerDirectory)
