@@ -5,14 +5,16 @@ using MsData = Microsoft.Data.Sqlite;
 
 namespace Turso.Tests;
 
-// Proves that EmbeddedDatabase routes the running-frame window subset
-// (func(...) OVER (... ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) through the real
-// sorter + AggReset/AggStep/AggFinalize opcode family emitted by WindowProgramBuilder, and that
-// the routed rows stay byte-identical to the tree-walking evaluator (cross-checked against a real
-// SQLite build for the partitioned case). EXPLAIN is the ground truth for "was this lowered to
-// bytecode?": a routed statement dumps the sorter/accumulator opcodes, while every deliberate
-// fallback shape throws on EXPLAIN because EXPLAIN only describes lowered programs. Fallback tests
-// also assert the evaluator still produces the correct value or raises its exact error.
+// Proves that EmbeddedDatabase routes windowed SELECTs through real bytecode: the streaming
+// running-frame program (sorter + AggReset/AggStep/AggFinalize emitted by WindowProgramBuilder) for the
+// narrow ROWS UNBOUNDED PRECEDING -> CURRENT ROW shape, and the buffered-window program
+// (OpenWindowBuffer/WindowBufferCompute/WindowBufferData emitted by BufferedWindowProgramBuilder) for
+// every other frame, function family, partition and ordering shape. Routed rows stay byte-identical to
+// the tree-walking evaluator (cross-checked against a real SQLite build for the partitioned case).
+// EXPLAIN is the ground truth for "was this lowered to bytecode?": a routed statement dumps its opcodes,
+// while every deliberate fallback shape throws on EXPLAIN because EXPLAIN only describes lowered
+// programs. Fallback tests also assert the evaluator still produces the correct value or raises its
+// exact error.
 public class WindowSqlRoutingTests
 {
     private const string RunningFrame = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
@@ -226,25 +228,26 @@ public class WindowSqlRoutingTests
             .Should().Equal("id", "SUM");
     }
 
-    // ---- Fallback boundaries (evaluator keeps ownership; EXPLAIN cannot describe them) ------
+    // ---- Buffered-window routing (shapes the running-frame builder cannot model) --------------
 
     [Test]
-    public void DefaultRangeFrameFallsBackToEvaluator()
+    public void DefaultRangeFrameRoutesThroughTheBufferedWindowProgram()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);");
 
-        // No ROWS clause -> default RANGE frame, which the running-frame builder cannot model.
+        // No ROWS clause -> default RANGE frame, which only the buffered lowering can model.
         var query = "SELECT id, sum(v) OVER (ORDER BY id) AS running FROM t ORDER BY id;";
         ReadRows(connection, query).Select(row => row[1]).Should().Equal(
             SqlValue.Integer(10), SqlValue.Integer(30), SqlValue.Integer(60));
 
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
     }
 
     [Test]
-    public void BoundedRowsFrameFallsBackToEvaluator()
+    public void BoundedRowsFrameRoutesThroughTheBufferedWindowProgram()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
@@ -254,11 +257,11 @@ public class WindowSqlRoutingTests
         ReadRows(connection, query).Select(row => row[1]).Should().Equal(
             SqlValue.Integer(10), SqlValue.Integer(30), SqlValue.Integer(50), SqlValue.Integer(70));
 
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
     }
 
     [Test]
-    public void UnboundedFollowingFrameFallsBackToEvaluator()
+    public void UnboundedFollowingFrameRoutesThroughTheBufferedWindowProgram()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
@@ -270,11 +273,11 @@ public class WindowSqlRoutingTests
         ReadRows(connection, query).Select(row => row[1]).Should().Equal(
             SqlValue.Integer(60), SqlValue.Integer(60), SqlValue.Integer(60));
 
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
     }
 
     [Test]
-    public void FilterClauseFallsBackToEvaluator()
+    public void FilterClauseRoutesThroughTheBufferedWindowProgram()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
@@ -288,8 +291,130 @@ public class WindowSqlRoutingTests
         rows[1][1].Should().Be(SqlValue.Integer(20));
         rows[2][1].Should().Be(SqlValue.Integer(50));
 
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+    }
+
+    [Test]
+    public void GroupConcatWithSeparatorRoutesThroughTheBufferedWindowProgram()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, label TEXT);");
+        Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
+
+        // A 2-argument group_concat's separator is not a bare column, so the running accumulator
+        // declines and the buffered lowering owns it.
+        var query = $"SELECT id, group_concat(label, '|') OVER (ORDER BY id {RunningFrame}) AS acc FROM t ORDER BY id;";
+        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
+            SqlValue.Text("a"), SqlValue.Text("a|b"), SqlValue.Text("a|b|c"));
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+    }
+
+    [Test]
+    public void RankingFunctionWindowRoutesThroughTheBufferedWindowProgram()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
+
+        var query = $"SELECT row_number() OVER (ORDER BY id {RunningFrame}) FROM t;";
+        ReadRows(connection, query).Select(row => row[0]).Should().Equal(
+            SqlValue.Integer(1),
+            SqlValue.Integer(2));
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+    }
+
+    [Test]
+    public void LimitedRunningWindowRoutesWithGatedResultRows()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+
+        var query = $"SELECT id, sum(v) OVER (ORDER BY id {RunningFrame}) AS running FROM t ORDER BY id LIMIT 2;";
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(10)),
+            (SqlValue.Integer(2), SqlValue.Integer(30)));
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("LimitGate");
+    }
+
+    [Test]
+    public void OrderByMissingPartitionPrefixRoutesThroughTheBufferedWindowProgram()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE sales(region TEXT, amount INTEGER);");
+        Execute(connection, "INSERT INTO sales VALUES ('a', 10), ('b', 5), ('a', 30);");
+
+        // The running-frame lowering needs the top ORDER BY to make partitions contiguous. A bare
+        // "ORDER BY amount" is not partition-contiguous, so the buffered lowering owns it and sorts
+        // the projected records after the window pass instead.
+        var query =
+            $"SELECT region, amount, sum(amount) OVER (PARTITION BY region ORDER BY amount {RunningFrame}) AS running " +
+            "FROM sales ORDER BY amount;";
+        ReadRows(connection, query).Select(row => (row[0], row[1], row[2])).Should().Equal(
+            (SqlValue.Text("b"), SqlValue.Integer(5), SqlValue.Integer(5)),
+            (SqlValue.Text("a"), SqlValue.Integer(10), SqlValue.Integer(10)),
+            (SqlValue.Text("a"), SqlValue.Integer(30), SqlValue.Integer(40)));
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Contain("WindowBufferCompute");
+    }
+
+    [Test]
+    public void PartitionedWindowWithoutTopOrderRoutesInScanOrder()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(grp INTEGER, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (1, 30);");
+
+        // With no top-level ORDER BY the buffered lowering emits in scan order while the window pass
+        // still folds each partition, which is exactly what the evaluator produces.
+        var query = $"SELECT grp, sum(v) OVER (PARTITION BY grp {RunningFrame}) AS running FROM t;";
+        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
+            (SqlValue.Integer(1), SqlValue.Integer(10)),
+            (SqlValue.Integer(2), SqlValue.Integer(20)),
+            (SqlValue.Integer(1), SqlValue.Integer(40)));
+
+        Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should()
+            .Contain("WindowBufferCompute").And.NotContain("OpenSorter");
+    }
+
+    // ---- Fallback boundaries (evaluator keeps ownership; EXPLAIN cannot describe them) ------
+
+    [Test]
+    public void WindowOverAJoinFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE l(id INTEGER, v INTEGER);");
+        Execute(connection, "CREATE TABLE r(id INTEGER, w INTEGER);");
+        Execute(connection, "INSERT INTO l VALUES (1, 10), (2, 20);");
+        Execute(connection, "INSERT INTO r VALUES (1, 100), (2, 200);");
+
+        // The window route claims exactly one base table; a join source keeps the evaluator.
+        var query =
+            "SELECT l.id, sum(r.w) OVER (ORDER BY l.id) FROM l JOIN r ON r.id = l.id ORDER BY l.id;";
+        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
+            SqlValue.Integer(100), SqlValue.Integer(300));
+
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
     }
+
+    [Test]
+    public void DistinctWindowSelectFallsBackToEvaluator()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(grp TEXT, v INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES ('a', 1), ('a', 1), ('b', 2);");
+
+        // DISTINCT de-duplicates the projected rows after windowing; the route owns only the
+        // window pipeline, so the evaluator keeps it.
+        var query = "SELECT DISTINCT count(*) OVER (PARTITION BY grp) FROM t;";
+        ReadRows(connection, query).Should().HaveCount(2);
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
 
     [Test]
     public void DistinctWindowArgumentFallsBackAndEvaluatorRejects()
@@ -300,35 +425,6 @@ public class WindowSqlRoutingTests
 
         var query = $"SELECT id, sum(DISTINCT v) OVER (ORDER BY id {RunningFrame}) FROM t ORDER BY id;";
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query));
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
-    }
-
-    [Test]
-    public void GroupConcatWithSeparatorFallsBackToEvaluator()
-    {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER, label TEXT);");
-        Execute(connection, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');");
-
-        // A 2-argument group_concat's separator is not a bare column, so the accumulator declines.
-        var query = $"SELECT id, group_concat(label, '|') OVER (ORDER BY id {RunningFrame}) AS acc FROM t ORDER BY id;";
-        ReadRows(connection, query).Select(row => row[1]).Should().Equal(
-            SqlValue.Text("a"), SqlValue.Text("a|b"), SqlValue.Text("a|b|c"));
-
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
-    }
-
-    [Test]
-    public void RankingFunctionWindowFallsBackAndEvaluatorProducesValues()
-    {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
-
-        var query = $"SELECT row_number() OVER (ORDER BY id {RunningFrame}) FROM t;";
-        ReadRows(connection, query).Select(row => row[0]).Should().Equal(
-            SqlValue.Integer(1),
-            SqlValue.Integer(2));
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
     }
 
@@ -369,48 +465,17 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void LimitedRunningWindowFallsBackToEvaluator()
+    public void CompoundWindowTermFallsBackToEvaluator()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);");
+        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
 
-        var query = $"SELECT id, sum(v) OVER (ORDER BY id {RunningFrame}) AS running FROM t ORDER BY id LIMIT 2;";
-        ReadRows(connection, query).Select(row => (row[0], row[1])).Should().Equal(
-            (SqlValue.Integer(1), SqlValue.Integer(10)),
-            (SqlValue.Integer(2), SqlValue.Integer(30)));
-
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
-    }
-
-    [Test]
-    public void OrderByMissingPartitionPrefixFallsBackToEvaluator()
-    {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE sales(region TEXT, amount INTEGER);");
-        Execute(connection, "INSERT INTO sales VALUES ('a', 10), ('b', 5), ('a', 30);");
-
-        // PARTITION BY region ORDER BY amount needs the top ORDER BY to be region, amount for the
-        // sort to be partition-contiguous. A bare "ORDER BY amount" is not, so the route declines.
+        // A compound term that opens a window buffer is not a conservative term, so the whole
+        // compound stays on the evaluator.
         var query =
-            $"SELECT region, amount, sum(amount) OVER (PARTITION BY region ORDER BY amount {RunningFrame}) AS running " +
-            "FROM sales ORDER BY amount;";
-        ReadRows(connection, query).Should().HaveCount(3);
-
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
-    }
-
-    [Test]
-    public void RunningWindowWithoutTopOrderButPartitionedFallsBackToEvaluator()
-    {
-        using var connection = new EmbeddedDatabase().Connect();
-        Execute(connection, "CREATE TABLE t(grp INTEGER, v INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20), (1, 30);");
-
-        // A partitioned window with no top-level ORDER BY cannot guarantee the builder's sorted
-        // emission equals the evaluator's scan-order output, so it declines.
-        var query = $"SELECT grp, sum(v) OVER (PARTITION BY grp {RunningFrame}) AS running FROM t;";
-        ReadRows(connection, query).Should().HaveCount(3);
+            $"SELECT sum(v) OVER (ORDER BY id {RunningFrame}) FROM t UNION ALL SELECT v FROM t;";
+        ReadRows(connection, query).Should().HaveCount(4);
 
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
     }

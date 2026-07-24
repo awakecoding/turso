@@ -426,7 +426,7 @@ public sealed class WindowFunctionSemanticsTests
                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
             ORDER BY grp, id;
             """;
-        const string fallback =
+        const string buffered =
             """
             SELECT id, rank() OVER (
                 PARTITION BY grp ORDER BY ord
@@ -434,11 +434,25 @@ public sealed class WindowFunctionSemanticsTests
             FROM t
             ORDER BY grp, id;
             """;
+        const string fallback =
+            """
+            SELECT DISTINCT rank() OVER (PARTITION BY grp ORDER BY ord)
+            FROM t
+            ORDER BY 1;
+            """;
 
         Opcodes(ReadRows(connection, "EXPLAIN " + compiled))
             .Should().Contain("SorterSort").And.Contain("AggStep").And.Contain("AggFinalize");
         ReadRows(connection, "EXPLAIN QUERY PLAN " + compiled)[0][3].AsText()
             .Should().Be("MANAGED COMPILED VDBE");
+
+        // The peer-relative GROUPS frame with EXCLUDE is not a streaming fold, so it lowers onto the
+        // buffered-window opcode family instead of the running accumulator.
+        Opcodes(ReadRows(connection, "EXPLAIN " + buffered))
+            .Should().Contain("OpenWindowBuffer").And.Contain("WindowBufferCompute");
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + buffered)[0][3].AsText()
+            .Should().Be("MANAGED COMPILED VDBE");
+        AssertMatchesSqlite(Setup, buffered);
 
         var explainFallback = () => ReadRows(connection, "EXPLAIN " + fallback);
         explainFallback.Should().Throw<EmbeddedSqlException>();

@@ -113,19 +113,27 @@ public sealed class OrderByNullOrderingTests
             "INSERT INTO t VALUES (2, 20), (NULL, 5), (1, 10), (NULL, 7), (3, 30);",
         ];
         const string frame = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
-        var compiled =
+        var running =
             $"SELECT id, sum(value) OVER (ORDER BY id ASC NULLS LAST {frame}) AS running " +
             "FROM t ORDER BY id ASC NULLS LAST;";
-        const string fallback =
+        const string buffered =
             "SELECT id, sum(value) OVER (ORDER BY id DESC NULLS FIRST) AS running " +
             "FROM t ORDER BY id DESC NULLS FIRST;";
+        const string fallback =
+            "SELECT DISTINCT sum(value) OVER (ORDER BY id DESC NULLS FIRST) AS running " +
+            "FROM t ORDER BY 1 DESC NULLS FIRST;";
 
-        AssertMatchesSqlite(setup, compiled);
+        AssertMatchesSqlite(setup, running);
+        AssertMatchesSqlite(setup, buffered);
         AssertMatchesSqlite(setup, fallback);
 
         using var connection = OpenManaged(setup);
-        Opcodes(ReadRows(connection, "EXPLAIN " + compiled))
+        Opcodes(ReadRows(connection, "EXPLAIN " + running))
             .Should().Contain("SorterSort").And.Contain("AggFinalize");
+        // The default RANGE frame lowers onto the buffered-window family, whose ORDER BY comparer
+        // reuses the evaluator's explicit NULL placement.
+        Opcodes(ReadRows(connection, "EXPLAIN " + buffered))
+            .Should().Contain("WindowBufferCompute").And.Contain("SorterSort");
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + fallback));
     }
 

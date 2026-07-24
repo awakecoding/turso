@@ -6781,12 +6781,17 @@ public sealed class EmbeddedDatabase : IDisposable
 
         // A SELECT carrying LIMIT/OFFSET lowers only when its LIMIT/OFFSET-free base is a
         // gate-able route. Direct scans, constant projections, source-less scalar Function programs,
-        // aggregates, the deliberately narrow bounded sorted-scan subset, and a strictly-gated
+        // aggregates, windows, the deliberately narrow bounded sorted-scan subset, and a strictly-gated
         // equi-join subset route through the dedicated path that layers LimitOffsetProgramBuilder
         // gates onto that base. DISTINCT, computed shapes, outer joins, and compounds keep
         // LIMIT/OFFSET on the evaluator.
         if (select.Limit is not null || select.Offset is not null)
         {
+            // The window route owns its own LIMIT/OFFSET composition because its base is a buffered
+            // pipeline the generic limited-select preflight does not model.
+            if (TryCompileWindowSelect(select, parameters, context, outerRow, out compiled))
+                return true;
+
             if (TryCompileLimitedSelect(select, parameters, context, outerRow, out compiled))
                 return true;
 
@@ -7677,6 +7682,7 @@ public sealed class EmbeddedDatabase : IDisposable
             or AggStepInstruction
             or AggFinalizeInstruction
             or OpenSorterInstruction
+            or OpenWindowBufferInstruction
             or FilterRegistersInstruction
             or OpenJoinCursorInstruction
             or ProjectRegistersInstruction
@@ -9523,27 +9529,37 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    // Lowers the largest window subset that WindowProgramBuilder can run with EXACT running-frame
-    // semantics: a single base-table SELECT whose window calls all share one running frame
-    // (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) over aggregate window functions. It reuses
-    // the evaluator's own accumulation (BuildAccumulatorAggregate), partition equality
-    // (BuildGroupComparers), and ordering (CompareRows) so a routed row is byte-identical to the
-    // fallback. Anything the running-frame program cannot reproduce exactly declines (returns false)
-    // so the tree-walking evaluator keeps ownership and raises its own value or error.
+    // Lowers a windowed SELECT over one base table to real bytecode, or declines so the tree-walking
+    // evaluator keeps ownership and raises its own value or error. Two lowerings sit behind this router,
+    // tried in order:
     //
-    // Routed grammar (all conditions required):
-    //   SELECT <proj> [,...] FROM <single base table> [WHERE <row predicate>]
-    //   [ORDER BY <partition cols as prefix> , <window ORDER BY terms>]
-    // where each <proj> is one of: '*', a bare backed column, a folded constant, or
-    //   agg(<bare column>|*) OVER ([PARTITION BY <bare cols>] [ORDER BY <scan terms>]
-    //                              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-    // with agg in {count, sum, total, avg, min, max, group_concat/1, registered aggregates}, and
-    // every window call sharing one identical OVER spec.
+    //  1. The streaming running-frame program (WindowProgramBuilder): the narrow shape whose window calls
+    //     all share one ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW spec over aggregate functions of
+    //     bare columns, which folds into the AggReset/AggStep/AggFinalize opcode family without buffering
+    //     a partition. See TryBuildRunningWindowProgram for its exact grammar.
+    //  2. The buffered-window program (BufferedWindowProgramBuilder): every other window shape whose
+    //     inputs are computable from one scanned row. It buffers the scanned rows through the
+    //     OpenWindowBuffer/WindowBufferInsert/WindowBufferCompute/WindowBufferData opcode family and
+    //     defers every window semantic — partitioning, per-partition ordering, peer groups, ROWS/RANGE/
+    //     GROUPS frames, EXCLUDE, FILTER, and the ranking/navigation/aggregate families — to the
+    //     evaluator's own ComputeWindowFunctions through a VdbeWindowEvaluator. That is what makes
+    //     sliding, forward-looking and peer-relative frames representable exactly.
     //
-    // Exactness of the emitted (partition, order) sort order requires the top-level ORDER BY to be
-    // the partition columns (in any direction, as a bijective prefix) followed by the window ORDER BY
-    // terms verbatim; absent an ORDER BY the window must be unpartitioned and unordered so the sorter
-    // preserves scan order. See the decline conditions below for everything routed to the evaluator.
+    // Both lowerings emit unconditional ResultRows, so LIMIT/OFFSET composes onto either through
+    // LimitOffsetProgramBuilder.
+    //
+    // Deliberately kept on the evaluator (decline, never a fake success):
+    //  - DISTINCT, GROUP BY, HAVING: the route owns only the window pipeline.
+    //  - a plain aggregate mixed with a window call, or a window call in WHERE/GROUP BY/HAVING: the
+    //    evaluator raises the exact diagnostic.
+    //  - any source that is not one base table (joins, compounds, CTEs, views, derived tables, schema
+    //    tables), and any base table the managed index planner would scan in index order, whose row
+    //    order the compiled scan does not reproduce.
+    //  - a WHERE the scan cannot evaluate per row, or any window argument / FILTER / PARTITION BY /
+    //    window ORDER BY / projection / ORDER BY term that is not computable from one scanned row
+    //    (subqueries, EXISTS, unbacked rowid references).
+    //  - a non-integral LIMIT/OFFSET bound and LIMIT 0, whose evaluator diagnostics and
+    //    validate-without-scanning timing the gate cannot reproduce.
     private bool TryCompileWindowSelect(
         SelectStatement select,
         SqlValue[] parameters,
@@ -9559,13 +9575,10 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
 
         // Reshaping/dedup clauses stay on the evaluator so this route owns only the pure
-        // partition -> order -> running-emit pipeline. LIMIT/OFFSET are handled upstream by
-        // TryCompileLimitedSelect (whose bases decline windows), so they never reach here.
+        // buffer -> window -> order -> emit pipeline.
         if (select.Distinct
             || select.Having is not null
             || select.GroupBy.Count != 0
-            || select.Limit is not null
-            || select.Offset is not null
             || select.Projections.Count == 0)
         {
             return false;
@@ -9574,16 +9587,115 @@ public sealed class EmbeddedDatabase : IDisposable
         // A window select that also carries a plain (non-window) aggregate or GROUP BY is an
         // evaluator error ("window functions cannot be combined with aggregates or GROUP BY");
         // decline so the evaluator raises it. ContainsAggregate is false for window calls.
-        if (select.Projections.Any(projection => ContainsAggregate(projection.Expression)))
+        if (select.Projections.Any(projection => ContainsAggregate(projection.Expression))
+            || select.OrderBy.Any(term => ContainsAggregate(term.Expression)))
+        {
+            return false;
+        }
+
+        // A window call outside the projection/ORDER BY positions is a misuse the evaluator names.
+        if (select.Where is not null && ContainsWindowFunction(select.Where))
+            return false;
+
+        // ExecuteSelect validates ORDER BY collations and then every window call before it touches a row.
+        // Running the same validations here decides eligibility, but a validation failure declines rather
+        // than throws: the evaluator owns every window diagnostic, so it raises the exact error at its
+        // exact point and EXPLAIN QUERY PLAN keeps reporting the statement as evaluator-owned.
+        IReadOnlyList<OrderByTerm> resolvedOrderBy;
+        List<FunctionExpression> windowFunctions;
+        try
+        {
+            resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
+            ValidateOrderByCollations(resolvedOrderBy);
+            windowFunctions = CollectSelectWindowFunctions(select);
+            foreach (var function in windowFunctions)
+            {
+                foreach (var partition in function.Window!.PartitionBy)
+                    ValidateCollation(GetCollation(partition));
+                ValidateOrderByCollations(function.Window!.OrderBy);
+                ValidateWindowFunction(function);
+            }
+        }
+        catch (EmbeddedSqlException)
+        {
+            return false;
+        }
+
+        if (windowFunctions.Count == 0)
             return false;
 
         var target = ResolveScanTarget(select.Source, context);
-        if (target is null)
+        if (target is null || target.Columns.Length == 0)
             return false;
+
+        // A managed index plan makes the evaluator scan in index order, which the compiled cursor (which
+        // walks the table's rows) does not reproduce. Decline so a routed window pass can never observe a
+        // different input order than the fallback would.
+        if (TryPlanManagedIndexScan(select, context) is not null)
+            return false;
+
+        // Resolve the bounds only after the non-executing validations above. ExecuteSelect establishes the
+        // same precedence, so a user callback in LIMIT/OFFSET cannot run before a missing collation or an
+        // invalid window diagnostic.
+        if (!TryResolveLimitOffset(select, parameters, context, outerRow, out var limit, out var offset))
+            return false;
+        if (limit == 0)
+            return false;
+
+        var baseSelect = select.Limit is null && select.Offset is null
+            ? select
+            : select with { Limit = null, Offset = null };
+
+        if (!TryBuildRunningWindowProgram(baseSelect, target, parameters, context, outerRow, out var program)
+            && !TryBuildBufferedWindowProgram(
+                baseSelect,
+                target,
+                windowFunctions,
+                resolvedOrderBy,
+                parameters,
+                context,
+                outerRow,
+                out program))
+        {
+            return false;
+        }
+
+        compiled = new CompiledSelect(
+            LimitOffsetProgramBuilder.Apply(program, offset, limit),
+            [new VdbeCursorSource(target.Rows)]);
+        return true;
+    }
+
+    // The streaming running-frame lowering. It reuses the evaluator's own accumulation
+    // (BuildAccumulatorAggregate), partition equality (BuildGroupComparers), and ordering (CompareRows)
+    // so a routed row is byte-identical to the fallback.
+    //
+    // Routed grammar (all conditions required):
+    //   SELECT <proj> [,...] FROM <single base table> [WHERE <row predicate>]
+    //   [ORDER BY <partition cols as prefix> , <window ORDER BY terms>]
+    // where each <proj> is one of: '*', a bare backed column, a folded constant, or
+    //   agg(<bare column>|*) OVER ([PARTITION BY <bare cols>] [ORDER BY <scan terms>]
+    //                              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    // with agg in {count, sum, total, avg, min, max, group_concat/1, registered aggregates}, and
+    // every window call sharing one identical OVER spec.
+    //
+    // Exactness of the emitted (partition, order) sort order requires the top-level ORDER BY to be
+    // the partition columns (in any direction, as a bijective prefix) followed by the window ORDER BY
+    // terms verbatim; absent an ORDER BY the window must be unpartitioned and unordered so the sorter
+    // preserves scan order. Everything else declines to the buffered lowering.
+    private bool TryBuildRunningWindowProgram(
+        SelectStatement select,
+        ScanTarget target,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out VdbeProgram program)
+    {
+        program = null!;
 
         // Classify every projection into a pass-through column, a running window call sharing
         // one spec, or a folded constant. Any other shape (computed expressions over window
-        // results, qualified stars, scalar functions) declines so the evaluator produces it.
+        // results, qualified stars, scalar functions) declines to the buffered lowering.
         WindowSpecification? spec = null;
         var windows = new List<AggregateFunctionSpec>();
         var outputs = new List<WindowOutput>();
@@ -9593,8 +9705,6 @@ public sealed class EmbeddedDatabase : IDisposable
             switch (projection.Expression)
             {
                 case StarExpression:
-                    if (target.Columns.Length == 0)
-                        return false;
                     for (var index = 0; index < target.Columns.Length; index++)
                         outputs.Add(WindowOutput.ForColumn(index));
                     continue;
@@ -9624,8 +9734,6 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (!sawWindow || spec is null)
             return false;
-
-        ValidateOrderByCollations(spec.OrderBy);
 
         // PARTITION BY keys must be bare, backed columns so the builder can copy them into the
         // partition-key registers and the reused group-key equality can compare them.
@@ -9681,7 +9789,6 @@ public sealed class EmbeddedDatabase : IDisposable
         else
         {
             var resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
-            ValidateOrderByCollations(resolvedOrderBy);
             if (resolvedOrderBy.Count != partitionCount + windowOrderCount)
                 return false;
 
@@ -9714,7 +9821,6 @@ public sealed class EmbeddedDatabase : IDisposable
                     return false;
             }
 
-            var columns = target.Columns;
             orderComparer = (leftRow, rightRow) => CompareRows(
                 CreateScanSourceRow(target, leftRow, context, outerRow),
                 CreateScanSourceRow(target, rightRow, context, outerRow),
@@ -9734,7 +9840,7 @@ public sealed class EmbeddedDatabase : IDisposable
             partitionComparer = groupComparer;
         }
 
-        var program = WindowProgramBuilder.Build(
+        program = WindowProgramBuilder.Build(
             target.TableName,
             target.Columns.Length,
             partitionColumns,
@@ -9743,8 +9849,268 @@ public sealed class EmbeddedDatabase : IDisposable
             orderComparer,
             partitionComparer,
             predicate);
-        compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows)]);
         return true;
+    }
+
+    // The general buffered-window lowering: every window shape whose inputs are computable from one
+    // scanned row. Partitioning, window ordering, peer groups, frame resolution, EXCLUDE, FILTER and the
+    // ranking/navigation/aggregate function families are all supplied to the emitted program as one
+    // VdbeWindowEvaluator built from the evaluator's own ComputeWindowFunctions, so a routed row is
+    // byte-identical to the fallback for every frame the evaluator supports. The projection and the
+    // statement's ORDER BY are likewise lowered as delegates over the (row, window values) record, reusing
+    // ReplaceWindowFunctions/Evaluate/CompareForOrdering, which is how computed keys and computed results
+    // over window values stay exact.
+    private bool TryBuildBufferedWindowProgram(
+        SelectStatement select,
+        ScanTarget target,
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        IReadOnlyList<OrderByTerm> resolvedOrderBy,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out VdbeProgram program)
+    {
+        program = null!;
+
+        // Stripping every window call to a placeholder value is exactly the substitution the routed
+        // projection performs, so eligibility is decided against the shape that will actually be
+        // evaluated rather than an approximation of it.
+        var placeholders = new Dictionary<FunctionExpression, SqlValue>();
+        foreach (var function in windowFunctions)
+            placeholders[function] = SqlValue.Null;
+
+        // Everything the window pass evaluates per row must be computable from that row alone.
+        foreach (var function in windowFunctions)
+        {
+            foreach (var argument in function.Arguments)
+            {
+                if (!IsRoutableWindowExpression(argument, target, placeholders))
+                    return false;
+            }
+
+            if (function.Filter is not null
+                && !IsRoutableWindowExpression(function.Filter, target, placeholders))
+            {
+                return false;
+            }
+
+            var window = function.Window!;
+            foreach (var partition in window.PartitionBy)
+            {
+                if (!IsRoutableWindowExpression(partition, target, placeholders))
+                    return false;
+            }
+
+            foreach (var term in window.OrderBy)
+            {
+                if (!IsRoutableWindowExpression(term.Expression, target, placeholders))
+                    return false;
+            }
+        }
+
+        var outputs = new List<BufferedWindowOutput>();
+        foreach (var projection in select.Projections)
+        {
+            switch (projection.Expression)
+            {
+                case StarExpression:
+                    for (var index = 0; index < target.Columns.Length; index++)
+                        outputs.Add(BufferedWindowOutput.ForColumn(index));
+                    continue;
+                case QualifiedStarExpression qualified
+                    when string.Equals(qualified.Qualifier, target.Qualifier, StringComparison.OrdinalIgnoreCase):
+                    for (var index = 0; index < target.Columns.Length; index++)
+                        outputs.Add(BufferedWindowOutput.ForColumn(index));
+                    continue;
+                case QualifiedStarExpression:
+                    // The evaluator raises "no such table: <qualifier>"; let it.
+                    return false;
+                case ColumnExpression column when target.ResolveColumnIndex(column.Name) is { } ordinal:
+                    outputs.Add(BufferedWindowOutput.ForColumn(ordinal));
+                    continue;
+                case FunctionExpression function when function.Window is not null:
+                    var windowOrdinal = IndexOfWindowFunction(windowFunctions, function);
+                    if (windowOrdinal < 0)
+                        return false;
+
+                    outputs.Add(BufferedWindowOutput.ForWindow(windowOrdinal));
+                    continue;
+                default:
+                    if (IsConstantScalarExpression(projection.Expression))
+                    {
+                        outputs.Add(BufferedWindowOutput.ForConstant(
+                            Evaluate(projection.Expression, parameters, null, context)));
+                        continue;
+                    }
+
+                    if (!IsRoutableWindowExpression(projection.Expression, target, placeholders))
+                        return false;
+
+                    outputs.Add(BufferedWindowOutput.ForComputed(BuildWindowProjectionFunction(
+                        projection.Expression, target, windowFunctions, parameters, context, outerRow)));
+                    continue;
+            }
+        }
+
+        if (outputs.Count == 0)
+            return false;
+
+        VdbeRowPredicate? predicate = null;
+        if (select.Where is not null)
+        {
+            predicate = CompileRowPredicate(select.Where, target, parameters, context, outerRow);
+            if (predicate is null)
+                return false;
+        }
+
+        VdbeRowComparer? orderComparer = null;
+        if (resolvedOrderBy.Count > 0)
+        {
+            foreach (var term in resolvedOrderBy)
+            {
+                if (!IsRoutableWindowExpression(term.Expression, target, placeholders))
+                    return false;
+            }
+
+            orderComparer = BuildWindowOrderComparer(
+                resolvedOrderBy, target, windowFunctions, parameters, context, outerRow);
+        }
+
+        program = BufferedWindowProgramBuilder.Build(
+            target.TableName,
+            target.Columns.Length,
+            windowFunctions.Count,
+            outputs,
+            BuildWindowEvaluator(target, windowFunctions, parameters, context, outerRow),
+            orderComparer,
+            predicate);
+        return true;
+    }
+
+    // An expression is routable through the buffered window pass when, with its window calls replaced by
+    // their computed values, what remains is evaluable against one scanned row and reads no rowid the
+    // materialized row cannot supply.
+    private bool IsRoutableWindowExpression(
+        Expression expression,
+        ScanTarget target,
+        IReadOnlyDictionary<FunctionExpression, SqlValue> placeholders)
+    {
+        var stripped = ReplaceWindowFunctions(expression, placeholders);
+        return IsScanPredicate(stripped) && !ReferencesUnbackedRowid(stripped, target);
+    }
+
+    private static int IndexOfWindowFunction(
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        FunctionExpression function)
+    {
+        for (var index = 0; index < windowFunctions.Count; index++)
+        {
+            if (windowFunctions[index].Equals(function))
+                return index;
+        }
+
+        return -1;
+    }
+
+    // The buffered program's single window pass: it rehydrates each buffered tuple into the SourceRow the
+    // evaluator would have seen and hands the whole buffer to ComputeWindowFunctionValueRows, so routed
+    // partitioning, framing, and per-function semantics are literally the evaluator's.
+    private VdbeWindowEvaluator BuildWindowEvaluator(
+        ScanTarget target,
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        var functions = windowFunctions.ToArray();
+        return bufferedRows =>
+        {
+            var rows = new List<SourceRow>(bufferedRows.Count);
+            foreach (var row in bufferedRows)
+                rows.Add(CreateScanSourceRow(target, row, context, outerRow));
+
+            return ComputeWindowFunctionValueRows(functions, rows, parameters, context);
+        };
+    }
+
+    // Lowers one computed projection over window results: the delegate receives the whole
+    // (scanned columns, window values) record, rebuilds the evaluator's per-row window substitution from
+    // its tail, and evaluates the substituted expression against the scanned row.
+    private VdbeScalarFunction BuildWindowProjectionFunction(
+        Expression expression,
+        ScanTarget target,
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        var functions = windowFunctions.ToArray();
+        var width = target.Columns.Length;
+        return new VdbeScalarFunction
+        {
+            Name = "window projection",
+            Invoke = record => Evaluate(
+                ReplaceWindowFunctions(expression, BuildWindowSubstitution(functions, record, width)),
+                parameters,
+                CreateScanSourceRow(target, record[..width], context, outerRow),
+                context),
+        };
+    }
+
+    // Lowers the statement's ORDER BY over the (row, window values) record. It mirrors
+    // ExecuteWindowSelect's comparison term for term — substitute, evaluate against the source row, and
+    // compare with the term's direction, NULL placement, and collation — so a routed sort is the
+    // evaluator's sort. The sorter is stable, matching the evaluator's StableSortIndices tie-break on
+    // scan position.
+    private VdbeRowComparer BuildWindowOrderComparer(
+        IReadOnlyList<OrderByTerm> resolvedOrderBy,
+        ScanTarget target,
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        var functions = windowFunctions.ToArray();
+        var width = target.Columns.Length;
+        return (left, right) =>
+        {
+            var leftRow = CreateScanSourceRow(target, left[..width], context, outerRow);
+            var rightRow = CreateScanSourceRow(target, right[..width], context, outerRow);
+            var leftSubstitution = BuildWindowSubstitution(functions, left, width);
+            var rightSubstitution = BuildWindowSubstitution(functions, right, width);
+            foreach (var term in resolvedOrderBy)
+            {
+                var comparison = CompareForOrdering(
+                    Evaluate(
+                        ReplaceWindowFunctions(term.Expression, leftSubstitution),
+                        parameters,
+                        leftRow,
+                        context),
+                    Evaluate(
+                        ReplaceWindowFunctions(term.Expression, rightSubstitution),
+                        parameters,
+                        rightRow,
+                        context),
+                    term,
+                    GetCollation(term.Expression));
+                if (comparison != 0)
+                    return comparison;
+            }
+
+            return 0;
+        };
+    }
+
+    private static Dictionary<FunctionExpression, SqlValue> BuildWindowSubstitution(
+        FunctionExpression[] windowFunctions,
+        SqlValue[] record,
+        int columnCount)
+    {
+        var substitution = new Dictionary<FunctionExpression, SqlValue>(windowFunctions.Length);
+        for (var index = 0; index < windowFunctions.Length; index++)
+            substitution[windowFunctions[index]] = record[columnCount + index];
+
+        return substitution;
     }
 
     // Recognizes a top-level running-frame window call over bare, backed columns, appends its
@@ -11209,6 +11575,12 @@ public sealed class EmbeddedDatabase : IDisposable
             WorkTableExpandInstruction => VdbeExplain.Describe(instruction),
             WorkTableExpandGenerationInstruction => VdbeExplain.Describe(instruction),
             CloseWorkTableInstruction => VdbeExplain.Describe(instruction),
+            OpenWindowBufferInstruction => VdbeExplain.Describe(instruction),
+            WindowBufferInsertInstruction => VdbeExplain.Describe(instruction),
+            WindowBufferComputeInstruction => VdbeExplain.Describe(instruction),
+            WindowBufferDataInstruction => VdbeExplain.Describe(instruction),
+            WindowBufferNextInstruction => VdbeExplain.Describe(instruction),
+            CloseWindowBufferInstruction => VdbeExplain.Describe(instruction),
             RowSetRewindInstruction => VdbeExplain.Describe(instruction),
             RowSetNextInstruction => VdbeExplain.Describe(instruction),
             GuardedRowInstruction => VdbeExplain.Describe(instruction),
@@ -19061,42 +19433,19 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context)
     {
         var rowCount = selectedRows.Count;
-        var windowValues = new Dictionary<FunctionExpression, SqlValue>[rowCount];
-        for (var index = 0; index < rowCount; index++)
-            windowValues[index] = new Dictionary<FunctionExpression, SqlValue>();
-        var inputs = PrepareWindowFunctionInputs(
+        var valueRows = ComputeWindowFunctionValueRows(
             windowFunctions,
             selectedRows,
             parameters,
             context);
-
-        var groups = new List<List<FunctionExpression>>();
-        foreach (var function in windowFunctions)
+        var windowValues = new Dictionary<FunctionExpression, SqlValue>[rowCount];
+        for (var index = 0; index < rowCount; index++)
         {
-            var group = groups.FirstOrDefault(candidate =>
-                WindowSpecsEqual(candidate[0].Window!, function.Window!));
-            if (group is null)
-            {
-                group = [];
-                groups.Add(group);
-            }
+            var substitution = new Dictionary<FunctionExpression, SqlValue>(windowFunctions.Count);
+            for (var ordinal = 0; ordinal < windowFunctions.Count; ordinal++)
+                substitution[windowFunctions[ordinal]] = valueRows[index][ordinal];
 
-            group.Add(function);
-        }
-
-        foreach (var group in groups)
-        {
-            var values = ComputeWindowFunctions(
-                group,
-                selectedRows,
-                inputs,
-                parameters,
-                context);
-            foreach (var function in group)
-            {
-                for (var index = 0; index < rowCount; index++)
-                    windowValues[index][function] = values[function][index];
-            }
+            windowValues[index] = substitution;
         }
 
         var orderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
@@ -19179,6 +19528,54 @@ public sealed class EmbeddedDatabase : IDisposable
             columnNames,
             ApplyDistinctLimit(resultRows, statement.Distinct, offset, limit, collations),
             0);
+    }
+
+    // Computes each collected window function's value for every selected row, aligned by function ordinal.
+    // Window calls are grouped by identical OVER spec so one partition/order/frame pass serves every
+    // function sharing a spec, which is how a statement carrying several different windows is evaluated.
+    // Both the tree-walking ExecuteWindowSelect and the compiled buffered-window route consume this, so
+    // the two paths cannot drift.
+    private SqlValue[][] ComputeWindowFunctionValueRows(
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var values = new SqlValue[rows.Count][];
+        for (var index = 0; index < rows.Count; index++)
+            values[index] = new SqlValue[windowFunctions.Count];
+
+        if (windowFunctions.Count == 0)
+            return values;
+
+        var inputs = PrepareWindowFunctionInputs(windowFunctions, rows, parameters, context);
+        var groups = new List<List<int>>();
+        foreach (var ordinal in Enumerable.Range(0, windowFunctions.Count))
+        {
+            var group = groups.FirstOrDefault(candidate =>
+                WindowSpecsEqual(windowFunctions[candidate[0]].Window!, windowFunctions[ordinal].Window!));
+            if (group is null)
+            {
+                group = [];
+                groups.Add(group);
+            }
+
+            group.Add(ordinal);
+        }
+
+        foreach (var group in groups)
+        {
+            var functions = group.Select(ordinal => windowFunctions[ordinal]).ToArray();
+            var computed = ComputeWindowFunctions(functions, rows, inputs, parameters, context);
+            for (var position = 0; position < functions.Length; position++)
+            {
+                var series = computed[functions[position]];
+                for (var index = 0; index < rows.Count; index++)
+                    values[index][group[position]] = series[index];
+            }
+        }
+
+        return values;
     }
 
     private Dictionary<FunctionExpression, WindowFunctionInput[]> PrepareWindowFunctionInputs(
