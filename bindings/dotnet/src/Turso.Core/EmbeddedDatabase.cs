@@ -764,14 +764,16 @@ public sealed class EmbeddedDatabase : IDisposable
     }
 
     internal static bool MayMutate(ParsedStatement statement) => statement is
-        CreateTableStatement or DropTableStatement or CreateIndexStatement or DropIndexStatement
+        CreateTableStatement or CreateTableAsSelectStatement
+        or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableDropColumnStatement
         or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement or VacuumStatement;
 
     internal static bool MayChangeSchema(ParsedStatement statement) => statement is
-        CreateTableStatement or DropTableStatement or CreateIndexStatement or DropIndexStatement
+        CreateTableStatement or CreateTableAsSelectStatement
+        or DropTableStatement or CreateIndexStatement or DropIndexStatement
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableDropColumnStatement;
@@ -841,6 +843,76 @@ public sealed class EmbeddedDatabase : IDisposable
                 _views,
                 _triggers));
         }
+    }
+
+    internal CreateTableMaterialization MaterializeCreateTableAs(
+        QueryStatement statement,
+        SqlValue[] parameters,
+        long lastInsertRowId,
+        bool foreignKeysEnabled,
+        bool recursiveTriggersEnabled,
+        CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return MaterializeCreateTableAs(
+                statement,
+                parameters,
+                new SchemaCatalog(_tables, _views, _triggers),
+                lastInsertRowId,
+                foreignKeysEnabled,
+                recursiveTriggersEnabled,
+                cancellationToken);
+        }
+    }
+
+    internal CreateTableMaterialization MaterializeCreateTableAs(
+        QueryStatement statement,
+        SqlValue[] parameters,
+        SchemaCatalog catalog,
+        long lastInsertRowId,
+        bool foreignKeysEnabled,
+        bool recursiveTriggersEnabled,
+        CancellationToken cancellationToken)
+    {
+        var context = new QueryContext(
+            catalog.Tables,
+            new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
+            catalog.Views,
+            catalog.Triggers,
+            LastInsertRowId: lastInsertRowId,
+            ForeignKeysEnabled: foreignKeysEnabled,
+            RecursiveTriggersEnabled: recursiveTriggersEnabled,
+            CancellationToken: cancellationToken);
+        var result = MaterializeQueryResult(ExecuteQuery(statement, parameters, context, outerRow: null));
+        var affinities = DescribeQueryAffinities(
+            statement,
+            context,
+            new Dictionary<string, IReadOnlyList<QueryAffinityColumn>>(StringComparer.OrdinalIgnoreCase));
+        if (affinities.Count != result.Columns.Length)
+            throw new InvalidOperationException("CREATE TABLE AS SELECT affinity metadata does not match the result width.");
+
+        var names = MakeCreateTableColumnNamesUnique(result.Columns);
+        var columns = new EmbeddedColumn[names.Length];
+        for (var index = 0; index < columns.Length; index++)
+        {
+            columns[index] = new EmbeddedColumn(
+                names[index],
+                CtasDeclaredType(affinities[index].Affinity),
+                PrimaryKey: false,
+                NotNull: false,
+                Unique: false,
+                DefaultValue: null);
+        }
+
+        var rows = new SqlValue[result.Rows.Count][];
+        for (var rowIndex = 0; rowIndex < rows.Length; rowIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            rows[rowIndex] = MaterializeQueryRow(result.Rows[rowIndex]);
+        }
+
+        return new CreateTableMaterialization(columns, rows);
     }
 
     internal bool ContainsTableOrView(string name)
@@ -1433,7 +1505,9 @@ public sealed class EmbeddedDatabase : IDisposable
             CancellationToken: cancellationToken);
         return statement switch
         {
-            CreateTableStatement create => ExecuteCreateTable(create, catalog),
+            CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
+            CreateTableAsSelectStatement => throw new InvalidOperationException(
+                "CREATE TABLE AS SELECT must be materialized by the owning connection."),
             DropTableStatement drop => ExecuteDmlWithAutoIncrementState(
                 context,
                 scoped => scoped.ForeignKeysEnabled
@@ -1472,7 +1546,9 @@ public sealed class EmbeddedDatabase : IDisposable
             PragmaIndexXInfoStatement indexXInfo => ExecutePragmaIndexXInfo(indexXInfo, tables),
             PragmaForeignKeyListStatement foreignKeyList => ExecutePragmaForeignKeyList(foreignKeyList, tables),
             PragmaForeignKeyCheckStatement foreignKeyCheck => ExecutePragmaForeignKeyCheck(foreignKeyCheck, tables),
-            PragmaTableListStatement => ExecutePragmaTableList(catalog),
+            PragmaTableListStatement tableList => ExecutePragmaTableList(
+                catalog,
+                tableList.Schema ?? "main"),
             PragmaDatabaseListStatement => ExecutePragmaDatabaseList(),
             PragmaEncodingStatement => ExecutePragmaEncoding(),
             ExplainStatement explain => ExecuteExplain(explain, parameters, context),
@@ -1561,14 +1637,17 @@ public sealed class EmbeddedDatabase : IDisposable
         return SqlValue.Null;
     }
 
-    private static ExecutionResult ExecutePragmaTableList(SchemaCatalog catalog)
+    private static ExecutionResult ExecutePragmaTableList(SchemaCatalog catalog, string schema)
     {
         var rows = new List<SqlValue[]>
         {
             new[]
             {
-                SqlValue.Text("main"),
-                SqlValue.Text("sqlite_schema"),
+                SqlValue.Text(schema),
+                SqlValue.Text(
+                    schema.Equals("temp", StringComparison.OrdinalIgnoreCase)
+                        ? "sqlite_temp_schema"
+                        : "sqlite_schema"),
                 SqlValue.Text("table"),
                 SqlValue.Integer(5),
                 SqlValue.Integer(0),
@@ -1580,12 +1659,12 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             rows.Add(
             [
-                SqlValue.Text("main"),
+                SqlValue.Text(schema),
                 SqlValue.Text(name),
                 SqlValue.Text("table"),
                 SqlValue.Integer(table.ColumnDefinitions.Length),
                 SqlValue.Integer(table.WithoutRowid ? 1 : 0),
-                SqlValue.Integer(0),
+                SqlValue.Integer(table.Strict ? 1 : 0),
             ]);
         }
 
@@ -1601,7 +1680,7 @@ public sealed class EmbeddedDatabase : IDisposable
                         catalog.Triggers));
             rows.Add(
             [
-                SqlValue.Text("main"),
+                SqlValue.Text(schema),
                 SqlValue.Text(name),
                 SqlValue.Text("view"),
                 SqlValue.Integer(columns.Count),
@@ -1830,7 +1909,10 @@ public sealed class EmbeddedDatabase : IDisposable
         return new ExecutionResult(columns, rows, 0);
     }
 
-    private ExecutionResult ExecuteCreateTable(CreateTableStatement statement, SchemaCatalog catalog)
+    private ExecutionResult ExecuteCreateTable(
+        CreateTableStatement statement,
+        SchemaCatalog catalog,
+        CancellationToken cancellationToken)
     {
         var tables = catalog.Tables;
         if (IsSqliteSequenceTable(statement.Name))
@@ -1875,7 +1957,25 @@ public sealed class EmbeddedDatabase : IDisposable
             statement.PrimaryKeyConflictAlgorithm,
             statement.PrimaryKeyConstraintName,
             statement.PrimaryKeyDeclarationOrder,
-            statement.TableForeignKeys);
+            statement.TableForeignKeys,
+            statement.Strict);
+        if (statement.InitialRows is { } initialRows)
+        {
+            for (var rowIndex = 0; rowIndex < initialRows.Count; rowIndex++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var row = initialRows[rowIndex].ToArray();
+                if (row.Length != table.ColumnDefinitions.Length)
+                {
+                    throw new InvalidOperationException(
+                        "A materialized CREATE TABLE AS SELECT row has the wrong column count.");
+                }
+
+                table.ApplyAffinities(row);
+                table.Rows.Add(row);
+                table.RowIds.Add(checked(rowIndex + 1L));
+            }
+        }
         if (table.IsAutoIncrement)
             EnsureSqliteSequenceTable(catalog);
 
@@ -4071,7 +4171,7 @@ public sealed class EmbeddedDatabase : IDisposable
             if (virtualOnly && column.GeneratedStored)
                 continue;
 
-            var value = EmbeddedTable.ApplyColumnAffinity(
+            var value = table.ApplyColumnAffinity(
                 column,
                 Evaluate(column.GenerationExpression!, parameters, source, context));
             row[columnIndex] = value;
@@ -4131,10 +4231,9 @@ public sealed class EmbeddedDatabase : IDisposable
                 IndexExpression: true));
     }
 
-    // Enforces primary-key integrity that a rowid alias cannot cover: WITHOUT ROWID keys are
-    // implicitly NOT NULL and unique on the full tuple, while a table-level PRIMARY KEY on a
-    // rowid table behaves like a UNIQUE index (NULLs distinct). Messages are table-qualified
-    // and list key columns in declaration order, matching SQLite.
+    // Enforces primary-key integrity that a rowid alias cannot cover. WITHOUT ROWID and
+    // STRICT keys are implicitly NOT NULL; a non-STRICT rowid table otherwise treats a
+    // table-level PRIMARY KEY like a UNIQUE index with distinct NULLs.
     private void ValidatePrimaryKey(string tableName, EmbeddedTable table, IReadOnlyList<SqlValue[]> rows)
     {
         if (!table.WithoutRowid && table.TableLevelPrimaryKey is null)
@@ -4144,7 +4243,7 @@ public sealed class EmbeddedDatabase : IDisposable
         if (primaryKey.Count == 0)
             return;
 
-        if (table.WithoutRowid)
+        if (table.WithoutRowid || table.Strict)
         {
             foreach (var row in rows)
             {
@@ -5873,7 +5972,6 @@ public sealed class EmbeddedDatabase : IDisposable
             if (ValuesMatchParent(parent, parentValues, childValues))
                 return true;
         }
-
         return false;
     }
 
@@ -5885,7 +5983,7 @@ public sealed class EmbeddedDatabase : IDisposable
         for (var position = 0; position < parent.ColumnIndices.Count; position++)
         {
             var parentColumn = parent.ColumnIndices[position];
-            var comparableChildValue = EmbeddedTable.ApplyColumnAffinity(
+            var comparableChildValue = parent.Table.CoerceColumnAffinity(
                 parent.Table.ColumnDefinitions[parentColumn],
                 childValues[position]);
             if (Compare(parentValues[position], comparableChildValue, parent.Collations[position]) != 0)
@@ -14314,8 +14412,14 @@ public sealed class EmbeddedDatabase : IDisposable
                 + FormatForeignKeyReference(foreignKey));
         }
 
-        var withoutRowid = table.WithoutRowid ? " WITHOUT ROWID" : string.Empty;
-        return $"CREATE TABLE {QuoteIdentifier(name)} ({string.Join(", ", columns)}){withoutRowid}";
+        var options = table switch
+        {
+            { WithoutRowid: true, Strict: true } => " WITHOUT ROWID, STRICT",
+            { WithoutRowid: true } => " WITHOUT ROWID",
+            { Strict: true } => " STRICT",
+            _ => string.Empty,
+        };
+        return $"CREATE TABLE {QuoteIdentifier(name)} ({string.Join(", ", columns)}){options}";
     }
 
     private static string FormatForeignKeyReference(ForeignKeyDefinition foreignKey)
@@ -14525,6 +14629,293 @@ public sealed class EmbeddedDatabase : IDisposable
         return DescribeQuery(
             statement.Query,
             context with { CommonTableExpressions = commonTableExpressions });
+    }
+
+    private sealed record QueryAffinityColumn(string? Qualifier, string Name, ColumnAffinity Affinity);
+
+    private static IReadOnlyList<QueryAffinityColumn> DescribeQueryAffinities(
+        QueryStatement statement,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        return statement switch
+        {
+            SelectStatement select => DescribeSelectAffinities(select, context, commonTableExpressions),
+            CompoundSelectStatement compound => DescribeQueryAffinities(
+                compound.Terms[0],
+                context,
+                commonTableExpressions),
+            WithSelectStatement with => DescribeWithSelectAffinities(with, context, commonTableExpressions),
+            ValuesClause values => Enumerable.Range(0, values.Rows[0].Count)
+                .Select(index => new QueryAffinityColumn(null, $"column{index + 1}", ColumnAffinity.Blob))
+                .ToArray(),
+            _ => throw new EmbeddedSqlException($"Unsupported query type {statement.GetType().Name}."),
+        };
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> DescribeSelectAffinities(
+        SelectStatement statement,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        var output = GetSourceAffinityColumns(statement.Source, context, commonTableExpressions);
+        var rawOutput = GetRawSourceAffinityColumns(statement.Source, context, commonTableExpressions);
+        var result = new List<QueryAffinityColumn>();
+        foreach (var projection in statement.Projections)
+        {
+            if (projection.Expression is StarExpression)
+            {
+                if (output.Count == 0)
+                    throw new EmbeddedSqlException("SELECT * requires a row source");
+                result.AddRange(output);
+                continue;
+            }
+
+            if (projection.Expression is QualifiedStarExpression qualifiedStar)
+            {
+                var matches = rawOutput
+                    .Where(column => string.Equals(
+                        column.Qualifier,
+                        qualifiedStar.Qualifier,
+                        StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                if (matches.Length == 0)
+                    throw new EmbeddedSqlException($"no such table: {qualifiedStar.Qualifier}");
+                result.AddRange(matches);
+                continue;
+            }
+
+            result.Add(new QueryAffinityColumn(
+                null,
+                projection.Alias ?? GetExpressionName(projection.Expression),
+                GetExpressionAffinity(
+                    projection.Expression,
+                    output,
+                    context,
+                    commonTableExpressions)));
+        }
+
+        return result;
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> DescribeWithSelectAffinities(
+        WithSelectStatement statement,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        var ctes = new Dictionary<string, IReadOnlyList<QueryAffinityColumn>>(
+            commonTableExpressions,
+            StringComparer.OrdinalIgnoreCase);
+        var runtimeCtes = new Dictionary<string, SourceData>(
+            context.CommonTableExpressions,
+            StringComparer.OrdinalIgnoreCase);
+        var namesInCurrentClause = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var cte in statement.CommonTableExpressions)
+        {
+            if (!namesInCurrentClause.Add(cte.Name))
+                throw new EmbeddedSqlException($"duplicate WITH table name: {cte.Name}");
+
+            var columns = DescribeQueryAffinities(
+                cte.Query,
+                context with { CommonTableExpressions = runtimeCtes },
+                ctes).ToArray();
+            if (cte.Columns is { } declared)
+            {
+                if (declared.Count != columns.Length)
+                    throw new EmbeddedSqlException($"table {cte.Name} has {columns.Length} values for {declared.Count} columns");
+                columns = columns
+                    .Select((column, index) => column with { Name = declared[index] })
+                    .ToArray();
+            }
+
+            ctes[cte.Name] = columns;
+            runtimeCtes[cte.Name] = new SourceData(columns.Select(column => column.Name).ToArray(), []);
+        }
+
+        return DescribeQueryAffinities(
+            statement.Query,
+            context with { CommonTableExpressions = runtimeCtes },
+            ctes);
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> GetSourceAffinityColumns(
+        TableSource? source,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        if (source is not JoinTableSource join)
+            return GetRawSourceAffinityColumns(source, context, commonTableExpressions);
+
+        var raw = GetRawSourceAffinityColumns(join, context, commonTableExpressions);
+        return GetOutputColumns(join, context)
+            .Select(column =>
+            {
+                var affinity = raw[column.Index];
+                return affinity with { Qualifier = column.Qualifier, Name = column.Name };
+            })
+            .ToArray();
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> GetRawSourceAffinityColumns(
+        TableSource? source,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        return source switch
+        {
+            null => [],
+            NamedTableSource named when IsSchemaTable(named.Name) =>
+            [
+                new(named.Alias ?? named.Name, "type", ColumnAffinity.Text),
+                new(named.Alias ?? named.Name, "name", ColumnAffinity.Text),
+                new(named.Alias ?? named.Name, "tbl_name", ColumnAffinity.Text),
+                new(named.Alias ?? named.Name, "rootpage", ColumnAffinity.Integer),
+                new(named.Alias ?? named.Name, "sql", ColumnAffinity.Text),
+            ],
+            NamedTableSource named when commonTableExpressions.TryGetValue(named.Name, out var cte)
+                => QualifyAffinityColumns(cte, named.Alias ?? named.Name),
+            NamedTableSource named when TryGetView(context, named.Name, out var view)
+                => QualifyAffinityColumns(
+                    DescribeViewAffinities(view, EnterView(context, view.Name), commonTableExpressions),
+                    named.Alias ?? view.Name),
+            NamedTableSource named => GetTableAffinityColumns(named, context.Tables),
+            GenerateSeriesSource => [new QueryAffinityColumn(null, "value", ColumnAffinity.Integer)],
+            DerivedTableSource derived => QualifyAffinityColumns(
+                DescribeQueryAffinities(derived.Query, context, commonTableExpressions),
+                derived.Alias),
+            JoinTableSource join => GetRawSourceAffinityColumns(join.Left, context, commonTableExpressions)
+                .Concat(GetRawSourceAffinityColumns(join.Right, context, commonTableExpressions))
+                .ToArray(),
+            _ => throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}."),
+        };
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> DescribeViewAffinities(
+        ViewDefinition view,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        var columns = DescribeQueryAffinities(view.Query, context, commonTableExpressions).ToArray();
+        if (view.Columns is not { } declared)
+            return columns;
+        if (declared.Count != columns.Length)
+            throw new EmbeddedSqlException($"expected {declared.Count} columns for {view.Name} but got {columns.Length}");
+
+        return columns.Select((column, index) => column with { Name = declared[index] }).ToArray();
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> GetTableAffinityColumns(
+        NamedTableSource source,
+        Dictionary<string, EmbeddedTable> tables)
+    {
+        var table = GetTable(source, tables);
+        return table.ColumnDefinitions
+            .Select(column => new QueryAffinityColumn(
+                source.Alias ?? source.Name,
+                column.Name,
+                table.GetColumnAffinity(column)))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> QualifyAffinityColumns(
+        IReadOnlyList<QueryAffinityColumn> columns,
+        string? qualifier)
+        => columns.Select(column => column with { Qualifier = qualifier }).ToArray();
+
+    private static ColumnAffinity GetExpressionAffinity(
+        Expression expression,
+        IReadOnlyList<QueryAffinityColumn> sourceColumns,
+        QueryContext context,
+        Dictionary<string, IReadOnlyList<QueryAffinityColumn>> commonTableExpressions)
+    {
+        if (expression is CollationExpression collation)
+        {
+            return GetExpressionAffinity(
+                collation.Expression,
+                sourceColumns,
+                context,
+                commonTableExpressions);
+        }
+        if (expression is CastExpression cast)
+            return EmbeddedTable.GetAffinity(cast.TypeName);
+        if (expression is ScalarSubqueryExpression { Query: SelectStatement { Source: null } select }
+            && select.Projections.Count == 1)
+        {
+            return GetExpressionAffinity(
+                select.Projections[0].Expression,
+                sourceColumns,
+                context,
+                commonTableExpressions);
+        }
+        if (expression is ScalarSubqueryExpression scalarSubquery)
+        {
+            var columns = DescribeQueryAffinities(
+                scalarSubquery.Query,
+                context,
+                commonTableExpressions);
+            return columns.Count == 1 ? columns[0].Affinity : ColumnAffinity.Blob;
+        }
+        if (expression is not ColumnExpression column)
+            return ColumnAffinity.Blob;
+
+        var name = column.UnqualifiedName ?? column.Name[(column.Name.LastIndexOf('.') + 1)..];
+        var matches = sourceColumns.Where(candidate =>
+            string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase)
+            && (column.Qualifier is null
+                || string.Equals(candidate.Qualifier, column.Qualifier, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+        return matches.Length == 1 ? matches[0].Affinity : ColumnAffinity.Blob;
+    }
+
+    private static string? CtasDeclaredType(ColumnAffinity affinity)
+        => affinity switch
+        {
+            ColumnAffinity.Integer => "INT",
+            ColumnAffinity.Numeric => "NUM",
+            ColumnAffinity.Real => "REAL",
+            ColumnAffinity.Text => "TEXT",
+            ColumnAffinity.Blob => null,
+            _ => throw new InvalidOperationException($"Unknown CTAS affinity {affinity}."),
+        };
+
+    private static string[] MakeCreateTableColumnNamesUnique(IReadOnlyList<string> names)
+    {
+        var result = new string[names.Count];
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < names.Count; index++)
+        {
+            var baseName = names[index];
+            if (used.Add(baseName))
+            {
+                result[index] = baseName;
+                continue;
+            }
+
+            var suffixBase = baseName;
+            var suffix = BigInteger.One;
+            var separator = baseName.LastIndexOf(':');
+            if (separator > 0
+                && BigInteger.TryParse(
+                    baseName.AsSpan(separator + 1),
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out var existingSuffix))
+            {
+                suffixBase = baseName[..separator];
+                suffix = existingSuffix + BigInteger.One;
+            }
+
+            string candidate;
+            do
+            {
+                candidate = $"{suffixBase}:{suffix}";
+                suffix += BigInteger.One;
+            }
+            while (!used.Add(candidate));
+            result[index] = candidate;
+        }
+
+        return result;
     }
 
     private static string GetExpressionName(Expression expression)
@@ -14826,10 +15217,10 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         var leftAffinity = leftColumn is null
             ? (ColumnAffinity?)null
-            : EmbeddedTable.GetColumnAffinity(leftColumn);
+            : EmbeddedTable.GetDeclaredColumnAffinity(leftColumn);
         var rightAffinity = rightColumn is null
             ? (ColumnAffinity?)null
-            : EmbeddedTable.GetColumnAffinity(rightColumn);
+            : EmbeddedTable.GetDeclaredColumnAffinity(rightColumn);
         if (leftAffinity is { } leftNumeric
             && IsNumericColumnAffinity(leftNumeric)
             && (rightAffinity is null || !IsNumericColumnAffinity(rightAffinity.Value)))
@@ -17060,7 +17451,7 @@ public sealed class EmbeddedDatabase : IDisposable
         return nulOffset >= 0 ? value[..nulOffset] : value;
     }
 
-    private static string FormatPrintfTextReal(double value)
+    internal static string FormatPrintfTextReal(double value)
     {
         if (double.IsNaN(value))
             return "NaN";
@@ -22489,6 +22880,7 @@ public sealed class EmbeddedConnection : IDisposable
     private const int MaximumAttachedDatabases = 10;
     private const char UnqualifiedSchemaMarker = '\0';
     private readonly EmbeddedDatabase _database;
+    private EmbeddedDatabase _tempDatabase;
     private readonly Dictionary<string, AttachedDatabase> _attachedDatabases = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _statementReaderGate = new();
     private readonly HashSet<ConnectionStatementReaderLease> _statementReaders = [];
@@ -22502,6 +22894,7 @@ public sealed class EmbeddedConnection : IDisposable
     private bool _foreignKeys;
     private bool _deferForeignKeys;
     private bool _recursiveTriggers;
+    private bool _tempInitialized;
     private int? _pendingPageSize;
     private bool _disposed;
 
@@ -22584,6 +22977,8 @@ public sealed class EmbeddedConnection : IDisposable
     internal EmbeddedConnection(EmbeddedDatabase database)
     {
         _database = database;
+        _tempDatabase = new EmbeddedDatabase();
+        _database.CopyFunctionAndCollationRegistriesTo(_tempDatabase);
     }
 
     internal bool HasActiveTransaction => _transactionDatabases is not null;
@@ -22708,10 +23103,12 @@ public sealed class EmbeddedConnection : IDisposable
         _foreignKeys = false;
         _deferForeignKeys = false;
         _recursiveTriggers = false;
+        _tempInitialized = false;
         _pendingPageSize = null;
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
+        ResetTemporaryDatabase();
         _database.RefreshFileCatalogForPooling();
     }
 
@@ -22719,6 +23116,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         _database.RegisterScalarFunction(name, arity, function);
+        _tempDatabase.RegisterScalarFunction(name, arity, function);
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Database.RegisterScalarFunction(name, arity, function);
     }
@@ -22727,6 +23125,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         var removed = _database.UnregisterScalarFunction(name, arity);
+        _tempDatabase.UnregisterScalarFunction(name, arity);
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Database.UnregisterScalarFunction(name, arity);
 
@@ -22737,6 +23136,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         var removed = _database.UnregisterScalarFunctions(name);
+        _tempDatabase.UnregisterScalarFunctions(name);
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Database.UnregisterScalarFunctions(name);
 
@@ -22752,6 +23152,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         _database.RegisterAggregateFunction(name, arity, seed, step, finalize);
+        _tempDatabase.RegisterAggregateFunction(name, arity, seed, step, finalize);
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Database.RegisterAggregateFunction(name, arity, seed, step, finalize);
     }
@@ -22760,6 +23161,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         var removed = _database.UnregisterAggregateFunctions(name);
+        _tempDatabase.UnregisterAggregateFunctions(name);
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Database.UnregisterAggregateFunctions(name);
 
@@ -22770,6 +23172,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         _database.RegisterCollation(name, compare);
+        _tempDatabase.RegisterCollation(name, compare);
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Database.RegisterCollation(name, compare);
     }
@@ -22778,6 +23181,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         var removed = _database.UnregisterCollation(name);
+        _tempDatabase.UnregisterCollation(name);
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Database.UnregisterCollation(name);
 
@@ -22817,6 +23221,7 @@ public sealed class EmbeddedConnection : IDisposable
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
+        _tempDatabase.Dispose();
         _disposed = true;
     }
 
@@ -22848,6 +23253,13 @@ public sealed class EmbeddedConnection : IDisposable
             return;
         foreach (var lease in leases.Reverse())
             lease.Dispose();
+    }
+
+    private void ResetTemporaryDatabase()
+    {
+        _tempDatabase.Dispose();
+        _tempDatabase = new EmbeddedDatabase();
+        _database.CopyFunctionAndCollationRegistriesTo(_tempDatabase);
     }
 
     internal ExecutionResult Execute(
@@ -22907,6 +23319,8 @@ public sealed class EmbeddedConnection : IDisposable
                 return ExecuteDetach(detach);
             case PragmaDatabaseListStatement:
                 return ExecutePragmaDatabaseList();
+            case PragmaTableListStatement { Schema: null }:
+                return ExecutePragmaTableList();
             case PragmaQueryOnlyStatement queryOnly:
                 return ExecutePragmaQueryOnly(queryOnly);
             case PragmaForeignKeysStatement foreignKeys:
@@ -22923,6 +23337,10 @@ public sealed class EmbeddedConnection : IDisposable
                 return ExecutePragmaPageSize(pageSize);
             case VacuumStatement vacuum:
                 return ExecuteVacuum(vacuum, parameters);
+            case CreateTableAsSelectStatement createTableAs:
+                if (_queryOnly)
+                    throw new EmbeddedSqlException("attempt to write a readonly database");
+                return ExecuteCreateTableAs(createTableAs, parameters, cancellationToken);
             default:
                 if (_queryOnly && EmbeddedDatabase.MayMutate(statement))
                     throw new EmbeddedSqlException("attempt to write a readonly database");
@@ -22997,7 +23415,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 ?? throw new InvalidOperationException(
                                     "A transactional mutation lost its statement catalog.");
                             transactionState.HasChanges = true;
-                            _transactionWriteDatabase = routed.Database;
+                            if (!ReferenceEquals(routed.Database, _tempDatabase))
+                                _transactionWriteDatabase = routed.Database;
                             if (EmbeddedDatabase.MayChangeSchema(routed.Statement))
                             {
                                 transactionState.PragmaHeader = transactionState.PragmaHeader with
@@ -23012,6 +23431,8 @@ public sealed class EmbeddedConnection : IDisposable
                     // connection; UPDATE/DELETE and zero-row inserts leave it unchanged.
                     if (result.LastInsertRowId is { } insertedRowId)
                         _lastInsertRowId = insertedRowId;
+                    if (ReferenceEquals(routed.Database, _tempDatabase))
+                        _tempInitialized = true;
 
                     return result;
                 }
@@ -23044,8 +23465,11 @@ public sealed class EmbeddedConnection : IDisposable
                         transactionState.Catalog = statementCatalog
                             ?? throw new InvalidOperationException("A partial transactional mutation lost its statement catalog.");
                         transactionState.HasChanges = true;
-                        _transactionWriteDatabase = routed.Database;
+                        if (!ReferenceEquals(routed.Database, _tempDatabase))
+                            _transactionWriteDatabase = routed.Database;
                     }
+                    if (ReferenceEquals(routed.Database, _tempDatabase))
+                        _tempInitialized = true;
 
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
@@ -23184,12 +23608,29 @@ public sealed class EmbeddedConnection : IDisposable
     private EmbeddedDatabase ResolveDatabase(string databaseName)
     {
         ArgumentNullException.ThrowIfNull(databaseName);
+        if (databaseName.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new EmbeddedSqlException(
+                "Managed backup excludes the connection-private temporary database.");
+        }
         if (databaseName.Equals("main", StringComparison.OrdinalIgnoreCase))
             return _database;
         if (_attachedDatabases.TryGetValue(databaseName, out var attachment))
             return attachment.Database;
 
         throw new EmbeddedSqlException($"no such database: {databaseName}");
+    }
+
+    private EmbeddedDatabase ResolveSchemaDatabase(string schema)
+    {
+        if (schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+            return _tempDatabase;
+        if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
+            return _database;
+        if (_attachedDatabases.TryGetValue(schema, out var attachment))
+            return attachment.Database;
+
+        throw new EmbeddedSqlException($"no such database: {schema}");
     }
 
     private ExecutionResult ExecuteDetach(DetachDatabaseStatement statement)
@@ -23223,6 +23664,8 @@ public sealed class EmbeddedConnection : IDisposable
         {
             new[] { SqlValue.Integer(0), SqlValue.Text("main"), SqlValue.Text(_database.DatabasePath) },
         };
+        if (_tempInitialized)
+            rows.Add([SqlValue.Integer(1), SqlValue.Text("temp"), SqlValue.Text(string.Empty)]);
 
         foreach (var pair in _attachedDatabases.OrderBy(pair => pair.Value.Sequence))
         {
@@ -23238,6 +23681,113 @@ public sealed class EmbeddedConnection : IDisposable
         }
 
         return new ExecutionResult(["seq", "name", "file"], rows.ToArray(), 0);
+    }
+
+    private ExecutionResult ExecutePragmaTableList()
+    {
+        var rows = new List<SqlValue[]>();
+        AddPragmaTableListRows(rows, _database, "main");
+        AddPragmaTableListRows(rows, _tempDatabase, "temp");
+        foreach (var pair in _attachedDatabases.OrderBy(pair => pair.Value.Sequence))
+            AddPragmaTableListRows(rows, pair.Value.Database, pair.Key);
+
+        return new ExecutionResult(
+            ["schema", "name", "type", "ncol", "wr", "strict"],
+            rows,
+            0);
+    }
+
+    private void AddPragmaTableListRows(
+        ICollection<SqlValue[]> rows,
+        EmbeddedDatabase database,
+        string schema)
+    {
+        var statement = new PragmaTableListStatement(schema);
+        var transactionState = GetTransactionState(database);
+        var result = transactionState is null
+            ? database.Execute(statement, new SqlValue[1])
+            : database.Execute(statement, new SqlValue[1], transactionState.Catalog);
+        foreach (var row in result.Rows)
+            rows.Add(row);
+    }
+
+    private ExecutionResult ExecuteCreateTableAs(
+        CreateTableAsSelectStatement statement,
+        SqlValue[] parameters,
+        CancellationToken cancellationToken)
+    {
+        var (targetSchema, targetName) = ResolveCreateTableTarget(statement);
+        var targetDatabase = ResolveSchemaDatabase(targetSchema);
+        if (CurrentCatalogContains(targetDatabase, targetName, ManagedSchemaObjectKind.Table))
+        {
+            if (statement.IfNotExists)
+                return ExecutionResult.Empty;
+
+            throw new EmbeddedSqlException($"table {targetName} already exists");
+        }
+        if (CurrentCatalogContains(targetDatabase, targetName, ManagedSchemaObjectKind.View))
+            throw new EmbeddedSqlException($"there is already a view named {targetName}");
+        if (CurrentCatalogContains(targetDatabase, targetName, ManagedSchemaObjectKind.Trigger))
+            throw new EmbeddedSqlException($"there is already a trigger named {targetName}");
+        if (CurrentCatalogContains(targetDatabase, targetName, ManagedSchemaObjectKind.Index))
+            throw new EmbeddedSqlException($"there is already an index named {targetName}");
+
+        var source = RouteQuery(statement.Query);
+        var sourceQuery = source.Statement as QueryStatement
+            ?? throw new InvalidOperationException("CREATE TABLE AS SELECT routing did not return a query.");
+        var sourceState = GetTransactionState(source.Database);
+        var materialization = sourceState is null
+            ? source.Database.MaterializeCreateTableAs(
+                sourceQuery,
+                parameters,
+                _lastInsertRowId,
+                _foreignKeys,
+                _recursiveTriggers,
+                cancellationToken)
+            : source.Database.MaterializeCreateTableAs(
+                sourceQuery,
+                parameters,
+                sourceState.Catalog,
+                _lastInsertRowId,
+                _foreignKeys,
+                _recursiveTriggers,
+                cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (ReferenceEquals(source.Database, _tempDatabase))
+            _tempInitialized = true;
+
+        var materialized = new CreateTableStatement(
+            ManagedSchemaName.Create(targetSchema, targetName),
+            materialization.Columns,
+            statement.IfNotExists,
+            Strict: false,
+            InitialRows: materialization.Rows);
+        return Execute(materialized, parameters, cancellationToken);
+    }
+
+    private (string Schema, string Name) ResolveCreateTableTarget(CreateTableAsSelectStatement statement)
+    {
+        if (ManagedSchemaName.TrySplit(statement.Name, out var schema, out var name))
+        {
+            if (statement.Temporary && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+                throw new EmbeddedSqlException("temporary table name must be unqualified");
+
+            _ = ResolveSchemaDatabase(schema);
+            return (schema, name);
+        }
+
+        return (statement.Temporary ? "temp" : "main", statement.Name);
+    }
+
+    private bool CurrentCatalogContains(
+        EmbeddedDatabase database,
+        string objectName,
+        ManagedSchemaObjectKind kind)
+    {
+        var state = GetTransactionState(database);
+        return state is null
+            ? database.ContainsSchemaObject(objectName, kind)
+            : CatalogContainsSchemaObject(state.Catalog, objectName, kind);
     }
 
     private RoutedStatement RouteStatement(ParsedStatement statement)
@@ -23278,6 +23828,38 @@ public sealed class EmbeddedConnection : IDisposable
                 dropColumn.TableName,
                 ManagedSchemaObjectKind.Table,
                 name => dropColumn with { TableName = name }),
+            PragmaTableInfoStatement tableInfo => RouteExistingNamedStatement(
+                tableInfo.TableName,
+                ManagedSchemaObjectKind.Table,
+                name => tableInfo with { TableName = name }),
+            PragmaTableXInfoStatement tableXInfo => RouteExistingNamedStatement(
+                tableXInfo.TableName,
+                ManagedSchemaObjectKind.Table,
+                name => tableXInfo with { TableName = name }),
+            PragmaIndexListStatement indexList => RouteExistingNamedStatement(
+                indexList.TableName,
+                ManagedSchemaObjectKind.Table,
+                name => indexList with { TableName = name }),
+            PragmaIndexInfoStatement indexInfo => RouteExistingNamedStatement(
+                indexInfo.IndexName,
+                ManagedSchemaObjectKind.Index,
+                name => indexInfo with { IndexName = name }),
+            PragmaForeignKeyListStatement foreignKeyList => RouteExistingNamedStatement(
+                foreignKeyList.TableName,
+                ManagedSchemaObjectKind.Table,
+                name => foreignKeyList with { TableName = name }),
+            PragmaForeignKeyCheckStatement { TableName: { } tableName } foreignKeyCheck
+                => RouteExistingNamedStatement(
+                    tableName,
+                    ManagedSchemaObjectKind.Table,
+                    name => foreignKeyCheck with { TableName = name, Schema = null }),
+            PragmaForeignKeyCheckStatement { TableName: null, Schema: { } foreignKeySchema } foreignKeyCheck
+                => RouteSchema(
+                    foreignKeySchema,
+                    string.Empty,
+                    _ => foreignKeyCheck with { Schema = null }),
+            PragmaTableListStatement { Schema: { } schema } tableList
+                => RouteSchema(schema, string.Empty, _ => tableList),
             WithDmlStatement with => RouteDataStatement(with),
             InsertStatement insert => RouteDataStatement(insert),
             UpdateStatement update => RouteDataStatement(update),
@@ -23316,6 +23898,13 @@ public sealed class EmbeddedConnection : IDisposable
 
     private string ResolveExistingObjectSchema(string objectName, ManagedSchemaObjectKind kind)
     {
+        if (GetTransactionState(_tempDatabase) is { } tempState
+            ? CatalogContainsSchemaObject(tempState.Catalog, objectName, kind)
+            : _tempDatabase.ContainsSchemaObject(objectName, kind))
+        {
+            return "temp";
+        }
+
         if (GetTransactionState(_database) is { } mainState
             ? CatalogContainsSchemaObject(mainState.Catalog, objectName, kind)
             : _database.ContainsSchemaObject(objectName, kind))
@@ -23357,7 +23946,18 @@ public sealed class EmbeddedConnection : IDisposable
         var hasIndexSchema = ManagedSchemaName.TrySplit(statement.Name, out var indexSchema, out var indexName);
         var hasTableSchema = ManagedSchemaName.TrySplit(statement.TableName, out var tableSchema, out var tableName);
         if (!hasIndexSchema && !hasTableSchema)
-            return new RoutedStatement(_database, statement, IsAttached: false);
+        {
+            var schema = CurrentCatalogContains(
+                _tempDatabase,
+                statement.TableName,
+                ManagedSchemaObjectKind.Table)
+                ? "temp"
+                : "main";
+            return RouteSchema(schema, statement.TableName, localTableName => statement with
+            {
+                TableName = localTableName,
+            });
+        }
         if (hasIndexSchema)
         {
             if (hasTableSchema && !string.Equals(indexSchema, tableSchema, StringComparison.OrdinalIgnoreCase))
@@ -23421,7 +24021,7 @@ public sealed class EmbeddedConnection : IDisposable
         if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
             return new RoutedStatement(_database, rewritten, IsAttached: false);
         if (schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
-            throw new EmbeddedSqlException("Managed ATTACH does not implement the temporary database.");
+            return new RoutedStatement(_tempDatabase, rewritten, IsAttached: false);
         if (!_attachedDatabases.TryGetValue(schema, out var attachment))
             throw new EmbeddedSqlException($"no such database: {schema}");
 
@@ -23434,6 +24034,14 @@ public sealed class EmbeddedConnection : IDisposable
             return schema;
 
         var objectName = schema[1..];
+        if (IsTemporarySchemaTable(objectName))
+            return "temp";
+        if (GetTransactionState(_tempDatabase) is { } tempState
+            ? tempState.Catalog.Tables.ContainsKey(objectName) || tempState.Catalog.Views.ContainsKey(objectName)
+            : _tempDatabase.ContainsTableOrView(objectName))
+        {
+            return "temp";
+        }
         if (GetTransactionState(_database) is { } mainState
             ? mainState.Catalog.Tables.ContainsKey(objectName) || mainState.Catalog.Views.ContainsKey(objectName)
             : _database.ContainsTableOrView(objectName))
@@ -23454,6 +24062,10 @@ public sealed class EmbeddedConnection : IDisposable
 
         return "main";
     }
+
+    private static bool IsTemporarySchemaTable(string name)
+        => name.Equals("sqlite_temp_master", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("sqlite_temp_schema", StringComparison.OrdinalIgnoreCase);
 
     private static void CollectStatementSchemas(
         ParsedStatement statement,
@@ -23885,7 +24497,7 @@ public sealed class EmbeddedConnection : IDisposable
             null => null,
             NamedTableSource named => commonTableExpressions.Contains(named.Name)
                 ? named
-                : named with { Name = RewritePersistentObjectName(named.Name, schema) },
+                : named with { Name = RewriteSourceObjectName(named.Name, schema) },
             DerivedTableSource derived => derived with
             {
                 Query = RewriteQuerySchema(derived.Query, schema, commonTableExpressions),
@@ -23904,6 +24516,15 @@ public sealed class EmbeddedConnection : IDisposable
             },
             _ => throw new InvalidOperationException($"Cannot rewrite source {source.GetType().Name}."),
         };
+    }
+
+    private static string RewriteSourceObjectName(string name, string schema)
+    {
+        var localName = RewritePersistentObjectName(name, schema);
+        return schema.Equals("temp", StringComparison.OrdinalIgnoreCase)
+            && IsTemporarySchemaTable(localName)
+                ? "sqlite_schema"
+                : localName;
     }
 
     private static IReadOnlyList<Projection>? RewriteProjections(
@@ -24063,6 +24684,8 @@ public sealed class EmbeddedConnection : IDisposable
 
     private RoutedStatement RouteSchema(string schema, string localName, Func<string, ParsedStatement> rewrite)
     {
+        if (schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+            return new RoutedStatement(_tempDatabase, rewrite(localName), IsAttached: false);
         if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
             return new RoutedStatement(_database, rewrite(localName), IsAttached: false);
         if (!_attachedDatabases.TryGetValue(schema, out var attachment))
@@ -24073,6 +24696,11 @@ public sealed class EmbeddedConnection : IDisposable
 
     private EmbeddedDatabase ResolveBlobDatabase(string databaseName)
     {
+        if (databaseName.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new EmbeddedSqlException(
+                "Managed incremental blob I/O does not support the temporary database.");
+        }
         if (databaseName.Equals("main", StringComparison.OrdinalIgnoreCase))
             return _database;
         if (_attachedDatabases.TryGetValue(databaseName, out var attachment))
@@ -24317,6 +24945,7 @@ public sealed class EmbeddedConnection : IDisposable
         var databases = _attachedDatabases.Values
             .OrderBy(attachment => attachment.PathIdentity, StringComparer.OrdinalIgnoreCase)
             .Select(attachment => attachment.Database)
+            .Prepend(_tempDatabase)
             .Prepend(_database);
         var states = new Dictionary<EmbeddedDatabase, TransactionDatabaseState>();
         try
@@ -24355,6 +24984,8 @@ public sealed class EmbeddedConnection : IDisposable
             throw new EmbeddedSqlException(
                 "Managed connections do not support reentrant writes from SQL callbacks.");
         }
+        if (ReferenceEquals(database, _tempDatabase))
+            return;
         if (_transactionWriteDatabase is null
             || ReferenceEquals(_transactionWriteDatabase, database))
         {
@@ -24413,12 +25044,19 @@ public sealed class EmbeddedConnection : IDisposable
         var changed = _transactionDatabases
             .Where(pair => pair.Value.HasChanges)
             .ToArray();
-        if (changed.Length > 1)
+        var persistentChanges = changed
+            .Where(pair => !ReferenceEquals(pair.Key, _tempDatabase))
+            .ToArray();
+        if (persistentChanges.Length > 1)
             throw new InvalidOperationException("A managed ATTACH transaction reached an unsafe multi-database write state.");
 
-        if (changed.Length == 1)
+        var tempChange = changed
+            .Where(pair => ReferenceEquals(pair.Key, _tempDatabase))
+            .Select(pair => pair.Value)
+            .SingleOrDefault();
+        if (persistentChanges.Length == 1)
         {
-            var (database, state) = changed[0];
+            var (database, state) = persistentChanges[0];
             try
             {
                 database.CommitTransaction(
@@ -24430,12 +25068,25 @@ public sealed class EmbeddedConnection : IDisposable
             }
             catch (EmbeddedPostCommitMaintenanceException)
             {
+                CommitTemporaryTransaction(tempChange);
                 ResetTransactionState();
                 throw;
             }
         }
 
+        CommitTemporaryTransaction(tempChange);
         ResetTransactionState();
+    }
+
+    private void CommitTemporaryTransaction(TransactionDatabaseState? tempChange)
+    {
+        if (tempChange is null)
+            return;
+
+        _tempDatabase.CommitTransaction(
+            tempChange.Catalog,
+            tempChange.Version,
+            tempChange.PragmaHeader);
     }
 
     // Runs an eligible top-level VALUES statement through its prepared, cached lowering. The lowering is
@@ -25173,7 +25824,8 @@ internal sealed class EmbeddedTable
         InsertConflictAlgorithm? primaryKeyConflictAlgorithm = null,
         string? primaryKeyConstraintName = null,
         int? primaryKeyDeclarationOrder = null,
-        IReadOnlyList<ForeignKeyDefinition>? tableForeignKeys = null)
+        IReadOnlyList<ForeignKeyDefinition>? tableForeignKeys = null,
+        bool strict = false)
     {
         Name = name;
         ColumnDefinitions = columns.ToArray();
@@ -25186,6 +25838,9 @@ internal sealed class EmbeddedTable
         }
 
         WithoutRowid = withoutRowid;
+        Strict = strict;
+        if (Strict)
+            ValidateStrictColumnTypes();
         TableLevelPrimaryKey = tablePrimaryKey is null
             ? null
             : Array.AsReadOnly(tablePrimaryKey.ToArray());
@@ -25626,6 +26281,8 @@ internal sealed class EmbeddedTable
 
     public bool WithoutRowid { get; }
 
+    public bool Strict { get; }
+
     // The table-level PRIMARY KEY(...) clause as declared, retained so the schema can be
     // regenerated verbatim; null when the primary key (if any) is column-level.
     public IReadOnlyList<TablePrimaryKeyColumn>? TableLevelPrimaryKey { get; }
@@ -25697,8 +26354,15 @@ internal sealed class EmbeddedTable
 
     // Applies the column's declared-type affinity to a value, used to coerce a computed
     // generated-column result the same way an inserted value is coerced.
-    public static SqlValue ApplyColumnAffinity(EmbeddedColumn column, SqlValue value)
-        => ApplyAffinity(column, value);
+    public SqlValue ApplyColumnAffinity(EmbeddedColumn column, SqlValue value)
+    {
+        var result = CoerceColumnAffinity(column, value);
+        ValidateStrictValue(column, result);
+        return result;
+    }
+
+    public SqlValue CoerceColumnAffinity(EmbeddedColumn column, SqlValue value)
+        => ApplyAffinity(column, value, Strict);
 
     // True when the column's declared-type affinity is numeric (INTEGER/REAL/NUMERIC): the
     // subset where a stored INTEGER/REAL/NULL value feeds arithmetic unchanged, so a compiled
@@ -25707,9 +26371,15 @@ internal sealed class EmbeddedTable
     // affinity the Arithmetic opcode deliberately does not.
     public bool ColumnHasNumericAffinity(int columnIndex)
     {
-        var affinity = GetAffinity(ColumnDefinitions[columnIndex].DeclaredType);
+        var affinity = GetColumnAffinity(ColumnDefinitions[columnIndex]);
         return affinity is ColumnAffinity.Integer or ColumnAffinity.Real or ColumnAffinity.Numeric;
     }
+
+    public ColumnAffinity GetColumnAffinity(EmbeddedColumn column)
+        => Strict
+            && string.Equals(column.DeclaredType?.Trim(), "ANY", StringComparison.OrdinalIgnoreCase)
+                ? ColumnAffinity.Blob
+                : GetAffinity(column.DeclaredType);
 
     public List<EmbeddedIndex> Indexes { get; } = [];
 
@@ -26145,12 +26815,13 @@ internal sealed class EmbeddedTable
             TablePrimaryKeyConflictAlgorithm,
             TablePrimaryKeyConstraintName,
             TablePrimaryKeyDeclarationOrder,
-            TableForeignKeys);
+            TableForeignKeys,
+            Strict);
 
         if (column.DefaultExpression is not null && Rows.Count > 0)
             throw new EmbeddedSqlException("Cannot add a column with non-constant default.");
 
-        var defaultValue = ApplyAffinity(column, column.DefaultValue ?? SqlValue.Null);
+        var defaultValue = ApplyColumnAffinity(column, column.DefaultValue ?? SqlValue.Null);
         if (column.NotNull && Rows.Count > 0 && defaultValue.Kind == SqlValueKind.Null)
             throw new EmbeddedSqlException("Cannot add a NOT NULL column without a default value.");
 
@@ -26291,7 +26962,7 @@ internal sealed class EmbeddedTable
     public SqlValue[] CreateRowWithDefaults(Func<Expression, SqlValue> evaluate)
     {
         return ColumnDefinitions
-            .Select(column => ApplyAffinity(
+            .Select(column => CoerceColumnAffinity(
                 column,
                 column.DefaultExpression is { } expression
                     ? evaluate(expression)
@@ -26349,7 +27020,8 @@ internal sealed class EmbeddedTable
             TablePrimaryKeyConflictAlgorithm,
             TablePrimaryKeyConstraintName,
             TablePrimaryKeyDeclarationOrder,
-            TableForeignKeys);
+            TableForeignKeys,
+            Strict);
         foreach (var row in Rows)
             clone.Rows.Add(row.ToArray());
 
@@ -26362,7 +27034,7 @@ internal sealed class EmbeddedTable
     public void ApplyAffinities(SqlValue[] row)
     {
         for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
-            row[columnIndex] = ApplyAffinity(ColumnDefinitions[columnIndex], row[columnIndex]);
+            row[columnIndex] = ApplyColumnAffinity(ColumnDefinitions[columnIndex], row[columnIndex]);
     }
 
     public void ValidateRows(string tableName, IReadOnlyList<SqlValue[]> rows)
@@ -26376,7 +27048,8 @@ internal sealed class EmbeddedTable
                 continue;
 
             var column = ColumnDefinitions[columnIndex];
-            if (column.NotNull && rows.Any(row => row[columnIndex].Kind == SqlValueKind.Null))
+            if ((column.NotNull || (Strict && IsPrimaryKeyColumn(columnIndex)))
+                && rows.Any(row => row[columnIndex].Kind == SqlValueKind.Null))
             {
                 throw new EmbeddedSqlException(
                     $"NOT NULL constraint failed: {tableName}.{column.Name}",
@@ -26402,10 +27075,18 @@ internal sealed class EmbeddedTable
         }
     }
 
-    private static SqlValue ApplyAffinity(EmbeddedColumn column, SqlValue value)
-        => ApplyAffinity(GetAffinity(column.DeclaredType), value);
+    private static SqlValue ApplyAffinity(EmbeddedColumn column, SqlValue value, bool strict)
+    {
+        if (strict
+            && string.Equals(column.DeclaredType?.Trim(), "ANY", StringComparison.OrdinalIgnoreCase))
+        {
+            return value.WithoutJsonSubtype();
+        }
 
-    internal static ColumnAffinity GetColumnAffinity(EmbeddedColumn column)
+        return ApplyAffinity(GetAffinity(column.DeclaredType), value);
+    }
+
+    internal static ColumnAffinity GetDeclaredColumnAffinity(EmbeddedColumn column)
         => GetAffinity(column.DeclaredType);
 
     internal static SqlValue ApplyColumnAffinity(ColumnAffinity affinity, SqlValue value)
@@ -26432,6 +27113,59 @@ internal sealed class EmbeddedTable
                 : numeric;
 
         return ConvertToIntegerWhenExact(numeric);
+    }
+
+    private void ValidateStrictColumnTypes()
+    {
+        foreach (var column in ColumnDefinitions)
+        {
+            if (string.IsNullOrWhiteSpace(column.DeclaredType))
+                throw new EmbeddedSqlException($"missing datatype for {Name}.{column.Name}");
+
+            var declaredType = column.DeclaredType.Trim();
+            if (declaredType.Equals("INT", StringComparison.OrdinalIgnoreCase)
+                || declaredType.Equals("INTEGER", StringComparison.OrdinalIgnoreCase)
+                || declaredType.Equals("REAL", StringComparison.OrdinalIgnoreCase)
+                || declaredType.Equals("TEXT", StringComparison.OrdinalIgnoreCase)
+                || declaredType.Equals("BLOB", StringComparison.OrdinalIgnoreCase)
+                || declaredType.Equals("ANY", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            throw new EmbeddedSqlException(
+                $"unknown datatype for {Name}.{column.Name}: \"{declaredType}\"");
+        }
+    }
+
+    private void ValidateStrictValue(EmbeddedColumn column, SqlValue value)
+    {
+        if (!Strict || value.Kind == SqlValueKind.Null)
+            return;
+
+        var declaredType = column.DeclaredType!.Trim().ToUpperInvariant();
+        var valid = declaredType switch
+        {
+            "INT" or "INTEGER" => value.Kind == SqlValueKind.Integer,
+            "REAL" => value.Kind == SqlValueKind.Real,
+            "TEXT" => value.Kind == SqlValueKind.Text,
+            "BLOB" => value.Kind == SqlValueKind.Blob,
+            "ANY" => true,
+            _ => throw new InvalidOperationException("A STRICT table contains an invalid declared type."),
+        };
+        if (valid)
+            return;
+
+        var storageClass = value.Kind switch
+        {
+            SqlValueKind.Integer => "INTEGER",
+            SqlValueKind.Real => "REAL",
+            SqlValueKind.Text => "TEXT",
+            SqlValueKind.Blob => "BLOB",
+            _ => throw new InvalidOperationException("NULL STRICT values are handled before storage-class validation."),
+        };
+        throw new EmbeddedSqlException(
+            $"cannot store {storageClass} value in {declaredType} column {Name}.{column.Name}");
     }
 
     internal static ColumnAffinity GetAffinity(string? declaredType)
@@ -26508,7 +27242,7 @@ internal sealed class EmbeddedTable
         return value.Kind switch
         {
             SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
-            SqlValueKind.Real => value.AsReal().ToString("R", CultureInfo.InvariantCulture),
+            SqlValueKind.Real => EmbeddedDatabase.FormatPrintfTextReal(value.AsReal()),
             SqlValueKind.Text => value.AsText(),
             _ => throw new InvalidOperationException($"Cannot convert {value.Kind} to text."),
         };
@@ -26538,6 +27272,10 @@ internal sealed record ExecutionResult(
     // not insert a row.
     public long? LastInsertRowId { get; init; }
 }
+
+internal sealed record CreateTableMaterialization(
+    IReadOnlyList<EmbeddedColumn> Columns,
+    IReadOnlyList<SqlValue[]> Rows);
 
 internal readonly record struct BlobMutationIdentity
 {

@@ -17,7 +17,15 @@ internal sealed record CreateTableStatement(
     InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm = null,
     string? PrimaryKeyConstraintName = null,
     int? PrimaryKeyDeclarationOrder = null,
-    IReadOnlyList<ForeignKeyDefinition>? TableForeignKeys = null) : ParsedStatement;
+    IReadOnlyList<ForeignKeyDefinition>? TableForeignKeys = null,
+    bool Strict = false,
+    IReadOnlyList<SqlValue[]>? InitialRows = null) : ParsedStatement;
+
+internal sealed record CreateTableAsSelectStatement(
+    string Name,
+    QueryStatement Query,
+    bool IfNotExists,
+    bool Temporary) : ParsedStatement;
 
 internal sealed record DropTableStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -193,9 +201,11 @@ internal sealed record PragmaIndexXInfoStatement(string IndexName) : ParsedState
 
 internal sealed record PragmaForeignKeyListStatement(string TableName) : ParsedStatement;
 
-internal sealed record PragmaForeignKeyCheckStatement(string? TableName) : ParsedStatement;
+internal sealed record PragmaForeignKeyCheckStatement(
+    string? TableName,
+    string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaTableListStatement : ParsedStatement;
+internal sealed record PragmaTableListStatement(string? Schema = null) : ParsedStatement;
 
 internal sealed record PragmaDatabaseListStatement : ParsedStatement;
 
