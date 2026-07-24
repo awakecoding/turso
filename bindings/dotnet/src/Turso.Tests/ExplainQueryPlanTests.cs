@@ -162,6 +162,12 @@ public sealed class ExplainQueryPlanTests
         cancelableSelect.Step(cancelable.Token).Should().Be(StatementStepResult.Row);
         cancelableSelect.GetValue(3).Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
         cancelableSelect.Step(cancelable.Token).Should().Be(StatementStepResult.Done);
+
+        using var cancelableCompound = connection.Prepare(
+            "EXPLAIN QUERY PLAN SELECT value FROM t UNION ALL SELECT value + 1 FROM t;");
+        cancelableCompound.Step(cancelable.Token).Should().Be(StatementStepResult.Row);
+        cancelableCompound.GetValue(3).Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+        cancelableCompound.Step(cancelable.Token).Should().Be(StatementStepResult.Done);
     }
 
     [Test]

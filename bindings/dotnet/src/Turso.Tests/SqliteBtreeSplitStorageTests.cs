@@ -662,13 +662,13 @@ public class SqliteBtreeSplitStorageTests
                     rowIds.Add(cell.Cell.RowId);
                 return;
             case SqliteBtreePageType.TableInterior:
-            {
-                var interior = SqliteTableInteriorPageView.Parse(page, usableSpace);
-                foreach (var cell in interior.Cells)
-                    AppendTableRowIds(pager, cell.Cell.LeftChildPage, usableSpace, rowIds);
-                AppendTableRowIds(pager, interior.Header.RightMostChildPage, usableSpace, rowIds);
-                return;
-            }
+                {
+                    var interior = SqliteTableInteriorPageView.Parse(page, usableSpace);
+                    foreach (var cell in interior.Cells)
+                        AppendTableRowIds(pager, cell.Cell.LeftChildPage, usableSpace, rowIds);
+                    AppendTableRowIds(pager, interior.Header.RightMostChildPage, usableSpace, rowIds);
+                    return;
+                }
             default:
                 throw new InvalidDataException("Expected a SQLite table b-tree page.");
         }

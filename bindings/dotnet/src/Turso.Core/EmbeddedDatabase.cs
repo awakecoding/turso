@@ -7037,12 +7037,13 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             SelectStatement select => !context.CancellationToken.CanBeCanceled
                 && TryCompileSelect(select, parameters, context, outerRow: null, out _),
-            CompoundSelectStatement compound => TryCompileCompoundSelect(
-                compound,
-                parameters,
-                context,
-                outerRow: null,
-                out _),
+            CompoundSelectStatement compound => !context.CancellationToken.CanBeCanceled
+                && TryCompileCompoundSelect(
+                    compound,
+                    parameters,
+                    context,
+                    outerRow: null,
+                    out _),
             ValuesClause values => TryPrepareValuesLowering(values, out _),
             // WITH execution starts by materializing CTE inputs. Report the evaluator boundary
             // rather than evaluating those inputs merely to discover a later compiled phase.
@@ -7904,7 +7905,8 @@ public sealed class EmbeddedDatabase : IDisposable
         // the first term's, exactly as the tree-walking fold below reports first.Columns. Everything
         // else (ORDER BY/LIMIT/OFFSET, INTERSECT/EXCEPT, mixed operators, non-lowerable terms) keeps
         // the evaluator.
-        if (TryCompileCompoundSelect(statement, parameters, context, outerRow, out var compiledCompound))
+        if (!context.CancellationToken.CanBeCanceled
+            && TryCompileCompoundSelect(statement, parameters, context, outerRow, out var compiledCompound))
         {
             var firstTerm = (SelectStatement)statement.Terms[0];
             var compoundColumns = GetColumnNames(

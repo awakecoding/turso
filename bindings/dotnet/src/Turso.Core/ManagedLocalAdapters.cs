@@ -93,6 +93,7 @@ public enum ManagedSnapshotFailure
     RowidNotAccessible,
     ColumnCountMismatch,
     PhysicalFileIdentityUnavailable,
+    SourceBusy,
 }
 
 public sealed class ManagedSnapshotException : Exception
@@ -427,14 +428,18 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
         }
         if (destinationConnection.HasActiveTransaction)
             throw new ManagedSnapshotException(ManagedSnapshotFailure.DestinationBusy);
+        var sourceTransactionActive = sourceConnection.HasActiveTransaction;
+        if (sourceTransactionActive
+            && !sourceName.Equals("main", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ManagedSnapshotException(ManagedSnapshotFailure.SourceBusy);
+        }
 
         ManagedConnectionAdapter? sourceSnapshot = null;
         EmbeddedDatabase? sourceSnapshotOwner = null;
         ManagedConnectionAdapter? destinationSnapshot = null;
         try
         {
-            var sourceTransactionActive = sourceConnection.HasActiveTransaction
-                                          && sourceName.Equals("main", StringComparison.OrdinalIgnoreCase);
             ManagedConnectionAdapter snapshotSource;
             if (sourceTransactionActive)
             {

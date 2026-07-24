@@ -408,8 +408,16 @@ public sealed class ManagedJournalPageMigrationTests
                         quantity INTEGER DEFAULT (2 + 3),
                         CONSTRAINT positive CHECK (quantity > 0)
                     );
+                    CREATE TABLE generated_key(
+                        tenant TEXT,
+                        sequence INTEGER,
+                        base INTEGER NOT NULL,
+                        doubled INTEGER AS (base * 2) STORED,
+                        PRIMARY KEY(tenant, sequence)
+                    );
                     INSERT INTO parent VALUES (1);
                     INSERT INTO child(id, parent_id, code) VALUES (1, 1, 'a');
+                    INSERT INTO generated_key(tenant, sequence, base) VALUES ('tenant', 1, 7);
                     PRAGMA journal_mode=DELETE;
                     PRAGMA page_size=8192;
                     VACUUM;
@@ -430,6 +438,13 @@ public sealed class ManagedJournalPageMigrationTests
                 .And.Contain("UNIQUE")
                 .And.Contain("DEFAULT (2 + 3)")
                 .And.Contain("CONSTRAINT \"positive\" CHECK (quantity > 0)");
+            verification.CommandText = "SELECT sql FROM sqlite_schema WHERE name='generated_key'";
+            verification.ExecuteScalar()!.ToString().Should()
+                .Contain("\"doubled\" INTEGER AS (base * 2) STORED")
+                .And.Contain("PRIMARY KEY (\"tenant\", \"sequence\")");
+            verification.CommandText =
+                "SELECT doubled FROM generated_key WHERE tenant='tenant' AND sequence=1";
+            verification.ExecuteScalar().Should().Be(14L);
 
             verification.CommandText = "PRAGMA foreign_keys=ON";
             verification.ExecuteNonQuery();
@@ -442,6 +457,10 @@ public sealed class ManagedJournalPageMigrationTests
             verification.CommandText = "INSERT INTO child(id, parent_id, code) VALUES (2, 1, 'a')";
             Assert.Throws<Turso.Data.Sqlite.SqliteException>(() => verification.ExecuteNonQuery())!
                 .Message.Should().Contain("UNIQUE constraint failed");
+            verification.CommandText =
+                "INSERT INTO generated_key(tenant, sequence, base) VALUES ('tenant', 1, 9)";
+            Assert.Throws<Turso.Data.Sqlite.SqliteException>(() => verification.ExecuteNonQuery())!
+                .Message.Should().Contain("UNIQUE constraint failed: generated_key.tenant, generated_key.sequence");
         }
         finally
         {

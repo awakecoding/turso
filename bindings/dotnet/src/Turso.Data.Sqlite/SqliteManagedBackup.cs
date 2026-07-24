@@ -39,6 +39,8 @@ internal static class SqliteManagedBackup
         {
             ManagedSnapshotFailure.DestinationBusy
                 => new SqliteException(Properties.Resources.SqliteNativeError(5, "database is locked"), 5),
+            ManagedSnapshotFailure.SourceBusy
+                => new SqliteException(Properties.Resources.SqliteNativeError(5, "source database is locked"), 5),
             ManagedSnapshotFailure.UnsupportedSchemaObject
                 => new NotSupportedException(Properties.Resources.ManagedBackupSchemaObjectNotSupported(exception.ObjectName)),
             ManagedSnapshotFailure.RowidNotAccessible

@@ -198,6 +198,14 @@ public sealed class ManagedBackupSnapshotTests
                         CONSTRAINT metric_value UNIQUE (label, amount) ON CONFLICT IGNORE
                     );
                     INSERT INTO constrained(id, code, label) VALUES (1, 'A', 'X');
+                    CREATE TABLE generated_key(
+                        tenant TEXT,
+                        sequence INTEGER,
+                        base INTEGER NOT NULL,
+                        doubled INTEGER AS (base * 2) STORED,
+                        PRIMARY KEY(tenant, sequence)
+                    );
+                    INSERT INTO generated_key(tenant, sequence, base) VALUES ('tenant', 1, 7);
                     """);
 
                 source.BackupDatabase(destination);
@@ -234,6 +242,16 @@ public sealed class ManagedBackupSnapshotTests
                 .WithMessage("*CHECK constraint failed: positive*");
             reopened.ExecuteScalar<double>(
                 "SELECT amount FROM constrained WHERE id = 2;").Should().Be(5);
+            var generatedSchema = reopened.ExecuteScalar<string>(
+                "SELECT sql FROM sqlite_master WHERE name = 'generated_key';");
+            generatedSchema.Should().Contain("\"doubled\" INTEGER AS (base * 2) STORED")
+                .And.Contain("PRIMARY KEY (\"tenant\", \"sequence\")");
+            reopened.ExecuteScalar<long>(
+                "SELECT doubled FROM generated_key WHERE tenant = 'tenant' AND sequence = 1;").Should().Be(14);
+            reopened.Invoking(connection => connection.ExecuteNonQuery(
+                    "INSERT INTO generated_key(tenant, sequence, base) VALUES ('tenant', 1, 9);"))
+                .Should().Throw<SqliteException>()
+                .WithMessage("*UNIQUE constraint failed: generated_key.tenant, generated_key.sequence*");
         }
         finally
         {
@@ -320,6 +338,106 @@ public sealed class ManagedBackupSnapshotTests
         {
             DeleteManagedDatabase(sourcePath);
             DeleteManagedDatabase(attachmentPath);
+        }
+    }
+
+    [TestCase("WAL")]
+    [TestCase("DELETE")]
+    public void ManagedBackupRejectsActiveAttachedSourceSnapshotBeforeDestinationMutation(string journalMode)
+    {
+        var sourcePath = CreateManagedDatabasePath();
+        var attachmentPath = CreateManagedDatabasePath();
+        try
+        {
+            using (var attachment = OpenManagedConnection(attachmentPath))
+            {
+                attachment.ExecuteNonQuery("CREATE TABLE payload(value TEXT); INSERT INTO payload VALUES ('committed');");
+                SetJournalMode(attachment, journalMode);
+            }
+
+            using var source = OpenManagedConnection(sourcePath);
+            using var destination = OpenManagedConnection();
+            SetJournalMode(source, journalMode);
+            source.ExecuteNonQuery($"ATTACH DATABASE '{attachmentPath}' AS source_aux;");
+            destination.ExecuteNonQuery("CREATE TABLE preserved(value TEXT); INSERT INTO preserved VALUES ('destination');");
+            using var transaction = source.BeginTransaction();
+            source.ExecuteNonQuery("INSERT INTO source_aux.payload VALUES ('uncommitted');");
+
+            var exception = Assert.Throws<SqliteException>(
+                () => source.BackupDatabase(destination, "main", "source_aux"));
+
+            exception!.SqliteErrorCode.Should().Be(5);
+            exception.Message.Should().Contain("source database is locked");
+            destination.ExecuteScalar<string>("SELECT value FROM preserved;").Should().Be("destination");
+            transaction.Rollback();
+        }
+        finally
+        {
+            DeleteManagedDatabase(sourcePath);
+            DeleteManagedDatabase(attachmentPath);
+        }
+    }
+
+    [TestCase("WAL")]
+    [TestCase("DELETE")]
+    public void ManagedBackupRoutesAttachedTransactionsAcrossJournalModes(string journalMode)
+    {
+        var sourcePath = CreateManagedDatabasePath();
+        var sourceAttachmentPath = CreateManagedDatabasePath();
+        var destinationPath = CreateManagedDatabasePath();
+        var destinationAttachmentPath = CreateManagedDatabasePath();
+        try
+        {
+            using (var sourceAttachment = OpenManagedConnection(sourceAttachmentPath))
+            {
+                sourceAttachment.ExecuteNonQuery(
+                    "CREATE TABLE payload(id INTEGER PRIMARY KEY, value TEXT);"
+                    + " INSERT INTO payload VALUES (1, 'committed');");
+                SetJournalMode(sourceAttachment, journalMode);
+            }
+
+            using (var destinationAttachment = OpenManagedConnection(destinationAttachmentPath))
+            {
+                destinationAttachment.ExecuteNonQuery(
+                    "CREATE TABLE old_payload(value TEXT); INSERT INTO old_payload VALUES ('old');");
+                SetJournalMode(destinationAttachment, journalMode);
+            }
+
+            using (var source = OpenManagedConnection(sourcePath))
+            using (var destination = OpenManagedConnection(destinationPath))
+            {
+                SetJournalMode(source, journalMode);
+                SetJournalMode(destination, journalMode);
+                source.ExecuteNonQuery($"ATTACH DATABASE '{sourceAttachmentPath}' AS source_aux;");
+                destination.ExecuteNonQuery($"ATTACH DATABASE '{destinationAttachmentPath}' AS destination_aux;");
+                destination.ExecuteNonQuery("CREATE TABLE main_marker(value TEXT); INSERT INTO main_marker VALUES ('main');");
+
+                using (var transaction = source.BeginTransaction())
+                {
+                    source.ExecuteNonQuery("INSERT INTO source_aux.payload VALUES (2, 'transaction');");
+                    transaction.Commit();
+                }
+
+                source.BackupDatabase(destination, "destination_aux", "source_aux");
+
+                destination.ExecuteScalar<long>("SELECT COUNT(*) FROM destination_aux.payload;").Should().Be(2);
+                destination.ExecuteScalar<string>(
+                    "SELECT value FROM destination_aux.payload WHERE id = 2;").Should().Be("transaction");
+                destination.ExecuteScalar<string>("SELECT value FROM main_marker;").Should().Be("main");
+                destination.ExecuteScalar<long>(
+                    "SELECT COUNT(*) FROM destination_aux.sqlite_master WHERE name = 'old_payload';").Should().Be(0);
+            }
+
+            using var reopened = OpenManagedConnection(destinationAttachmentPath);
+            reopened.ExecuteScalar<string>("PRAGMA journal_mode;").Should().Be(journalMode.ToLowerInvariant());
+            reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM payload;").Should().Be(2);
+        }
+        finally
+        {
+            DeleteManagedDatabase(sourcePath);
+            DeleteManagedDatabase(sourceAttachmentPath);
+            DeleteManagedDatabase(destinationPath);
+            DeleteManagedDatabase(destinationAttachmentPath);
         }
     }
 
@@ -621,6 +739,12 @@ public sealed class ManagedBackupSnapshotTests
         return connection;
     }
 
+    private static void SetJournalMode(SqliteConnection connection, string journalMode)
+    {
+        connection.ExecuteScalar<string>($"PRAGMA journal_mode={journalMode};")
+            .Should().Be(journalMode.ToLowerInvariant());
+    }
+
     private static void InsertData(
         SqliteConnection connection,
         long rowid,
@@ -653,7 +777,7 @@ public sealed class ManagedBackupSnapshotTests
 
     private static void DeleteManagedDatabase(string path)
     {
-        foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm", "-journal" })
         {
             var candidate = path + suffix;
             if (File.Exists(candidate))

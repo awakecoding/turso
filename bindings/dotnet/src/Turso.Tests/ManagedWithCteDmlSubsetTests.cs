@@ -115,10 +115,10 @@ public class ManagedWithCteDmlSubsetTests
             """);
 
         using var audit = connection.Prepare("SELECT id, mark FROM audit ORDER BY id;");
-            AssertRows(
-                ReadRows(audit),
-                [SqlValue.Integer(1), SqlValue.Integer(1)],
-                [SqlValue.Integer(2), SqlValue.Integer(0)]);
+        AssertRows(
+            ReadRows(audit),
+            [SqlValue.Integer(1), SqlValue.Integer(1)],
+            [SqlValue.Integer(2), SqlValue.Integer(0)]);
     }
 
     [Test]

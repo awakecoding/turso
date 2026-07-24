@@ -22,10 +22,10 @@ public sealed class TursoSqliteSqlNullabilityProcessor(
                 Arguments:
                 [
                     SqlFunctionExpression
-                    {
-                        IsBuiltIn: true,
-                        Name: var name
-                    } function,
+                {
+                    IsBuiltIn: true,
+                    Name: var name
+                } function,
                     _
                 ]
             }
