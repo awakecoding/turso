@@ -300,9 +300,22 @@ internal sealed record RollbackToSavepointStatement(string Name) : ParsedStateme
 
 internal abstract record TableSource;
 
-internal sealed record NamedTableSource(string Name, string? Alias = null) : TableSource;
+internal sealed record NamedTableSource(
+    string Name,
+    string? Alias = null,
+    TableIndexDirective? IndexDirective = null) : TableSource;
 
-internal sealed record GenerateSeriesSource(Expression Start, Expression Stop, Expression Step) : TableSource;
+internal abstract record TableIndexDirective;
+
+internal sealed record IndexedByDirective(string IndexName) : TableIndexDirective;
+
+internal sealed record NotIndexedDirective : TableIndexDirective;
+
+internal sealed record GenerateSeriesSource(
+    Expression Start,
+    Expression Stop,
+    Expression Step,
+    string? Alias = null) : TableSource;
 
 internal sealed record DerivedTableSource(QueryStatement Query, string? Alias) : TableSource;
 

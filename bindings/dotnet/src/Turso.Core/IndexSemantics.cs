@@ -296,11 +296,22 @@ internal static class IndexExpressionSemantics
         var queryTerms = SplitConjuncts(queryPredicate);
         foreach (var required in SplitConjuncts(indexPredicate))
         {
-            if (!queryTerms.Any(candidate => ExpressionsEqual(candidate, required)))
+            if (!queryTerms.Any(candidate => PredicateTermsEqual(candidate, required)))
                 return false;
         }
 
         return true;
+    }
+
+    public static bool PredicateTermsEqual(Expression candidate, Expression required)
+    {
+        if (ExpressionsEqual(candidate, required))
+            return true;
+
+        return candidate is BinaryExpression { Operator: BinaryOperator.Equal } candidateEqual
+            && required is BinaryExpression { Operator: BinaryOperator.Equal } requiredEqual
+            && ExpressionsEqual(candidateEqual.Left, requiredEqual.Right)
+            && ExpressionsEqual(candidateEqual.Right, requiredEqual.Left);
     }
 
     public static bool ContainsFunction(
@@ -466,7 +477,7 @@ internal static class IndexExpressionSemantics
         }
     }
 
-    private static IReadOnlyList<Expression> SplitConjuncts(Expression expression)
+    public static IReadOnlyList<Expression> SplitConjuncts(Expression expression)
     {
         var terms = new List<Expression>();
         Add(expression, terms);
