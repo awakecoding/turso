@@ -33,6 +33,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly int[] _cursorPositions;
     private readonly SqlValue[]?[] _materializedRows;
     private readonly long[] _materializedRowIds;
+    private readonly IReadOnlyList<SqlValue[]>?[] _joinCursorRows;
     private readonly SorterRuntime?[] _sorters;
     private readonly object?[] _accumulatorContexts;
     private readonly bool[] _accumulatorInitialized;
@@ -76,6 +77,7 @@ public sealed class ResumableStatement : IDisposable
         _cursorPositions = new int[program.CursorCount];
         _materializedRows = new SqlValue[program.CursorCount][];
         _materializedRowIds = new long[program.CursorCount];
+        _joinCursorRows = new IReadOnlyList<SqlValue[]>?[program.CursorCount];
         _sorters = new SorterRuntime?[program.SorterCount];
         _accumulatorContexts = new object?[program.AccumulatorCount];
         _accumulatorInitialized = new bool[program.AccumulatorCount];
@@ -199,6 +201,16 @@ public sealed class ResumableStatement : IDisposable
                     _materializedRows[open.Cursor.Index] = null;
                     AdvanceInstructionPointer();
                     break;
+                case OpenJoinCursorInstruction openJoin:
+                    {
+                        var rows = openJoin.Plan.Materialize();
+                        OpenCursor(openJoin.Cursor);
+                        _joinCursorRows[openJoin.Cursor.Index] = rows;
+                        _cursorPositions[openJoin.Cursor.Index] = -1;
+                        _materializedRows[openJoin.Cursor.Index] = null;
+                        AdvanceInstructionPointer();
+                        break;
+                    }
                 case OpenWriteCursorInstruction openWrite:
                     OpenCursor(openWrite.Cursor);
                     _cursorPositions[openWrite.Cursor.Index] = -1;
@@ -207,6 +219,7 @@ public sealed class ResumableStatement : IDisposable
                     break;
                 case CloseCursorInstruction close:
                     CloseCursor(close.Cursor);
+                    _joinCursorRows[close.Cursor.Index] = null;
                     AdvanceInstructionPointer();
                     break;
                 case RewindCursorInstruction rewind:
@@ -265,6 +278,39 @@ public sealed class ResumableStatement : IDisposable
                             AdvanceInstructionPointer();
                         else
                             _instructionPointer = filterRegisters.FalseTarget;
+
+                        break;
+                    }
+                case ProjectRegistersInstruction project:
+                    {
+                        var input = ReadRegisters(project.Input);
+                        var output = project.Transform(input)
+                            ?? throw new InvalidOperationException("A register projection returned null.");
+                        if (output.Length != project.Output.Count)
+                        {
+                            throw new InvalidOperationException(
+                                $"A register projection declared {project.Output.Count} outputs but returned {output.Length}.");
+                        }
+
+                        Array.Copy(output, 0, _registers, project.Output.Start.Index, output.Length);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case DistinctFilterInstruction distinctFilter:
+                    {
+                        var candidate = ReadRegisters(distinctFilter.Values);
+                        if (RowSetContains(
+                                distinctFilter.DistinctSetIndex,
+                                candidate,
+                                distinctFilter.Equality))
+                        {
+                            _instructionPointer = distinctFilter.DuplicateTarget;
+                        }
+                        else
+                        {
+                            (_distinctSets[distinctFilter.DistinctSetIndex] ??= []).Add(candidate);
+                            AdvanceInstructionPointer();
+                        }
 
                         break;
                     }
@@ -612,6 +658,7 @@ public sealed class ResumableStatement : IDisposable
                     break;
                 case HaltInstruction:
                     Array.Clear(_openCursors);
+                    Array.Clear(_joinCursorRows);
                     AdvanceInstructionPointer();
                     State = ResumableStatementState.Done;
                     return ResumableStatementStepResult.Done;
@@ -642,6 +689,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_cursorPositions);
         Array.Clear(_materializedRows);
         Array.Clear(_materializedRowIds);
+        Array.Clear(_joinCursorRows);
         Array.Clear(_sorters);
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
@@ -704,6 +752,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_registers);
         Array.Clear(_openCursors);
         Array.Clear(_materializedRows);
+        Array.Clear(_joinCursorRows);
         Array.Clear(_sorters);
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
@@ -819,6 +868,9 @@ public sealed class ResumableStatement : IDisposable
     // scanned UPDATE/DELETE rows) or, failing that, its read source.
     private int CursorRowCount(Cursor cursor)
     {
+        if (_joinCursorRows[cursor.Index] is { } joinedRows)
+            return joinedRows.Count;
+
         var writeTarget = WriteTargetOrNull(cursor);
         return writeTarget is not null
             ? writeTarget.RowCount
@@ -855,11 +907,20 @@ public sealed class ResumableStatement : IDisposable
         if (writeTarget?.GetRow is { } getRow)
             return getRow(position);
 
+        if (_joinCursorRows[cursor.Index] is { } joinedRows)
+            return joinedRows[position];
+
         return RequireCursorSource(cursor).Rows[position];
     }
 
     private long CurrentCursorRowId(Cursor cursor)
     {
+        if (_joinCursorRows[cursor.Index] is not null)
+        {
+            throw new InvalidOperationException(
+                $"Join cursor {cursor.Index} exposes source rowids as hidden columns, not as one cursor rowid.");
+        }
+
         if (_materializedRows[cursor.Index] is not null)
             return _materializedRowIds[cursor.Index];
 
