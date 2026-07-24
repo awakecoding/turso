@@ -267,14 +267,17 @@ public sealed class ManagedAutoIncrementTests
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT)");
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, removed TEXT)");
 
         QueryManaged(
                 connection,
                 "SELECT sql, (SELECT count(*) FROM sqlite_sequence) "
                 + "FROM sqlite_schema WHERE name = 'sqlite_sequence'")
             .Rows.Should().Equal(["T:CREATE TABLE sqlite_sequence(name,seq)\u001fI:0"]);
-        Execute(connection, "INSERT INTO t DEFAULT VALUES");
+        Execute(connection, "INSERT INTO t(removed) VALUES ('drop-me')");
+        Execute(connection, "ALTER TABLE t DROP COLUMN removed");
+        QueryManaged(connection, "SELECT name, seq FROM sqlite_sequence")
+            .Rows.Should().Equal(["T:t\u001fI:1"]);
         Execute(connection, "ALTER TABLE t RENAME TO renamed");
         QueryManaged(connection, "SELECT name, seq FROM sqlite_sequence")
             .Rows.Should().Equal(["T:renamed\u001fI:1"]);

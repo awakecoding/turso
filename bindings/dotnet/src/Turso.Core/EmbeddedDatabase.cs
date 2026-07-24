@@ -2598,7 +2598,19 @@ public sealed class EmbeddedDatabase : IDisposable
         if (statement.Upsert is { } upsert)
         {
             foreach (var target in upsert.Target)
-                _ = table.GetColumnIndex(target.Name);
+            {
+                if (target.Expression is { } expression)
+                {
+                    ValidateExpressionSchema(expression, targetRow, context, cancellationToken);
+                }
+                else
+                {
+                    _ = table.GetColumnIndex(
+                        target.Name
+                        ?? throw new InvalidOperationException("UPSERT target is missing a column or expression."));
+                }
+            }
+            ValidateExpressionSchema(upsert.TargetWhere, targetRow, context, cancellationToken);
             if (upsert.Action is DoUpdateUpsertAction update)
             {
                 foreach (var assignment in update.Assignments)
@@ -26858,7 +26870,10 @@ internal sealed class EmbeddedTable
 
         var dependentIndex = Indexes.FirstOrDefault(index =>
             index.Origin == EmbeddedIndexOrigin.Explicit
-            && index.Columns.Any(column => column.ColumnIndex == droppedColumnIndex));
+            && (index.Columns.Any(column =>
+                    column.ColumnIndex == droppedColumnIndex
+                    || column.Expression is not null && ReferencesColumn(column.Expression, name))
+                || ReferencesColumn(index.Where, name)));
         if (dependentIndex is not null)
         {
             throw new EmbeddedSqlException(
@@ -26878,7 +26893,8 @@ internal sealed class EmbeddedTable
                 TablePrimaryKeyConflictAlgorithm,
                 TablePrimaryKeyConstraintName,
                 TablePrimaryKeyDeclarationOrder,
-                TableForeignKeys);
+                TableForeignKeys,
+                Strict);
         }
         catch (EmbeddedSqlException exception)
         {
@@ -26890,15 +26906,17 @@ internal sealed class EmbeddedTable
         foreach (var index in Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            replacement.Indexes.Add(index with
+            var rewritten = index with
             {
                 Columns = index.Columns
-                    .Select(column => column with
-                    {
-                        ColumnIndex = replacement.GetColumnIndex(column.Name),
-                    })
+                    .Select(column => column.IsExpression
+                        ? column
+                        : column with { ColumnIndex = replacement.GetColumnIndex(column.Name) })
                     .ToArray(),
-            });
+            };
+            IndexExpressionSemantics.ValidateDefinition(Name, replacement, rewritten);
+            IndexExpressionSemantics.ValidateRoundTrip(Name, replacement, rewritten);
+            replacement.Indexes.Add(rewritten);
         }
 
         if (RowIds.Count != Rows.Count)
@@ -26924,6 +26942,16 @@ internal sealed class EmbeddedTable
 
         replacement.RowIds.AddRange(RowIds);
         return replacement;
+
+        static bool ReferencesColumn(Expression? expression, string columnName)
+        {
+            if (expression is null)
+                return false;
+
+            var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            CollectColumnReferences(expression, references);
+            return references.Contains(columnName);
+        }
     }
 
     public void Rename(string newName)

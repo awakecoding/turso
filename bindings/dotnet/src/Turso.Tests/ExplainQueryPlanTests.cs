@@ -185,6 +185,48 @@ public sealed class ExplainQueryPlanTests
     }
 
     [Test]
+    public void ClassifiesJoinCompoundWindowAndBitwiseIndexRoutesTruthfully()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE left_items(id INTEGER PRIMARY KEY,flags INTEGER);");
+        Execute(connection, "CREATE TABLE right_items(id INTEGER PRIMARY KEY,value TEXT);");
+        Execute(connection, "INSERT INTO left_items VALUES (1,1),(2,2);");
+        Execute(connection, "INSERT INTO right_items VALUES (1,'one'),(3,'three');");
+        Execute(
+            connection,
+            "CREATE INDEX left_bits ON left_items((flags << 2) | id) WHERE (flags & 1) = 1;");
+
+        ReadPlan(
+                connection,
+                "EXPLAIN QUERY PLAN SELECT l.id,r.value FROM left_items l JOIN right_items r ON r.id=l.id;")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
+        ReadPlan(
+                connection,
+                "EXPLAIN QUERY PLAN SELECT id FROM left_items UNION ALL SELECT id FROM right_items;")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
+        ReadPlan(
+                connection,
+                "EXPLAIN QUERY PLAN SELECT row_number() OVER (ORDER BY id) FROM left_items;")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+        ReadPlan(
+                connection,
+                """
+                EXPLAIN QUERY PLAN
+                SELECT l.id FROM left_items l JOIN right_items r ON r.id=l.id
+                UNION ALL SELECT id FROM left_items
+                """)
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+        ReadPlan(
+                connection,
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id FROM left_items
+                WHERE (flags & 1) = 1 AND ((flags << 2) | id) = 5
+                """)
+            .Rows[0][3].Should().Be(SqlValue.Text("SEARCH left_items USING INDEX left_bits"));
+    }
+
+    [Test]
     public void SelectsPartialExpressionIndexesOnlyForIdenticalImpliedPredicates()
     {
         using var connection = new EmbeddedDatabase().Connect();

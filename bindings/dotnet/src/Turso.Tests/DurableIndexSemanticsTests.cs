@@ -448,6 +448,62 @@ public sealed class DurableIndexSemanticsTests
     }
 
     [Test]
+    public void BitwisePartialExpressionIndexRoundTripsAndRejectsRowValuesBeforePublication()
+    {
+        var path = CreateDatabasePath("partial-bitwise-expression");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE items(id INTEGER PRIMARY KEY,flags INTEGER,kind INTEGER,payload TEXT);
+                    INSERT INTO items VALUES (1,1,2,'one'),(2,2,3,'two'),(3,3,4,'three');
+                    CREATE INDEX items_bits
+                        ON items(((flags << 4) | kind) DESC)
+                        WHERE (flags & 1) = 1;
+                    """);
+
+                Action rowValue = () => Execute(
+                    connection,
+                    "CREATE INDEX rejected_row_value ON items((flags,kind));");
+                rowValue.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*expression is prohibited in index expressions*");
+                Query(connection, "PRAGMA index_list(items);").Select(row => row[1].AsText())
+                    .Should().Contain("items_bits").And.NotContain("rejected_row_value");
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Query(
+                        connection,
+                        """
+                        SELECT id FROM items
+                        WHERE (flags & 1) = 1
+                        ORDER BY ((flags << 4) | kind) DESC
+                        """)
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(3, 1);
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name='items_bits';")
+                .Should().Contain("(flags << 4) | kind")
+                .And.Contain("WHERE (flags & 1) = 1");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void Utf16RTrimIndexUsesSqliteUtf8CollationOrder()
     {
         var path = CreateDatabasePath("utf16-rtrim");
@@ -762,6 +818,70 @@ public sealed class DurableIndexSemanticsTests
                     ORDER BY label COLLATE NOCASE DESC, id ASC;
                     """)
                 .Should().Equal(1, 2, 3, 5);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void LimitedRowAssignmentsKeepPartialExpressionIndexesAtomic()
+    {
+        var path = CreateDatabasePath("limited-dml-partial-row-assignment");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE items(
+                        id INTEGER PRIMARY KEY,
+                        active INTEGER,
+                        left_value INTEGER,
+                        right_value INTEGER
+                    );
+                    INSERT INTO items VALUES (1,1,1,2),(2,1,3,4),(3,0,1,2);
+                    CREATE UNIQUE INDEX items_active_key
+                        ON items((left_value << 8) | right_value)
+                        WHERE active = 1;
+                    UPDATE items
+                    SET (left_value,right_value)=(right_value,left_value)
+                    WHERE active = 1
+                    ORDER BY id
+                    LIMIT 2;
+                    """);
+
+                Query(connection, "SELECT id,left_value,right_value FROM items ORDER BY id;")
+                    .Select(row => string.Join(':', row.Select(value => value.AsInteger())))
+                    .Should().Equal("1:2:1", "2:4:3", "3:1:2");
+
+                Action conflict = () => Execute(
+                    connection,
+                    """
+                    UPDATE items
+                    SET (left_value,right_value)=(9,9)
+                    WHERE active = 1
+                    ORDER BY id
+                    LIMIT 2;
+                    """);
+                conflict.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("UNIQUE constraint failed: index 'items_active_key'");
+                Query(connection, "SELECT id,left_value,right_value FROM items ORDER BY id;")
+                    .Select(row => string.Join(':', row.Select(value => value.AsInteger())))
+                    .Should().Equal("1:2:1", "2:4:3", "3:1:2");
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Convert.ToInt64(Scalar(
+                    sqlite,
+                    "SELECT count(*) FROM items INDEXED BY items_active_key WHERE active = 1;"))
+                .Should().Be(2);
         }
         finally
         {

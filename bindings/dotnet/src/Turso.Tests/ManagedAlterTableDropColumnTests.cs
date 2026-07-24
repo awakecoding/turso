@@ -88,6 +88,67 @@ public sealed class ManagedAlterTableDropColumnTests
             .Should().Throw<Exception>().WithMessage("*expected 5 columns*got 4*");
     }
 
+    [Test]
+    public void DropColumnPreservesAutoincrementStrictAndPartialExpressionIndexState()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var connection = OpenManagedFile(path))
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE data(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        removed TEXT,
+                        flags INT,
+                        kind INT
+                    ) STRICT;
+                    INSERT INTO data(id,removed,flags,kind) VALUES
+                        (1,'drop-me',1,2),
+                        (20,'high',3,4);
+                    DELETE FROM data WHERE id=20;
+                    CREATE INDEX data_bits
+                        ON data((flags << 4) | kind)
+                        WHERE (flags & 1) = 1;
+                    ALTER TABLE data DROP COLUMN removed;
+                    INSERT INTO data(flags,kind) VALUES (5,6);
+                    """);
+
+                Scalar<long>(connection, "SELECT id FROM data WHERE flags=5;").Should().Be(21);
+                Scalar<long>(
+                        connection,
+                        "SELECT seq FROM sqlite_sequence WHERE name='data';")
+                    .Should().Be(21);
+                Scalar<string>(
+                        connection,
+                        "SELECT sql FROM sqlite_schema WHERE name='data';")
+                    .Should().EndWith(" STRICT");
+                Scalar<string>(
+                        connection,
+                        "SELECT sql FROM sqlite_schema WHERE name='data_bits';")
+                    .Should().Contain("(flags << 4) | kind")
+                    .And.Contain("WHERE (flags & 1) = 1");
+            }
+
+            ManagedSqliteConnection.ClearAllPools();
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            Scalar<string>(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Scalar<long>(sqlite, "SELECT seq FROM sqlite_sequence WHERE name='data';").Should().Be(21);
+            Scalar<long>(
+                    sqlite,
+                    "SELECT count(*) FROM data INDEXED BY data_bits WHERE (flags & 1) = 1;")
+                .Should().Be(2);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     [TestCase(
         "CREATE TABLE t(a);",
         "a",
@@ -112,6 +173,14 @@ public sealed class ManagedAlterTableDropColumnTests
         "CREATE TABLE t(a, b); CREATE INDEX t_a ON t(a);",
         "a",
         "error in index t_a")]
+    [TestCase(
+        "CREATE TABLE t(a, b); CREATE INDEX t_a ON t((a << 1)) WHERE b > 0;",
+        "a",
+        "error in index t_a")]
+    [TestCase(
+        "CREATE TABLE t(a, b); CREATE INDEX t_b ON t((a << 1)) WHERE b > 0;",
+        "b",
+        "error in index t_b")]
     [TestCase(
         "CREATE TABLE t(a, b CHECK(a > 0), c);",
         "a",

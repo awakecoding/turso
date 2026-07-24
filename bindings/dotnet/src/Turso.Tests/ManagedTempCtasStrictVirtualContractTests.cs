@@ -332,6 +332,80 @@ public sealed class ManagedTempCtasStrictVirtualContractTests
     }
 
     [Test]
+    public void CtasMaterializesWindowJoinAndCompoundResults()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE numbers(id INTEGER,value INTEGER)",
+            "INSERT INTO numbers VALUES (1,10),(2,20),(3,30)",
+            "CREATE TABLE labels(id INTEGER,label TEXT)",
+            "INSERT INTO labels VALUES (1,'one'),(3,'three')",
+            "CREATE TABLE window_copy AS "
+                + "SELECT id,sum(value) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS running FROM numbers",
+            "CREATE TABLE join_copy AS "
+                + "SELECT numbers.id,labels.label FROM numbers LEFT JOIN labels ON labels.id=numbers.id",
+            "CREATE TABLE compound_copy AS "
+                + "SELECT id,value FROM numbers WHERE id<=2 UNION ALL SELECT id,value FROM numbers WHERE id=3",
+        ];
+
+        AssertMatchesSqlite(setup, "SELECT rowid,* FROM window_copy ORDER BY rowid");
+        AssertMatchesSqlite(setup, "SELECT rowid,* FROM join_copy ORDER BY rowid");
+        AssertMatchesSqlite(setup, "SELECT rowid,* FROM compound_copy ORDER BY rowid");
+    }
+
+    [Test]
+    public void TempTablesComposeWindowAndExpressionOperators()
+    {
+        string[] setup =
+        [
+            "CREATE TEMP TABLE bits(id INTEGER,flags INTEGER)",
+            "INSERT INTO temp.bits VALUES (1,2),(2,3),(3,4)",
+        ];
+
+        AssertMatchesSqlite(
+            setup,
+            """
+            SELECT id,(flags << 1) | 1 AS shifted,
+                   sum(flags) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS running
+            FROM temp.bits
+            WHERE (id,flags) >= (1,2)
+            ORDER BY id
+            """);
+    }
+
+    [Test]
+    public void StrictRowValuesBitwiseDefaultsGeneratedColumnsAndChecksCompose()
+    {
+        string[] setup =
+        [
+            """
+            CREATE TABLE strict_ops(
+                id INT PRIMARY KEY,
+                left_value INT DEFAULT (1 << 3),
+                right_value INT,
+                packed INT AS ((left_value << 4) | right_value) STORED,
+                CHECK ((left_value,right_value) >= (0,0) AND (left_value & 1) = 0)
+            ) STRICT
+            """,
+            "INSERT INTO strict_ops(id,right_value) VALUES (1,2)",
+            "UPDATE strict_ops SET (left_value,right_value)=(right_value,left_value) WHERE id=1",
+        ];
+
+        AssertMatchesSqlite(
+            setup,
+            "SELECT id,left_value,right_value,packed,"
+                + "(left_value,right_value)=(2,8) AS row_match FROM strict_ops");
+        CaptureManagedError(
+                setup,
+                "INSERT INTO strict_ops(id,left_value,right_value) VALUES (2,3,1)")
+            .Should().Contain("CHECK constraint failed");
+        CaptureSqliteError(
+                setup,
+                "INSERT INTO strict_ops(id,left_value,right_value) VALUES (2,3,1)")
+            .Should().Contain("CHECK constraint failed");
+    }
+
+    [Test]
     public void StrictAffinityAndAnyPreservationMatchSqlite()
     {
         string[] setup =
