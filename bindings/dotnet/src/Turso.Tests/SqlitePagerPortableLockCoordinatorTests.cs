@@ -171,6 +171,31 @@ public sealed class SqlitePagerPortableLockCoordinatorTests
 
     [Test]
     [NonParallelizable]
+    public void LinuxEmbeddedDatabaseOwnershipSurvivesVersionReaderDisposal()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("This regression covers Linux process-owned fcntl lock release semantics.");
+
+        var workDirectory = CreateWorkDirectory();
+        try
+        {
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            using (EmbeddedDatabase.OpenFile(databasePath))
+            {
+                RunSqliteWorker(databasePath, "busy");
+                RunManagedWorker(databasePath, "owned");
+            }
+
+            RunSqliteWorker(databasePath, "available");
+        }
+        finally
+        {
+            DeleteWorkDirectory(workDirectory);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
     public void OrdinarySqliteReaderPreventsManagedOpenUntilReaderCloses()
     {
         if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())

@@ -1,4 +1,7 @@
+using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace Turso.Core.Storage;
 
@@ -33,6 +36,8 @@ public sealed class SqlitePagerClientOwnershipException : InvalidOperationExcept
 /// Owns SQLite's complete main-file lock-byte range for every physical pager in
 /// this process. This excludes ordinary SQLite and other managed processes while
 /// allowing all managed pagers in the owning process to share one carrier lock.
+/// Linux uses an open-file-description lock because closing any unrelated
+/// descriptor releases every process-owned POSIX record lock for that file.
 /// </summary>
 internal sealed class SqliteManagedFileOwnership
 {
@@ -197,9 +202,17 @@ internal sealed class SqliteManagedFileOwnership
 
     private static void Lock(FileStream stream)
     {
-        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
+        if (OperatingSystem.IsWindows())
         {
             stream.Lock(PendingByte, LockRangeLength);
+            return;
+        }
+        if (OperatingSystem.IsLinux())
+        {
+            LinuxOpenFileDescriptionLocks.Lock(
+                stream.SafeFileHandle,
+                PendingByte,
+                LockRangeLength);
             return;
         }
 
@@ -210,9 +223,17 @@ internal sealed class SqliteManagedFileOwnership
 
     private static void Unlock(FileStream stream)
     {
-        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
+        if (OperatingSystem.IsWindows())
         {
             stream.Unlock(PendingByte, LockRangeLength);
+            return;
+        }
+        if (OperatingSystem.IsLinux())
+        {
+            LinuxOpenFileDescriptionLocks.Unlock(
+                stream.SafeFileHandle,
+                PendingByte,
+                LockRangeLength);
             return;
         }
 
@@ -268,6 +289,75 @@ internal sealed class SqliteManagedFileOwnership
             var owner = Interlocked.Exchange(ref _owner, null);
             owner?.Release();
         }
+    }
+}
+
+internal static partial class LinuxOpenFileDescriptionLocks
+{
+    private const int SetLockCommand = 37;
+    private const short WriteLockType = 1;
+    private const short UnlockType = 2;
+    private const short SeekSet = 0;
+    private const int AccessDenied = 13;
+    private const int ResourceTemporarilyUnavailable = 11;
+
+    internal static void Lock(SafeFileHandle handle, long offset, long length)
+    {
+        EnsureSupportedArchitecture();
+        var fileLock = new FileLock(WriteLockType, SeekSet, offset, length);
+        if (Fcntl(handle, SetLockCommand, ref fileLock) == 0)
+            return;
+
+        var error = Marshal.GetLastPInvokeError();
+        var exception = new Win32Exception(error);
+        if (error is AccessDenied or ResourceTemporarilyUnavailable)
+        {
+            throw new IOException(
+                "The Linux SQLite main-file ownership range is held by another client.",
+                exception);
+        }
+
+        throw new InvalidOperationException(
+            "Linux open-file-description lock acquisition failed.",
+            exception);
+    }
+
+    internal static void Unlock(SafeFileHandle handle, long offset, long length)
+    {
+        EnsureSupportedArchitecture();
+        var fileLock = new FileLock(UnlockType, SeekSet, offset, length);
+        if (Fcntl(handle, SetLockCommand, ref fileLock) == 0)
+            return;
+
+        var error = Marshal.GetLastPInvokeError();
+        throw new IOException(
+            "Linux open-file-description lock release failed.",
+            new Win32Exception(error));
+    }
+
+    private static void EnsureSupportedArchitecture()
+    {
+        if (!Environment.Is64BitProcess || Marshal.SizeOf<FileLock>() != 32)
+        {
+            throw new PlatformNotSupportedException(
+                "Managed physical databases require the 64-bit Linux fcntl lock layout.");
+        }
+    }
+
+    [LibraryImport("libc", EntryPoint = "fcntl", SetLastError = true)]
+    private static partial int Fcntl(
+        SafeFileHandle fileDescriptor,
+        int command,
+        ref FileLock fileLock);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileLock(short type, short whence, long start, long length)
+    {
+        internal short Type = type;
+        internal short Whence = whence;
+        internal long Start = start;
+        internal long Length = length;
+        internal int ProcessId;
     }
 }
 
