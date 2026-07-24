@@ -262,10 +262,14 @@ public sealed class ManagedPragmaRuntimeSliceTests
             unsupported.Should().Throw<EmbeddedSqlException>()
                 .WithMessage($"Unsupported PRAGMA {pragma}. At SQL offset *");
         }
+        Assert.Throws<EmbeddedSqlException>(() => ReadValue(connection, "PRAGMA page_count;"))!
+            .Message.Should().Be("Managed PRAGMA page_count requires a file-backed database.");
+        Assert.Throws<EmbeddedSqlException>(() => ReadValue(connection, "PRAGMA temp.freelist_count;"))!
+            .Message.Should().Be("Managed PRAGMA freelist_count requires a file-backed database.");
     }
 
     [Test]
-    public void FileBackedHeaderPragmaWritesRejectWithoutMutatingDurableMetadata()
+    public void FileBackedHeaderPragmaWritesAreDurableTransactionalAndSchemaScoped()
     {
         var fileSystem = new InMemoryFileSystem();
         using (var database = EmbeddedDatabase.OpenFile("pragma-header-writes.db", fileSystem))
@@ -273,24 +277,52 @@ public sealed class ManagedPragmaRuntimeSliceTests
         {
             Execute(connection, "CREATE TABLE data(value INTEGER);");
             ReadValue(connection, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(1));
-            ReadValue(connection, "PRAGMA user_version;").Should().Be(SqlValue.Integer(0));
-            ReadValue(connection, "PRAGMA application_id;").Should().Be(SqlValue.Integer(0));
-            ReadValue(connection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("wal"));
+            Execute(connection, "PRAGMA schema_version = 40;");
+            Execute(connection, "PRAGMA user_version = 456;");
+            Execute(connection, "PRAGMA application_id = 789;");
+            Execute(connection, "CREATE TABLE committed(value INTEGER);");
+            Execute(connection, "ATTACH 'pragma-header-attached.db' AS aux;");
+            Execute(connection, "PRAGMA aux.user_version = 12;");
+            Execute(connection, "PRAGMA aux.application_id = 34;");
+            ReadValue(connection, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(41));
 
-            var unsupportedWrite = () => Execute(connection, "PRAGMA schema_version = 99;");
-            unsupportedWrite.Should().Throw<EmbeddedSqlException>()
-                .WithMessage("Managed file-backed databases do not support writes to PRAGMA schema_version.");
-            ReadValue(connection, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(1));
+            Execute(connection, "BEGIN;");
+            Execute(connection, "PRAGMA main.user_version = 999;");
+            Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "PRAGMA aux.user_version = 999;"))!
+                .Message.Should().Contain("cannot modify more than one database");
+            Execute(connection, "ROLLBACK;");
+            ReadValue(connection, "PRAGMA main.user_version;").Should().Be(SqlValue.Integer(456));
+            ReadValue(connection, "PRAGMA aux.user_version;").Should().Be(SqlValue.Integer(12));
+
+            Execute(connection, "BEGIN;");
+            Execute(connection, "PRAGMA aux.user_version = 56;");
+            Execute(connection, "COMMIT;");
+            ReadValue(connection, "PRAGMA aux.user_version;").Should().Be(SqlValue.Integer(56));
         }
 
-        using var readOnlyDatabase = EmbeddedDatabase.OpenFile(
-            "pragma-header-writes.db",
-            fileSystem,
-            readOnly: true);
-        using var readOnlyConnection = readOnlyDatabase.Connect();
-        var readOnlyWrite = () => Execute(readOnlyConnection, "PRAGMA user_version = 99;");
-        readOnlyWrite.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("attempt to write a readonly database");
+        using (var reopened = EmbeddedDatabase.OpenFile("pragma-header-writes.db", fileSystem))
+        using (var connection = reopened.Connect())
+        {
+            ReadValue(connection, "PRAGMA schema_version;").Should().Be(SqlValue.Integer(41));
+            ReadValue(connection, "PRAGMA user_version;").Should().Be(SqlValue.Integer(456));
+            ReadValue(connection, "PRAGMA application_id;").Should().Be(SqlValue.Integer(789));
+        }
+        using (var attached = EmbeddedDatabase.OpenFile("pragma-header-attached.db", fileSystem))
+        using (var connection = attached.Connect())
+        {
+            ReadValue(connection, "PRAGMA user_version;").Should().Be(SqlValue.Integer(56));
+            ReadValue(connection, "PRAGMA application_id;").Should().Be(SqlValue.Integer(34));
+        }
+        using (var readOnlyDatabase = EmbeddedDatabase.OpenFile(
+                   "pragma-header-writes.db",
+                   fileSystem,
+                   readOnly: true))
+        using (var readOnlyConnection = readOnlyDatabase.Connect())
+        {
+            var readOnlyWrite = () => Execute(readOnlyConnection, "PRAGMA user_version = 99;");
+            readOnlyWrite.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("attempt to write a readonly database");
+        }
     }
 
     [Test]
@@ -303,6 +335,9 @@ public sealed class ManagedPragmaRuntimeSliceTests
         unsupported.Should().Throw<EmbeddedSqlException>()
             .WithMessage("Unsupported PRAGMA automatic_index. At SQL offset *");
 
+        ReadRows(connection, "PRAGMA temp.database_list;")
+            .Select(row => row[1].AsText())
+            .Should().Equal("main", "temp");
         using (var tempTableList = connection.Prepare("PRAGMA temp.table_list;"))
         {
             tempTableList.Step().Should().Be(StatementStepResult.Row);
@@ -310,9 +345,10 @@ public sealed class ManagedPragmaRuntimeSliceTests
             tempTableList.GetValue(1).Should().Be(SqlValue.Text("sqlite_temp_schema"));
         }
 
-        var unsupportedSchema = () => connection.Prepare("PRAGMA temp.journal_mode;");
-        unsupportedSchema.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Unsupported PRAGMA database temp. At SQL offset *");
+        ReadValue(connection, "PRAGMA temp.journal_mode;").Should().Be(SqlValue.Text("memory"));
+        using var unknownSchema = connection.Prepare("PRAGMA missing.page_count;");
+        Assert.Throws<EmbeddedSqlException>(() => unknownSchema.Step())!
+            .Message.Should().Be("no such database: missing");
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

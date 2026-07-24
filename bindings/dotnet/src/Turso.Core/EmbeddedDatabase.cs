@@ -64,18 +64,22 @@ internal readonly record struct FileCatalogVersion(
     uint ChangeCounter,
     uint SchemaCookie,
     uint DatabaseSizeInPages,
+    uint FreelistPageCount,
     int UserVersion,
     int ApplicationId,
-    int PageSize)
+    int PageSize,
+    SqliteTextEncoding TextEncoding)
 {
     public static FileCatalogVersion FromHeader(SqliteDatabaseHeader header)
         => new(
             header.ChangeCounter,
             header.SchemaCookie,
             header.DatabaseSizeInPages,
+            header.FreelistPageCount,
             header.UserVersion,
             header.ApplicationId,
-            header.PageSize);
+            header.PageSize,
+            header.TextEncoding);
 }
 
 internal sealed class EmbeddedConflictRollbackException : EmbeddedSqlException
@@ -680,7 +684,9 @@ public sealed class EmbeddedDatabase : IDisposable
                 }
                 else
                 {
-                    PersistFileCatalog(cancellableWorking);
+                    PersistFileCatalog(
+                        cancellableWorking,
+                        forceFullRewrite: cancellableResult.ForceFullCatalogRewrite);
                 }
 
                 return cancellableResult;
@@ -757,7 +763,11 @@ public sealed class EmbeddedDatabase : IDisposable
                 throw;
             }
             if (result.Changed)
-                PersistFileCatalog(working);
+            {
+                PersistFileCatalog(
+                    working,
+                    forceFullRewrite: result.ForceFullCatalogRewrite);
+            }
 
             return result;
         }
@@ -769,7 +779,10 @@ public sealed class EmbeddedDatabase : IDisposable
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableDropColumnStatement
-        or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement or VacuumStatement;
+        or InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement
+        or ReindexStatement or VacuumStatement
+        or PragmaHeaderIntegerStatement { Value: not null }
+        or PragmaJournalModeStatement { Mode: not null };
 
     internal static bool MayChangeSchema(ParsedStatement statement) => statement is
         CreateTableStatement or CreateTableAsSelectStatement
@@ -932,7 +945,11 @@ public sealed class EmbeddedDatabase : IDisposable
                 ManagedSchemaObjectKind.Trigger => _triggers.ContainsKey(name),
                 ManagedSchemaObjectKind.Index => _tables.Values.Any(table =>
                     table.Indexes.Any(index =>
-                        string.Equals(index.Name, name, StringComparison.OrdinalIgnoreCase))),
+                        string.Equals(index.Name, name, StringComparison.OrdinalIgnoreCase))
+                    || string.Equals(
+                        table.WithoutRowidPrimaryKeyIndexName,
+                        name,
+                        StringComparison.OrdinalIgnoreCase)),
                 _ => throw new InvalidOperationException($"Unknown managed schema object kind {kind}."),
             };
         }
@@ -991,7 +1008,8 @@ public sealed class EmbeddedDatabase : IDisposable
     internal void CommitTransaction(
         SchemaCatalog catalog,
         long version,
-        PragmaHeaderMetadata? pragmaHeader = null)
+        PragmaHeaderMetadata? pragmaHeader = null,
+        bool forceFullRewrite = false)
     {
         lock (_gate)
         {
@@ -1009,7 +1027,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 return;
             }
 
-            PersistFileCatalog(catalog, pragmaHeader);
+            PersistFileCatalog(catalog, pragmaHeader, forceFullRewrite);
         }
     }
 
@@ -1113,6 +1131,36 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         lock (_gate)
             return _fileStore is null ? SqlitePageSize.Default : _fileCatalogVersion.PageSize;
+    }
+
+    internal uint GetPageCount()
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null)
+                throw new EmbeddedSqlException("Managed PRAGMA page_count requires a file-backed database.");
+            return _fileCatalogVersion.DatabaseSizeInPages;
+        }
+    }
+
+    internal uint GetFreelistCount()
+    {
+        lock (_gate)
+        {
+            if (_fileStore is null)
+                throw new EmbeddedSqlException("Managed PRAGMA freelist_count requires a file-backed database.");
+            return _fileCatalogVersion.FreelistPageCount;
+        }
+    }
+
+    internal SqliteTextEncoding GetTextEncoding()
+    {
+        lock (_gate)
+        {
+            return _fileStore is null || _fileCatalogVersion.TextEncoding == SqliteTextEncoding.Unset
+                ? SqliteTextEncoding.Utf8
+                : _fileCatalogVersion.TextEncoding;
+        }
     }
 
     internal SqliteJournalMode GetJournalMode()
@@ -1247,29 +1295,73 @@ public sealed class EmbeddedDatabase : IDisposable
             _triggers);
     }
 
-    internal void SetInMemoryPragmaHeaderMetadata(PragmaHeaderMetadata metadata)
+    internal void SetPragmaHeaderInteger(
+        PragmaHeaderIntegerKind kind,
+        int value,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            if (_fileStore is not null)
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_readOnly)
+                throw new EmbeddedSqlException("attempt to write a readonly database");
+
+            if (_fileStore is null)
             {
-                if (_readOnly)
-                    throw new EmbeddedSqlException("attempt to write a readonly database");
-                throw new EmbeddedSqlException(
-                    "Managed file-backed databases do not support writes to schema_version, user_version, or application_id.");
-            }
-
-            if (_inMemoryPragmaHeader == metadata)
+                var updated = UpdatePragmaHeaderInteger(_inMemoryPragmaHeader, kind, value);
+                if (_inMemoryPragmaHeader == updated)
+                    return;
+                _inMemoryPragmaHeader = updated;
+                _version++;
                 return;
+            }
+            if (_fileSystem is null || _fileCatalogWriteLock is null)
+                throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
-            _inMemoryPragmaHeader = metadata;
-            _version++;
+            lock (_fileCatalogWriteLock)
+            {
+                using var catalogWriteLease = EnterPhysicalFileCatalogWriteLock(_fileSystem, _databasePath);
+                EnsureFileCatalogVersionCurrent();
+                var current = new PragmaHeaderMetadata(
+                    unchecked((int)_fileCatalogVersion.SchemaCookie),
+                    _fileCatalogVersion.UserVersion,
+                    _fileCatalogVersion.ApplicationId);
+                var updated = UpdatePragmaHeaderInteger(current, kind, value);
+                if (current == updated)
+                    return;
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    _fileCatalogVersion = _fileStore.UpdatePragmaHeader(updated);
+                    _version++;
+                }
+                catch (EmbeddedPostCommitMaintenanceException)
+                {
+                    _fileCatalogVersion = _fileStore.CommittedCatalogVersion;
+                    _version++;
+                    throw;
+                }
+            }
         }
     }
 
+    private static PragmaHeaderMetadata UpdatePragmaHeaderInteger(
+        PragmaHeaderMetadata current,
+        PragmaHeaderIntegerKind kind,
+        int value)
+        => kind switch
+        {
+            PragmaHeaderIntegerKind.SchemaVersion => current with { SchemaVersion = value },
+            PragmaHeaderIntegerKind.UserVersion => current with { UserVersion = value },
+            PragmaHeaderIntegerKind.ApplicationId => current with { ApplicationId = value },
+            _ => throw new InvalidOperationException($"Unknown PRAGMA header integer kind {kind}."),
+        };
+
     private void PersistFileCatalog(
         SchemaCatalog catalog,
-        PragmaHeaderMetadata? pragmaHeader = null)
+        PragmaHeaderMetadata? pragmaHeader = null,
+        bool forceFullRewrite = false)
     {
         if (_fileStore is null || _fileSystem is null || _fileCatalogWriteLock is null)
             throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
@@ -1284,7 +1376,8 @@ public sealed class EmbeddedDatabase : IDisposable
                     catalog.Tables,
                     catalog.Views,
                     catalog.Triggers,
-                    pragmaHeader);
+                    pragmaHeader,
+                    forceFullRewrite);
                 PublishCatalog(catalog, committedVersion);
             }
             catch (EmbeddedPostCommitMaintenanceException)
@@ -1380,9 +1473,11 @@ public sealed class EmbeddedDatabase : IDisposable
             header.ChangeCounter,
             header.SchemaCookie,
             header.DatabaseSizeInPages,
+            header.FreelistPageCount,
             header.UserVersion,
             header.ApplicationId,
-            header.PageSize);
+            header.PageSize,
+            header.TextEncoding);
     }
 
     private static object GetFileCatalogWriteLock(IFileSystem fileSystem, string path)
@@ -1551,6 +1646,10 @@ public sealed class EmbeddedDatabase : IDisposable
                 tableList.Schema ?? "main"),
             PragmaDatabaseListStatement => ExecutePragmaDatabaseList(),
             PragmaEncodingStatement => ExecutePragmaEncoding(),
+            PragmaPageCountStatement => ExecutePragmaPageCount(),
+            PragmaFreelistCountStatement => ExecutePragmaFreelistCount(),
+            AnalyzeStatement => throw AnalyzeNotSupported(),
+            ReindexStatement reindex => ExecuteReindex(reindex, catalog),
             ExplainStatement explain => ExecuteExplain(explain, parameters, context),
             ExplainQueryPlanStatement explainQueryPlan => ExecuteExplainQueryPlan(explainQueryPlan, parameters, context),
             BeginStatement => ExecutionResult.Empty,
@@ -1698,8 +1797,23 @@ public sealed class EmbeddedDatabase : IDisposable
             [[SqlValue.Integer(0), SqlValue.Text("main"), SqlValue.Text(_databasePath)]],
             0);
 
-    private static ExecutionResult ExecutePragmaEncoding()
-        => new(["encoding"], [[SqlValue.Text("UTF-8")]], 0);
+    private ExecutionResult ExecutePragmaEncoding()
+        => new(["encoding"], [[SqlValue.Text(FormatPragmaEncoding(GetTextEncoding()))]], 0);
+
+    internal static string FormatPragmaEncoding(SqliteTextEncoding encoding)
+        => encoding switch
+        {
+            SqliteTextEncoding.Utf8 or SqliteTextEncoding.Unset => "UTF-8",
+            SqliteTextEncoding.Utf16LittleEndian => "UTF-16le",
+            SqliteTextEncoding.Utf16BigEndian => "UTF-16be",
+            _ => throw new InvalidOperationException($"Unknown SQLite text encoding {encoding}."),
+        };
+
+    private ExecutionResult ExecutePragmaPageCount()
+        => new(["page_count"], [[SqlValue.Integer(GetPageCount())]], 0);
+
+    private ExecutionResult ExecutePragmaFreelistCount()
+        => new(["freelist_count"], [[SqlValue.Integer(GetFreelistCount())]], 0);
 
     private static ExecutionResult ExecutePragmaIndexList(
         PragmaIndexListStatement statement,
@@ -1709,10 +1823,38 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!tables.TryGetValue(statement.TableName, out var table))
             return new ExecutionResult(columns, [], 0);
 
-        var rows = new SqlValue[table.Indexes.Count][];
-        for (var seq = 0; seq < table.Indexes.Count; seq++)
+        var indexes = table.Indexes
+            .Where(index => index.Origin == EmbeddedIndexOrigin.Explicit)
+            .Reverse()
+            .Select(index => (
+                index.Name,
+                index.Unique,
+                index.Origin,
+                index.IsPartial))
+            .Concat(
+                table.Indexes
+                    .Where(index => index.Origin != EmbeddedIndexOrigin.Explicit)
+                    .Select(index => (
+                        index.Name,
+                        index.Unique,
+                        index.Origin,
+                        index.IsPartial))
+                    .Concat(table.WithoutRowidPrimaryKeyIndexName is { } primaryKeyIndexName
+                        ?
+                        [
+                            (
+                                primaryKeyIndexName,
+                                Unique: true,
+                                Origin: EmbeddedIndexOrigin.PrimaryKey,
+                                IsPartial: false),
+                        ]
+                        : [])
+                    .OrderByDescending(index => GetAutoIndexOrdinal(index.Name)))
+            .ToArray();
+        var rows = new SqlValue[indexes.Length][];
+        for (var seq = 0; seq < indexes.Length; seq++)
         {
-            var index = table.Indexes[table.Indexes.Count - 1 - seq];
+            var index = indexes[seq];
             rows[seq] =
             [
                 SqlValue.Integer(seq),
@@ -1731,11 +1873,40 @@ public sealed class EmbeddedDatabase : IDisposable
         return new ExecutionResult(columns, rows, 0);
     }
 
+    private static int GetAutoIndexOrdinal(string indexName)
+    {
+        var separator = indexName.LastIndexOf('_');
+        return separator >= 0
+            && int.TryParse(
+                indexName.AsSpan(separator + 1),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var ordinal)
+                ? ordinal
+                : 0;
+    }
+
     private static ExecutionResult ExecutePragmaIndexInfo(
         PragmaIndexInfoStatement statement,
         Dictionary<string, EmbeddedTable> tables)
     {
         string[] columns = ["seqno", "cid", "name"];
+        if (TryFindWithoutRowidPrimaryKey(
+                tables,
+                statement.IndexName,
+                out _,
+                out var primaryKeyTable))
+        {
+            var primaryKey = primaryKeyTable.PrimaryKeySchema
+                ?? throw new InvalidOperationException("WITHOUT ROWID table has no primary-key metadata.");
+            var primaryKeyRows = primaryKey.Terms.Select((term, seqno) => new[]
+            {
+                SqlValue.Integer(seqno),
+                SqlValue.Integer(term.ColumnIndex),
+                SqlValue.Text(term.ColumnName),
+            }).ToArray();
+            return new ExecutionResult(columns, primaryKeyRows, 0);
+        }
         if (!TryFindIndex(tables, statement.IndexName, out _, out var index))
             return new ExecutionResult(columns, [], 0);
 
@@ -1759,6 +1930,17 @@ public sealed class EmbeddedDatabase : IDisposable
         Dictionary<string, EmbeddedTable> tables)
     {
         string[] columns = ["seqno", "cid", "name", "desc", "coll", "key"];
+        if (TryFindWithoutRowidPrimaryKey(
+                tables,
+                statement.IndexName,
+                out _,
+                out var primaryKeyTable))
+        {
+            return new ExecutionResult(
+                columns,
+                BuildWithoutRowidPrimaryKeyXInfo(primaryKeyTable),
+                0);
+        }
         if (!TryFindIndex(tables, statement.IndexName, out var table, out var index))
             return new ExecutionResult(columns, [], 0);
 
@@ -1798,7 +1980,11 @@ public sealed class EmbeddedDatabase : IDisposable
                     SqlValue.Integer(rows.Count),
                     SqlValue.Integer(suffix.ColumnIndex),
                     SqlValue.Text(suffix.ColumnName),
-                    SqlValue.Integer(suffix.SortOrder == SqliteKeySortOrder.Descending ? 1 : 0),
+                    SqlValue.Integer(
+                        index.Origin == EmbeddedIndexOrigin.Explicit
+                        && suffix.SortOrder == SqliteKeySortOrder.Descending
+                            ? 1
+                            : 0),
                     SqlValue.Text(suffix.Collation.Name ?? "BINARY"),
                     SqlValue.Integer(0),
                 ]);
@@ -1818,6 +2004,47 @@ public sealed class EmbeddedDatabase : IDisposable
         }
 
         return new ExecutionResult(columns, rows, 0);
+    }
+
+    private static SqlValue[][] BuildWithoutRowidPrimaryKeyXInfo(EmbeddedTable table)
+    {
+        var primaryKey = table.PrimaryKeySchema
+            ?? throw new InvalidOperationException("WITHOUT ROWID table has no primary-key metadata.");
+        var rows = new List<SqlValue[]>(table.ColumnDefinitions.Length);
+        var primaryKeyColumns = new HashSet<int>();
+        foreach (var term in primaryKey.Terms)
+        {
+            primaryKeyColumns.Add(term.ColumnIndex);
+            rows.Add(
+            [
+                SqlValue.Integer(rows.Count),
+                SqlValue.Integer(term.ColumnIndex),
+                SqlValue.Text(term.ColumnName),
+                SqlValue.Integer(term.SortOrder == SqliteKeySortOrder.Descending ? 1 : 0),
+                SqlValue.Text(term.Collation.Name ?? "BINARY"),
+                SqlValue.Integer(1),
+            ]);
+        }
+
+        for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
+        {
+            if (primaryKeyColumns.Contains(columnIndex))
+                continue;
+            var column = table.ColumnDefinitions[columnIndex];
+            if (column.IsGenerated && !column.GeneratedStored)
+                continue;
+            rows.Add(
+            [
+                SqlValue.Integer(rows.Count),
+                SqlValue.Integer(columnIndex),
+                SqlValue.Text(column.Name),
+                SqlValue.Integer(0),
+                SqlValue.Text(column.Collation ?? "BINARY"),
+                SqlValue.Integer(0),
+            ]);
+        }
+
+        return rows.ToArray();
     }
 
     private static ExecutionResult ExecutePragmaForeignKeyList(
@@ -2229,6 +2456,101 @@ public sealed class EmbeddedDatabase : IDisposable
         return new ExecutionResult([], [], 0, true);
     }
 
+    private ExecutionResult ExecuteReindex(ReindexStatement statement, SchemaCatalog catalog)
+    {
+        var selected = new List<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)>();
+        if (statement.Target is null)
+        {
+            AddAllIndexes(selected, catalog.Tables);
+        }
+        else if (statement.TargetKind == ReindexTargetKind.Collation)
+        {
+            if (!HasCollation(statement.Target))
+                throw new EmbeddedSqlException($"no such collation sequence: {statement.Target}");
+
+            foreach (var (tableName, table) in catalog.Tables)
+            {
+                foreach (var index in table.Indexes)
+                {
+                    if (index.Columns.Any(term => string.Equals(
+                            IndexExpressionSemantics.GetCollationName(table, term),
+                            statement.Target,
+                            StringComparison.OrdinalIgnoreCase)))
+                    {
+                        selected.Add((tableName, table, index));
+                    }
+                }
+            }
+        }
+        else if (catalog.Tables.TryGetValue(statement.Target, out var targetTable))
+        {
+            foreach (var index in targetTable.Indexes)
+                selected.Add((statement.Target, targetTable, index));
+        }
+        else if (TryFindIndex(catalog.Tables, statement.Target, out var indexedTable, out var targetIndex))
+        {
+            var tableName = catalog.Tables.Single(entry => ReferenceEquals(entry.Value, indexedTable)).Key;
+            selected.Add((tableName, indexedTable, targetIndex));
+        }
+        else if (TryFindWithoutRowidPrimaryKey(
+                     catalog.Tables,
+                     statement.Target,
+                     out var primaryKeyTableName,
+                     out var primaryKeyTable))
+        {
+            foreach (var index in primaryKeyTable.Indexes)
+                selected.Add((primaryKeyTableName, primaryKeyTable, index));
+        }
+        else
+        {
+            throw new EmbeddedSqlException("unable to identify the object to be reindexed");
+        }
+
+        foreach (var (tableName, table, index) in selected)
+        {
+            IndexExpressionSemantics.ValidateDefinition(tableName, table, index);
+            IndexExpressionSemantics.ValidateRoundTrip(tableName, table, index);
+        }
+
+        // The file writer's unchanged-schema full rewrite rebuilds every index tree in one
+        // pager transaction. In-memory catalogs have no physical index image to rebuild.
+        return _fileStore is null
+            ? ExecutionResult.Empty
+            : new ExecutionResult(
+                [],
+                [],
+                0,
+                Changed: true,
+                ForceFullCatalogRewrite: true);
+    }
+
+    private static void AddAllIndexes(
+        ICollection<(string TableName, EmbeddedTable Table, EmbeddedIndex Index)> destination,
+        IReadOnlyDictionary<string, EmbeddedTable> tables)
+    {
+        foreach (var (tableName, table) in tables)
+        {
+            foreach (var index in table.Indexes)
+                destination.Add((tableName, table, index));
+        }
+    }
+
+    internal bool HasCollation(string name)
+    {
+        lock (_gate)
+        {
+            return name.Equals("BINARY", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("RTRIM", StringComparison.OrdinalIgnoreCase)
+                || _collations.ContainsKey(name);
+        }
+    }
+
+    internal static EmbeddedSqlException AnalyzeNotSupported()
+        => new(
+            "Managed ANALYZE is not supported because sqlite_stat tables and planner statistics "
+            + "are not implemented; no statistics were changed.");
+
     private bool IsRegisteredScalarFunction(string name, int arity)
     {
         var normalized = name.ToUpperInvariant();
@@ -2277,6 +2599,34 @@ public sealed class EmbeddedDatabase : IDisposable
 
         table = null!;
         index = null!;
+        return false;
+    }
+
+    private static bool TryFindWithoutRowidPrimaryKey(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        string target,
+        out string tableName,
+        out EmbeddedTable table)
+    {
+        foreach (var entry in tables)
+        {
+            if (!entry.Value.WithoutRowid
+                || (!string.Equals(entry.Key, target, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(
+                        entry.Value.WithoutRowidPrimaryKeyIndexName,
+                        target,
+                        StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            tableName = entry.Key;
+            table = entry.Value;
+            return true;
+        }
+
+        tableName = string.Empty;
+        table = null!;
         return false;
     }
 
@@ -22912,7 +23262,7 @@ public sealed class EmbeddedConnection : IDisposable
     private bool _deferForeignKeys;
     private bool _recursiveTriggers;
     private bool _tempInitialized;
-    private int? _pendingPageSize;
+    private readonly Dictionary<EmbeddedDatabase, int> _pendingPageSizes = [];
     private bool _disposed;
 
     private sealed class AttachedDatabase : IDisposable
@@ -22983,6 +23333,7 @@ public sealed class EmbeddedConnection : IDisposable
         public PragmaHeaderMetadata PragmaHeader { get; set; } = pragmaHeader;
         public bool HasChanges { get; set; }
         public bool HasSnapshotPragmaHeader { get; set; }
+        public bool ForceFullCatalogRewrite { get; set; }
         public HashSet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations { get; } = [];
     }
 
@@ -23121,7 +23472,7 @@ public sealed class EmbeddedConnection : IDisposable
         _deferForeignKeys = false;
         _recursiveTriggers = false;
         _tempInitialized = false;
-        _pendingPageSize = null;
+        _pendingPageSizes.Clear();
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
@@ -23286,6 +23637,11 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfDisposed();
         cancellationToken.ThrowIfCancellationRequested();
+        if (_transactionMutationDatabase is not null && EmbeddedDatabase.MayMutate(statement))
+        {
+            throw new EmbeddedSqlException(
+                "Managed connections do not support reentrant writes from SQL callbacks.");
+        }
         if (_transactionMutationDatabase is not null
             && statement is BeginStatement
                 or CommitStatement
@@ -23334,10 +23690,17 @@ public sealed class EmbeddedConnection : IDisposable
                     () => ExecuteAttach(attach, parameters));
             case DetachDatabaseStatement detach:
                 return ExecuteDetach(detach);
-            case PragmaDatabaseListStatement:
+            case PragmaDatabaseListStatement databaseList:
+                ValidatePragmaSchema(databaseList.Schema);
                 return ExecutePragmaDatabaseList();
             case PragmaTableListStatement { Schema: null }:
                 return ExecutePragmaTableList();
+            case PragmaEncodingStatement encoding:
+                return ExecutePragmaEncoding(encoding);
+            case PragmaPageCountStatement pageCount:
+                return ExecutePragmaPageCount(pageCount);
+            case PragmaFreelistCountStatement freelistCount:
+                return ExecutePragmaFreelistCount(freelistCount);
             case PragmaQueryOnlyStatement queryOnly:
                 return ExecutePragmaQueryOnly(queryOnly);
             case PragmaForeignKeysStatement foreignKeys:
@@ -23347,11 +23710,13 @@ public sealed class EmbeddedConnection : IDisposable
             case PragmaRecursiveTriggersStatement recursiveTriggers:
                 return ExecutePragmaRecursiveTriggers(recursiveTriggers);
             case PragmaHeaderIntegerStatement headerInteger:
-                return ExecutePragmaHeaderInteger(headerInteger);
+                return ExecutePragmaHeaderInteger(headerInteger, cancellationToken);
             case PragmaJournalModeStatement journalMode:
                 return ExecutePragmaJournalMode(journalMode);
             case PragmaPageSizeStatement pageSize:
                 return ExecutePragmaPageSize(pageSize);
+            case AnalyzeStatement:
+                throw EmbeddedDatabase.AnalyzeNotSupported();
             case VacuumStatement vacuum:
                 return ExecuteVacuum(vacuum, parameters);
             case CreateTableAsSelectStatement createTableAs:
@@ -23432,6 +23797,7 @@ public sealed class EmbeddedConnection : IDisposable
                                 ?? throw new InvalidOperationException(
                                     "A transactional mutation lost its statement catalog.");
                             transactionState.HasChanges = true;
+                            transactionState.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
                             if (!ReferenceEquals(routed.Database, _tempDatabase))
                                 _transactionWriteDatabase = routed.Database;
                             if (EmbeddedDatabase.MayChangeSchema(routed.Statement))
@@ -23641,13 +24007,25 @@ public sealed class EmbeddedConnection : IDisposable
     private EmbeddedDatabase ResolveSchemaDatabase(string schema)
     {
         if (schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            _tempInitialized = true;
             return _tempDatabase;
+        }
         if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
             return _database;
         if (_attachedDatabases.TryGetValue(schema, out var attachment))
             return attachment.Database;
 
         throw new EmbeddedSqlException($"no such database: {schema}");
+    }
+
+    private EmbeddedDatabase ResolvePragmaDatabase(string? schema)
+        => schema is null ? _database : ResolveSchemaDatabase(schema);
+
+    private void ValidatePragmaSchema(string? schema)
+    {
+        if (schema is not null)
+            _ = ResolveSchemaDatabase(schema);
     }
 
     private ExecutionResult ExecuteDetach(DetachDatabaseStatement statement)
@@ -23659,6 +24037,7 @@ public sealed class EmbeddedConnection : IDisposable
             throw new EmbeddedSqlException("database is locked");
 
         _attachedDatabases.Remove(statement.Alias);
+        _pendingPageSizes.Remove(attachment.Database);
         attachment.Dispose();
         return ExecutionResult.Empty;
     }
@@ -23698,6 +24077,30 @@ public sealed class EmbeddedConnection : IDisposable
         }
 
         return new ExecutionResult(["seq", "name", "file"], rows.ToArray(), 0);
+    }
+
+    private ExecutionResult ExecutePragmaEncoding(PragmaEncodingStatement statement)
+    {
+        var database = ResolvePragmaDatabase(statement.Schema);
+        var encoding = ReferenceEquals(database, _tempDatabase)
+            ? _database.GetTextEncoding()
+            : database.GetTextEncoding();
+        return new ExecutionResult(
+            ["encoding"],
+            [[SqlValue.Text(EmbeddedDatabase.FormatPragmaEncoding(encoding))]],
+            0);
+    }
+
+    private ExecutionResult ExecutePragmaPageCount(PragmaPageCountStatement statement)
+    {
+        var database = ResolvePragmaDatabase(statement.Schema);
+        return new ExecutionResult(["page_count"], [[SqlValue.Integer(database.GetPageCount())]], 0);
+    }
+
+    private ExecutionResult ExecutePragmaFreelistCount(PragmaFreelistCountStatement statement)
+    {
+        var database = ResolvePragmaDatabase(statement.Schema);
+        return new ExecutionResult(["freelist_count"], [[SqlValue.Integer(database.GetFreelistCount())]], 0);
     }
 
     private ExecutionResult ExecutePragmaTableList()
@@ -23857,10 +24260,12 @@ public sealed class EmbeddedConnection : IDisposable
                 indexList.TableName,
                 ManagedSchemaObjectKind.Table,
                 name => indexList with { TableName = name }),
-            PragmaIndexInfoStatement indexInfo => RouteExistingNamedStatement(
+            PragmaIndexInfoStatement indexInfo => RouteExistingIndexMetadataStatement(
                 indexInfo.IndexName,
-                ManagedSchemaObjectKind.Index,
                 name => indexInfo with { IndexName = name }),
+            PragmaIndexXInfoStatement indexXInfo => RouteExistingIndexMetadataStatement(
+                indexXInfo.IndexName,
+                name => indexXInfo with { IndexName = name }),
             PragmaForeignKeyListStatement foreignKeyList => RouteExistingNamedStatement(
                 foreignKeyList.TableName,
                 ManagedSchemaObjectKind.Table,
@@ -23877,6 +24282,7 @@ public sealed class EmbeddedConnection : IDisposable
                     _ => foreignKeyCheck with { Schema = null }),
             PragmaTableListStatement { Schema: { } schema } tableList
                 => RouteSchema(schema, string.Empty, _ => tableList),
+            ReindexStatement reindex => RouteReindex(reindex),
             WithDmlStatement with => RouteDataStatement(with),
             InsertStatement insert => RouteDataStatement(insert),
             UpdateStatement update => RouteDataStatement(update),
@@ -23891,6 +24297,83 @@ public sealed class EmbeddedConnection : IDisposable
                 => throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH."),
             _ => new RoutedStatement(_database, statement, IsAttached: false),
         };
+    }
+
+    private RoutedStatement RouteReindex(ReindexStatement statement)
+    {
+        if (statement.Target is null)
+        {
+            if (_attachedDatabases.Count != 0)
+            {
+                throw new EmbeddedSqlException(
+                    "Managed REINDEX without a target is not supported while databases are attached; "
+                    + "qualify a table or index.");
+            }
+
+            return new RoutedStatement(_database, statement, IsAttached: false);
+        }
+
+        if (ManagedSchemaName.TrySplit(statement.Target, out var schema, out var localName))
+            return RouteSchema(schema, localName, name => statement with { Target = name });
+
+        if (_database.HasCollation(statement.Target))
+        {
+            if (_attachedDatabases.Count != 0)
+            {
+                throw new EmbeddedSqlException(
+                    "Managed collation REINDEX is not supported while databases are attached; "
+                    + "qualify a table or index.");
+            }
+
+            return new RoutedStatement(
+                _database,
+                statement with { TargetKind = ReindexTargetKind.Collation },
+                IsAttached: false);
+        }
+
+        schema = ResolveExistingIndexOrTableSchema(statement.Target);
+        if (schema is null)
+            throw new EmbeddedSqlException("unable to identify the object to be reindexed");
+
+        return RouteSchema(schema, statement.Target, name => statement with { Target = name });
+    }
+
+    private RoutedStatement RouteExistingIndexMetadataStatement(
+        string objectName,
+        Func<string, ParsedStatement> rewrite)
+    {
+        if (ManagedSchemaName.TrySplit(objectName, out var schema, out var localName))
+            return RouteSchema(schema, localName, rewrite);
+
+        schema = FindExistingObjectSchema(objectName, ManagedSchemaObjectKind.Index)
+            ?? FindExistingObjectSchema(objectName, ManagedSchemaObjectKind.Table)
+            ?? "main";
+        return RouteSchema(schema, objectName, rewrite);
+    }
+
+    private string? ResolveExistingIndexOrTableSchema(string target)
+    {
+        if (CurrentCatalogContains(_tempDatabase, target, ManagedSchemaObjectKind.Table)
+            || CurrentCatalogContains(_tempDatabase, target, ManagedSchemaObjectKind.Index))
+        {
+            return "temp";
+        }
+        if (CurrentCatalogContains(_database, target, ManagedSchemaObjectKind.Table)
+            || CurrentCatalogContains(_database, target, ManagedSchemaObjectKind.Index))
+        {
+            return "main";
+        }
+
+        foreach (var pair in _attachedDatabases.OrderBy(pair => pair.Value.Sequence))
+        {
+            if (CurrentCatalogContains(pair.Value.Database, target, ManagedSchemaObjectKind.Table)
+                || CurrentCatalogContains(pair.Value.Database, target, ManagedSchemaObjectKind.Index))
+            {
+                return pair.Key;
+            }
+        }
+
+        return null;
     }
 
     private RoutedStatement RouteNamedStatement(string objectName, Func<string, ParsedStatement> rewrite)
@@ -23914,6 +24397,9 @@ public sealed class EmbeddedConnection : IDisposable
     }
 
     private string ResolveExistingObjectSchema(string objectName, ManagedSchemaObjectKind kind)
+        => FindExistingObjectSchema(objectName, kind) ?? "main";
+
+    private string? FindExistingObjectSchema(string objectName, ManagedSchemaObjectKind kind)
     {
         if (GetTransactionState(_tempDatabase) is { } tempState
             ? CatalogContainsSchemaObject(tempState.Catalog, objectName, kind)
@@ -23940,7 +24426,7 @@ public sealed class EmbeddedConnection : IDisposable
             }
         }
 
-        return "main";
+        return null;
     }
 
     private static bool CatalogContainsSchemaObject(
@@ -23954,7 +24440,11 @@ public sealed class EmbeddedConnection : IDisposable
             ManagedSchemaObjectKind.Trigger => catalog.Triggers.ContainsKey(objectName),
             ManagedSchemaObjectKind.Index => catalog.Tables.Values.Any(table =>
                 table.Indexes.Any(index =>
-                    string.Equals(index.Name, objectName, StringComparison.OrdinalIgnoreCase))),
+                    string.Equals(index.Name, objectName, StringComparison.OrdinalIgnoreCase))
+                || string.Equals(
+                    table.WithoutRowidPrimaryKeyIndexName,
+                    objectName,
+                    StringComparison.OrdinalIgnoreCase)),
             _ => throw new InvalidOperationException($"Unknown managed schema object kind {kind}."),
         };
 
@@ -24746,6 +25236,7 @@ public sealed class EmbeddedConnection : IDisposable
             AlterTableRenameStatement rename => ManagedSchemaName.TrySplit(rename.TableName, out _, out _),
             AlterTableRenameColumnStatement renameColumn => ManagedSchemaName.TrySplit(renameColumn.TableName, out _, out _),
             AlterTableDropColumnStatement dropColumn => ManagedSchemaName.TrySplit(dropColumn.TableName, out _, out _),
+            ReindexStatement { Target: { } target } => ManagedSchemaName.TrySplit(target, out _, out _),
             InsertStatement insert => ManagedSchemaName.TrySplit(insert.TableName, out _, out _)
                 || insert.Rows.SelectMany(row => row).Any(ExpressionContainsSchemaQualification)
                 || (insert.Source is not null && QueryContainsSchemaQualification(insert.Source))
@@ -25081,7 +25572,8 @@ public sealed class EmbeddedConnection : IDisposable
                     state.Version,
                     database.IsFileBacked && !state.HasSnapshotPragmaHeader
                         ? null
-                        : state.PragmaHeader);
+                        : state.PragmaHeader,
+                    state.ForceFullCatalogRewrite);
             }
             catch (EmbeddedPostCommitMaintenanceException)
             {
@@ -25121,6 +25613,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     private ExecutionResult ExecutePragmaQueryOnly(PragmaQueryOnlyStatement statement)
     {
+        ValidatePragmaSchema(statement.Schema);
         if (statement.Enabled is { } enabled)
         {
             _queryOnly = enabled;
@@ -25132,6 +25625,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     private ExecutionResult ExecutePragmaForeignKeys(PragmaForeignKeysStatement statement)
     {
+        ValidatePragmaSchema(statement.Schema);
         // SQLite leaves this connection setting unchanged while a transaction or savepoint
         // is active; it is neither transactional nor shared with sibling connections.
         if (statement.Enabled is { } enabled && _transactionDatabases is null)
@@ -25144,6 +25638,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     private ExecutionResult ExecutePragmaDeferForeignKeys(PragmaDeferForeignKeysStatement statement)
     {
+        ValidatePragmaSchema(statement.Schema);
         if (statement.Enabled is { } enabled)
         {
             _deferForeignKeys = enabled;
@@ -25181,6 +25676,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     private ExecutionResult ExecutePragmaRecursiveTriggers(PragmaRecursiveTriggersStatement statement)
     {
+        ValidatePragmaSchema(statement.Schema);
         if (statement.Enabled is { } enabled)
         {
             _recursiveTriggers = enabled;
@@ -25193,8 +25689,11 @@ public sealed class EmbeddedConnection : IDisposable
             0);
     }
 
-    private ExecutionResult ExecutePragmaHeaderInteger(PragmaHeaderIntegerStatement statement)
+    private ExecutionResult ExecutePragmaHeaderInteger(
+        PragmaHeaderIntegerStatement statement,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var columnName = statement.Kind switch
         {
             PragmaHeaderIntegerKind.SchemaVersion => "schema_version",
@@ -25203,9 +25702,11 @@ public sealed class EmbeddedConnection : IDisposable
             _ => throw new InvalidOperationException($"Unknown PRAGMA header integer kind {statement.Kind}."),
         };
 
+        var database = ResolvePragmaDatabase(statement.Schema);
+        var transactionState = GetTransactionState(database);
         if (statement.Value is null)
         {
-            var metadata = GetTransactionState(_database)?.PragmaHeader ?? _database.GetPragmaHeaderMetadata();
+            var metadata = transactionState?.PragmaHeader ?? database.GetPragmaHeaderMetadata();
             var value = statement.Kind switch
             {
                 PragmaHeaderIntegerKind.SchemaVersion => metadata.SchemaVersion,
@@ -25218,16 +25719,22 @@ public sealed class EmbeddedConnection : IDisposable
 
         if (_queryOnly)
             throw new EmbeddedSqlException("attempt to write a readonly database");
+        if (database.IsReadOnly)
+            throw new EmbeddedSqlException("attempt to write a readonly database");
 
-        if (_database.IsFileBacked)
+        if (_transactionDatabases is null)
         {
-            if (_database.IsReadOnly)
-                throw new EmbeddedSqlException("attempt to write a readonly database");
-            throw new EmbeddedSqlException(
-                $"Managed file-backed databases do not support writes to PRAGMA {columnName}.");
+            database.SetPragmaHeaderInteger(
+                statement.Kind,
+                statement.Value.Value,
+                cancellationToken);
+            if (ReferenceEquals(database, _tempDatabase))
+                _tempInitialized = true;
+            return ExecutionResult.Empty;
         }
 
-        var current = GetTransactionState(_database)?.PragmaHeader ?? _database.GetPragmaHeaderMetadata();
+        var current = transactionState?.PragmaHeader
+            ?? throw new InvalidOperationException("The managed transaction lost its PRAGMA target state.");
         var updated = statement.Kind switch
         {
             PragmaHeaderIntegerKind.SchemaVersion => current with { SchemaVersion = statement.Value.Value },
@@ -25236,58 +25743,54 @@ public sealed class EmbeddedConnection : IDisposable
             _ => throw new InvalidOperationException($"Unknown PRAGMA header integer kind {statement.Kind}."),
         };
 
-        if (_transactionDatabases is null)
+        if (updated != current)
         {
-            _database.SetInMemoryPragmaHeaderMetadata(updated);
+            cancellationToken.ThrowIfCancellationRequested();
+            EnsureTransactionMayMutate(database, statement);
+            transactionState.PragmaHeader = updated;
+            transactionState.HasChanges = true;
+            transactionState.HasSnapshotPragmaHeader = true;
+            if (!ReferenceEquals(database, _tempDatabase))
+                _transactionWriteDatabase = database;
         }
-        else if (updated != current)
-        {
-            EnsureTransactionMayMutate(_database, statement);
-            var state = GetTransactionState(_database)
-                ?? throw new InvalidOperationException("The managed transaction lost its primary database state.");
-            state.PragmaHeader = updated;
-            state.HasChanges = true;
-            _transactionWriteDatabase = _database;
-        }
+        if (ReferenceEquals(database, _tempDatabase))
+            _tempInitialized = true;
 
         return ExecutionResult.Empty;
     }
 
     private ExecutionResult ExecutePragmaJournalMode(PragmaJournalModeStatement statement)
     {
-        var current = _database.IsFileBacked
-            ? _database.GetJournalMode().ToString().ToLowerInvariant()
+        var database = ResolvePragmaDatabase(statement.Schema);
+        var current = database.IsFileBacked
+            ? database.GetJournalMode().ToString().ToLowerInvariant()
             : "memory";
         if (statement.Mode is null)
             return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
 
-        if (!_database.IsFileBacked)
+        if (!database.IsFileBacked)
             return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
         if (!Enum.TryParse<SqliteJournalMode>(statement.Mode, ignoreCase: true, out var requested))
             return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
-        if (requested == _database.GetJournalMode())
+        if (requested == database.GetJournalMode())
             return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
-        if (_queryOnly || _database.IsReadOnly)
+        if (_queryOnly || database.IsReadOnly)
             return new ExecutionResult(["journal_mode"], [[SqlValue.Text(current)]], 0);
         if (_transactionDatabases is not null)
             throw new EmbeddedSqlException("cannot change journal mode while a transaction is active");
-        if (_attachedDatabases.Count != 0)
-        {
-            throw new EmbeddedSqlException(
-                "Managed journal-mode transitions require all attached databases to be detached.");
-        }
 
-        var result = _database.SwitchJournalMode(requested).ToString().ToLowerInvariant();
+        var result = database.SwitchJournalMode(requested).ToString().ToLowerInvariant();
         return new ExecutionResult(["journal_mode"], [[SqlValue.Text(result)]], 0);
     }
 
     private ExecutionResult ExecutePragmaPageSize(PragmaPageSizeStatement statement)
     {
-        var current = _database.GetPageSize();
+        var database = ResolvePragmaDatabase(statement.Schema);
+        var current = database.GetPageSize();
         if (statement.Value is null)
             return new ExecutionResult(["page_size"], [[SqlValue.Integer(current)]], 0);
 
-        if (_queryOnly || _database.IsReadOnly)
+        if (_queryOnly || database.IsReadOnly)
             return ExecutionResult.Empty;
 
         var requested = statement.Value.Value;
@@ -25298,7 +25801,10 @@ public sealed class EmbeddedConnection : IDisposable
             return ExecutionResult.Empty;
         }
 
-        _pendingPageSize = _database.IsFileBacked ? requested : null;
+        if (database.IsFileBacked)
+            _pendingPageSizes[database] = requested;
+        else
+            _pendingPageSizes.Remove(database);
         return ExecutionResult.Empty;
     }
 
@@ -25316,8 +25822,9 @@ public sealed class EmbeddedConnection : IDisposable
         if (!database.IsFileBacked && statement.Into is null)
             return ExecutionResult.Empty;
 
-        var isMain = ReferenceEquals(database, _database);
-        var pendingPageSize = isMain ? _pendingPageSize : null;
+        int? pendingPageSize = _pendingPageSizes.TryGetValue(database, out var pendingPageSizeValue)
+            ? pendingPageSizeValue
+            : null;
         var currentPageSize = database.GetPageSize();
         var targetPageSize = statement.Into is not null
             ? pendingPageSize ?? currentPageSize
@@ -25359,8 +25866,7 @@ public sealed class EmbeddedConnection : IDisposable
             database.VacuumInto(destinationPath, targetPageSize);
         }
 
-        if (isMain)
-            _pendingPageSize = null;
+        _pendingPageSizes.Remove(database);
         return ExecutionResult.Empty;
     }
 
@@ -25396,6 +25902,10 @@ public sealed class EmbeddedConnection : IDisposable
             return ["seq", "name", "file"];
         if (statement is PragmaEncodingStatement)
             return ["encoding"];
+        if (statement is PragmaPageCountStatement)
+            return ["page_count"];
+        if (statement is PragmaFreelistCountStatement)
+            return ["freelist_count"];
         if (statement is PragmaQueryOnlyStatement { Enabled: null })
             return ["query_only"];
         if (statement is PragmaForeignKeysStatement { Enabled: null })
@@ -25464,6 +25974,7 @@ public sealed class EmbeddedConnection : IDisposable
                     pair.Value.HasChanges,
                     pair.Value.PragmaHeader,
                     pair.Value.HasSnapshotPragmaHeader,
+                    pair.Value.ForceFullCatalogRewrite,
                     new HashSet<EmbeddedDatabase.ForeignKeyViolation>(
                         pair.Value.PendingDeferredViolations))),
             _transactionWriteDatabase));
@@ -25501,6 +26012,7 @@ public sealed class EmbeddedConnection : IDisposable
             state.HasChanges = savedState.HasChanges;
             state.PragmaHeader = savedState.PragmaHeader;
             state.HasSnapshotPragmaHeader = savedState.HasSnapshotPragmaHeader;
+            state.ForceFullCatalogRewrite = savedState.ForceFullCatalogRewrite;
             state.PendingDeferredViolations.Clear();
             state.PendingDeferredViolations.UnionWith(savedState.PendingDeferredViolations);
         }
@@ -25548,6 +26060,7 @@ public sealed class EmbeddedConnection : IDisposable
         bool HasChanges,
         PragmaHeaderMetadata PragmaHeader,
         bool HasSnapshotPragmaHeader,
+        bool ForceFullCatalogRewrite,
         IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations);
 
     private void ThrowIfDisposed()
@@ -25613,7 +26126,9 @@ public sealed class EmbeddedStatement : IDisposable
             or PragmaIndexListStatement or PragmaIndexInfoStatement or PragmaIndexXInfoStatement
             or PragmaForeignKeyListStatement
             or PragmaForeignKeyCheckStatement or PragmaTableListStatement
-            or PragmaDatabaseListStatement or PragmaEncodingStatement or ExplainStatement)
+            or PragmaDatabaseListStatement or PragmaEncodingStatement
+            or PragmaPageCountStatement or PragmaFreelistCountStatement
+            or ExplainStatement)
             || _statement is ExplainQueryPlanStatement
             || _statement is PragmaQueryOnlyStatement { Enabled: null }
             || _statement is PragmaForeignKeysStatement { Enabled: null }
@@ -26011,7 +26526,10 @@ internal sealed class EmbeddedTable
                 if (isPrimaryKey && !existing.IsPrimaryKey)
                 {
                     if (existing.Index is not null)
+                    {
+                        WithoutRowidPrimaryKeyIndexName = existing.Index.Name;
                         Indexes.Remove(existing.Index);
+                    }
                     groups[existingPosition] = (existing.Columns, IsPrimaryKey: true, Index: null);
                 }
                 return;
@@ -26019,7 +26537,11 @@ internal sealed class EmbeddedTable
 
             autoIndex++;
             EmbeddedIndex? index = null;
-            if (!isPrimaryKey)
+            if (isPrimaryKey)
+            {
+                WithoutRowidPrimaryKeyIndexName = $"sqlite_autoindex_{Name}_{autoIndex}";
+            }
+            else
             {
                 index = new EmbeddedIndex(
                     $"sqlite_autoindex_{Name}_{autoIndex}",
@@ -26284,6 +26806,8 @@ internal sealed class EmbeddedTable
     public bool HasRowidAlias => RowidAliasColumnIndex >= 0;
 
     public bool IsAutoIncrement { get; }
+
+    public string? WithoutRowidPrimaryKeyIndexName { get; private set; }
 
     public InsertConflictAlgorithm? RowidAliasConflictAlgorithm
         => !HasRowidAlias
@@ -26962,6 +27486,24 @@ internal sealed class EmbeddedTable
     public void Rename(string newName)
     {
         var autoIndexPrefix = $"sqlite_autoindex_{Name}_";
+        string? renamedWithoutRowidPrimaryKeyIndex = null;
+        if (WithoutRowidPrimaryKeyIndexName is { } primaryKeyIndexName)
+        {
+            if (!primaryKeyIndexName.StartsWith(autoIndexPrefix, StringComparison.OrdinalIgnoreCase)
+                || !int.TryParse(
+                    primaryKeyIndexName.AsSpan(autoIndexPrefix.Length),
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var primaryKeyOrdinal)
+                || primaryKeyOrdinal <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"Constraint index '{primaryKeyIndexName}' does not match table '{Name}'.");
+            }
+
+            renamedWithoutRowidPrimaryKeyIndex =
+                $"sqlite_autoindex_{newName}_{primaryKeyOrdinal}";
+        }
         var renamedIndexes = new List<(int Position, string Name)>();
         for (var index = 0; index < Indexes.Count; index++)
         {
@@ -26988,6 +27530,7 @@ internal sealed class EmbeddedTable
         }
 
         Name = newName;
+        WithoutRowidPrimaryKeyIndexName = renamedWithoutRowidPrimaryKeyIndex;
         foreach (var (position, name) in renamedIndexes)
             Indexes[position] = Indexes[position] with { Name = name };
     }
@@ -27296,7 +27839,8 @@ internal sealed record ExecutionResult(
     string[] Columns,
     IReadOnlyList<SqlValue[]> Rows,
     int RowsAffected,
-    bool Changed = false)
+    bool Changed = false,
+    bool ForceFullCatalogRewrite = false)
 {
     public static ExecutionResult Empty { get; } = new([], [], 0);
 

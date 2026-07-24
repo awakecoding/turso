@@ -207,17 +207,17 @@ internal sealed record PragmaForeignKeyCheckStatement(
 
 internal sealed record PragmaTableListStatement(string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaDatabaseListStatement : ParsedStatement;
+internal sealed record PragmaDatabaseListStatement(string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaEncodingStatement : ParsedStatement;
+internal sealed record PragmaEncodingStatement(string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaQueryOnlyStatement(bool? Enabled) : ParsedStatement;
+internal sealed record PragmaQueryOnlyStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaForeignKeysStatement(bool? Enabled) : ParsedStatement;
+internal sealed record PragmaForeignKeysStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaDeferForeignKeysStatement(bool? Enabled) : ParsedStatement;
+internal sealed record PragmaDeferForeignKeysStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaRecursiveTriggersStatement(bool? Enabled) : ParsedStatement;
+internal sealed record PragmaRecursiveTriggersStatement(bool? Enabled, string? Schema = null) : ParsedStatement;
 
 internal enum PragmaHeaderIntegerKind
 {
@@ -228,11 +228,28 @@ internal enum PragmaHeaderIntegerKind
 
 internal sealed record PragmaHeaderIntegerStatement(
     PragmaHeaderIntegerKind Kind,
-    int? Value) : ParsedStatement;
+    int? Value,
+    string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaJournalModeStatement(string? Mode) : ParsedStatement;
+internal sealed record PragmaJournalModeStatement(string? Mode, string? Schema = null) : ParsedStatement;
 
-internal sealed record PragmaPageSizeStatement(int? Value) : ParsedStatement;
+internal sealed record PragmaPageSizeStatement(int? Value, string? Schema = null) : ParsedStatement;
+
+internal sealed record PragmaPageCountStatement(string? Schema = null) : ParsedStatement;
+
+internal sealed record PragmaFreelistCountStatement(string? Schema = null) : ParsedStatement;
+
+internal sealed record AnalyzeStatement(string? Target) : ParsedStatement;
+
+internal enum ReindexTargetKind
+{
+    Automatic,
+    Collation,
+}
+
+internal sealed record ReindexStatement(
+    string? Target,
+    ReindexTargetKind TargetKind = ReindexTargetKind.Automatic) : ParsedStatement;
 
 internal sealed record VacuumStatement(string? Schema, Expression? Into) : ParsedStatement;
 

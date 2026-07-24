@@ -65,6 +65,10 @@ internal sealed class SqlParser
             return ParseAttach();
         if (ConsumeKeyword("DETACH"))
             return ParseDetach();
+        if (ConsumeKeyword("ANALYZE"))
+            return new AnalyzeStatement(ParseOptionalMaintenanceTarget());
+        if (ConsumeKeyword("REINDEX"))
+            return new ReindexStatement(ParseOptionalMaintenanceTarget());
         if (ConsumeKeyword("VACUUM"))
             return ParseVacuum();
         if (IsQueryStart())
@@ -135,6 +139,11 @@ internal sealed class SqlParser
             ConsumeKeyword("INTO") ? ParseExpression() : null);
     }
 
+    private string? ParseOptionalMaintenanceTarget()
+        => _lexer.Current.Kind is TokenKind.Semicolon or TokenKind.End
+            ? null
+            : ParsePragmaQualifiedName();
+
     private ParsedStatement ParsePragma()
     {
         var name = ExpectIdentifier();
@@ -166,48 +175,59 @@ internal sealed class SqlParser
             RequireReadOnlyPragma(name);
             return new PragmaTableListStatement(schema);
         }
-        if (schema is not null && !schema.Equals("main", StringComparison.OrdinalIgnoreCase))
-            throw Error($"Unsupported PRAGMA database {schema}.");
         if (name.Equals("database_list", StringComparison.OrdinalIgnoreCase))
         {
             RequireReadOnlyPragma(name);
-            return new PragmaDatabaseListStatement();
+            return new PragmaDatabaseListStatement(schema);
         }
         if (name.Equals("encoding", StringComparison.OrdinalIgnoreCase))
         {
             RequireReadOnlyPragma(name);
-            return new PragmaEncodingStatement();
+            return new PragmaEncodingStatement(schema);
         }
         if (name.Equals("query_only", StringComparison.OrdinalIgnoreCase))
-            return new PragmaQueryOnlyStatement(ParseOptionalPragmaBoolean(name));
+            return new PragmaQueryOnlyStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("foreign_keys", StringComparison.OrdinalIgnoreCase))
-            return new PragmaForeignKeysStatement(ParseOptionalPragmaBoolean(name));
+            return new PragmaForeignKeysStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("defer_foreign_keys", StringComparison.OrdinalIgnoreCase))
-            return new PragmaDeferForeignKeysStatement(ParseOptionalPragmaBoolean(name));
+            return new PragmaDeferForeignKeysStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("recursive_triggers", StringComparison.OrdinalIgnoreCase))
-            return new PragmaRecursiveTriggersStatement(ParseOptionalPragmaBoolean(name));
+            return new PragmaRecursiveTriggersStatement(ParseOptionalPragmaBoolean(name), schema);
         if (name.Equals("schema_version", StringComparison.OrdinalIgnoreCase))
         {
             return new PragmaHeaderIntegerStatement(
                 PragmaHeaderIntegerKind.SchemaVersion,
-                ParseOptionalPragmaInteger(name));
+                ParseOptionalPragmaInteger(name),
+                schema);
         }
         if (name.Equals("user_version", StringComparison.OrdinalIgnoreCase))
         {
             return new PragmaHeaderIntegerStatement(
                 PragmaHeaderIntegerKind.UserVersion,
-                ParseOptionalPragmaInteger(name));
+                ParseOptionalPragmaInteger(name),
+                schema);
         }
         if (name.Equals("application_id", StringComparison.OrdinalIgnoreCase))
         {
             return new PragmaHeaderIntegerStatement(
                 PragmaHeaderIntegerKind.ApplicationId,
-                ParseOptionalPragmaInteger(name));
+                ParseOptionalPragmaInteger(name),
+                schema);
         }
         if (name.Equals("journal_mode", StringComparison.OrdinalIgnoreCase))
-            return new PragmaJournalModeStatement(ParseOptionalPragmaMode(name));
+            return new PragmaJournalModeStatement(ParseOptionalPragmaMode(name), schema);
         if (name.Equals("page_size", StringComparison.OrdinalIgnoreCase))
-            return new PragmaPageSizeStatement(ParseOptionalPragmaInteger(name));
+            return new PragmaPageSizeStatement(ParseOptionalPragmaInteger(name), schema);
+        if (name.Equals("page_count", StringComparison.OrdinalIgnoreCase))
+        {
+            RequireReadOnlyPragma(name);
+            return new PragmaPageCountStatement(schema);
+        }
+        if (name.Equals("freelist_count", StringComparison.OrdinalIgnoreCase))
+        {
+            RequireReadOnlyPragma(name);
+            return new PragmaFreelistCountStatement(schema);
+        }
 
         throw Error($"Unsupported PRAGMA {name}.");
     }
@@ -215,7 +235,7 @@ internal sealed class SqlParser
     private string ParsePragmaObjectName(string? pragmaSchema)
     {
         Expect(TokenKind.LeftParen);
-        var objectName = ParseSchemaQualifiedName();
+        var objectName = ParsePragmaQualifiedName();
         Expect(TokenKind.RightParen);
         if (ManagedSchemaName.TrySplit(objectName, out var objectSchema, out var localName))
         {
@@ -2757,6 +2777,29 @@ internal sealed class SqlParser
             throw Error("Only one schema qualifier is supported for database objects.");
 
         return ManagedSchemaName.Create(schemaOrName, name);
+    }
+
+    private string ParsePragmaQualifiedName()
+    {
+        var schemaOrName = ExpectIdentifierOrString();
+        if (!Consume(TokenKind.Dot))
+            return schemaOrName;
+
+        var name = ExpectIdentifierOrString();
+        if (_lexer.Current.Kind == TokenKind.Dot)
+            throw Error("Only one schema qualifier is supported for database objects.");
+
+        return ManagedSchemaName.Create(schemaOrName, name);
+    }
+
+    private string ExpectIdentifierOrString()
+    {
+        if (_lexer.Current.Kind is not (TokenKind.Identifier or TokenKind.String))
+            throw Error("Expected an identifier.");
+
+        var value = _lexer.Current.Text;
+        _lexer.Next();
+        return value;
     }
 
     private bool Consume(TokenKind kind)
