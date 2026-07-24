@@ -32,6 +32,15 @@ public sealed record SqliteKeyCollation
     /// <summary>Whether this is the BINARY collation.</summary>
     public bool IsBinary => string.Equals(Name, "BINARY", StringComparison.Ordinal);
 
+    /// <summary>Whether this is SQLite's built-in NOCASE collation.</summary>
+    public bool IsNoCase => string.Equals(Name, "NOCASE", StringComparison.Ordinal);
+
+    /// <summary>Whether this is SQLite's built-in RTRIM collation.</summary>
+    public bool IsRTrim => string.Equals(Name, "RTRIM", StringComparison.Ordinal);
+
+    /// <summary>Whether the managed index writer can reproduce this collation.</summary>
+    public bool IsSupportedByManagedIndexWriter => IsBinary || IsNoCase || IsRTrim;
+
     /// <summary>Creates a descriptor for a concrete SQLite collation name.</summary>
     public static SqliteKeyCollation FromName(string name)
     {
@@ -70,9 +79,8 @@ public sealed record SqlitePrimaryKeyTerm(
 /// writable.
 /// </para>
 /// <para>
-/// The current managed index-page primitives support only BINARY ascending key
-/// comparisons. Call <see cref="EnsureSupportedByBinaryAscendingIndexWriter"/>
-/// before using a schema with those primitives.
+/// Call <see cref="EnsureSupportedByManagedIndexWriter"/> before using a schema
+/// with the managed index-page primitives.
 /// </para>
 /// </remarks>
 public sealed class SqlitePrimaryKeySchema
@@ -182,6 +190,37 @@ public sealed class SqlitePrimaryKeySchema
         var failures = new List<string>();
         foreach (var term in _terms)
             AddBinaryCollationFailure(term, failures);
+
+        if (failures.Count != 0)
+            throw new NotSupportedException(string.Join("; ", failures) + ".");
+    }
+
+    /// <summary>
+    /// Rejects unavailable or application-defined collations. The managed writer
+    /// reproduces SQLite's BINARY, NOCASE, and RTRIM collations in either direction.
+    /// </summary>
+    public void EnsureSupportedByManagedIndexWriter(bool allowDescending = true)
+    {
+        var failures = new List<string>();
+        foreach (var term in _terms)
+        {
+            if (!allowDescending && term.SortOrder == SqliteKeySortOrder.Descending)
+            {
+                failures.Add(
+                    $"primary-key term '{term.ColumnName}' is descending, but the managed index writer supports only ascending terms");
+            }
+
+            if (!term.Collation.IsAvailable)
+            {
+                failures.Add(
+                    $"primary-key term '{term.ColumnName}' has unavailable collation metadata");
+            }
+            else if (!term.Collation.IsSupportedByManagedIndexWriter)
+            {
+                failures.Add(
+                    $"primary-key term '{term.ColumnName}' uses application-defined collation {term.Collation.Name}, which cannot be restored before the file catalog is loaded");
+            }
+        }
 
         if (failures.Count != 0)
             throw new NotSupportedException(string.Join("; ", failures) + ".");

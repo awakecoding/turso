@@ -17,8 +17,10 @@ internal sealed record EmbeddedFileCatalog(
 /// SQLite-format storage. It persists the schema on page 1 as a real
 /// <c>sqlite_schema</c> table b-tree and stores each ordinary user table's
 /// rows and BINARY ascending secondary indexes in recursively constructed
-/// SQLite b-trees. The supported WITHOUT ROWID subset uses recursively
-/// constructed SQLite index b-trees. Table and index records may use standard
+/// SQLite b-trees. WITHOUT ROWID tables use recursively constructed SQLite
+/// index b-trees with composite ASC/DESC primary keys, built-in collations,
+/// generated-column storage, and primary-key-suffixed secondary indexes.
+/// Table and index records may use standard
 /// SQLite overflow pages. All bytes are genuine SQLite page, cell, and record encodings;
 /// nothing is a bespoke serialization format.
 /// </summary>
@@ -173,7 +175,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 create.UniqueConstraints,
                 create.CheckConstraints,
                 create.PrimaryKeyConflictAlgorithm,
-                create.PrimaryKeyConstraintName);
+                create.PrimaryKeyConstraintName,
+                create.PrimaryKeyDeclarationOrder);
             LoadTableRows(entry.Name, table, entry.RootPage, occupiedBtreePages);
             tables[entry.Name] = table;
             rootPages[entry.Name] = entry.RootPage;
@@ -189,12 +192,6 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new EmbeddedSqlException(
                     $"Stored index '{entry.Name}' references missing table '{entry.TableName}'.");
             }
-            if (table.WithoutRowid)
-            {
-                throw new EmbeddedSqlException(
-                    $"Stored index '{entry.Name}' references WITHOUT ROWID table '{entry.TableName}', but secondary indexes on the managed WITHOUT ROWID persistence subset are not supported.");
-            }
-
             if (entry.Sql is null)
             {
                 var implicitIndex = table.Indexes.SingleOrDefault(index =>
@@ -317,7 +314,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                             activePages,
                             pageCount,
                             overflowReader,
-                            CreateIndexComparer(index));
+                            CreateIndexComparer(indexedTable, index));
                         break;
                 }
             }
@@ -355,7 +352,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         if (table.WithoutRowid)
         {
-            CollectWithoutRowidTableTreePages(entry, activePages, pageCount, overflowReader);
+            CollectWithoutRowidTableTreePages(entry, table, activePages, pageCount, overflowReader);
             return;
         }
 
@@ -432,6 +429,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private void CollectWithoutRowidTableTreePages(
         SchemaEntry entry,
+        EmbeddedTable table,
         ISet<uint> activePages,
         uint pageCount,
         SqliteOverflowChainReader overflowReader)
@@ -452,7 +450,11 @@ internal sealed class EmbeddedFileStore : IDisposable
             activePages,
             pageCount,
             overflowReader,
-            "root");
+            "root",
+            CreatePrimaryKeyComparer(
+                table.PrimaryKeySchema
+                    ?? throw new InvalidDataException(
+                        $"Stored WITHOUT ROWID table '{entry.Name}' is missing primary-key metadata.")));
     }
 
     private void CollectIndexTreePages(
@@ -1015,18 +1017,19 @@ internal sealed class EmbeddedFileStore : IDisposable
             var rootPageImage = _pager.ReadCommittedPage(rootPage);
             var overflowReader = new SqliteOverflowChainReader(_pager, _header);
             var rootHeader = SqliteBtreePageHeader.Parse(rootPageImage);
+            var comparer = CreatePrimaryKeyComparer(primaryKeySchema);
             var records = rootHeader.PageType switch
             {
-                SqliteBtreePageType.IndexLeaf => ReadIndexLeafRecords(rootPageImage, overflowReader),
+                SqliteBtreePageType.IndexLeaf => ReadIndexLeafRecords(rootPageImage, overflowReader, comparer),
                 SqliteBtreePageType.IndexInterior => ReadIndexInteriorRecords(
                     new SchemaEntry("table", tableName, tableName, rootPage, string.Empty),
                     rootPageImage,
                     overflowReader,
-                    occupiedBtreePages),
+                    occupiedBtreePages,
+                    comparer),
                 _ => throw new InvalidDataException(
                     $"Stored WITHOUT ROWID table '{tableName}' root page has unsupported type {rootHeader.PageType}."),
             };
-            var comparer = new SqliteIndexRecordComparer(_textEncoding);
             SqlValue[]? previousKey = null;
             var syntheticRowId = 0L;
 
@@ -1034,6 +1037,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 var storedValues = SqliteRecordCodec.Decode(record, _textEncoding);
                 var row = RestoreWithoutRowidRecord(tableName, table, primaryKeySchema, storedValues);
+                EmbeddedDatabase.RecomputeVirtualGeneratedColumns(table, tableName, row);
                 var key = primaryKeySchema.ProjectKey(row);
                 if (key.Any(value => value.Kind == SqlValueKind.Null))
                 {
@@ -1043,7 +1047,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 if (previousKey is not null && comparer.Compare(previousKey, key) >= 0)
                 {
                     throw new InvalidDataException(
-                        $"Stored WITHOUT ROWID table '{tableName}' primary keys are not strictly increasing in BINARY order.");
+                        $"Stored WITHOUT ROWID table '{tableName}' primary keys are not strictly increasing in declared key order.");
                 }
 
                 table.Rows.Add(row);
@@ -1060,7 +1064,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         catch (Exception exception) when (exception is InvalidDataException or ArgumentOutOfRangeException or OverflowException)
         {
             throw new EmbeddedSqlException(
-                $"Stored WITHOUT ROWID table '{tableName}' is not a valid supported SQLite index b-tree.",
+                $"Stored WITHOUT ROWID table '{tableName}' is not a valid supported SQLite index b-tree "
+                + $"for primary key ({string.Join(", ", primaryKeySchema.Terms.Select(term =>
+                    $"{term.ColumnName} {term.Collation.Name} {term.SortOrder}"))}).",
                 exception);
         }
     }
@@ -7173,7 +7179,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         string tableName,
         EmbeddedTable table,
         string primaryKeyKind,
-        bool allowDescending = false)
+        bool allowDescending = false,
+        bool allowBuiltInCollations = false)
     {
         var primaryKeySchema = table.PrimaryKeySchema;
         if (primaryKeySchema is null)
@@ -7184,7 +7191,9 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         try
         {
-            if (allowDescending)
+            if (allowBuiltInCollations)
+                primaryKeySchema.EnsureSupportedByManagedIndexWriter(allowDescending);
+            else if (allowDescending)
                 primaryKeySchema.EnsureSupportedByBinaryIndexWriter();
             else
                 primaryKeySchema.EnsureSupportedByBinaryAscendingIndexWriter();
@@ -7199,8 +7208,10 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             throw new EmbeddedSqlException(
                 $"The managed file engine cannot persist {primaryKeyKind} table '{tableName}' because {exception.Message} "
-                + "The managed primary-key index writer supports only BINARY terms"
-                + (allowDescending ? "." : " in ascending order."),
+                + (allowBuiltInCollations
+                    ? "The managed primary-key index writer supports BINARY, NOCASE, and RTRIM terms."
+                    : "The managed primary-key index writer supports only BINARY terms"
+                        + (allowDescending ? "." : " in ascending order.")),
                 exception);
         }
     }
@@ -7209,55 +7220,40 @@ internal sealed class EmbeddedFileStore : IDisposable
         string tableName,
         EmbeddedTable table)
     {
-        if (table.HasVirtualGeneratedColumns)
-        {
-            throw new EmbeddedSqlException(
-                $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because VIRTUAL generated columns are outside the supported WITHOUT ROWID subset.");
-        }
-
-        ValidatePrimaryKeyIndexPrerequisites(tableName, table, "WITHOUT ROWID");
+        ValidatePrimaryKeyIndexPrerequisites(
+            tableName,
+            table,
+            "WITHOUT ROWID",
+            allowDescending: true,
+            allowBuiltInCollations: true);
         var primaryKeySchema = table.PrimaryKeySchema
             ?? throw new InvalidOperationException("Validated WITHOUT ROWID table is missing its primary-key schema.");
-        if (primaryKeySchema.Terms.Count != 1 || table.PrimaryKeyColumns.Count != 1)
-        {
-            throw new EmbeddedSqlException(
-                $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because only one ascending BINARY primary-key column is supported.");
-        }
-
-        var term = primaryKeySchema.Terms[0];
-        var primaryKeyColumn = table.PrimaryKeyColumns[0];
-        if (term.ColumnIndex != primaryKeyColumn.Index
-            || primaryKeyColumn.Descending
-            || term.ColumnIndex < 0
-            || term.ColumnIndex >= table.ColumnDefinitions.Length
-            || !string.Equals(
-                term.ColumnName,
-                table.ColumnDefinitions[term.ColumnIndex].Name,
-                StringComparison.OrdinalIgnoreCase))
+        if (primaryKeySchema.Terms.Count != table.PrimaryKeyColumns.Count)
         {
             throw new EmbeddedSqlException(
                 $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because its primary-key metadata is inconsistent.");
         }
 
-        foreach (var column in table.ColumnDefinitions)
+        for (var position = 0; position < primaryKeySchema.Terms.Count; position++)
         {
-            if (column.Unique)
+            var term = primaryKeySchema.Terms[position];
+            var primaryKeyColumn = table.PrimaryKeyColumns[position];
+            if (term.ColumnIndex != primaryKeyColumn.Index
+                || (term.SortOrder == SqliteKeySortOrder.Descending) != primaryKeyColumn.Descending
+                || term.ColumnIndex < 0
+                || term.ColumnIndex >= table.ColumnDefinitions.Length
+                || !string.Equals(
+                    term.ColumnName,
+                    table.ColumnDefinitions[term.ColumnIndex].Name,
+                    StringComparison.OrdinalIgnoreCase))
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because column '{column.Name}' has a UNIQUE constraint, which requires an additional on-disk index b-tree.");
-            }
-            if (column.IsGenerated && !column.GeneratedStored)
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because column '{column.Name}' is a VIRTUAL generated column, whose value is not stored in the SQLite record format; declare it STORED to persist it.");
+                    $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because its primary-key metadata is inconsistent.");
             }
         }
 
-        if (table.Indexes.Count != 0)
-        {
-            throw new EmbeddedSqlException(
-                $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because secondary indexes require a primary-key-aware index writer that is not implemented.");
-        }
+        foreach (var index in table.Indexes)
+            ValidateIndexRepresentable(tableName, table, index);
 
         return primaryKeySchema;
     }
@@ -7617,7 +7613,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         RebuildPageAllocator allocator)
     {
         var primaryKeySchema = ValidateWithoutRowidTableRepresentable(name, table);
-        var comparer = new SqliteIndexRecordComparer(_textEncoding);
+        var comparer = CreatePrimaryKeyComparer(primaryKeySchema);
         var records = BuildWithoutRowidTableRecords(name, table, primaryKeySchema, comparer);
         try
         {
@@ -7862,7 +7858,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         EmbeddedIndex index,
         RebuildPageAllocator allocator)
     {
-        var comparer = CreateIndexComparer(index);
+        var comparer = CreateIndexComparer(table, index);
         var leafGroups = PartitionIndexLeafRecords(
             $"index '{index.Name}' on table '{tableName}'",
             BuildIndexRecords(tableName, table, index, comparer),
@@ -8479,7 +8475,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             if (comparer.Compare(records[index - 1].Key, records[index].Key) >= 0)
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because its primary keys are not strictly increasing in BINARY order.");
+                    $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because its primary keys are not strictly increasing in declared key order.");
             }
             if (comparer.Compare(records[index - 1].Record, records[index].Record) >= 0)
             {
@@ -8497,7 +8493,9 @@ internal sealed class EmbeddedFileStore : IDisposable
         SqlitePrimaryKeySchema primaryKeySchema,
         IReadOnlyList<SqlValue> row)
     {
-        var values = new SqlValue[row.Count];
+        var storedColumnCount = table.ColumnDefinitions.Count(
+            column => !column.IsGenerated || column.GeneratedStored);
+        var values = new SqlValue[storedColumnCount];
         var primaryKeyColumns = new bool[row.Count];
         var destination = 0;
         foreach (var term in primaryKeySchema.Terms)
@@ -8507,6 +8505,12 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new EmbeddedSqlException(
                     $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because its primary-key metadata is inconsistent.");
             }
+            if (table.ColumnDefinitions[term.ColumnIndex].IsGenerated
+                && !table.ColumnDefinitions[term.ColumnIndex].GeneratedStored)
+            {
+                throw new EmbeddedSqlException(
+                    $"The managed file engine cannot persist WITHOUT ROWID table '{tableName}' because VIRTUAL generated column '{term.ColumnName}' cannot be part of its primary key.");
+            }
 
             primaryKeyColumns[term.ColumnIndex] = true;
             values[destination++] = row[term.ColumnIndex];
@@ -8514,7 +8518,8 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         for (var columnIndex = 0; columnIndex < row.Count; columnIndex++)
         {
-            if (!primaryKeyColumns[columnIndex])
+            var column = table.ColumnDefinitions[columnIndex];
+            if (!primaryKeyColumns[columnIndex] && (!column.IsGenerated || column.GeneratedStored))
                 values[destination++] = row[columnIndex];
         }
 
@@ -8530,13 +8535,15 @@ internal sealed class EmbeddedFileStore : IDisposable
         SqlitePrimaryKeySchema primaryKeySchema,
         IReadOnlyList<SqlValue> storedValues)
     {
-        if (storedValues.Count != table.ColumnDefinitions.Length)
+        var storedColumnCount = table.ColumnDefinitions.Count(
+            column => !column.IsGenerated || column.GeneratedStored);
+        if (storedValues.Count != storedColumnCount)
         {
             throw new InvalidDataException(
-                $"Stored WITHOUT ROWID table '{tableName}' record has {storedValues.Count} column(s), but the schema declares {table.ColumnDefinitions.Length}.");
+                $"Stored WITHOUT ROWID table '{tableName}' record has {storedValues.Count} stored column(s), but the schema requires {storedColumnCount}.");
         }
 
-        var row = new SqlValue[storedValues.Count];
+        var row = new SqlValue[table.ColumnDefinitions.Length];
         var primaryKeyColumns = new bool[row.Length];
         var source = 0;
         foreach (var term in primaryKeySchema.Terms)
@@ -8553,7 +8560,10 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         for (var columnIndex = 0; columnIndex < row.Length; columnIndex++)
         {
-            if (!primaryKeyColumns[columnIndex])
+            var column = table.ColumnDefinitions[columnIndex];
+            if (column.IsGenerated && !column.GeneratedStored)
+                row[columnIndex] = SqlValue.Null;
+            else if (!primaryKeyColumns[columnIndex])
                 row[columnIndex] = storedValues[source++];
         }
 
@@ -8575,6 +8585,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                 $"The managed file engine cannot persist index '{index.Name}' because table '{tableName}' has inconsistent row and rowid counts.");
         }
 
+        var storageColumns = table.WithoutRowid
+            ? GetWithoutRowidIndexStorageColumns(table, index)
+            : null;
         var records = new List<byte[]>(table.Rows.Count);
         for (var rowIndex = 0; rowIndex < table.Rows.Count; rowIndex++)
         {
@@ -8585,10 +8598,20 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"The managed file engine cannot persist index '{index.Name}' because table '{tableName}' has a row with an invalid column count.");
             }
 
-            var values = new SqlValue[index.Columns.Count + 1];
-            for (var column = 0; column < index.Columns.Count; column++)
-                values[column] = row[index.Columns[column].ColumnIndex];
-            values[^1] = SqlValue.Integer(table.RowIds[rowIndex]);
+            SqlValue[] values;
+            if (table.WithoutRowid)
+            {
+                values = new SqlValue[storageColumns!.Count];
+                for (var column = 0; column < storageColumns.Count; column++)
+                    values[column] = row[storageColumns[column].ColumnIndex];
+            }
+            else
+            {
+                values = new SqlValue[index.Columns.Count + 1];
+                for (var column = 0; column < index.Columns.Count; column++)
+                    values[column] = row[index.Columns[column].ColumnIndex];
+                values[^1] = SqlValue.Integer(table.RowIds[rowIndex]);
+            }
             var record = SqliteRecordCodec.Encode(values, _textEncoding);
             comparer.Validate(record);
             records.Add(record);
@@ -8607,10 +8630,67 @@ internal sealed class EmbeddedFileStore : IDisposable
         return records;
     }
 
-    private SqliteIndexRecordComparer CreateIndexComparer(EmbeddedIndex index)
+    private SqliteIndexRecordComparer CreateIndexComparer(EmbeddedTable table, EmbeddedIndex index)
+    {
+        if (!table.WithoutRowid)
+        {
+            return new SqliteIndexRecordComparer(
+                _textEncoding,
+                index.Columns.Select(column => column.Descending).ToArray());
+        }
+
+        var terms = GetWithoutRowidIndexStorageColumns(table, index)
+            .Select(column => new SqliteIndexComparisonTerm(
+                column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
+                GetIndexCollation(table, column)))
+            .ToArray();
+        return new SqliteIndexRecordComparer(_textEncoding, terms);
+    }
+
+    private SqliteIndexRecordComparer CreatePrimaryKeyComparer(SqlitePrimaryKeySchema schema)
         => new(
             _textEncoding,
-            index.Columns.Select(column => column.Descending).ToArray());
+            schema.Terms.Select(term => new SqliteIndexComparisonTerm(term.SortOrder, term.Collation)).ToArray());
+
+    private static IReadOnlyList<EmbeddedIndexColumn> GetWithoutRowidIndexStorageColumns(
+        EmbeddedTable table,
+        EmbeddedIndex index)
+    {
+        var primaryKeySchema = table.PrimaryKeySchema
+            ?? throw new EmbeddedSqlException(
+                $"The managed file engine cannot persist index '{index.Name}' because WITHOUT ROWID table '{table.Name}' is missing primary-key metadata.");
+        var columns = new List<EmbeddedIndexColumn>(index.Columns);
+        foreach (var term in primaryKeySchema.Terms)
+        {
+            var keyCollation = term.Collation.Name
+                ?? throw new EmbeddedSqlException(
+                    $"The managed file engine cannot persist index '{index.Name}' because primary-key collation metadata is unavailable.");
+            var alreadyPresent = index.Columns.Any(column =>
+                column.ColumnIndex == term.ColumnIndex
+                && string.Equals(
+                    GetIndexCollation(table, column).Name,
+                    keyCollation,
+                    StringComparison.OrdinalIgnoreCase));
+            if (alreadyPresent)
+                continue;
+
+            columns.Add(new EmbeddedIndexColumn(
+                term.ColumnName,
+                term.ColumnIndex,
+                keyCollation,
+                term.SortOrder == SqliteKeySortOrder.Descending));
+        }
+
+        return columns;
+    }
+
+    private static SqliteKeyCollation GetIndexCollation(EmbeddedTable table, EmbeddedIndexColumn column)
+    {
+        var name = column.Collation
+            ?? table.ColumnDefinitions[column.ColumnIndex].Collation
+            ?? "BINARY";
+        return SqliteKeyCollation.FromName(name);
+    }
 
     private PreparedSchemaTree BuildSchemaTree(
         IReadOnlyList<SchemaEntry> entries,
@@ -8887,16 +8967,38 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new EmbeddedSqlException(
                     $"The managed file engine cannot persist index '{index.Name}' because its column metadata is inconsistent.");
             }
-            if (column.Descending && index.Origin != EmbeddedIndexOrigin.PrimaryKey)
+            if (!table.WithoutRowid
+                && column.Descending
+                && index.Origin != EmbeddedIndexOrigin.PrimaryKey)
             {
                 throw new EmbeddedSqlException(
                     $"The managed file engine cannot persist index '{index.Name}' because descending index terms are not yet supported for file-backed databases.");
             }
-            if (column.Collation is not null
-                && !string.Equals(column.Collation, "BINARY", StringComparison.OrdinalIgnoreCase))
+            var collation = GetIndexCollation(table, column);
+            if ((!table.WithoutRowid && !collation.IsBinary)
+                || (table.WithoutRowid && !collation.IsSupportedByManagedIndexWriter))
             {
                 throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist index '{index.Name}' because collation '{column.Collation}' is not BINARY.");
+                    table.WithoutRowid
+                        ? $"The managed file engine cannot persist index '{index.Name}' because application-defined collation '{collation.Name}' cannot be restored before the file catalog is loaded."
+                        : $"The managed file engine cannot persist index '{index.Name}' because collation '{collation.Name}' is not BINARY.");
+            }
+        }
+
+        if (table.WithoutRowid)
+        {
+            var primaryKeySchema = table.PrimaryKeySchema
+                ?? throw new EmbeddedSqlException(
+                    $"The managed file engine cannot persist index '{index.Name}' because WITHOUT ROWID table '{tableName}' is missing primary-key metadata.");
+            try
+            {
+                primaryKeySchema.EnsureSupportedByManagedIndexWriter();
+            }
+            catch (NotSupportedException exception)
+            {
+                throw new EmbeddedSqlException(
+                    $"The managed file engine cannot persist index '{index.Name}' because its WITHOUT ROWID primary-key suffix is unsupported: {exception.Message}",
+                    exception);
             }
         }
     }
@@ -8925,7 +9027,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             columns[index] = new EmbeddedIndexColumn(
                 table.Columns[columnIndex],
                 columnIndex,
-                column.Collation,
+                column.Collation ?? table.ColumnDefinitions[columnIndex].Collation,
                 column.Descending);
         }
 
@@ -8945,7 +9047,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         var overflowReader = new SqliteOverflowChainReader(_pager, _header);
-        var comparer = CreateIndexComparer(index);
+        var comparer = CreateIndexComparer(table, index);
         IReadOnlyList<byte[]> actualRecords;
         try
         {
@@ -8971,6 +9073,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 exception);
         }
 
+        ValidateUniqueIndexRecords(entry.TableName, table, index, actualRecords);
         var expectedRecords = BuildIndexRecords(entry.TableName, table, index, comparer);
         if (actualRecords.Count != expectedRecords.Count)
         {
@@ -8985,6 +9088,43 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new EmbeddedSqlException(
                     $"Stored index '{entry.Name}' does not match table '{entry.TableName}' at record {recordIndex}.");
             }
+        }
+    }
+
+    private void ValidateUniqueIndexRecords(
+        string tableName,
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<byte[]> records)
+    {
+        if (!index.Unique)
+            return;
+
+        var logicalComparer = new SqliteIndexRecordComparer(
+            _textEncoding,
+            index.Columns.Select(column => new SqliteIndexComparisonTerm(
+                column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
+                GetIndexCollation(table, column))).ToArray());
+        SqlValue[]? previousKey = null;
+        foreach (var record in records)
+        {
+            var values = SqliteRecordCodec.Decode(record, _textEncoding);
+            if (values.Length < index.Columns.Count)
+            {
+                throw new EmbeddedSqlException(
+                    $"Stored unique index '{index.Name}' on table '{tableName}' has a truncated key record.");
+            }
+
+            var key = values.Take(index.Columns.Count).ToArray();
+            if (key.Any(value => value.Kind == SqlValueKind.Null))
+                continue;
+            if (previousKey is not null && logicalComparer.Compare(previousKey, key) == 0)
+            {
+                throw new EmbeddedSqlException(
+                    $"Stored unique index '{index.Name}' on table '{tableName}' contains duplicate non-NULL keys.");
+            }
+
+            previousKey = key;
         }
     }
 
@@ -9191,7 +9331,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (previousRecord is not null && comparer.Compare(previousRecord, value) >= 0)
         {
             throw new InvalidDataException(
-                $"Stored index '{indexName}' {level} are not globally ordered by their complete BINARY keys.");
+                $"Stored index '{indexName}' {level} are not globally ordered by their declared complete keys.");
         }
 
         records.Add(value);

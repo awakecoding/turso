@@ -85,6 +85,78 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
     }
 
     [Test]
+    public void AttachedWithoutRowidCatalogCommitsRollsBackAndReopens()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var main = EmbeddedDatabase.OpenFile("attach-without-rowid-main.db", fileSystem))
+        using (var connection = main.Connect())
+        {
+            Execute(connection, "ATTACH DATABASE 'attach-without-rowid-aux.db' AS aux;");
+            Execute(connection, """
+                CREATE TABLE aux.entry(
+                    tenant TEXT,
+                    sequence INTEGER,
+                    value TEXT,
+                    computed INTEGER GENERATED ALWAYS AS (sequence + 1) VIRTUAL,
+                    PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                    UNIQUE(value)
+                ) WITHOUT ROWID;
+                """);
+            Execute(connection, "CREATE INDEX aux.entry_computed ON entry(computed DESC);");
+            Execute(connection, "BEGIN;");
+            Execute(connection, "INSERT INTO aux.entry(tenant, sequence, value) VALUES ('alpha', 1, 'one');");
+            Execute(connection, "INSERT INTO aux.entry(tenant, sequence, value) VALUES ('Alpha', 2, 'two');");
+            Execute(connection, "COMMIT;");
+
+            Execute(connection, "BEGIN;");
+            Execute(connection, "UPDATE aux.entry SET sequence = 9 WHERE value = 'one';");
+            Execute(connection, "INSERT INTO aux.entry(tenant, sequence, value) VALUES ('beta', 3, 'rolled-back');");
+            Execute(connection, "ROLLBACK;");
+            var attachedRows = ReadRows(
+                connection,
+                "SELECT tenant, sequence, value, computed FROM aux.entry ORDER BY sequence DESC;");
+            attachedRows.Should().HaveCount(2);
+            attachedRows[0].Should().Equal(
+                SqlValue.Text("Alpha"),
+                SqlValue.Integer(2),
+                SqlValue.Text("two"),
+                SqlValue.Integer(3));
+            attachedRows[1].Should().Equal(
+                SqlValue.Text("alpha"),
+                SqlValue.Integer(1),
+                SqlValue.Text("one"),
+                SqlValue.Integer(2));
+            Execute(connection, "DETACH aux;");
+        }
+
+        using (var reopened = EmbeddedDatabase.OpenFile("attach-without-rowid-aux.db", fileSystem))
+        using (var connection = reopened.Connect())
+        {
+            var reopenedRows = ReadRows(
+                connection,
+                "SELECT tenant, sequence, value, computed FROM entry ORDER BY sequence DESC;");
+            reopenedRows.Should().HaveCount(2);
+            reopenedRows[0].Should().Equal(
+                SqlValue.Text("Alpha"),
+                SqlValue.Integer(2),
+                SqlValue.Text("two"),
+                SqlValue.Integer(3));
+            reopenedRows[1].Should().Equal(
+                SqlValue.Text("alpha"),
+                SqlValue.Integer(1),
+                SqlValue.Text("one"),
+                SqlValue.Integer(2));
+            ReadRows(connection, "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'entry_computed';")
+                .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(1));
+        }
+
+        fileSystem.DeleteFile("attach-without-rowid-main.db");
+        fileSystem.DeleteFile("attach-without-rowid-main.db-wal");
+        fileSystem.DeleteFile("attach-without-rowid-aux.db");
+        fileSystem.DeleteFile("attach-without-rowid-aux.db-wal");
+    }
+
+    [Test]
     public void DirectManagedAttachRejectsUnsafeAliasesUnknownSchemasAndCrossDatabaseQueries()
     {
         var fileSystem = new InMemoryFileSystem();

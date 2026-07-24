@@ -19,9 +19,22 @@ public sealed class ManagedJournalPageMigrationTests
         using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
         using (var connection = database.Connect())
         {
-            Execute(connection, "CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('before');");
+            Execute(connection, """
+                CREATE TABLE data(value TEXT);
+                INSERT INTO data VALUES ('before');
+                CREATE TABLE keyed(
+                    tenant TEXT,
+                    sequence INTEGER,
+                    value TEXT,
+                    PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                    UNIQUE(value)
+                ) WITHOUT ROWID;
+                CREATE INDEX keyed_value ON keyed(value DESC);
+                INSERT INTO keyed VALUES ('alpha', 1, 'before');
+                """);
             ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
             Execute(connection, "INSERT INTO data VALUES ('delete');");
+            Execute(connection, "INSERT INTO keyed VALUES ('Alpha', 2, 'delete');");
         }
 
         fileSystem.FileExists(path + "-wal").Should().BeFalse();
@@ -38,12 +51,15 @@ public sealed class ManagedJournalPageMigrationTests
             ReadValue(connection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("delete"));
             ReadValue(connection, "PRAGMA journal_mode=WAL;").Should().Be(SqlValue.Text("wal"));
             Execute(connection, "INSERT INTO data VALUES ('wal');");
+            Execute(connection, "INSERT INTO keyed VALUES ('beta', 3, 'wal');");
         }
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
         using var reopenedConnection = reopened.Connect();
         ReadValue(reopenedConnection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("wal"));
         ReadValue(reopenedConnection, "SELECT COUNT(*) FROM data;").Should().Be(SqlValue.Integer(3));
+        ReadValue(reopenedConnection, "SELECT COUNT(*) FROM keyed;").Should().Be(SqlValue.Integer(3));
+        ReadValue(reopenedConnection, "SELECT value FROM keyed LIMIT 1;").Should().Be(SqlValue.Text("delete"));
     }
 
     [TestCase(512)]
@@ -62,8 +78,24 @@ public sealed class ManagedJournalPageMigrationTests
         using (var connection = database.Connect())
         {
             Execute(connection, "CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT);");
+            Execute(connection, """
+                CREATE TABLE keyed(
+                    tenant TEXT,
+                    sequence INTEGER,
+                    value TEXT,
+                    doubled INTEGER GENERATED ALWAYS AS (sequence * 2) VIRTUAL,
+                    PRIMARY KEY(tenant COLLATE NOCASE, sequence DESC),
+                    UNIQUE(value)
+                ) WITHOUT ROWID;
+                """);
+            Execute(connection, "CREATE INDEX keyed_doubled ON keyed(doubled DESC);");
             for (var index = 0; index < 40; index++)
+            {
                 Execute(connection, $"INSERT INTO data VALUES ({index}, 'value-{index:D2}');");
+                Execute(
+                    connection,
+                    $"INSERT INTO keyed(tenant, sequence, value) VALUES ('tenant-{index % 4}', {index}, 'keyed-{index:D2}');");
+            }
 
             ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
             Execute(connection, $"PRAGMA page_size={pageSize};");
@@ -71,6 +103,9 @@ public sealed class ManagedJournalPageMigrationTests
             Execute(connection, "VACUUM;");
             ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(pageSize));
             ReadValue(connection, "SELECT COUNT(*) FROM data;").Should().Be(SqlValue.Integer(40));
+            ReadValue(connection, "SELECT COUNT(*) FROM keyed;").Should().Be(SqlValue.Integer(40));
+            ReadValue(connection, "SELECT doubled FROM keyed WHERE tenant = 'tenant-3' AND sequence = 39;")
+                .Should().Be(SqlValue.Integer(78));
         }
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
@@ -79,6 +114,8 @@ public sealed class ManagedJournalPageMigrationTests
         ReadValue(reopenedConnection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("delete"));
         ReadValue(reopenedConnection, "SELECT value FROM data WHERE id=39;")
             .Should().Be(SqlValue.Text("value-39"));
+        ReadValue(reopenedConnection, "SELECT value FROM keyed WHERE tenant = 'tenant-3' AND sequence = 39;")
+            .Should().Be(SqlValue.Text("keyed-39"));
     }
 
     [Test]

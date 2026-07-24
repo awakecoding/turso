@@ -68,6 +68,20 @@ public class WithoutRowidTests
     }
 
     [Test]
+    public void CollatedCompositePrimaryKeyControlsNaturalScanOrder()
+    {
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(a TEXT, b INT, v TEXT, PRIMARY KEY(a COLLATE NOCASE, b DESC)) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('beta', 1, 'b1')",
+                "INSERT INTO t VALUES ('Alpha', 1, 'a1')",
+                "INSERT INTO t VALUES ('alpha', 3, 'a3')",
+                "INSERT INTO t VALUES ('charlie', 2, 'c2')",
+            ],
+            "SELECT a, b, v FROM t");
+    }
+
+    [Test]
     public void UpdateToPrimaryKeyReordersScan()
     {
         AssertMatchesSqlite(
@@ -165,6 +179,120 @@ public class WithoutRowidTests
     }
 
     [Test]
+    public void InsertConflictAlgorithmsAndConstraintReplacementMatchSqlite()
+    {
+        AssertMatchesSqlite(
+            [
+                """
+                CREATE TABLE t(
+                    k TEXT COLLATE NOCASE PRIMARY KEY ON CONFLICT REPLACE,
+                    alternate TEXT,
+                    value TEXT,
+                    UNIQUE(alternate) ON CONFLICT IGNORE
+                ) WITHOUT ROWID
+                """,
+                "INSERT INTO t VALUES ('one', 'a', 'first')",
+                "INSERT INTO t VALUES ('ONE', 'b', 'constraint-replaced')",
+                "INSERT OR IGNORE INTO t VALUES ('two', 'b', 'ignored')",
+                "INSERT OR REPLACE INTO t VALUES ('three', 'b', 'statement-replaced')",
+                "INSERT INTO t VALUES ('four', NULL, 'null-one')",
+                "INSERT INTO t VALUES ('five', NULL, 'null-two')",
+                """
+                INSERT INTO t VALUES ('THREE', 'c', 'upserted')
+                ON CONFLICT(k) DO UPDATE SET value = excluded.value
+                """,
+            ],
+            "SELECT k, alternate, value FROM t");
+    }
+
+    [Test]
+    public void AbortFailAndRollbackConflictAtomicityMatchesSqlite()
+    {
+        var create = new[]
+        {
+            "CREATE TABLE t(k INTEGER PRIMARY KEY, value TEXT UNIQUE) WITHOUT ROWID",
+            "INSERT INTO t VALUES (1, 'one')",
+        };
+        AssertStateAfterErrorMatchesSqlite(
+            create,
+            "INSERT OR ABORT INTO t VALUES (2, 'two'), (1, 'duplicate'), (3, 'three')",
+            "SELECT k, value FROM t");
+        AssertStateAfterErrorMatchesSqlite(
+            create,
+            "INSERT OR FAIL INTO t VALUES (2, 'two'), (1, 'duplicate'), (3, 'three')",
+            "SELECT k, value FROM t");
+        AssertStateAfterErrorMatchesSqlite(
+            [.. create, "BEGIN", "INSERT INTO t VALUES (4, 'transaction-row')"],
+            "INSERT OR ROLLBACK INTO t VALUES (2, 'two'), (1, 'duplicate')",
+            "SELECT k, value FROM t");
+    }
+
+    [Test]
+    public void WithoutRowidInsertDoesNotChangeLastInsertRowid()
+    {
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE ordinary(value TEXT)",
+                "INSERT INTO ordinary VALUES ('rowid-source')",
+                "CREATE TABLE keyed(k INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID",
+                "INSERT INTO keyed VALUES (99, 'without-rowid')",
+                "INSERT INTO keyed VALUES (100, 'upsert') ON CONFLICT(k) DO UPDATE SET value = excluded.value",
+            ],
+            "SELECT last_insert_rowid() AS value");
+    }
+
+    [Test]
+    public void UpdateReturningVisitsRowsInClusteredPrimaryKeyOrder()
+    {
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(k INTEGER PRIMARY KEY DESC, value TEXT) WITHOUT ROWID",
+                "INSERT INTO t VALUES (1, 'a'), (3, 'c'), (2, 'b')",
+            ],
+            "UPDATE t SET k = k + 10 RETURNING k, value");
+    }
+
+    [Test]
+    public void InsertAndDeleteReturningPreserveGeneratedValuesAndClusteredOrder()
+    {
+        AssertMatchesSqlite(
+            [
+                """
+                CREATE TABLE t(
+                    k INTEGER PRIMARY KEY DESC,
+                    value INTEGER,
+                    computed INTEGER GENERATED ALWAYS AS (value * 2) VIRTUAL
+                ) WITHOUT ROWID
+                """,
+            ],
+            "INSERT INTO t(k, value) VALUES (1, 10), (3, 30), (2, 20) RETURNING k, computed");
+        AssertMatchesSqlite(
+            [
+                """
+                CREATE TABLE t(
+                    k INTEGER PRIMARY KEY DESC,
+                    value INTEGER,
+                    computed INTEGER GENERATED ALWAYS AS (value * 2) VIRTUAL
+                ) WITHOUT ROWID
+                """,
+                "INSERT INTO t(k, value) VALUES (1, 10), (3, 30), (2, 20)",
+            ],
+            "DELETE FROM t WHERE value >= 20 RETURNING k, computed");
+    }
+
+    [TestCase("_rowid_")]
+    [TestCase("oid")]
+    public void EveryHiddenRowidSpellingIsRejected(string pseudoColumn)
+    {
+        AssertErrorMatchesSqlite(
+            [
+                "CREATE TABLE t(k INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID",
+                "INSERT INTO t VALUES (1, 'one')",
+            ],
+            $"SELECT {pseudoColumn} FROM t");
+    }
+
+    [Test]
     public void DuplicateCompositePrimaryKeyIsRejectedWithKeyColumnOrder()
     {
         AssertErrorMatchesSqlite(
@@ -226,6 +354,22 @@ public class WithoutRowidTests
         var managed = RunManaged(setup, query);
         var reference = RunSqlite(setup, query);
 
+        OutputsShouldMatch(managed, reference);
+    }
+
+    private static void AssertStateAfterErrorMatchesSqlite(
+        IReadOnlyList<string> setup,
+        string failingStatement,
+        string query)
+    {
+        var managed = RunManagedAfterError(setup, failingStatement, query);
+        var reference = RunSqliteAfterError(setup, failingStatement, query);
+
+        OutputsShouldMatch(managed, reference);
+    }
+
+    private static void OutputsShouldMatch(QueryOutput managed, ReferenceOutput reference)
+    {
         managed.Columns.Should().Equal(reference.Columns, "column names should match SQLite");
         managed.Rows.Should().HaveCount(reference.Rows.Count);
         for (var row = 0; row < reference.Rows.Count; row++)
@@ -313,6 +457,39 @@ public class WithoutRowidTests
         return new QueryOutput(columns, rows);
     }
 
+    private static QueryOutput RunManagedAfterError(
+        IReadOnlyList<string> setup,
+        string failingStatement,
+        string query)
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        foreach (var statement in setup)
+            Execute(connection, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, failingStatement));
+
+        return ReadManagedOutput(connection, query);
+    }
+
+    private static QueryOutput ReadManagedOutput(EmbeddedConnection connection, string query)
+    {
+        using var command = connection.Prepare(query);
+        var columns = new string[command.GetColumnCount()];
+        for (var ordinal = 0; ordinal < columns.Length; ordinal++)
+            columns[ordinal] = command.GetColumnName(ordinal);
+
+        var rows = new List<SqlValue[]>();
+        while (command.Step() == StatementStepResult.Row)
+        {
+            var values = new SqlValue[command.GetColumnCount()];
+            for (var ordinal = 0; ordinal < values.Length; ordinal++)
+                values[ordinal] = command.GetValue(ordinal);
+            rows.Add(values);
+        }
+
+        return new QueryOutput(columns, rows);
+    }
+
     private static ReferenceOutput RunSqlite(IReadOnlyList<string> setup, string query)
     {
         using var connection = new MsData.SqliteConnection("Data Source=:memory:");
@@ -338,6 +515,44 @@ public class WithoutRowidTests
             for (var column = 0; column < values.Length; column++)
                 values[column] = reader.IsDBNull(column) ? null : reader.GetValue(column);
 
+            rows.Add(values);
+        }
+
+        return new ReferenceOutput(columns, rows);
+    }
+
+    private static ReferenceOutput RunSqliteAfterError(
+        IReadOnlyList<string> setup,
+        string failingStatement,
+        string query)
+    {
+        using var connection = new MsData.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        foreach (var statement in setup)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = statement;
+            command.ExecuteNonQuery();
+        }
+        using (var failing = connection.CreateCommand())
+        {
+            failing.CommandText = failingStatement;
+            Assert.Throws<MsData.SqliteException>(() => failing.ExecuteNonQuery());
+        }
+
+        using var queryCommand = connection.CreateCommand();
+        queryCommand.CommandText = query;
+        using var reader = queryCommand.ExecuteReader();
+        var columns = new string[reader.FieldCount];
+        for (var column = 0; column < columns.Length; column++)
+            columns[column] = reader.GetName(column);
+
+        var rows = new List<object?[]>();
+        while (reader.Read())
+        {
+            var values = new object?[reader.FieldCount];
+            for (var column = 0; column < values.Length; column++)
+                values[column] = reader.IsDBNull(column) ? null : reader.GetValue(column);
             rows.Add(values);
         }
 

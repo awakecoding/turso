@@ -380,13 +380,16 @@ internal sealed class SqlParser
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null;
         InsertConflictAlgorithm? tablePrimaryKeyConflictAlgorithm = null;
         string? tablePrimaryKeyConstraintName = null;
+        int? tablePrimaryKeyDeclarationOrder = null;
         var uniqueConstraints = new List<TableUniqueConstraint>();
         var checkConstraints = new List<CheckConstraint>();
+        var tableConstraintOrder = 0;
         do
         {
             if (IsTableConstraintStart())
             {
                 var parsed = ParseTableConstraint();
+                var declarationOrder = tableConstraintOrder++;
                 switch (parsed)
                 {
                     case PrimaryKeyTableConstraint primaryKey:
@@ -396,6 +399,7 @@ internal sealed class SqlParser
                         tablePrimaryKey = primaryKey.Columns;
                         tablePrimaryKeyConflictAlgorithm = primaryKey.ConflictAlgorithm;
                         tablePrimaryKeyConstraintName = primaryKey.Name;
+                        tablePrimaryKeyDeclarationOrder = declarationOrder;
                         break;
                     case ForeignKeyTableConstraint foreignKey:
                         AttachTableForeignKey(columns, foreignKey.Definition);
@@ -404,7 +408,8 @@ internal sealed class SqlParser
                         uniqueConstraints.Add(new TableUniqueConstraint(
                             unique.Name,
                             unique.Columns,
-                            unique.ConflictAlgorithm));
+                            unique.ConflictAlgorithm,
+                            declarationOrder));
                         break;
                     case CheckTableConstraint check:
                         checkConstraints.Add(new CheckConstraint(
@@ -443,7 +448,8 @@ internal sealed class SqlParser
             uniqueConstraints,
             checkConstraints,
             tablePrimaryKeyConflictAlgorithm,
-            tablePrimaryKeyConstraintName);
+            tablePrimaryKeyConstraintName,
+            tablePrimaryKeyDeclarationOrder);
     }
 
     private abstract record TableConstraint;
