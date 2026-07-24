@@ -138,62 +138,113 @@ public class TursoConnection : DbConnection
         }
 
         _replicaDatabase?.EnsureCanClose();
-        var nativeDatabase = _nativeDatabase;
-        var managedDatabase = _managedDatabase;
-        var managedPoolLease = _managedPoolLease;
-        var managedEncryptionFileSystem = _managedEncryptionFileSystem;
-        var reusable = false;
+        var cancellationError = _replicaDatabase?.CancelPendingOperationsForClose();
         try
         {
-            CloseOpenReaders();
-            _transaction?.Dispose();
-            ResetOpenCommands();
-            reusable = true;
-        }
-        finally
-        {
-            _nativeDatabase = null;
-            _replicaDatabase = null;
-            _managedDatabase = null;
-            _managedPoolLease = null;
-            _managedEncryptionFileSystem = null;
+            var nativeDatabase = _nativeDatabase;
+            var managedDatabase = _managedDatabase;
+            var managedPoolLease = _managedPoolLease;
+            var managedEncryptionFileSystem = _managedEncryptionFileSystem;
+            var reusable = false;
             try
             {
-                nativeDatabase?.Dispose();
+                CloseOpenReaders();
+                _transaction?.Dispose();
+                ResetOpenCommands();
+                reusable = true;
             }
             finally
             {
+                _nativeDatabase = null;
+                _replicaDatabase = null;
+                _managedDatabase = null;
+                _managedPoolLease = null;
+                _managedEncryptionFileSystem = null;
                 try
                 {
-                    if (managedPoolLease is not null)
-                        managedPoolLease.Release(reusable);
-                    else
-                        managedDatabase?.Dispose();
+                    nativeDatabase?.Dispose();
                 }
                 finally
                 {
-                    managedEncryptionFileSystem?.Dispose();
-                    _readUncommitted = false;
-                    _managedSharedMemory = false;
-                    _managedReadOnly = false;
+                    try
+                    {
+                        if (managedPoolLease is not null)
+                            managedPoolLease.Release(reusable);
+                        else
+                            managedDatabase?.Dispose();
+                    }
+                    finally
+                    {
+                        managedEncryptionFileSystem?.Dispose();
+                        _readUncommitted = false;
+                        _managedSharedMemory = false;
+                        _managedReadOnly = false;
+                    }
                 }
             }
         }
+        catch (Exception cleanupError) when (cancellationError is not null)
+        {
+            throw new AggregateException(
+                "Embedded replica cancellation and connection cleanup both failed.",
+                cancellationError,
+                cleanupError);
+        }
+
+        if (cancellationError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cancellationError).Throw();
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !_disposed)
+        if (!disposing || _disposed)
+        {
+            _disposed = true;
+            base.Dispose(disposing);
+            return;
+        }
+
+        Exception? disposalError = null;
+        try
         {
             Close();
-            _disposed = true;
-            _ownedReplicaHttpHandler?.Dispose();
-            _ownedReplicaHttpHandler = null;
+        }
+        catch (Exception exception)
+        {
+            if (State != ConnectionState.Closed)
+                throw;
+            disposalError = exception;
         }
 
         _disposed = true;
-        base.Dispose(disposing);
+        var ownedReplicaHttpHandler = _ownedReplicaHttpHandler;
+        _ownedReplicaHttpHandler = null;
+        try
+        {
+            ownedReplicaHttpHandler?.Dispose();
+        }
+        catch (Exception exception)
+        {
+            disposalError = CombineDisposalErrors(disposalError, exception);
+        }
+
+        try
+        {
+            base.Dispose(disposing);
+        }
+        catch (Exception exception)
+        {
+            disposalError = CombineDisposalErrors(disposalError, exception);
+        }
+
+        if (disposalError is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(disposalError).Throw();
     }
+
+    private static Exception CombineDisposalErrors(Exception? existing, Exception next)
+        => existing is null
+            ? next
+            : new AggregateException("Multiple errors occurred while disposing the Turso connection.", existing, next);
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
@@ -488,9 +539,6 @@ public class TursoConnection : DbConnection
             return;
         }
 
-        if (_connectionOptions.SyncInterval > 0)
-            throw new NotSupportedException("Sync Interval requires embedded replica support, which is not supported yet by the .NET provider.");
-
         if (_connectionOptions.GetEncryptionCipher().HasValue || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
             throw new InvalidOperationException("Encryption Cipher and Encryption Key are local database options and cannot be used with remote Turso URLs.");
 
@@ -515,12 +563,6 @@ public class TursoConnection : DbConnection
 
     private TursoReplicaOptions GetReplicaOptions()
     {
-        if (_connectionOptions.SyncInterval > 0)
-        {
-            throw new NotSupportedException(
-                "Sync Interval is not supported yet for embedded replica connections. Call Sync or SyncAsync explicitly.");
-        }
-
         if (_connectionOptions.GetEncryptionCipher().HasValue
             || !string.IsNullOrWhiteSpace(_connectionOptions["Encryption Key"]))
         {
@@ -552,6 +594,7 @@ public class TursoConnection : DbConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_nativeDatabase is not null || _managedDatabase is not null || _remoteClient is not null)
             throw new InvalidOperationException("The connection is already open.");
+        ValidateAutomaticSyncPolicy();
         if (!string.IsNullOrWhiteSpace(_connectionOptions["Password"]))
         {
             if (!_connectionOptions.IsRemote && _connectionOptions.LocalProvider == TursoLocalProvider.Managed)
@@ -562,6 +605,24 @@ public class TursoConnection : DbConnection
 
             throw new NotSupportedException(
                 "Password is not supported. Use Encryption Cipher and Encryption Key for local encrypted databases.");
+        }
+    }
+
+    private void ValidateAutomaticSyncPolicy()
+    {
+        var syncInterval = _connectionOptions.SyncInterval;
+        if (syncInterval < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(TursoConnectionStringBuilder.SyncInterval),
+                syncInterval,
+                "Sync Interval cannot be negative.");
+        }
+
+        if (syncInterval > 0)
+        {
+            throw new NotSupportedException(
+                "Automatic synchronization is not supported. Sync Interval must be 0. Call Sync or SyncAsync explicitly.");
         }
     }
 
@@ -609,8 +670,6 @@ public class TursoConnection : DbConnection
             throw new InvalidOperationException("Auth Token requires a remote Turso URL Data Source.");
         if (!string.IsNullOrWhiteSpace(_connectionOptions.ReplicaPath))
             throw new InvalidOperationException("Replica Path requires a remote Turso URL Data Source.");
-        if (_connectionOptions.SyncInterval > 0)
-            throw new InvalidOperationException("Sync Interval requires a remote embedded replica connection.");
         if (_connectionOptions.Tls.HasValue)
             throw new InvalidOperationException("Tls requires a remote Turso URL Data Source.");
     }

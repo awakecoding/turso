@@ -38,15 +38,58 @@ public class TursoRemoteTests
         options.BootstrapIfEmpty.Should().BeTrue();
     }
 
-    [Test]
-    public void TestRemoteReplicaRejectsAutomaticSyncBeforeNetworkAccess()
+    [TestCase("Data Source=:memory:;Local Provider=Managed;Sync Interval=1")]
+    [TestCase("Data Source=http://127.0.0.1:1;Sync Interval=1")]
+    [TestCase("Data Source=http://127.0.0.1:1;Replica Path=replica.db;Sync Interval=1")]
+    public void TestAutomaticSyncIsRejectedBeforeOpeningAnyConnection(string connectionString)
     {
-        using var connection = new TursoConnection(
-            "Data Source=libsql://example.turso.io;Auth Token=secret;Replica Path=replica.db;Sync Interval=1");
+        using var connection = new TursoConnection(connectionString);
 
         connection.Invoking(x => x.Open())
             .Should().Throw<NotSupportedException>()
-            .WithMessage("Sync Interval is not supported yet for embedded replica connections. Call Sync or SyncAsync explicitly.");
+            .WithMessage(
+                "Automatic synchronization is not supported. Sync Interval must be 0. Call Sync or SyncAsync explicitly.");
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+    }
+
+    [TestCase("Data Source=:memory:;Local Provider=Managed;Sync Interval=-1")]
+    [TestCase("Data Source=http://127.0.0.1:1;Sync Interval=-1")]
+    [TestCase("Data Source=http://127.0.0.1:1;Replica Path=replica.db;Sync Interval=-1")]
+    public void TestNegativeSyncIntervalIsRejectedBeforeOpeningAnyConnection(string connectionString)
+    {
+        using var connection = new TursoConnection(connectionString);
+
+        connection.Invoking(x => x.Open())
+            .Should().Throw<ArgumentOutOfRangeException>()
+            .WithParameterName(nameof(TursoConnectionStringBuilder.SyncInterval));
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+    }
+
+    [Test]
+    public async Task TestConcurrentAutomaticOpenRejectionsLeaveConnectionReusable()
+    {
+        using var connection = new TursoConnection(
+            "Data Source=http://127.0.0.1:1;Sync Interval=1");
+
+        var attempts = Enumerable.Range(0, 32)
+            .Select(_ => connection.OpenAsync(CancellationToken.None))
+            .ToArray();
+
+        foreach (var attempt in attempts)
+        {
+            var open = async () => await attempt;
+            await open.Should().ThrowAsync<NotSupportedException>()
+                .WithMessage(
+                    "Automatic synchronization is not supported. Sync Interval must be 0. Call Sync or SyncAsync explicitly.");
+        }
+
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        connection.Close();
+        connection.ConnectionString = "Data Source=http://127.0.0.1:1;Sync Interval=0";
+        connection.Open();
+        connection.State.Should().Be(System.Data.ConnectionState.Open);
+        connection.Close();
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
     }
 
     [Test]
