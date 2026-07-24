@@ -359,6 +359,8 @@ internal sealed class SqlParser
             throw Error("Temporary triggers and views are not supported.");
         if (ConsumeKeyword("TRIGGER"))
             return ParseCreateTrigger();
+        if (ConsumeKeyword("VIRTUAL"))
+            throw Error("Managed CREATE VIRTUAL TABLE modules are not supported.");
 
         return ParseCreateTable();
     }
@@ -914,14 +916,7 @@ internal sealed class SqlParser
 
         ExpectKeyword("UPDATE");
         ExpectKeyword("SET");
-        var assignments = new List<ColumnAssignment>();
-        do
-        {
-            var column = ExpectIdentifier();
-            Expect(TokenKind.Equal);
-            assignments.Add(new ColumnAssignment(column, ParseExpression()));
-        }
-        while (Consume(TokenKind.Comma));
+        var assignments = ParseAssignments();
 
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
@@ -938,17 +933,7 @@ internal sealed class SqlParser
         var tableName = ParseSchemaQualifiedName();
         RejectUnsupportedDmlTargetSuffix("UPDATE");
         ExpectKeyword("SET");
-        var assignments = new List<ColumnAssignment>();
-        do
-        {
-            if (_lexer.Current.Kind == TokenKind.LeftParen)
-                throw Error("Managed UPDATE does not support row-value assignments.");
-
-            var column = ExpectIdentifier();
-            Expect(TokenKind.Equal);
-            assignments.Add(new ColumnAssignment(column, ParseExpression()));
-        }
-        while (Consume(TokenKind.Comma));
+        var assignments = ParseAssignments();
 
         if (CurrentIsKeyword("FROM"))
             throw Error("Managed UPDATE FROM is not supported.");
@@ -960,6 +945,40 @@ internal sealed class SqlParser
         var returning = ParseReturning();
         var (orderBy, limit, offset) = ParseLimitedDmlTail("UPDATE");
         return new UpdateStatement(tableName, assignments, where, returning, orderBy, limit, offset);
+    }
+
+    private IReadOnlyList<ColumnAssignment> ParseAssignments()
+    {
+        var assignments = new List<ColumnAssignment>();
+        do
+        {
+            string[] columns;
+            var isRowAssignment = Consume(TokenKind.LeftParen);
+            if (isRowAssignment)
+            {
+                columns = ParseIdentifierList();
+                Expect(TokenKind.RightParen);
+            }
+            else
+            {
+                columns = [ExpectIdentifier()];
+            }
+
+            Expect(TokenKind.Equal);
+            var value = ParseExpression();
+            for (var index = 0; index < columns.Length; index++)
+            {
+                assignments.Add(new ColumnAssignment(
+                    columns[index],
+                    value,
+                    index,
+                    columns.Length,
+                    isRowAssignment));
+            }
+        }
+        while (Consume(TokenKind.Comma));
+
+        return assignments;
     }
 
     private ParsedStatement ParseDelete()
@@ -1630,24 +1649,29 @@ internal sealed class SqlParser
 
     private Expression ParseComparison()
     {
-        var expression = ParseAddSubtract();
+        var expression = ParseRelational();
         while (true)
         {
             if (ConsumeKeyword("IS"))
             {
                 var isNot = ConsumeKeyword("NOT");
+                var distinct = ConsumeKeyword("DISTINCT");
+                if (distinct)
+                    ExpectKeyword("FROM");
                 expression = new BinaryExpression(
                     expression,
-                    isNot ? BinaryOperator.IsNot : BinaryOperator.Is,
-                    ParseAddSubtract());
+                    distinct
+                        ? isNot ? BinaryOperator.Is : BinaryOperator.IsNot
+                        : isNot ? BinaryOperator.IsNot : BinaryOperator.Is,
+                    ParseRelational());
                 continue;
             }
             var negated = ConsumeKeyword("NOT");
             if (ConsumeKeyword("BETWEEN"))
             {
-                var lower = ParseAddSubtract();
+                var lower = ParseRelational();
                 ExpectKeyword("AND");
-                expression = new BetweenExpression(expression, lower, ParseAddSubtract(), negated);
+                expression = new BetweenExpression(expression, lower, ParseRelational(), negated);
                 continue;
             }
             if (ConsumeKeyword("IN"))
@@ -1675,27 +1699,66 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("LIKE"))
             {
-                var pattern = ParseAddSubtract();
+                var pattern = ParseRelational();
                 Expression? escape = null;
                 if (ConsumeKeyword("ESCAPE"))
-                    escape = ParseAddSubtract();
+                    escape = ParseRelational();
 
                 expression = new LikeExpression(expression, pattern, escape, negated);
                 continue;
             }
             if (ConsumeKeyword("GLOB"))
             {
-                expression = new GlobExpression(expression, ParseAddSubtract(), negated);
+                expression = new GlobExpression(expression, ParseRelational(), negated);
+                continue;
+            }
+            if (CurrentIsKeyword("REGEXP") || CurrentIsKeyword("MATCH"))
+            {
+                var functionName = _lexer.Current.Text.ToUpperInvariant();
+                _lexer.Next();
+                Expression function = new FunctionExpression(
+                    functionName,
+                    [ParseRelational(), expression],
+                    CountStar: false);
+                expression = negated
+                    ? new UnaryExpression(UnaryOperator.Not, function)
+                    : function;
                 continue;
             }
             if (negated)
-                throw Error("Expected BETWEEN, IN, LIKE, or GLOB after NOT.");
-            if (!TryParseComparisonOperator(out var operation))
+                throw Error("Expected BETWEEN, IN, LIKE, GLOB, REGEXP, or MATCH after NOT.");
+            if (!TryParseEqualityOperator(out var operation))
                 return expression;
 
-            expression = new BinaryExpression(expression, operation, ParseAddSubtract());
+            expression = new BinaryExpression(expression, operation, ParseRelational());
         }
+    }
 
+    private Expression ParseRelational()
+    {
+        var expression = ParseBitwise();
+        while (TryParseRelationalOperator(out var operation))
+            expression = new BinaryExpression(expression, operation, ParseBitwise());
+
+        return expression;
+    }
+
+    private Expression ParseBitwise()
+    {
+        var expression = ParseAddSubtract();
+        while (true)
+        {
+            if (Consume(TokenKind.BitwiseAnd))
+                expression = new BinaryExpression(expression, BinaryOperator.BitwiseAnd, ParseAddSubtract());
+            else if (Consume(TokenKind.BitwiseOr))
+                expression = new BinaryExpression(expression, BinaryOperator.BitwiseOr, ParseAddSubtract());
+            else if (Consume(TokenKind.ShiftLeft))
+                expression = new BinaryExpression(expression, BinaryOperator.ShiftLeft, ParseAddSubtract());
+            else if (Consume(TokenKind.ShiftRight))
+                expression = new BinaryExpression(expression, BinaryOperator.ShiftRight, ParseAddSubtract());
+            else
+                return expression;
+        }
     }
 
     private Expression ParseAddSubtract()
@@ -1746,11 +1809,49 @@ internal sealed class SqlParser
 
     private Expression ParseCollation()
     {
-        var expression = ParsePrimary();
+        var expression = ParseUnary();
         while (ConsumeKeyword("COLLATE"))
             expression = new CollationExpression(expression, ExpectIdentifier());
 
         return expression;
+    }
+
+    private Expression ParseUnary()
+    {
+        if (Consume(TokenKind.Plus))
+            return new UnaryExpression(UnaryOperator.Plus, ParseUnary());
+        if (Consume(TokenKind.Minus))
+        {
+            if (_lexer.Current is { Kind: TokenKind.Integer, Text: "9223372036854775808" })
+            {
+                _lexer.Next();
+                return new LiteralExpression(SqlValue.Integer(long.MinValue));
+            }
+
+            return new UnaryExpression(UnaryOperator.Negate, ParseUnary());
+        }
+        if (Consume(TokenKind.BitwiseNot))
+            return new UnaryExpression(UnaryOperator.BitwiseNot, ParseUnary());
+
+        return ParsePrimary();
+    }
+
+    private Expression ParseSignedPrimary()
+    {
+        if (Consume(TokenKind.Plus))
+            return new UnaryExpression(UnaryOperator.Plus, ParseSignedPrimary());
+        if (Consume(TokenKind.Minus))
+        {
+            if (_lexer.Current is { Kind: TokenKind.Integer, Text: "9223372036854775808" })
+            {
+                _lexer.Next();
+                return new LiteralExpression(SqlValue.Integer(long.MinValue));
+            }
+
+            return new UnaryExpression(UnaryOperator.Negate, ParseSignedPrimary());
+        }
+
+        return ParsePrimary();
     }
 
     private Expression ParsePrimary()
@@ -1765,22 +1866,20 @@ internal sealed class SqlParser
             }
 
             var expression = ParseExpression();
+            if (Consume(TokenKind.Comma))
+            {
+                var values = new List<Expression> { expression, ParseExpression() };
+                while (Consume(TokenKind.Comma))
+                    values.Add(ParseExpression());
+                Expect(TokenKind.RightParen);
+                return new RowValueExpression(values);
+            }
+
             Expect(TokenKind.RightParen);
             return expression;
         }
         if (ConsumeKeyword("EXISTS"))
             return new ExistsExpression(ParseParenthesizedQuery(), Negated: false);
-        if (Consume(TokenKind.Minus))
-        {
-            if (_lexer.Current is { Kind: TokenKind.Integer, Text: "9223372036854775808" })
-            {
-                _lexer.Next();
-                return new LiteralExpression(SqlValue.Integer(long.MinValue));
-            }
-
-            var value = ParsePrimary();
-            return new BinaryExpression(new LiteralExpression(SqlValue.Integer(0)), BinaryOperator.Subtract, value);
-        }
 
         var token = _lexer.Current;
         switch (token.Kind)
@@ -1945,7 +2044,7 @@ internal sealed class SqlParser
         throw Error($"Parameter {token} was not found.");
     }
 
-    private bool TryParseComparisonOperator(out BinaryOperator operation)
+    private bool TryParseEqualityOperator(out BinaryOperator operation)
     {
         if (Consume(TokenKind.Equal))
         {
@@ -1957,6 +2056,13 @@ internal sealed class SqlParser
             operation = BinaryOperator.NotEqual;
             return true;
         }
+
+        operation = default;
+        return false;
+    }
+
+    private bool TryParseRelationalOperator(out BinaryOperator operation)
+    {
         if (Consume(TokenKind.LessThan))
         {
             operation = BinaryOperator.LessThan;
@@ -2089,7 +2195,7 @@ internal sealed class SqlParser
                 var startOffset = _lexer.Current.Offset;
                 var expression = _lexer.Current.Kind == TokenKind.LeftParen
                     ? ParseExpression()
-                    : ParsePrimary();
+                    : ParseSignedPrimary();
                 var endOffset = _lexer.Current.Offset;
                 defaultSql = _sql[startOffset..endOffset].Trim();
                 if (TryGetLiteralDefault(expression, out var literalValue))
@@ -2290,13 +2396,11 @@ internal sealed class SqlParser
             return true;
         }
 
-        if (expression is BinaryExpression
+        if (expression is UnaryExpression
             {
-                Left: LiteralExpression { Value.Kind: SqlValueKind.Integer } zero,
-                Operator: BinaryOperator.Subtract,
-                Right: LiteralExpression right,
-            }
-            && zero.Value.AsInteger() == 0)
+                Operator: UnaryOperator.Negate,
+                Operand: LiteralExpression right,
+            })
         {
             value = right.Value.Kind switch
             {
@@ -2305,6 +2409,15 @@ internal sealed class SqlParser
                 _ => default,
             };
             return right.Value.Kind is SqlValueKind.Integer or SqlValueKind.Real;
+        }
+        if (expression is UnaryExpression
+            {
+                Operator: UnaryOperator.Plus,
+                Operand: LiteralExpression positive,
+            })
+        {
+            value = positive.Value;
+            return true;
         }
 
         value = default;

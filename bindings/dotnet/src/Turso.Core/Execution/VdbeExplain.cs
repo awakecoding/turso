@@ -330,7 +330,7 @@ public static class VdbeExplain
         var symbol = VdbeArithmetic.Symbol(arithmetic.Operator);
         var destination = arithmetic.Destination.Index;
         var start = arithmetic.Operands.Start.Index;
-        // Unary sign operators render as a prefix over their single operand; binary operators render infix.
+        // Unary operators render as a prefix over their single operand; binary operators render infix.
         return arithmetic.Operands.Count == 1
             ? $"r[{destination}]={symbol}r[{start}]"
             : $"r[{destination}]=r[{start}] {symbol} r[{start + 1}]";

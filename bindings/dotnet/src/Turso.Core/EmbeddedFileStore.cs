@@ -7472,6 +7472,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             null or LiteralExpression or ColumnExpression or StarExpression or QualifiedStarExpression => null,
             ParameterExpression => "a bind parameter",
+            RowValueExpression rowValue => FindRuntimeDependency(rowValue.Values),
             FunctionExpression function => $"function {function.Name}()",
             ScalarSubqueryExpression subquery => FindRuntimeDependency(subquery.Query),
             ExistsExpression exists => FindRuntimeDependency(exists.Query),

@@ -2,9 +2,8 @@ namespace Turso.Core.Execution;
 
 /// <summary>
 /// The arithmetic operation an <see cref="ArithmeticInstruction"/> applies to its register operands. Each
-/// operator has a fixed arity — the binary operators (<see cref="Add"/>, <see cref="Subtract"/>,
-/// <see cref="Multiply"/>, <see cref="Divide"/>, <see cref="Modulo"/>) consume two operand registers and
-/// the unary sign operators (<see cref="Negate"/>, <see cref="Identity"/>) consume one — which the program
+/// operator has a fixed arity — binary operators consume two operand registers and unary operators consume
+/// one — which the program
 /// validator pins against the instruction's operand range so an arity error can never reach execution.
 /// </summary>
 public enum ArithmeticOperator
@@ -26,16 +25,31 @@ public enum ArithmeticOperator
     /// divisor yields NULL.</summary>
     Modulo,
 
+    /// <summary>Bitwise AND (<c>a &amp; b</c>) over integer-coerced operands.</summary>
+    BitwiseAnd,
+
+    /// <summary>Bitwise OR (<c>a | b</c>) over integer-coerced operands.</summary>
+    BitwiseOr,
+
+    /// <summary>Signed left shift (<c>a &lt;&lt; b</c>) with SQLite's saturated shift count.</summary>
+    ShiftLeft,
+
+    /// <summary>Signed right shift (<c>a &gt;&gt; b</c>) with SQLite's saturated shift count.</summary>
+    ShiftRight,
+
+    /// <summary>Bitwise complement (<c>~a</c>) over an integer-coerced operand.</summary>
+    BitwiseNot,
+
     /// <summary>Unary negation (<c>-a</c>), the arithmetic complement of <see cref="Identity"/>.</summary>
     Negate,
 
-    /// <summary>Unary plus (<c>+a</c>): a numeric no-op that returns its operand unchanged.</summary>
+    /// <summary>Unary plus (<c>+a</c>): a storage-class-preserving no-op.</summary>
     Identity,
 }
 
 /// <summary>
-/// Raised by <see cref="VdbeArithmetic.Evaluate"/> to signal an arithmetic type error — an operand that is
-/// not a number and not NULL (a <see cref="SqlValueKind.Text"/> or <see cref="SqlValueKind.Blob"/> value).
+/// Raised by <see cref="VdbeArithmetic.Evaluate"/> to signal an operand type incompatible with the selected
+/// arithmetic operator.
 /// It is the arithmetic sibling of <see cref="VdbeFunctionException"/>: the interpreter does not catch it,
 /// so a failing <see cref="ArithmeticInstruction"/> propagates the exception out of the step with the
 /// destination register left untouched, and a caller may catch this single shape to distinguish an operand
@@ -79,14 +93,14 @@ public sealed class VdbeArithmeticException : InvalidOperationException
 ///   <item><description><b>Division / modulo by zero</b> — a zero divisor yields NULL (never a raised
 ///   divide-by-zero); integer <c>long.MinValue / -1</c> yields the real magnitude and <c>x % -1</c> yields
 ///   zero, both avoiding the sole two's-complement overflow.</description></item>
-///   <item><description><b>Type errors</b> — a non-NULL, non-numeric operand (text or blob) raises a
-///   <see cref="VdbeArithmeticException"/>; the family applies no SQL affinity coercion.</description></item>
+///   <item><description><b>Type errors</b> — numeric operators require numbers, bitwise operators require
+///   integers, and identity accepts every storage class; the family applies no SQL affinity coercion.</description></item>
 /// </list>
 /// </remarks>
 public static class VdbeArithmetic
 {
     /// <summary>The number of operand registers an <paramref name="op"/> consumes: two for the binary
-    /// operators, one for the unary sign operators.</summary>
+    /// operators, one for unary operators.</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="op"/> is not a defined operator.</exception>
     public static int Arity(ArithmeticOperator op) => op switch
     {
@@ -94,8 +108,14 @@ public static class VdbeArithmetic
             or ArithmeticOperator.Subtract
             or ArithmeticOperator.Multiply
             or ArithmeticOperator.Divide
-            or ArithmeticOperator.Modulo => 2,
-        ArithmeticOperator.Negate or ArithmeticOperator.Identity => 1,
+            or ArithmeticOperator.Modulo
+            or ArithmeticOperator.BitwiseAnd
+            or ArithmeticOperator.BitwiseOr
+            or ArithmeticOperator.ShiftLeft
+            or ArithmeticOperator.ShiftRight => 2,
+        ArithmeticOperator.Negate
+            or ArithmeticOperator.Identity
+            or ArithmeticOperator.BitwiseNot => 1,
         _ => throw new ArgumentOutOfRangeException(nameof(op), op, "Unknown arithmetic operator."),
     };
 
@@ -108,6 +128,11 @@ public static class VdbeArithmetic
         ArithmeticOperator.Multiply => "*",
         ArithmeticOperator.Divide => "/",
         ArithmeticOperator.Modulo => "%",
+        ArithmeticOperator.BitwiseAnd => "&",
+        ArithmeticOperator.BitwiseOr => "|",
+        ArithmeticOperator.ShiftLeft => "<<",
+        ArithmeticOperator.ShiftRight => ">>",
+        ArithmeticOperator.BitwiseNot => "~",
         ArithmeticOperator.Negate => "-",
         ArithmeticOperator.Identity => "+",
         _ => throw new ArgumentOutOfRangeException(nameof(op), op, "Unknown arithmetic operator."),
@@ -120,12 +145,11 @@ public static class VdbeArithmetic
     /// <param name="op">The arithmetic operation to apply.</param>
     /// <param name="operands">The operand tuple, whose length must equal <see cref="Arity"/> of
     /// <paramref name="op"/>. The interpreter passes a private snapshot, so the method may read it freely.</param>
-    /// <returns>The computed value: NULL when any operand is NULL or a divisor is zero, an integer when both
-    /// operands are integers and the operation neither overflows nor forces a real result, otherwise a
-    /// real.</returns>
+    /// <returns>The computed value, preserving the operand storage class for
+    /// <see cref="ArithmeticOperator.Identity"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="operands"/> is null.</exception>
     /// <exception cref="VdbeArithmeticException">The operand count disagrees with the operator's arity, or a
-    /// non-NULL operand is a text or blob value.</exception>
+    /// non-NULL operand is incompatible with the selected operator.</exception>
     public static SqlValue Evaluate(ArithmeticOperator op, SqlValue[] operands)
     {
         ArgumentNullException.ThrowIfNull(operands);
@@ -150,6 +174,11 @@ public static class VdbeArithmetic
                 => Additive(op, operands[0], operands[1]),
             ArithmeticOperator.Divide => Divide(operands[0], operands[1]),
             ArithmeticOperator.Modulo => Modulo(operands[0], operands[1]),
+            ArithmeticOperator.BitwiseAnd => Bitwise(operands[0], operands[1], and: true),
+            ArithmeticOperator.BitwiseOr => Bitwise(operands[0], operands[1], and: false),
+            ArithmeticOperator.ShiftLeft => Shift(operands[0], operands[1], left: true),
+            ArithmeticOperator.ShiftRight => Shift(operands[0], operands[1], left: false),
+            ArithmeticOperator.BitwiseNot => BitwiseNot(operands[0]),
             ArithmeticOperator.Negate => Negate(operands[0]),
             ArithmeticOperator.Identity => Identity(operands[0]),
             _ => throw new VdbeArithmeticException($"Unknown arithmetic operator {op}."),
@@ -275,9 +304,39 @@ public static class VdbeArithmetic
 
     private static SqlValue Identity(SqlValue value)
     {
-        RequireNumeric(value, ArithmeticOperator.Identity);
         return value;
     }
+
+    private static SqlValue Bitwise(SqlValue left, SqlValue right, bool and)
+    {
+        var a = RequireInteger(left, and ? ArithmeticOperator.BitwiseAnd : ArithmeticOperator.BitwiseOr);
+        var b = RequireInteger(right, and ? ArithmeticOperator.BitwiseAnd : ArithmeticOperator.BitwiseOr);
+        return SqlValue.Integer(and ? a & b : a | b);
+    }
+
+    private static SqlValue BitwiseNot(SqlValue value)
+        => SqlValue.Integer(~RequireInteger(value, ArithmeticOperator.BitwiseNot));
+
+    private static SqlValue Shift(SqlValue value, SqlValue count, bool left)
+    {
+        var integer = RequireInteger(value, left ? ArithmeticOperator.ShiftLeft : ArithmeticOperator.ShiftRight);
+        var shift = RequireInteger(count, left ? ArithmeticOperator.ShiftLeft : ArithmeticOperator.ShiftRight);
+        if (shift < 0)
+        {
+            var reversed = shift == long.MinValue ? 64L : -shift;
+            return SqlValue.Integer(left
+                ? ShiftRight(integer, reversed)
+                : ShiftLeft(integer, reversed));
+        }
+
+        return SqlValue.Integer(left ? ShiftLeft(integer, shift) : ShiftRight(integer, shift));
+    }
+
+    private static long ShiftLeft(long value, long count)
+        => count >= 64 ? 0 : unchecked(value << (int)count);
+
+    private static long ShiftRight(long value, long count)
+        => count >= 64 ? value < 0 ? -1 : 0 : value >> (int)count;
 
     private static void RequireNumeric(SqlValue value, ArithmeticOperator op)
     {
@@ -286,6 +345,17 @@ public static class VdbeArithmetic
             throw new VdbeArithmeticException(
                 $"Arithmetic operator '{Symbol(op)}' requires a numeric operand but received a {value.Kind} value.");
         }
+    }
+
+    private static long RequireInteger(SqlValue value, ArithmeticOperator op)
+    {
+        if (value.Kind != SqlValueKind.Integer)
+        {
+            throw new VdbeArithmeticException(
+                $"Arithmetic operator '{Symbol(op)}' requires an integer operand but received a {value.Kind} value.");
+        }
+
+        return value.AsInteger();
     }
 
     private static double ToReal(SqlValue value) => value.Kind switch

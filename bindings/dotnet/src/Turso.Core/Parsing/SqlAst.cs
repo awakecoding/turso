@@ -323,7 +323,12 @@ internal sealed record FrameBound(FrameBoundKind Kind, Expression? Offset);
 
 internal sealed record WindowFrame(FrameBound Start, FrameBound End);
 
-internal sealed record ColumnAssignment(string Column, Expression Value);
+internal sealed record ColumnAssignment(
+    string Column,
+    Expression Value,
+    int ValueIndex = 0,
+    int ValueCount = 1,
+    bool IsRowAssignment = false);
 
 internal sealed record EmbeddedColumn(
     string Name,
@@ -415,6 +420,8 @@ internal sealed record CurrentTimeExpression(CurrentTimeKind Kind) : Expression;
 
 internal sealed record ParameterExpression(int Index) : Expression;
 
+internal sealed record RowValueExpression(IReadOnlyList<Expression> Values) : Expression;
+
 internal sealed record ColumnExpression(
     string Name,
     string? Qualifier = null,
@@ -465,6 +472,10 @@ internal enum BinaryOperator
     Multiply,
     Divide,
     Modulo,
+    BitwiseAnd,
+    BitwiseOr,
+    ShiftLeft,
+    ShiftRight,
     Concatenate,
     JsonArrow,
     JsonArrowText,
@@ -483,4 +494,7 @@ internal enum BinaryOperator
 internal enum UnaryOperator
 {
     Not,
+    Plus,
+    Negate,
+    BitwiseNot,
 }
