@@ -7278,7 +7278,9 @@ public sealed class EmbeddedDatabase : IDisposable
         var offset = statement.Offset is null
             ? 0
             : Math.Max(0, RequireLimitInteger(Evaluate(statement.Offset, parameters, outerRow, context)));
-        var hasAggregate = statement.Projections.Any(projection => ContainsAggregate(projection.Expression));
+        var hasAggregate = statement.Projections.Any(projection => ContainsAggregate(projection.Expression))
+            || statement.Having is not null && ContainsAggregate(statement.Having)
+            || statement.OrderBy.Any(term => ContainsAggregate(term.Expression));
         var windowFunctions = CollectSelectWindowFunctions(statement);
         var hasWindow = windowFunctions.Count > 0;
         if (statement.Where is not null && ContainsWindowFunction(statement.Where))
@@ -7334,20 +7336,27 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (hasAggregate || statement.GroupBy.Count > 0)
         {
-            if (statement.GroupBy.Count == 0
-                && statement.Projections.Any(projection => !IsAggregateExpression(projection.Expression)))
-                throw new EmbeddedSqlException("Mixing aggregate and non-aggregate expressions is not supported.");
-
             if (statement.GroupBy.Count == 0)
             {
+                var representative = GetAggregateRepresentative(statement, selectedRows, parameters, context);
                 if (statement.Having is not null
-                    && !IsTrue(EvaluateAggregate(statement.Having, selectedRows, parameters, context)))
+                && !IsTrue(EvaluateAggregate(
+                    statement.Having,
+                    selectedRows,
+                    parameters,
+                    context,
+                    representative)))
                 {
                     return new ExecutionResult(columnNames, [], 0);
                 }
 
                 var aggregateValues = statement.Projections
-                    .Select(projection => EvaluateAggregate(projection.Expression, selectedRows, parameters, context))
+                .Select(projection => EvaluateAggregate(
+                    projection.Expression,
+                    selectedRows,
+                    parameters,
+                    context,
+                    representative))
                 .ToArray();
                 return new ExecutionResult(
                     columnNames,
@@ -7358,13 +7367,6 @@ public sealed class EmbeddedDatabase : IDisposable
                         limit,
                         statement.Projections.Select(projection => GetCollation(projection.Expression)).ToArray()),
                     0);
-            }
-
-            if (statement.Projections.Any(projection =>
-                    !IsAggregateExpression(projection.Expression)
-                    && !statement.GroupBy.Contains(projection.Expression)))
-            {
-                throw new EmbeddedSqlException("Non-aggregate projections must appear in GROUP BY.");
             }
 
             var groups = new Dictionary<string, List<SourceRow>>(StringComparer.Ordinal);
@@ -7380,21 +7382,34 @@ public sealed class EmbeddedDatabase : IDisposable
                 group.Add(row);
             }
 
-            var groupedRows = groups.Values
-                .Select(group => new GroupedResult(
-                    group[0],
+            var groupedRows = groups.Values.Select(group =>
+            {
+                var representative = GetAggregateRepresentative(statement, group, parameters, context)
+                    ?? group[0];
+                return new GroupedResult(
+                    representative,
                     group,
                     statement.Projections
                         .Select(projection => ContainsAggregate(projection.Expression)
-                            ? EvaluateAggregate(projection.Expression, group, parameters, context)
-                            : Evaluate(projection.Expression, parameters, group[0], context))
-                        .ToArray()))
-                .ToList();
+                            ? EvaluateAggregate(
+                                projection.Expression,
+                                group,
+                                parameters,
+                                context,
+                                representative)
+                            : Evaluate(projection.Expression, parameters, representative, context))
+                        .ToArray());
+            }).ToList();
             if (statement.Having is not null)
             {
                 groupedRows.RemoveAll(group => !IsTrue(
                     hasAggregate
-                        ? EvaluateAggregate(statement.Having, group.Rows, parameters, context)
+                        ? EvaluateAggregate(
+                            statement.Having,
+                            group.Rows,
+                            parameters,
+                            context,
+                            group.Representative)
                         : Evaluate(statement.Having, parameters, group.Representative, context)));
             }
             if (statement.OrderBy.Count > 0)
@@ -7541,61 +7556,61 @@ public sealed class EmbeddedDatabase : IDisposable
         switch (source)
         {
             case NamedTableSource named when context.CommonTableExpressions.TryGetValue(named.Name, out var commonTableExpression):
-            {
-                var qualifier = named.Alias ?? named.Name;
-                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
-                    return null;
-
-                return column.Index < commonTableExpression.Columns.Length
-                    ? commonTableExpression.Collations?.ElementAtOrDefault(column.Index)
-                    : null;
-            }
-            case NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table):
-            {
-                var qualifier = named.Alias ?? named.Name;
-                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
-                    return null;
-
-                for (var index = 0; index < table.Columns.Length; index++)
                 {
-                    if (string.Equals(table.Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
-                        return table.ColumnDefinitions[index].Collation;
+                    var qualifier = named.Alias ?? named.Name;
+                    if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                        return null;
+
+                    return column.Index < commonTableExpression.Columns.Length
+                        ? commonTableExpression.Collations?.ElementAtOrDefault(column.Index)
+                        : null;
                 }
+            case NamedTableSource named when context.Tables.TryGetValue(named.Name, out var table):
+                {
+                    var qualifier = named.Alias ?? named.Name;
+                    if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                        return null;
 
-                return null;
-            }
+                    for (var index = 0; index < table.Columns.Length; index++)
+                    {
+                        if (string.Equals(table.Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
+                            return table.ColumnDefinitions[index].Collation;
+                    }
+
+                    return null;
+                }
             case NamedTableSource named when TryGetView(context, named.Name, out var view):
-            {
-                var qualifier = named.Alias ?? view.Name;
-                if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
-                    return null;
+                {
+                    var qualifier = named.Alias ?? view.Name;
+                    if (!string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase))
+                        return null;
 
-                var viewContext = EnterView(context, view.Name);
-                var columns = ResolveViewColumns(view, viewContext);
-                return column.Index >= columns.Length
-                    ? null
-                    : GetQueryOutputCollations(view.Query, viewContext).ElementAtOrDefault(column.Index);
-            }
+                    var viewContext = EnterView(context, view.Name);
+                    var columns = ResolveViewColumns(view, viewContext);
+                    return column.Index >= columns.Length
+                        ? null
+                        : GetQueryOutputCollations(view.Query, viewContext).ElementAtOrDefault(column.Index);
+                }
             case DerivedTableSource derived:
-            {
-                if (!string.Equals(column.Qualifier, derived.Alias, StringComparison.OrdinalIgnoreCase))
-                    return null;
+                {
+                    if (!string.Equals(column.Qualifier, derived.Alias, StringComparison.OrdinalIgnoreCase))
+                        return null;
 
-                var columns = DescribeQuery(derived.Query, context);
-                return column.Index >= columns.Length
-                    ? null
-                    : GetQueryOutputCollations(derived.Query, context).ElementAtOrDefault(column.Index);
-            }
+                    var columns = DescribeQuery(derived.Query, context);
+                    return column.Index >= columns.Length
+                        ? null
+                        : GetQueryOutputCollations(derived.Query, context).ElementAtOrDefault(column.Index);
+                }
             case JoinTableSource join:
-            {
-                var leftWidth = GetSourceColumns(join.Left, context).Length;
-                return column.Index < leftWidth
-                    ? GetDeclaredOutputColumnCollation(join.Left, column, context)
-                    : GetDeclaredOutputColumnCollation(
-                        join.Right,
-                        column with { Index = column.Index - leftWidth },
-                        context);
-            }
+                {
+                    var leftWidth = GetSourceColumns(join.Left, context).Length;
+                    return column.Index < leftWidth
+                        ? GetDeclaredOutputColumnCollation(join.Left, column, context)
+                        : GetDeclaredOutputColumnCollation(
+                            join.Right,
+                            column with { Index = column.Index - leftWidth },
+                            context);
+                }
             default:
                 return null;
         }
@@ -10405,7 +10420,9 @@ public sealed class EmbeddedDatabase : IDisposable
             FunctionExpression function when function.Window is not null => false,
             FunctionExpression function when IsBuiltInAggregate(function) => true,
             FunctionExpression function => IsManagedPercentileAggregate(function.Name)
-                || TryGetAggregateFunction(function.Name, function.Arguments.Count, out _),
+                || TryGetAggregateFunction(function.Name, function.Arguments.Count, out _)
+                || function.Arguments.Any(ContainsAggregate),
+            UnaryExpression unary => ContainsAggregate(unary.Operand),
             BinaryExpression binary => ContainsAggregate(binary.Left) || ContainsAggregate(binary.Right),
             CollationExpression collation => ContainsAggregate(collation.Expression),
             CastExpression cast => ContainsAggregate(cast.Expression),
@@ -10453,11 +10470,97 @@ public sealed class EmbeddedDatabase : IDisposable
         };
     }
 
+    private SourceRow? GetAggregateRepresentative(
+        SelectStatement statement,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (rows.Count == 0)
+            return null;
+
+        FunctionExpression? controllingExtremum = null;
+        foreach (var projection in statement.Projections)
+            controllingExtremum = FindLastExtremumAggregate(projection.Expression) ?? controllingExtremum;
+        foreach (var term in statement.OrderBy)
+            controllingExtremum = FindLastExtremumAggregate(term.Expression) ?? controllingExtremum;
+        if (statement.Having is not null)
+            controllingExtremum = FindLastExtremumAggregate(statement.Having) ?? controllingExtremum;
+
+        if (controllingExtremum is null)
+            return rows[0];
+
+        var effectiveRows = ApplyAggregateModifiers(controllingExtremum, rows, parameters, context);
+        if (effectiveRows.Count == 0)
+            return rows[0];
+
+        var maximum = controllingExtremum.Name == "MAX";
+        var extreme = SqlValue.Null;
+        SourceRow? representative = null;
+        foreach (var row in effectiveRows)
+        {
+            var value = Evaluate(controllingExtremum.Arguments[0], parameters, row, context);
+            if (value.Kind == SqlValueKind.Null)
+                continue;
+
+            if (representative is null
+                || (maximum ? Compare(value, extreme) > 0 : Compare(value, extreme) < 0))
+            {
+                extreme = value;
+                representative = row;
+            }
+        }
+
+        // SQLite visits every row for an all-NULL min/max and leaves the final row selected.
+        return representative ?? effectiveRows[^1];
+    }
+
+    private static FunctionExpression? FindLastExtremumAggregate(Expression? expression)
+    {
+        return expression switch
+        {
+            FunctionExpression { Window: null, Name: "MIN" or "MAX", Arguments.Count: 1 } function
+                => function,
+            FunctionExpression { Window: null } function => function.Arguments
+                .Reverse()
+                .Select(FindLastExtremumAggregate)
+                .FirstOrDefault(aggregate => aggregate is not null),
+            UnaryExpression unary => FindLastExtremumAggregate(unary.Operand),
+            BinaryExpression binary => FindLastExtremumAggregate(binary.Right)
+                ?? FindLastExtremumAggregate(binary.Left),
+            CollationExpression collation => FindLastExtremumAggregate(collation.Expression),
+            CastExpression cast => FindLastExtremumAggregate(cast.Expression),
+            CaseExpression @case => FindLastExtremumAggregate(@case.Else)
+                ?? @case.Clauses
+                    .Reverse()
+                    .Select(clause => FindLastExtremumAggregate(clause.Then)
+                        ?? FindLastExtremumAggregate(clause.When))
+                    .FirstOrDefault(function => function is not null)
+                ?? FindLastExtremumAggregate(@case.Operand),
+            LikeExpression like => FindLastExtremumAggregate(like.Escape)
+                ?? FindLastExtremumAggregate(like.Pattern)
+                ?? FindLastExtremumAggregate(like.Value),
+            GlobExpression glob => FindLastExtremumAggregate(glob.Pattern)
+                ?? FindLastExtremumAggregate(glob.Value),
+            InExpression @in => @in.Values
+                    .Reverse()
+                    .Select(FindLastExtremumAggregate)
+                    .FirstOrDefault(function => function is not null)
+                ?? FindLastExtremumAggregate(@in.Value),
+            InSubqueryExpression @in => FindLastExtremumAggregate(@in.Value),
+            BetweenExpression between => FindLastExtremumAggregate(between.Upper)
+                ?? FindLastExtremumAggregate(between.Lower)
+                ?? FindLastExtremumAggregate(between.Value),
+            _ => null,
+        };
+    }
+
     private SqlValue EvaluateAggregate(
         Expression expression,
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        SourceRow? representative = null)
     {
         return expression switch
         {
@@ -10468,39 +10571,67 @@ public sealed class EmbeddedDatabase : IDisposable
                 => EvaluateAggregateFunction(function, rows, parameters, context),
             FunctionExpression function when TryGetAggregateFunction(function.Name, function.Arguments.Count, out _)
                 => EvaluateAggregateFunction(function, rows, parameters, context),
+            FunctionExpression function => EvaluateScalarFunction(
+                function with
+                {
+                    Arguments = function.Arguments
+                        .Select(argument => new LiteralExpression(
+                            EvaluateAggregate(argument, rows, parameters, context, representative)))
+                        .ToArray(),
+                },
+                parameters,
+                representative,
+                context),
+            UnaryExpression unary => unary.Operator switch
+            {
+                UnaryOperator.Not => EvaluateAggregate(unary.Operand, rows, parameters, context, representative) is var value
+                    && value.Kind == SqlValueKind.Null
+                        ? SqlValue.Null
+                        : SqlValue.Integer(IsTrue(value) ? 0 : 1),
+                _ => throw new EmbeddedSqlException($"Unsupported unary operator {unary.Operator}."),
+            },
             BinaryExpression binary => EvaluateBinaryValues(
                 binary.Operator,
-                EvaluateAggregate(binary.Left, rows, parameters, context),
-                EvaluateAggregate(binary.Right, rows, parameters, context)),
-            CollationExpression collation => EvaluateAggregate(collation.Expression, rows, parameters, context),
-            CastExpression cast => CastValue(EvaluateAggregate(cast.Expression, rows, parameters, context), cast.TypeName),
-            CaseExpression @case => EvaluateAggregateCase(@case, rows, parameters, context),
+                EvaluateAggregate(binary.Left, rows, parameters, context, representative),
+                EvaluateAggregate(binary.Right, rows, parameters, context, representative)),
+            CollationExpression collation
+                => EvaluateAggregate(collation.Expression, rows, parameters, context, representative),
+            CastExpression cast => CastValue(
+                EvaluateAggregate(cast.Expression, rows, parameters, context, representative),
+                cast.TypeName),
+            CaseExpression @case => EvaluateAggregateCase(@case, rows, parameters, context, representative),
             LikeExpression like => EvaluateLikeValues(
-                EvaluateAggregate(like.Value, rows, parameters, context),
-                EvaluateAggregate(like.Pattern, rows, parameters, context),
-                like.Escape is null ? null : EvaluateAggregate(like.Escape, rows, parameters, context),
+                EvaluateAggregate(like.Value, rows, parameters, context, representative),
+                EvaluateAggregate(like.Pattern, rows, parameters, context, representative),
+                like.Escape is null
+                    ? null
+                    : EvaluateAggregate(like.Escape, rows, parameters, context, representative),
                 like.Negated),
             GlobExpression glob => EvaluateGlobValues(
-                EvaluateAggregate(glob.Value, rows, parameters, context),
-                EvaluateAggregate(glob.Pattern, rows, parameters, context),
+                EvaluateAggregate(glob.Value, rows, parameters, context, representative),
+                EvaluateAggregate(glob.Pattern, rows, parameters, context, representative),
                 glob.Negated),
             InExpression @in => EvaluateInValues(
-                EvaluateAggregate(@in.Value, rows, parameters, context),
-                @in.Values.Select(value => EvaluateAggregate(value, rows, parameters, context)),
+                EvaluateAggregate(@in.Value, rows, parameters, context, representative),
+                @in.Values.Select(value => EvaluateAggregate(value, rows, parameters, context, representative)),
                 @in.Negated),
             InSubqueryExpression @in => EvaluateInSubquery(
-                @in with { Value = new LiteralExpression(EvaluateAggregate(@in.Value, rows, parameters, context)) },
+                @in with
+                {
+                    Value = new LiteralExpression(
+                        EvaluateAggregate(@in.Value, rows, parameters, context, representative)),
+                },
                 parameters,
-                rows.Count == 0 ? null : rows[0],
+                representative,
                 context),
             BetweenExpression between => EvaluateBetweenValues(
-                EvaluateAggregate(between.Value, rows, parameters, context),
-                EvaluateAggregate(between.Lower, rows, parameters, context),
-                EvaluateAggregate(between.Upper, rows, parameters, context),
+                EvaluateAggregate(between.Value, rows, parameters, context, representative),
+                EvaluateAggregate(between.Lower, rows, parameters, context, representative),
+                EvaluateAggregate(between.Upper, rows, parameters, context, representative),
                 between.Negated),
             _ => rows.Count == 0 && expression is ColumnExpression
                 ? SqlValue.Null
-                : Evaluate(expression, parameters, rows.Count == 0 ? null : rows[0], context),
+                : Evaluate(expression, parameters, representative ?? (rows.Count == 0 ? null : rows[0]), context),
         };
     }
 
@@ -10885,26 +11016,27 @@ public sealed class EmbeddedDatabase : IDisposable
         CaseExpression expression,
         IReadOnlyList<SourceRow> rows,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        SourceRow? representative)
     {
         var operand = expression.Operand is null
             ? (SqlValue?)null
-            : EvaluateAggregate(expression.Operand, rows, parameters, context);
+            : EvaluateAggregate(expression.Operand, rows, parameters, context, representative);
         foreach (var clause in expression.Clauses)
         {
-            var when = EvaluateAggregate(clause.When, rows, parameters, context);
+            var when = EvaluateAggregate(clause.When, rows, parameters, context, representative);
             var matches = operand is null
                 ? IsTrue(when)
                 : operand.Value.Kind != SqlValueKind.Null
                     && when.Kind != SqlValueKind.Null
                     && Compare(operand.Value, when) == 0;
             if (matches)
-                return EvaluateAggregate(clause.Then, rows, parameters, context);
+                return EvaluateAggregate(clause.Then, rows, parameters, context, representative);
         }
 
         return expression.Else is null
             ? SqlValue.Null
-            : EvaluateAggregate(expression.Else, rows, parameters, context);
+            : EvaluateAggregate(expression.Else, rows, parameters, context, representative);
     }
 
     private SqlValue EvaluateScalarFunction(
@@ -12768,10 +12900,20 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             var comparison = CompareForOrdering(
                 ContainsAggregate(term.Expression)
-                    ? EvaluateAggregate(term.Expression, left.Rows, parameters, context)
+                    ? EvaluateAggregate(
+                        term.Expression,
+                        left.Rows,
+                        parameters,
+                        context,
+                        left.Representative)
                     : Evaluate(term.Expression, parameters, left.Representative, context),
                 ContainsAggregate(term.Expression)
-                    ? EvaluateAggregate(term.Expression, right.Rows, parameters, context)
+                    ? EvaluateAggregate(
+                        term.Expression,
+                        right.Rows,
+                        parameters,
+                        context,
+                        right.Representative)
                     : Evaluate(term.Expression, parameters, right.Representative, context),
                 GetCollation(term.Expression));
             if (comparison == 0)
@@ -14905,21 +15047,21 @@ public sealed class EmbeddedDatabase : IDisposable
             switch (value.Kind)
             {
                 case SqlValueKind.Integer:
-                {
-                    var index = value.AsInteger();
-                    path = index >= 0
-                        ? $"$[{index}]"
-                        : $"$[#{index}]";
-                    return true;
-                }
+                    {
+                        var index = value.AsInteger();
+                        path = index >= 0
+                            ? $"$[{index}]"
+                            : $"$[#{index}]";
+                        return true;
+                    }
                 case SqlValueKind.Text:
-                {
-                    var nameOrPath = value.AsText();
-                    path = nameOrPath.Length == 0 || nameOrPath.StartsWith('$')
-                        ? nameOrPath
-                        : "$." + QuoteString(nameOrPath);
-                    return true;
-                }
+                    {
+                        var nameOrPath = value.AsText();
+                        path = nameOrPath.Length == 0 || nameOrPath.StartsWith('$')
+                            ? nameOrPath
+                            : "$." + QuoteString(nameOrPath);
+                        return true;
+                    }
                 default:
                     path = string.Empty;
                     return false;
