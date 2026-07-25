@@ -53,6 +53,8 @@ internal sealed class SqlParser
             return ParseAlterTable();
         if (ConsumeKeyword("INSERT"))
             return ParseInsert();
+        if (ConsumeKeyword("REPLACE"))
+            return ParseInsert(InsertConflictAlgorithm.Replace);
         if (ConsumeKeyword("UPDATE"))
             return ParseUpdate();
         if (ConsumeKeyword("DELETE"))
@@ -994,6 +996,8 @@ internal sealed class SqlParser
     {
         if (ConsumeKeyword("INSERT"))
             return ParseInsert();
+        if (ConsumeKeyword("REPLACE"))
+            return ParseInsert(InsertConflictAlgorithm.Replace);
         if (ConsumeKeyword("UPDATE"))
             return ParseUpdate();
         if (ConsumeKeyword("DELETE"))
@@ -1046,9 +1050,9 @@ internal sealed class SqlParser
         return text;
     }
 
-    private ParsedStatement ParseInsert()
+    private ParsedStatement ParseInsert(InsertConflictAlgorithm? impliedConflictAlgorithm = null)
     {
-        var conflictAlgorithm = ParseInsertConflictAlgorithm();
+        var conflictAlgorithm = impliedConflictAlgorithm ?? ParseInsertConflictAlgorithm();
         ExpectKeyword("INTO");
         var tableName = ParseSchemaQualifiedName();
         RejectQualifiedTriggerDmlTarget(tableName);
@@ -2280,6 +2284,12 @@ internal sealed class SqlParser
                 return new ParameterExpression(ResolveParameterIndex(token.Text));
             case TokenKind.Identifier:
                 _lexer.Next();
+                if (_inTriggerBody
+                    && string.Equals(token.Text, "RAISE", StringComparison.OrdinalIgnoreCase)
+                    && Consume(TokenKind.LeftParen))
+                {
+                    return ParseRaiseExpression();
+                }
                 if (Consume(TokenKind.Dot))
                 {
                     var columnName = ExpectIdentifier();

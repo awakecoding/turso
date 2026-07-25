@@ -2230,6 +2230,63 @@ public class EmbeddedEngineTests
     }
 
     [Test]
+    public void BeforeTriggerRunsForEveryInsertedRow()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TABLE log(id INTEGER);");
+        Execute(
+            connection,
+            "CREATE TRIGGER trg BEFORE INSERT ON t BEGIN INSERT INTO log VALUES (NEW.id); END;");
+        Execute(connection, "INSERT INTO t VALUES (1), (2);");
+
+        AssertCount(connection, "SELECT COUNT(*) FROM log;", 2);
+    }
+
+    [Test]
+    public void WhenClauseFiltersDistinctTriggerRowSet()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TABLE log(id INTEGER);");
+        Execute(
+            connection,
+            "CREATE TRIGGER trg AFTER INSERT ON t WHEN NEW.id = 2 BEGIN INSERT INTO log VALUES (NEW.id); END;");
+        Execute(connection, "INSERT INTO t VALUES (1), (2), (3);");
+
+        AssertCount(connection, "SELECT COUNT(*) FROM log;", 1);
+    }
+
+    [Test]
+    public void NewReferencesResolveForInsertedTriggerRows()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TABLE log(n INTEGER);");
+        Execute(
+            connection,
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.id); END;");
+        Execute(connection, "INSERT INTO t VALUES (7);");
+
+        ReadRows(connection, "SELECT n FROM log;").Single()[0].Should().Be(SqlValue.Integer(7));
+    }
+
+    [Test]
+    public void LiteralSelectTriggerBodyStatementIsAccepted()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER);");
+        Execute(connection, "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END;");
+        Execute(connection, "INSERT INTO t VALUES (1);");
+
+        AssertCount(connection, "SELECT COUNT(*) FROM t;", 1);
+    }
+
+    [Test]
     public void ParameterInTriggerBodyIsRejected()
     {
         var database = new EmbeddedDatabase();

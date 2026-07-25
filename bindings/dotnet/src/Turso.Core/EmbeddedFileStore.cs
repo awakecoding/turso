@@ -7536,6 +7536,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             || persisted.Event != trigger.Event
             || !SameColumnList(persisted.UpdateOfColumns, trigger.UpdateOfColumns)
             || !string.Equals(persisted.TableName, trigger.TableName, StringComparison.OrdinalIgnoreCase)
+            || (persisted.When is null) != (trigger.When is null)
             || persisted.Body.Count != trigger.Body.Count
             || !HaveSameStatementKinds(persisted.Body, trigger.Body))
         {

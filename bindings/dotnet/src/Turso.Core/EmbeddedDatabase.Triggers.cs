@@ -39,8 +39,44 @@ public sealed partial class EmbeddedDatabase
         }
     }
 
-    internal sealed record TriggerRowFrame(TriggerRowImage? Old, TriggerRowImage? New)
+    internal sealed record TriggerRowFrame
     {
+        public TriggerRowFrame(TriggerRowImage? Old, TriggerRowImage? New)
+        {
+            this.Old = Old;
+            this.New = New;
+        }
+
+        // The main evaluator's legacy no-row-trigger path still carries raw row arrays.
+        // Keeping that adapter here lets all trigger execution share one frame type.
+        public TriggerRowFrame(
+            SqlValue[]? OldRow,
+            long? OldRowId,
+            SqlValue[]? NewRow,
+            long? NewRowId)
+        {
+            this.OldRow = OldRow;
+            this.OldRowId = OldRowId;
+            this.NewRow = NewRow;
+            this.NewRowId = NewRowId;
+        }
+
+        public TriggerRowImage? Old { get; }
+
+        public TriggerRowImage? New { get; }
+
+        public SqlValue[]? OldRow { get; }
+
+        public long? OldRowId { get; }
+
+        public SqlValue[]? NewRow { get; }
+
+        public long? NewRowId { get; }
+
+        public static TriggerRowFrame Empty { get; } = new(null, null, null, null);
+
+        public bool IsEmpty => Old is null && New is null && OldRow is null && NewRow is null;
+
         public static bool IsTriggerQualifier(string? qualifier)
             => string.Equals(qualifier, "OLD", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(qualifier, "NEW", StringComparison.OrdinalIgnoreCase);
@@ -222,6 +258,7 @@ public sealed partial class EmbeddedDatabase
 
         var backup = CloneTables(context.Tables);
         var state = new TriggerStatementState(context.LastInsertRowId);
+        var initialLastInsertRowId = state.LiveLastInsertRowId;
         var triggerContext = context with { TriggerState = state };
         try
         {
@@ -232,6 +269,20 @@ public sealed partial class EmbeddedDatabase
         }
         catch (EmbeddedConflictFailException)
         {
+            throw;
+        }
+        catch (EmbeddedConflictRollbackException exception)
+        {
+            RestoreTables(context.Tables, backup);
+            throw new EmbeddedConflictRollbackException(
+                new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception),
+                state.LiveLastInsertRowId);
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            RestoreTables(context.Tables, backup);
+            if (state.LiveLastInsertRowId != initialLastInsertRowId)
+                throw new EmbeddedStatementAbortException(exception, state.LiveLastInsertRowId);
             throw;
         }
         catch
@@ -443,12 +494,6 @@ public sealed partial class EmbeddedDatabase
             throw new EmbeddedSqlException(
                 "Managed trigger UPDATE does not support an outer OR REPLACE conflict policy.");
         }
-        if (table.HasNonDefaultConflictAlgorithms && context.ConflictAlgorithmOverride is null)
-        {
-            throw new EmbeddedSqlException(
-                "Managed row triggers do not support UPDATE on tables with schema-level conflict algorithms.");
-        }
-
         var beforeTriggers = GetRowTriggers(
             context,
             statement.TableName,
@@ -1358,11 +1403,8 @@ public sealed partial class EmbeddedDatabase
         SqlValue[] parameters,
         QueryContext context)
     {
-        if (statement.ConflictAlgorithm is not null || statement.Upsert is not null || statement.Returning is not null)
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSTEAD OF INSERT triggers do not support conflict clauses, UPSERT, or RETURNING.");
-        }
+        if (statement.Upsert is not null)
+            throw new EmbeddedSqlException("cannot UPSERT a view");
         if (context.Views is null || !context.Views.TryGetValue(statement.TableName, out var view))
             throw new EmbeddedSqlException($"no such view: {statement.TableName}");
 
@@ -1399,6 +1441,8 @@ public sealed partial class EmbeddedDatabase
                 (IReadOnlyList<SqlValue>)row.Select(expression =>
                     Evaluate(expression, parameters, row: null, context)).ToArray()).ToArray()
             : sourceRows.Select(row => (IReadOnlyList<SqlValue>)row.ToArray()).ToArray();
+        var returningRows = new List<SqlValue[]>();
+        var outputColumns = BuildOutputColumns(statement.TableName, columns);
         foreach (var input in inputs)
         {
             if (input.Count != targetIndices.Length)
@@ -1413,10 +1457,36 @@ public sealed partial class EmbeddedDatabase
             var frame = new TriggerRowFrame(
                 Old: null,
                 new TriggerRowImage(columns, values, HasRowid: false, RowId: 0));
-            _ = FireRowTriggers(triggers, frame, context);
+            if (FireRowTriggers(triggers, frame, context))
+                continue;
+            if (statement.Returning is null)
+                continue;
+
+            var source = new SourceRow(
+                columns,
+                values,
+                BuildQualifiedColumns(statement.TableName, columns),
+                OutputColumns: outputColumns);
+            var output = new List<SqlValue>();
+            foreach (var projection in statement.Returning)
+            {
+                if (projection.Expression is QualifiedStarExpression)
+                    throw new EmbeddedSqlException("RETURNING may not use TABLE.* wildcards");
+                if (projection.Expression is StarExpression)
+                    output.AddRange(values);
+                else
+                    output.Add(Evaluate(projection.Expression, parameters, source, context));
+            }
+            returningRows.Add(output.ToArray());
         }
 
-        return new ExecutionResult([], [], 0, context.TriggerState!.Changed);
+        return new ExecutionResult(
+            statement.Returning is null
+                ? []
+                : GetColumnNames(statement.Returning, outputColumns, outputColumns),
+            returningRows,
+            0,
+            context.TriggerState!.Changed);
     }
 
     private ExecutionResult PerformInsteadOfUpdate(

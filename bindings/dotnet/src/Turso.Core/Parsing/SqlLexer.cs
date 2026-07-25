@@ -51,7 +51,12 @@ internal static class SqlScript
             }
             else
             {
-                header = AdvanceTriggerHeader(header, token, ref inTriggerBody, ref triggerBodyAtStatementStart);
+                header = AdvanceTriggerHeader(
+                    header,
+                    token,
+                    sql,
+                    ref inTriggerBody,
+                    ref triggerBodyAtStatementStart);
             }
 
             lexer.Next();
@@ -64,6 +69,7 @@ internal static class SqlScript
     private static TriggerHeader AdvanceTriggerHeader(
         TriggerHeader header,
         SqlToken token,
+        string sql,
         ref bool inTriggerBody,
         ref bool triggerBodyAtStatementStart)
     {
@@ -116,6 +122,12 @@ internal static class SqlScript
             && token.Text.Equals(keyword, StringComparison.OrdinalIgnoreCase);
 
     private static bool IsIdentifier(SqlToken token) => token.Kind == TokenKind.Identifier;
+
+    private static bool IsQuotedIdentifier(string sql, SqlToken token)
+        => token.Offset < sql.Length && sql[token.Offset] is '"' or '[' or '`';
+
+    private static bool IsTriggerEvent(SqlToken token)
+        => IsKeyword(token, "INSERT") || IsKeyword(token, "UPDATE") || IsKeyword(token, "DELETE");
 
     private enum TriggerHeader
     {
