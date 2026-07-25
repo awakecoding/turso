@@ -1131,14 +1131,16 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, EmbeddedTable> tables,
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
-        PragmaHeaderMetadata? pragmaHeader = null)
+        PragmaHeaderMetadata? pragmaHeader = null,
+        bool forceFullRewrite = false)
         => PersistCore(
             tables,
             views,
             triggers,
             reclaimTrailingPages: false,
             incrementSchemaCookie: false,
-            pragmaHeader);
+            pragmaHeader,
+            forceFullRewrite);
 
     internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
 
@@ -1157,7 +1159,43 @@ internal sealed class EmbeddedFileStore : IDisposable
             catalog.Triggers,
             reclaimTrailingPages: true,
             incrementSchemaCookie: true,
-            pragmaHeader: null);
+            pragmaHeader: null,
+            forceFullRewrite: true);
+    }
+
+    internal FileCatalogVersion UpdatePragmaHeader(PragmaHeaderMetadata metadata)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+
+        var pageOne = _pager.ReadCommittedPage(SchemaRootPage);
+        var current = SqliteDatabaseHeader.Parse(pageOne);
+        if (unchecked((int)current.SchemaCookie) == metadata.SchemaVersion
+            && current.UserVersion == metadata.UserVersion
+            && current.ApplicationId == metadata.ApplicationId)
+        {
+            return CommittedCatalogVersion;
+        }
+
+        var changeCounter = unchecked(current.ChangeCounter + 1);
+        var updated = current with
+        {
+            ChangeCounter = changeCounter,
+            VersionValidFor = changeCounter,
+            SchemaCookie = unchecked((uint)metadata.SchemaVersion),
+            UserVersion = metadata.UserVersion,
+            ApplicationId = metadata.ApplicationId,
+        };
+        updated.WriteTo(pageOne);
+        using (var transaction = _pager.BeginTransaction(_pager.CommittedPageCount))
+        {
+            transaction.WritePage(SchemaRootPage, pageOne);
+            transaction.Commit();
+        }
+
+        _header = updated;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
+        return CommittedCatalogVersion;
     }
 
     internal SqliteJournalMode JournalMode => _pager.JournalMode;
@@ -1355,7 +1393,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
         bool reclaimTrailingPages,
         bool incrementSchemaCookie,
-        PragmaHeaderMetadata? pragmaHeader)
+        PragmaHeaderMetadata? pragmaHeader,
+        bool forceFullRewrite)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1366,7 +1405,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
         ValidateSchemaDefinitions(tables, views, triggers);
 
-        if (!reclaimTrailingPages
+        if (!forceFullRewrite
+            && !reclaimTrailingPages
             && pragmaHeader is null
             && TryPersistBoundedTableLeafMutation(tables, views, triggers))
         {

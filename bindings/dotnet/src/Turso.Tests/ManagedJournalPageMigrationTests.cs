@@ -315,7 +315,7 @@ public sealed class ManagedJournalPageMigrationTests
     }
 
     [Test]
-    public void FormatTransitionsRejectTransactionsAndJournalModeAttachmentsWhileVacuumTargetsSchemas()
+    public void FormatTransitionsRejectTransactionsAndTargetAttachedSchemasIndependently()
     {
         var fileSystem = new InMemoryFileSystem();
         using var database = EmbeddedDatabase.OpenFile("transition-busy.db", fileSystem);
@@ -329,10 +329,13 @@ public sealed class ManagedJournalPageMigrationTests
         Execute(connection, "ROLLBACK;");
 
         Execute(connection, "ATTACH 'attached.db' AS other;");
-        Assert.Throws<EmbeddedSqlException>(() => ReadValue(connection, "PRAGMA journal_mode=DELETE;"))!
-            .Message.Should().Contain("attached databases");
-        Execute(connection, "VACUUM main;");
+        ReadValue(connection, "PRAGMA other.journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
+        ReadValue(connection, "PRAGMA main.journal_mode;").Should().Be(SqlValue.Text("wal"));
+        Execute(connection, "PRAGMA other.page_size=1024;");
         Execute(connection, "VACUUM other;");
+        ReadValue(connection, "PRAGMA other.page_size;").Should().Be(SqlValue.Integer(1024));
+        ReadValue(connection, "PRAGMA main.journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
+        Execute(connection, "VACUUM main;");
     }
 
     [Test]
@@ -430,6 +433,8 @@ public sealed class ManagedJournalPageMigrationTests
             using (var database = EmbeddedDatabase.OpenFile(path))
             using (var connection = database.Connect())
             {
+                ReadValue(connection, "PRAGMA encoding;").Should().Be(SqlValue.Text("UTF-16le"));
+                ReadValue(connection, "PRAGMA temp.encoding;").Should().Be(SqlValue.Text("UTF-16le"));
                 Execute(connection, "PRAGMA page_size=8192; VACUUM;");
                 ReadValue(connection, "SELECT value FROM data;").Should().Be(SqlValue.Text("héllo"));
             }
