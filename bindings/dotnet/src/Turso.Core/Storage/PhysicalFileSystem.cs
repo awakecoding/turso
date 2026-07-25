@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
 namespace Turso.Core.Storage;
@@ -7,8 +9,10 @@ namespace Turso.Core.Storage;
 /// use an OS handle with positional <see cref="RandomAccess"/> I/O, which is
 /// safe for concurrent offset-addressed reads and writes on a single handle.
 /// </summary>
-public sealed class PhysicalFileSystem : IFileSystem
+public sealed partial class PhysicalFileSystem : IFileSystem, IAtomicFileSystem
 {
+    private const uint ReplaceFileWriteThrough = 0x00000001;
+
     /// <summary>A shared, stateless instance.</summary>
     public static PhysicalFileSystem Instance { get; } = new();
 
@@ -48,13 +52,102 @@ public sealed class PhysicalFileSystem : IFileSystem
         ArgumentException.ThrowIfNullOrEmpty(path);
         File.Delete(path);
     }
+
+    void IAtomicFileSystem.ReplaceFileAtomically(
+        string sourcePath,
+        string destinationPath,
+        bool replaceEmptyDestination)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sourcePath);
+        ArgumentException.ThrowIfNullOrEmpty(destinationPath);
+        var source = Path.GetFullPath(sourcePath);
+        var destination = Path.GetFullPath(destinationPath);
+        var pathComparer = OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+        if (pathComparer.Equals(source, destination))
+            throw new IOException("Atomic file replacement requires distinct source and destination paths.");
+        if (!File.Exists(source))
+            throw new FileNotFoundException("The atomic replacement source does not exist.", source);
+
+        if (!File.Exists(destination))
+        {
+            File.Move(source, destination);
+            return;
+        }
+
+        if (!replaceEmptyDestination)
+            throw new IOException("output file already exists");
+        using var destinationReservation = new FileStream(
+            destination,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 1,
+            FileOptions.None);
+        if (OperatingSystem.IsWindows())
+        {
+            destinationReservation.Lock(0, 1);
+            try
+            {
+                if (destinationReservation.Length != 0)
+                    throw new IOException("output file already exists");
+                if (ReplaceFile(
+                        destination,
+                        source,
+                        backupFileName: null,
+                        ReplaceFileWriteThrough,
+                        IntPtr.Zero,
+                        IntPtr.Zero) == 0)
+                {
+                    throw new Win32Exception(Marshal.GetLastPInvokeError());
+                }
+            }
+            finally
+            {
+                destinationReservation.Unlock(0, 1);
+            }
+            return;
+        }
+        if (OperatingSystem.IsLinux())
+        {
+            destinationReservation.Lock(0, 1);
+            try
+            {
+                if (destinationReservation.Length != 0)
+                    throw new IOException("output file already exists");
+                File.Move(source, destination, overwrite: true);
+            }
+            finally
+            {
+                destinationReservation.Unlock(0, 1);
+            }
+            return;
+        }
+
+        throw new PlatformNotSupportedException(
+            "Atomic replacement of an existing empty destination is supported only on Windows and Linux.");
+    }
+
+    [LibraryImport(
+        "kernel32.dll",
+        EntryPoint = "ReplaceFileW",
+        StringMarshalling = StringMarshalling.Utf16,
+        SetLastError = true)]
+    private static partial int ReplaceFile(
+        string replacedFileName,
+        string replacementFileName,
+        string? backupFileName,
+        uint replaceFlags,
+        IntPtr exclude,
+        IntPtr reserved);
 }
 
 /// <summary>
 /// Gives <see cref="SqlitePager"/> its required shared data handles without
 /// weakening the default sharing policy for direct page-store users.
 /// </summary>
-internal sealed class SqlitePagerPhysicalFileSystem(PhysicalFileSystem fileSystem) : IFileSystem
+internal sealed class SqlitePagerPhysicalFileSystem(PhysicalFileSystem fileSystem) : IFileSystem, IAtomicFileSystem
 {
     public bool FileExists(string path) => fileSystem.FileExists(path);
 
@@ -62,6 +155,15 @@ internal sealed class SqlitePagerPhysicalFileSystem(PhysicalFileSystem fileSyste
         => fileSystem.OpenPagerFile(path, mode, readOnly);
 
     public void DeleteFile(string path) => fileSystem.DeleteFile(path);
+
+    void IAtomicFileSystem.ReplaceFileAtomically(
+        string sourcePath,
+        string destinationPath,
+        bool replaceEmptyDestination)
+        => ((IAtomicFileSystem)fileSystem).ReplaceFileAtomically(
+            sourcePath,
+            destinationPath,
+            replaceEmptyDestination);
 }
 
 /// <summary>

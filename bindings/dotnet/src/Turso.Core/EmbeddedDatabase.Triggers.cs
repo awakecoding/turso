@@ -293,7 +293,7 @@ public sealed partial class EmbeddedDatabase
                 TriggerEvent.Delete,
                 beforeDelete.Concat(afterDelete));
         }
-        var plan = PrepareInsert(statement, table);
+        var plan = PrepareInsert(statement, table, context);
         var sourceRows = statement.Source is null
             ? null
             : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
@@ -320,7 +320,8 @@ public sealed partial class EmbeddedDatabase
                 context,
                 allowExistingRowid: true,
                 validateCheckConstraints: false,
-                resolveNotNullReplace: false);
+                resolveNotNullReplace: false,
+                deferRowidTracking: true);
             var automaticRowId = UsesAutomaticRowId(table, plan, values);
             var beforeFrame = new TriggerRowFrame(
                 Old: null,
@@ -332,6 +333,8 @@ public sealed partial class EmbeddedDatabase
             }
             if (automaticRowId)
                 rowId = FinalizeAutomaticRowId(statement.TableName, table, plan, row, parameters, context);
+            else if (table.HasRowid)
+                FinalizeExplicitRowId(plan, rowId);
 
             var replacementAttempted = false;
             try
@@ -463,7 +466,7 @@ public sealed partial class EmbeddedDatabase
             statement.TableName,
             TriggerEvent.Update,
             beforeTriggers.Concat(afterTriggers));
-        var plan = PrepareUpdate(statement, table);
+        var plan = PrepareUpdate(statement, table, context);
         var selectedPositions = statement.Limit is null
             ? null
             : SelectLimitedDmlPositions(
@@ -709,7 +712,6 @@ public sealed partial class EmbeddedDatabase
         table.ValidateRows(tableName, [candidate]);
         ValidatePrimaryKey(tableName, table, [candidate]);
         var conflicts = FindReplacementConflicts(table, candidate, candidateRowId)
-            .OrderBy(position => position)
             .Select(position => CaptureTriggerRowIdentity(table, position))
             .ToArray();
         foreach (var identity in conflicts)
@@ -864,7 +866,9 @@ public sealed partial class EmbeddedDatabase
         QueryContext context)
     {
         ResetInsertPlan(table, plan);
-        var rowId = plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1;
+        var rowId = plan.AutoIncrement is null
+            ? plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1
+            : plan.AutoIncrement.NextRowId(plan.AnyRow, plan.LargestRowId);
         plan.Used.Add(rowId);
         plan.AnyRow = true;
         if (rowId > plan.LargestRowId)
@@ -881,6 +885,15 @@ public sealed partial class EmbeddedDatabase
         plan.Used.UnionWith(table.RowIds);
         plan.AnyRow = table.RowIds.Count > 0;
         plan.LargestRowId = plan.AnyRow ? table.RowIds.Max() : long.MinValue;
+    }
+
+    private static void FinalizeExplicitRowId(InsertPlan plan, long rowId)
+    {
+        plan.AutoIncrement?.Observe(rowId);
+        plan.Used.Add(rowId);
+        if (!plan.AnyRow || rowId > plan.LargestRowId)
+            plan.LargestRowId = rowId;
+        plan.AnyRow = true;
     }
 
     private IReadOnlyList<TriggerRowIdentity> CaptureTriggerRowIdentities(
@@ -979,8 +992,8 @@ public sealed partial class EmbeddedDatabase
         var conflictTarget = ResolveUpsertConflictTarget(
             statement.TableName,
             table,
-            statement.Upsert.Target);
-        var insertPlan = PrepareInsert(statement, table);
+            statement.Upsert);
+        var insertPlan = PrepareInsert(statement, table, context);
         var updateAction = statement.Upsert.Action as DoUpdateUpsertAction;
         var doUpdateContext = context with
         {
@@ -998,7 +1011,7 @@ public sealed partial class EmbeddedDatabase
                 statement.TableName,
                 updateAction.Assignments,
                 Where: null);
-            updatePlan = PrepareUpdate(updateStatement, table);
+            updatePlan = PrepareUpdate(updateStatement, table, doUpdateContext);
             if (updatePlan.RowidAssignment is not null
                 || updatePlan.ColumnAssignments.Any(
                     assignment => assignment.Index == table.RowidAliasColumnIndex))
@@ -1078,7 +1091,8 @@ public sealed partial class EmbeddedDatabase
                 context,
                 allowExistingRowid: true,
                 validateCheckConstraints: false,
-                resolveNotNullReplace: false);
+                resolveNotNullReplace: false,
+                deferRowidTracking: true);
             var automaticRowId = UsesAutomaticRowId(table, insertPlan, values);
             var beforeInsertFrame = new TriggerRowFrame(
                 Old: null,
@@ -1104,6 +1118,10 @@ public sealed partial class EmbeddedDatabase
                     parameters,
                     context);
             }
+            else if (table.HasRowid)
+            {
+                FinalizeExplicitRowId(insertPlan, candidateRowId);
+            }
 
             try
             {
@@ -1127,6 +1145,7 @@ public sealed partial class EmbeddedDatabase
                 continue;
             }
             var conflictPosition = FindUpsertConflictPosition(
+                table,
                 conflictTarget,
                 candidate,
                 table.Rows);
@@ -1554,9 +1573,7 @@ public sealed partial class EmbeddedDatabase
 
         foreach (var trigger in programs)
         {
-            ValidateTriggerExpression(trigger.When, triggerEvent, columns, hasRowid);
-            foreach (var statement in trigger.Body)
-                ValidateTriggerStatement(statement, triggerEvent, columns, hasRowid);
+            ValidateTriggerSchema(trigger, context, context.CancellationToken);
         }
     }
 
@@ -1582,6 +1599,22 @@ public sealed partial class EmbeddedDatabase
         }
     }
 
+    private bool HasForeignKeyActionTriggers(
+        QueryContext context,
+        string parentTableName,
+        TriggerEvent parentEvent,
+        IReadOnlySet<string>? parentUpdatedColumns = null)
+    {
+        if (!context.ForeignKeysEnabled)
+            return false;
+        var root = new TriggerMutationEdge(
+            parentTableName,
+            parentEvent,
+            parentUpdatedColumns);
+        return GetTransitiveForeignKeyActionMutationEdges(context, root)
+            .Any(mutation => GetMutationEdgeTriggers(context, mutation).Any());
+    }
+
     private void ValidateTriggerBodyTargets(
         QueryContext context,
         IEnumerable<TriggerDefinition> triggers)
@@ -1594,14 +1627,21 @@ public sealed partial class EmbeddedDatabase
                 switch (statement)
                 {
                     case InsertStatement insert when context.Tables.TryGetValue(insert.TableName, out var insertTable):
-                        _ = PrepareInsert(insert, insertTable);
+                        _ = PrepareInsert(insert, insertTable, context);
+                        if (insert.Upsert is not null)
+                        {
+                            _ = ResolveUpsertConflictTarget(
+                                insert.TableName,
+                                insertTable,
+                                insert.Upsert);
+                        }
                         break;
                     case InsertStatement insert when context.Views?.ContainsKey(insert.TableName) == true:
                         break;
                     case InsertStatement insert:
                         throw new EmbeddedSqlException($"no such table: {insert.TableName}");
                     case UpdateStatement update when context.Tables.TryGetValue(update.TableName, out var updateTable):
-                        _ = PrepareUpdate(update, updateTable);
+                        _ = PrepareUpdate(update, updateTable, context);
                         break;
                     case UpdateStatement update when context.Views?.ContainsKey(update.TableName) == true:
                         break;
@@ -1642,6 +1682,20 @@ public sealed partial class EmbeddedDatabase
                         ValidateTriggerExpressionSources(context, assignment.Value, commonTableExpressions);
                     ValidateTriggerExpressionSources(context, upsertUpdate.Where, commonTableExpressions);
                 }
+                if (insert.Upsert is { } upsert)
+                {
+                    foreach (var target in upsert.Target)
+                    {
+                        ValidateTriggerExpressionSources(
+                            context,
+                            target.Expression,
+                            commonTableExpressions);
+                    }
+                    ValidateTriggerExpressionSources(
+                        context,
+                        upsert.TargetWhere,
+                        commonTableExpressions);
+                }
                 break;
             case UpdateStatement update:
                 foreach (var expression in update.Assignments.Select(assignment => assignment.Value)
@@ -1674,6 +1728,19 @@ public sealed partial class EmbeddedDatabase
                              .Append(select.Offset))
                 {
                     ValidateTriggerExpressionSources(context, expression, commonTableExpressions);
+                }
+                foreach (var window in select.NamedWindows)
+                {
+                    foreach (var expression in window.Specification.PartitionBy
+                                 .Concat(window.Specification.OrderBy.Select(term => term.Expression))
+                                 .Append(window.Specification.Frame?.Start.Offset)
+                                 .Append(window.Specification.Frame?.End.Offset))
+                    {
+                        ValidateTriggerExpressionSources(
+                            context,
+                            expression,
+                            commonTableExpressions);
+                    }
                 }
                 break;
             case ValuesClause values:
@@ -1784,6 +1851,13 @@ public sealed partial class EmbeddedDatabase
                     }
                 }
                 yield break;
+            case RowValueExpression rowValue:
+                foreach (var value in rowValue.Values)
+                {
+                    foreach (var nested in EnumerateExpressionQueries(value))
+                        yield return nested;
+                }
+                yield break;
             case CollationExpression collation:
                 expression = collation.Expression;
                 break;
@@ -1870,6 +1944,13 @@ public sealed partial class EmbeddedDatabase
                         foreach (var column in EnumerateTriggerColumnExpressions(child))
                             yield return column;
                     }
+                }
+                yield break;
+            case RowValueExpression rowValue:
+                foreach (var value in rowValue.Values)
+                {
+                    foreach (var column in EnumerateTriggerColumnExpressions(value))
+                        yield return column;
                 }
                 yield break;
             case CollationExpression collation:
@@ -1964,11 +2045,14 @@ public sealed partial class EmbeddedDatabase
         QueryContext context,
         TriggerMutationEdge mutation,
         string targetName,
-        HashSet<(string TableName, TriggerEvent Event)> visited)
+        HashSet<(string TableName, TriggerEvent Event, string Columns)> visited)
     {
         if (string.Equals(mutation.TableName, targetName, StringComparison.OrdinalIgnoreCase))
             return true;
-        var key = (mutation.TableName.ToUpperInvariant(), mutation.Event);
+        var key = (
+            mutation.TableName.ToUpperInvariant(),
+            mutation.Event,
+            GetMutationColumnKey(mutation.UpdatedColumns));
         if (!visited.Add(key))
             return false;
         foreach (var action in GetForeignKeyActionMutationEdges(context, mutation))
@@ -2121,11 +2205,14 @@ public sealed partial class EmbeddedDatabase
     {
         var pending = new Queue<TriggerMutationEdge>(
             GetForeignKeyActionMutationEdges(context, root));
-        var visited = new HashSet<(string TableName, TriggerEvent Event)>();
+        var visited = new HashSet<(string TableName, TriggerEvent Event, string Columns)>();
         while (pending.Count > 0)
         {
             var mutation = pending.Dequeue();
-            var key = (mutation.TableName.ToUpperInvariant(), mutation.Event);
+            var key = (
+                mutation.TableName.ToUpperInvariant(),
+                mutation.Event,
+                GetMutationColumnKey(mutation.UpdatedColumns));
             if (!visited.Add(key))
                 continue;
             yield return mutation;
@@ -2133,6 +2220,15 @@ public sealed partial class EmbeddedDatabase
                 pending.Enqueue(nested);
         }
     }
+
+    private static string GetMutationColumnKey(IReadOnlySet<string>? columns)
+        => columns is null
+            ? string.Empty
+            : string.Join(
+                "\u001f",
+                columns
+                    .Select(column => column.ToUpperInvariant())
+                    .OrderBy(column => column, StringComparer.Ordinal));
 
     private static IEnumerable<TriggerDefinition> GetMutationEdgeTriggers(
         QueryContext context,
@@ -2252,6 +2348,12 @@ public sealed partial class EmbeddedDatabase
                         ValidateTriggerExpression(assignment.Value, triggerEvent, columns, hasRowid);
                     ValidateTriggerExpression(upsertUpdate.Where, triggerEvent, columns, hasRowid);
                 }
+                if (insert.Upsert is { } upsert)
+                {
+                    foreach (var target in upsert.Target)
+                        ValidateTriggerExpression(target.Expression, triggerEvent, columns, hasRowid);
+                    ValidateTriggerExpression(upsert.TargetWhere, triggerEvent, columns, hasRowid);
+                }
                 ValidateTriggerProjections(insert.Returning, triggerEvent, columns, hasRowid);
                 break;
             case UpdateStatement update:
@@ -2295,6 +2397,14 @@ public sealed partial class EmbeddedDatabase
                 foreach (var expression in select.GroupBy)
                     ValidateTriggerExpression(expression, triggerEvent, columns, hasRowid);
                 ValidateTriggerExpression(select.Having, triggerEvent, columns, hasRowid);
+                foreach (var window in select.NamedWindows)
+                {
+                    ValidateTriggerWindow(
+                        window.Specification,
+                        triggerEvent,
+                        columns,
+                        hasRowid);
+                }
                 foreach (var term in select.OrderBy)
                     ValidateTriggerExpression(term.Expression, triggerEvent, columns, hasRowid);
                 ValidateTriggerExpression(select.Limit, triggerEvent, columns, hasRowid);
@@ -2321,6 +2431,20 @@ public sealed partial class EmbeddedDatabase
                 ValidateTriggerQuery(with.Query, triggerEvent, columns, hasRowid);
                 return;
         }
+    }
+
+    private void ValidateTriggerWindow(
+        WindowSpecification window,
+        TriggerEvent triggerEvent,
+        string[] columns,
+        bool hasRowid)
+    {
+        foreach (var expression in window.PartitionBy)
+            ValidateTriggerExpression(expression, triggerEvent, columns, hasRowid);
+        foreach (var term in window.OrderBy)
+            ValidateTriggerExpression(term.Expression, triggerEvent, columns, hasRowid);
+        ValidateTriggerExpression(window.Frame?.Start.Offset, triggerEvent, columns, hasRowid);
+        ValidateTriggerExpression(window.Frame?.End.Offset, triggerEvent, columns, hasRowid);
     }
 
     private void ValidateTriggerSource(
@@ -2410,6 +2534,10 @@ public sealed partial class EmbeddedDatabase
                     ValidateTriggerExpression(function.Window.Frame?.Start.Offset, triggerEvent, columns, hasRowid);
                     ValidateTriggerExpression(function.Window.Frame?.End.Offset, triggerEvent, columns, hasRowid);
                 }
+                return;
+            case RowValueExpression rowValue:
+                foreach (var value in rowValue.Values)
+                    ValidateTriggerExpression(value, triggerEvent, columns, hasRowid);
                 return;
             case ScalarSubqueryExpression subquery:
                 ValidateTriggerQuery(subquery.Query, triggerEvent, columns, hasRowid);

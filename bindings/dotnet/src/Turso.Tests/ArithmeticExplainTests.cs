@@ -30,6 +30,10 @@ public class ArithmeticExplainTests
         Symbol(ArithmeticOperator.Multiply).Should().Be("*");
         Symbol(ArithmeticOperator.Divide).Should().Be("/");
         Symbol(ArithmeticOperator.Modulo).Should().Be("%");
+        Symbol(ArithmeticOperator.BitwiseAnd).Should().Be("&");
+        Symbol(ArithmeticOperator.BitwiseOr).Should().Be("|");
+        Symbol(ArithmeticOperator.ShiftLeft).Should().Be("<<");
+        Symbol(ArithmeticOperator.ShiftRight).Should().Be(">>");
     }
 
     [Test]

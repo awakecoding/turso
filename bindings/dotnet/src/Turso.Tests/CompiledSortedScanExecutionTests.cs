@@ -433,7 +433,7 @@ public class CompiledSortedScanExecutionTests
     }
 
     [Test]
-    public void BoundedOrderPreflightLeavesComputedJoinAndCompoundShapesOnTheEvaluator()
+    public void BoundedOrderPreflightRoutesSafeJoinButLeavesOtherShapesOnEvaluator()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -448,7 +448,7 @@ public class CompiledSortedScanExecutionTests
             .Should().Equal(SqlValue.Integer(2), SqlValue.Integer(3));
 
         const string join = "SELECT t.value FROM t JOIN u ON t.value = u.value ORDER BY t.value LIMIT 2;";
-        RouteUsesSorter(connection, join).Should().BeFalse();
+        RouteUsesSorter(connection, join).Should().BeTrue();
         ReadRows(connection, join).Select(row => row[0])
             .Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
 

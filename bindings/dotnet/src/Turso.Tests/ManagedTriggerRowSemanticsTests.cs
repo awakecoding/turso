@@ -111,6 +111,25 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
+    public void ForeignKeyActionTriggerFailPreservesOnlyCompletedParentRows()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER "
+                    + "REFERENCES parent(id) ON UPDATE CASCADE)",
+                "INSERT INTO parent VALUES (1), (2)",
+                "INSERT INTO child VALUES (10, 1), (20, 2)",
+                "CREATE TRIGGER child_after AFTER UPDATE ON child "
+                    + "WHEN OLD.parent_id = 1 BEGIN SELECT RAISE(FAIL, 'cascade-stop'); END",
+            ],
+            "UPDATE parent SET id = id + 10",
+            "SELECT 'parent', id, NULL FROM parent "
+                + "UNION ALL SELECT 'child', id, parent_id FROM child ORDER BY 1, 2");
+    }
+
+    [Test]
     public void UpsertGeneratedAndWithoutRowidImagesMatchSqlite()
     {
         AssertMatchesSqlite(
@@ -219,6 +238,39 @@ public sealed class ManagedTriggerRowSemanticsTests
             ],
             "INSERT OR ABORT INTO source VALUES (1)",
             "SELECT (SELECT COUNT(*) FROM source), (SELECT COUNT(*) FROM sink)");
+    }
+
+    [Test]
+    public void ReplaceDeleteTriggersFollowConstraintDiscoveryOrder()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY, first_key TEXT UNIQUE, second_key TEXT UNIQUE)",
+                "CREATE TABLE trace(id INTEGER)",
+                "INSERT INTO data VALUES (10, 'A', 'X'), (1, 'B', 'Y')",
+                "CREATE TRIGGER data_deleted AFTER DELETE ON data BEGIN "
+                    + "INSERT INTO trace VALUES (OLD.id); "
+                    + "SELECT CASE WHEN OLD.id = 1 THEN RAISE(FAIL, 'replace-stop') END; END",
+            ],
+            "INSERT OR REPLACE INTO data VALUES (3, 'A', 'Y')",
+            "SELECT 'data', id FROM data "
+                + "UNION ALL SELECT 'trace', id FROM trace ORDER BY 1, 2");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(pk INTEGER, first_key TEXT UNIQUE, second_key TEXT UNIQUE, "
+                    + "PRIMARY KEY(pk)) WITHOUT ROWID",
+                "CREATE TABLE trace(pk INTEGER)",
+                "INSERT INTO data VALUES (1, 'A0', 'B0'), (2, 'A', 'B2'), (3, 'A3', 'B')",
+                "CREATE TRIGGER data_deleted AFTER DELETE ON data BEGIN "
+                    + "INSERT INTO trace VALUES (OLD.pk); "
+                    + "SELECT CASE WHEN OLD.pk = 1 THEN RAISE(FAIL, 'replace-pk-stop') END; END",
+            ],
+            "INSERT OR REPLACE INTO data VALUES (1, 'A', 'B')",
+            "SELECT 'data', pk FROM data "
+                + "UNION ALL SELECT 'trace', pk FROM trace ORDER BY 1, 2");
     }
 
     [Test]
@@ -648,6 +700,60 @@ public sealed class ManagedTriggerRowSemanticsTests
             .Message.Should().Contain("no such column: OLD.id");
         callbacks.Should().Be(0);
         ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+    }
+
+    [Test]
+    public void UnqualifiedPseudoRowColumnsFailBeforeTriggerCallbacks()
+    {
+        var callbacks = 0;
+        using var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "mark",
+            1,
+            values =>
+            {
+                callbacks++;
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE data(value INTEGER)");
+        Execute(
+            connection,
+            "CREATE TRIGGER data_after AFTER INSERT ON data BEGIN "
+                + "SELECT mark(NEW.value); SELECT value; END");
+
+        Assert.Throws<EmbeddedSqlException>(
+            () => Execute(connection, "INSERT INTO data VALUES (1)"))!
+            .Message.Should().Contain("no such column: value");
+        callbacks.Should().Be(0);
+        ReadRows(connection, "SELECT value FROM data").Should().BeEmpty();
+    }
+
+    [Test]
+    public void UnknownNamedWindowsFailBeforeTriggerCallbacks()
+    {
+        var callbacks = 0;
+        using var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "mark",
+            1,
+            values =>
+            {
+                callbacks++;
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE data(value INTEGER)");
+        Execute(
+            connection,
+            "CREATE TRIGGER data_after AFTER INSERT ON data BEGIN "
+                + "SELECT mark(NEW.value); SELECT row_number() OVER missing; END");
+
+        Assert.Throws<EmbeddedSqlException>(
+            () => Execute(connection, "INSERT INTO data VALUES (1)"))!
+            .Message.Should().Be("no such window: missing");
+        callbacks.Should().Be(0);
+        ReadRows(connection, "SELECT value FROM data").Should().BeEmpty();
     }
 
     [Test]
@@ -1135,7 +1241,7 @@ public sealed class ManagedTriggerRowSemanticsTests
 
         Assert.Throws<EmbeddedSqlException>(
             () => Execute(connection, "ALTER TABLE target RENAME COLUMN value TO renamed"))!
-            .Message.Should().Contain("trigger source_after depends on it");
+            .Message.Should().Contain("error in trigger source_after after rename column");
         Execute(connection, "INSERT INTO target VALUES (7)");
         Execute(connection, "INSERT INTO source VALUES (1)");
         ReadRows(connection, "SELECT value FROM trace").Should().ContainSingle()
@@ -1226,6 +1332,23 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
+    public void QueryAliasesShadowOldAndNewPseudoRows()
+    {
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT)",
+                "CREATE TABLE other(value TEXT)",
+                "CREATE TABLE trace(value TEXT)",
+                "INSERT INTO data VALUES (1, 'trigger-old')",
+                "INSERT INTO other VALUES ('query-old')",
+                "CREATE TRIGGER data_after AFTER UPDATE ON data BEGIN "
+                    + "INSERT INTO trace SELECT old.value FROM other AS old; END",
+                "UPDATE data SET value = 'new' WHERE id = 1",
+            ],
+            "SELECT value FROM trace");
+    }
+
+    [Test]
     public void FileTriggerCollationScanIsNestedAndAllowsBuiltins()
     {
         var fileSystem = new InMemoryFileSystem();
@@ -1253,6 +1376,200 @@ public sealed class ManagedTriggerRowSemanticsTests
         Execute(reopenedConnection, "INSERT INTO source VALUES (1)");
         ReadRows(reopenedConnection, "SELECT value FROM trace").Should().ContainSingle()
             .Which[0].Should().Be(SqlValue.Text("1"));
+    }
+
+    [Test]
+    public void AutoIncrementTriggerAttemptsAndRowidsMatchSqlite()
+    {
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE data(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)",
+                "CREATE TABLE trace(phase TEXT, id INTEGER)",
+                "CREATE TRIGGER data_before BEFORE INSERT ON data WHEN NEW.value = 'outer' BEGIN "
+                    + "INSERT INTO trace VALUES ('before', NEW.rowid); "
+                    + "INSERT INTO data(value) VALUES ('inner'); END",
+                "CREATE TRIGGER data_after AFTER INSERT ON data BEGIN "
+                    + "INSERT INTO trace VALUES ('after', NEW.id); END",
+                "INSERT INTO data(value) VALUES ('outer')",
+            ],
+            "SELECT 'data', id, value FROM data "
+                + "UNION ALL SELECT 'trace-' || phase, id, NULL FROM trace "
+                + "UNION ALL SELECT 'sequence', seq, NULL FROM sqlite_sequence ORDER BY 1, 2");
+
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE data(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)",
+                "CREATE TRIGGER data_before BEFORE INSERT ON data WHEN NEW.value = 'skip' "
+                    + "BEGIN SELECT RAISE(IGNORE); END",
+                "INSERT INTO data(value) VALUES ('skip'), ('kept')",
+            ],
+            "SELECT 'data', id FROM data "
+                + "UNION ALL SELECT 'sequence', seq FROM sqlite_sequence ORDER BY 1");
+
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE data(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)",
+                "CREATE TRIGGER data_before BEFORE INSERT ON data WHEN NEW.value = 'outer' "
+                    + "BEGIN INSERT INTO data(value) VALUES ('inner'); END",
+                "INSERT INTO data VALUES (100, 'outer')",
+            ],
+            "SELECT 'data', id FROM data "
+                + "UNION ALL SELECT 'sequence', seq FROM sqlite_sequence ORDER BY 1, 2");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "CREATE TABLE data(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)",
+                "CREATE TRIGGER data_before BEFORE INSERT ON data WHEN NEW.value = 'fail' "
+                    + "BEGIN SELECT RAISE(FAIL, 'sequence-fail'); END",
+            ],
+            "INSERT INTO data(value) VALUES ('kept'), ('fail')",
+            "SELECT 'data', id FROM data "
+                + "UNION ALL SELECT 'sequence', seq FROM sqlite_sequence ORDER BY 1");
+    }
+
+    [Test]
+    public void TriggerMutationsHonorPartialExpressionIndexes()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "CREATE TABLE source(id INTEGER PRIMARY KEY, value INTEGER)",
+                "CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER)",
+                "CREATE UNIQUE INDEX target_expression ON target((value + 1)) WHERE value > 0",
+                "CREATE TRIGGER source_after AFTER INSERT ON source BEGIN "
+                    + "INSERT INTO target VALUES (NEW.id, NEW.value); END",
+                "INSERT INTO source VALUES (1, 5)",
+            ],
+            "INSERT INTO source VALUES (2, 5)",
+            "SELECT 'source', id, value FROM source "
+                + "UNION ALL SELECT 'target', id, value FROM target ORDER BY 1, 2");
+    }
+
+    [Test]
+    public void TriggerUpsertExpressionTargetsValidateQualifiersBeforeCallbacks()
+    {
+        var callbacks = 0;
+        using var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "mark",
+            1,
+            values =>
+            {
+                callbacks++;
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE source(id INTEGER)");
+        Execute(connection, "CREATE TABLE target(value TEXT)");
+        Execute(connection, "CREATE UNIQUE INDEX target_lower ON target(lower(value))");
+        Execute(
+            connection,
+            "CREATE TRIGGER source_after AFTER INSERT ON source BEGIN "
+                + "SELECT mark(NEW.id); "
+                + "INSERT INTO target VALUES ('A') "
+                + "ON CONFLICT(lower(nope.value)) DO UPDATE SET value = excluded.value; END");
+
+        Assert.Throws<EmbeddedSqlException>(
+            () => Execute(connection, "INSERT INTO source VALUES (1)"))!
+            .Message.Should().Contain("no such column: nope.value");
+        callbacks.Should().Be(0);
+        ReadRows(connection, "SELECT id FROM source").Should().BeEmpty();
+
+        Execute(connection, "DROP TRIGGER source_after");
+        Execute(
+            connection,
+            "CREATE TRIGGER source_after AFTER INSERT ON source BEGIN "
+                + "INSERT INTO target VALUES ('A') "
+                + "ON CONFLICT(lower(target.value)) DO UPDATE SET value = excluded.value; END");
+        Execute(connection, "INSERT INTO source VALUES (1)");
+        ReadRows(connection, "SELECT value FROM target").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Text("A"));
+    }
+
+    [Test]
+    public void TriggerBodiesComposeWindowsJoinsCompoundsAndOperators()
+    {
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE source(id INTEGER)",
+                "CREATE TABLE lhs(id INTEGER, value TEXT)",
+                "CREATE TABLE rhs(id INTEGER, value TEXT)",
+                "CREATE TABLE audit(sequence INTEGER, value TEXT)",
+                "INSERT INTO lhs VALUES (1, 'left-1'), (2, 'left-2')",
+                "INSERT INTO rhs VALUES (1, 'right-1'), (2, 'right-2')",
+                "CREATE TRIGGER source_after AFTER INSERT ON source "
+                    + "WHEN (NEW.id & 1) = 1 BEGIN "
+                    + "INSERT INTO audit "
+                    + "SELECT row_number() OVER (ORDER BY lhs.id), lhs.value || ':' || rhs.value "
+                    + "FROM lhs JOIN rhs ON lhs.id = rhs.id; "
+                    + "INSERT INTO audit "
+                    + "SELECT 99, CAST(value AS TEXT) FROM ("
+                    + "SELECT NEW.id << 1 AS value UNION ALL SELECT NEW.id + 10 EXCEPT SELECT -1"
+                    + "); END",
+                "INSERT INTO source VALUES (3)",
+            ],
+            "SELECT sequence, value FROM audit ORDER BY rowid");
+    }
+
+    [Test]
+    public void TempSchemaTriggersAreConnectionLocalAndUseTempCatalog()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TEMP TABLE temp_source(id INTEGER)");
+        Execute(connection, "CREATE TEMP TABLE temp_audit(id INTEGER)");
+        Execute(
+            connection,
+            "CREATE TRIGGER temp.source_after AFTER INSERT ON temp.temp_source "
+                + "BEGIN INSERT INTO temp_audit VALUES (NEW.id); END");
+        Execute(connection, "INSERT INTO temp.temp_source VALUES (7)");
+
+        ReadRows(connection, "SELECT id FROM temp.temp_audit").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Integer(7));
+        ReadRows(
+                connection,
+                "SELECT name FROM temp.sqlite_schema WHERE type = 'trigger'")
+            .Should().ContainSingle().Which[0].Should().Be(SqlValue.Text("source_after"));
+    }
+
+    [Test]
+    public void DropColumnValidatesFullRowTriggerDependencies()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE data(id INTEGER, removable TEXT)");
+        Execute(connection, "CREATE TABLE audit(value TEXT)");
+        Execute(
+            connection,
+            "CREATE TRIGGER independent AFTER INSERT ON data BEGIN "
+                + "SELECT RAISE(IGNORE) WHERE NEW.id < 0; "
+                + "INSERT INTO audit SELECT CAST(NEW.id AS TEXT); END");
+
+        Execute(connection, "ALTER TABLE data DROP COLUMN removable");
+        Execute(connection, "INSERT INTO data VALUES (1)");
+        ReadRows(connection, "SELECT value FROM audit").Should().ContainSingle()
+            .Which[0].Should().Be(SqlValue.Text("1"));
+
+        Execute(connection, "CREATE TABLE dependent(id INTEGER, removable TEXT)");
+        Execute(
+            connection,
+            "CREATE TRIGGER dependent_after AFTER INSERT ON dependent "
+                + "WHEN NEW.removable IS NOT NULL BEGIN SELECT NEW.removable; END");
+        Assert.Throws<EmbeddedSqlException>(
+            () => Execute(connection, "ALTER TABLE dependent DROP COLUMN removable"))!
+            .Message.Should().Contain("error in trigger dependent_after after drop column");
+        ReadRows(connection, "PRAGMA table_info(dependent)").Should().HaveCount(2);
+
+        Execute(connection, "CREATE TABLE window_source(id INTEGER)");
+        Execute(connection, "CREATE TABLE window_target(id INTEGER, removable INTEGER)");
+        Execute(
+            connection,
+            "CREATE TRIGGER window_after AFTER INSERT ON window_source BEGIN "
+                + "SELECT row_number() OVER named FROM window_target "
+                + "WINDOW named AS (ORDER BY removable); END");
+        Assert.Throws<EmbeddedSqlException>(
+            () => Execute(connection, "ALTER TABLE window_target DROP COLUMN removable"))!
+            .Message.Should().Contain("error in trigger window_after after drop column");
+        ReadRows(connection, "PRAGMA table_info(window_target)").Should().HaveCount(2);
     }
 
     private static void AssertMatchesSqlite(IReadOnlyList<string> setup, string query)

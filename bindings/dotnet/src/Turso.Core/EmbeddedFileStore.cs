@@ -40,6 +40,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private readonly IFileSystem _fileSystem;
     private readonly string _databasePath;
     private readonly string _walPath;
+    private readonly EmbeddedDatabase _indexExpressionEvaluator = new();
     private int _pageSize;
     private int _usableSpace;
     private SqliteDatabaseHeader _header;
@@ -178,7 +179,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 create.PrimaryKeyConflictAlgorithm,
                 create.PrimaryKeyConstraintName,
                 create.PrimaryKeyDeclarationOrder,
-                create.TableForeignKeys);
+                create.TableForeignKeys,
+                create.Strict);
             LoadTableRows(entry.Name, table, entry.RootPage, occupiedBtreePages);
             tables[entry.Name] = table;
             rootPages[entry.Name] = entry.RootPage;
@@ -228,6 +230,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             indexRootPages.Add(entry.Name, entry.RootPage);
         }
 
+        EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
         ValidateAllocationMap(schemaEntries, tables);
 
         foreach (var entry in schemaEntries)
@@ -1134,7 +1137,13 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
         PragmaHeaderMetadata? pragmaHeader = null)
-        => PersistCore(tables, views, triggers, reclaimTrailingPages: false, pragmaHeader);
+        => PersistCore(
+            tables,
+            views,
+            triggers,
+            reclaimTrailingPages: false,
+            incrementSchemaCookie: false,
+            pragmaHeader);
 
     internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
 
@@ -1147,7 +1156,13 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         ThrowIfDisposed();
         var catalog = Load();
-        _ = PersistCore(catalog.Tables, catalog.Views, catalog.Triggers, reclaimTrailingPages: true, pragmaHeader: null);
+        _ = PersistCore(
+            catalog.Tables,
+            catalog.Views,
+            catalog.Triggers,
+            reclaimTrailingPages: true,
+            incrementSchemaCookie: true,
+            pragmaHeader: null);
     }
 
     internal SqliteJournalMode JournalMode => _pager.JournalMode;
@@ -1192,7 +1207,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             {
                 replacement.Persist(tables, views, triggers);
                 replacement.SwitchJournalMode(SqliteJournalMode.Delete);
-                replacement.RewriteMigrationHeader(_header);
+                replacement.RewriteVacuumHeader(_header);
             }
 
             _pager.ReplaceDatabaseFile(temporaryPath);
@@ -1214,7 +1229,96 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
     }
 
-    private void RewriteMigrationHeader(SqliteDatabaseHeader sourceHeader)
+    internal void VacuumInto(
+        string destinationPath,
+        int pageSize,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers)
+    {
+        ThrowIfDisposed();
+        ThrowIfPostCommitMaintenanceFaulted();
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+        _ = SqlitePageSize.Encode(pageSize);
+
+        var atomicFileSystem = TursoEncryptionFileSystem.Unwrap(_fileSystem) as IAtomicFileSystem
+            ?? throw new EmbeddedSqlException(
+                "VACUUM INTO requires a file system with atomic replacement support.");
+        var replaceEmptyDestination = _fileSystem.FileExists(destinationPath);
+        if (replaceEmptyDestination)
+        {
+            using var destination = _fileSystem.OpenFile(
+                destinationPath,
+                FileOpenMode.OpenExisting,
+                readOnly: true);
+            if (destination.Length != 0)
+                throw new EmbeddedSqlException("output file already exists");
+        }
+        foreach (var suffix in new[] { "-wal", "-journal" })
+        {
+            if (_fileSystem.FileExists(destinationPath + suffix))
+                throw new EmbeddedSqlException("output file already exists");
+        }
+        var destinationShmPath = destinationPath + "-shm";
+        var replaceEmptyDestinationShm = _fileSystem.FileExists(destinationShmPath);
+        if (replaceEmptyDestinationShm)
+        {
+            using var destinationShm = _fileSystem.OpenFile(
+                destinationShmPath,
+                FileOpenMode.OpenExisting,
+                readOnly: true);
+            if (destinationShm.Length != 0)
+                throw new EmbeddedSqlException("output file already exists");
+        }
+
+        var temporaryPath = destinationPath + $".vacuum-{Guid.NewGuid():N}.tmp";
+        var temporaryWalPath = temporaryPath + "-wal";
+        var temporaryJournalPath = temporaryPath + "-journal";
+        var temporaryShmPath = temporaryPath + "-shm";
+        try
+        {
+            using (var replacement = Open(
+                       temporaryPath,
+                       _fileSystem,
+                       out _,
+                       initialPageSize: pageSize,
+                       initialTextEncoding: _textEncoding))
+            {
+                replacement.Persist(tables, views, triggers);
+                replacement.SwitchJournalMode(SqliteJournalMode.Delete);
+                replacement.RewriteVacuumHeader(_header);
+            }
+
+            try
+            {
+                atomicFileSystem.ReplaceFileAtomically(
+                    temporaryPath,
+                    destinationPath,
+                    replaceEmptyDestination);
+            }
+            catch (IOException exception) when (exception.Message == "output file already exists")
+            {
+                throw new EmbeddedSqlException("output file already exists", exception);
+            }
+
+            if (_fileSystem.FileExists(temporaryShmPath))
+            {
+                atomicFileSystem.ReplaceFileAtomically(
+                    temporaryShmPath,
+                    destinationShmPath,
+                    replaceEmptyDestinationShm);
+            }
+        }
+        finally
+        {
+            TryDeleteArtifact(temporaryJournalPath);
+            TryDeleteArtifact(temporaryWalPath);
+            TryDeleteArtifact(temporaryShmPath);
+            TryDeleteArtifact(temporaryPath);
+        }
+    }
+
+    private void RewriteVacuumHeader(SqliteDatabaseHeader sourceHeader)
     {
         var pageOne = _pager.ReadCommittedPage(SchemaRootPage);
         var current = SqliteDatabaseHeader.Parse(pageOne);
@@ -1224,7 +1328,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             ChangeCounter = changeCounter,
             VersionValidFor = changeCounter,
             DatabaseSizeInPages = _pager.CommittedPageCount,
-            SchemaCookie = sourceHeader.SchemaCookie,
+            SchemaCookie = unchecked(sourceHeader.SchemaCookie + 1),
             DefaultPageCacheSize = sourceHeader.DefaultPageCacheSize,
             TextEncoding = sourceHeader.TextEncoding,
             UserVersion = sourceHeader.UserVersion,
@@ -1255,6 +1359,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
         bool reclaimTrailingPages,
+        bool incrementSchemaCookie,
         PragmaHeaderMetadata? pragmaHeader)
     {
         ThrowIfDisposed();
@@ -1263,6 +1368,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         // Validate first: a reject must leave the existing database untouched.
         foreach (var (name, table) in tables)
             EmbeddedFileStore.ValidateTableRepresentable(name, table);
+        EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
         ValidateSchemaDefinitions(tables, views, triggers);
 
         if (!reclaimTrailingPages
@@ -1343,7 +1449,9 @@ internal sealed class EmbeddedFileStore : IDisposable
             FreelistPageCount = freelist.PageCount,
             SchemaCookie = pragmaHeader is { } metadata
                 ? unchecked((uint)metadata.SchemaVersion)
-                : schemaChanged ? currentHeader.SchemaCookie + 1 : currentHeader.SchemaCookie,
+                : schemaChanged || incrementSchemaCookie
+                    ? unchecked(currentHeader.SchemaCookie + 1)
+                    : currentHeader.SchemaCookie,
             UserVersion = pragmaHeader?.UserVersion ?? currentHeader.UserVersion,
             ApplicationId = pragmaHeader?.ApplicationId ?? currentHeader.ApplicationId,
         };
@@ -1359,7 +1467,9 @@ internal sealed class EmbeddedFileStore : IDisposable
             indexPages,
             freelist);
 
-        using (var transaction = _pager.BeginTransaction(target))
+        using (var transaction = reclaimTrailingPages
+                   ? _pager.BeginExclusiveRewriteTransaction(target)
+                   : _pager.BeginTransaction(target))
         {
             foreach (var name in tableNames)
             {
@@ -6527,8 +6637,10 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private static bool IsBoundedIndexLeafMutationCompatible(IndexDefinition definition)
         => definition.Index.Columns.Count != 0
+           && !definition.Index.IsPartial
            && definition.Index.Columns.All(column =>
-               !column.Descending
+               !column.IsExpression
+               && !column.Descending
                && (column.Collation is null
                    || string.Equals(column.Collation, "BINARY", StringComparison.OrdinalIgnoreCase)));
 
@@ -7459,6 +7571,12 @@ internal sealed class EmbeddedFileStore : IDisposable
                         CollectTriggerReferencedTables(assignment.Value, tables);
                     CollectTriggerReferencedTables(upsertUpdate.Where, tables);
                 }
+                if (insert.Upsert is { } upsert)
+                {
+                    foreach (var target in upsert.Target)
+                        CollectTriggerReferencedTables(target.Expression, tables);
+                    CollectTriggerReferencedTables(upsert.TargetWhere, tables);
+                }
                 break;
             case UpdateStatement update:
                 tables.Add(update.TableName);
@@ -7493,6 +7611,16 @@ internal sealed class EmbeddedFileStore : IDisposable
                              .Append(select.Offset))
                 {
                     CollectTriggerReferencedTables(expression, tables);
+                }
+                foreach (var window in select.NamedWindows)
+                {
+                    foreach (var expression in window.Specification.PartitionBy
+                                 .Concat(window.Specification.OrderBy.Select(term => term.Expression))
+                                 .Append(window.Specification.Frame?.Start.Offset)
+                                 .Append(window.Specification.Frame?.End.Offset))
+                    {
+                        CollectTriggerReferencedTables(expression, tables);
+                    }
                 }
                 break;
             case ValuesClause values:
@@ -7574,6 +7702,10 @@ internal sealed class EmbeddedFileStore : IDisposable
                         CollectTriggerReferencedTables(child, tables);
                     }
                 }
+                return;
+            case RowValueExpression rowValue:
+                foreach (var value in rowValue.Values)
+                    CollectTriggerReferencedTables(value, tables);
                 return;
             case CollationExpression collation:
                 CollectTriggerReferencedTables(collation.Expression, tables);
@@ -7683,6 +7815,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 FindRuntimeDependency(select.Where),
                 FindRuntimeDependency(select.GroupBy),
                 FindRuntimeDependency(select.Having),
+                FindRuntimeDependency(select.NamedWindows),
                 FindRuntimeDependency(select.OrderBy),
                 FindRuntimeDependency(select.Limit),
                 FindRuntimeDependency(select.Offset)),
@@ -7746,6 +7879,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             null or LiteralExpression or CurrentTimeExpression or ColumnExpression or RaiseExpression
                 or StarExpression or QualifiedStarExpression => null,
             ParameterExpression => "a bind parameter",
+            RowValueExpression rowValue => FindRuntimeDependency(rowValue.Values),
             FunctionExpression function => $"function {function.Name}()",
             ScalarSubqueryExpression subquery => FindRuntimeDependency(subquery.Query),
             ExistsExpression exists => FindRuntimeDependency(exists.Query),
@@ -7803,14 +7937,19 @@ internal sealed class EmbeddedFileStore : IDisposable
             return null;
         var collation = upsert.Target
             .Select(column => column.Collation)
-            .FirstOrDefault(name => name is not null);
+            .FirstOrDefault(name => name is not null && !IsBuiltInCollation(name));
         if (collation is not null)
             return $"explicit collation '{collation}'";
+        var targetDependency = FirstRuntimeDependency(
+            FirstRuntimeDependency(upsert.Target.Select(target =>
+                FindRuntimeDependency(target.Expression)).ToArray()),
+            FindRuntimeDependency(upsert.TargetWhere));
         return upsert.Action is DoUpdateUpsertAction update
             ? FirstRuntimeDependency(
+                targetDependency,
                 FindRuntimeDependency(update.Assignments),
                 FindRuntimeDependency(update.Where))
-            : null;
+            : targetDependency;
     }
 
     private static string? FindRuntimeDependency(IEnumerable<OrderByTerm> terms)
@@ -7823,6 +7962,27 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         return null;
+    }
+
+    private static string? FindRuntimeDependency(IEnumerable<NamedWindowDefinition> windows)
+    {
+        foreach (var window in windows)
+        {
+            var dependency = FindRuntimeDependency(window.Specification);
+            if (dependency is not null)
+                return dependency;
+        }
+
+        return null;
+    }
+
+    private static string? FindRuntimeDependency(WindowSpecification window)
+    {
+        return FirstRuntimeDependency(
+            FindRuntimeDependency(window.PartitionBy),
+            FindRuntimeDependency(window.OrderBy),
+            FindRuntimeDependency(window.Frame?.Start.Offset),
+            FindRuntimeDependency(window.Frame?.End.Offset));
     }
 
     private static string? FindRuntimeDependency(IEnumerable<Expression> expressions)
@@ -9165,19 +9325,36 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"The managed file engine cannot persist index '{index.Name}' because table '{tableName}' has a row with an invalid column count.");
             }
 
+            var rowId = table.HasRowid ? table.RowIds[rowIndex] : (long?)null;
+            if (!IndexExpressionSemantics.Qualifies(
+                    index,
+                    table,
+                    row,
+                    rowId,
+                    _indexExpressionEvaluator.EvaluateIndexExpression))
+            {
+                continue;
+            }
+            var key = IndexExpressionSemantics.ProjectKey(
+                index,
+                table,
+                row,
+                rowId,
+                _indexExpressionEvaluator.EvaluateIndexExpression);
+
             SqlValue[] values;
             if (table.WithoutRowid)
             {
                 values = new SqlValue[storageColumns!.Count];
-                for (var column = 0; column < storageColumns.Count; column++)
+                Array.Copy(key, values, key.Length);
+                for (var column = index.Columns.Count; column < storageColumns.Count; column++)
                     values[column] = row[storageColumns[column].ColumnIndex];
             }
             else
             {
                 values = new SqlValue[index.Columns.Count + 1];
-                for (var column = 0; column < index.Columns.Count; column++)
-                    values[column] = row[index.Columns[column].ColumnIndex];
-                values[^1] = SqlValue.Integer(table.RowIds[rowIndex]);
+                Array.Copy(key, values, key.Length);
+                values[^1] = SqlValue.Integer(rowId!.Value);
             }
             var record = SqliteRecordCodec.Encode(values, _textEncoding);
             comparer.Validate(record);
@@ -9253,12 +9430,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private static SqliteKeyCollation GetIndexCollation(EmbeddedTable table, EmbeddedIndexColumn column)
-    {
-        var name = column.Collation
-            ?? table.ColumnDefinitions[column.ColumnIndex].Collation
-            ?? "BINARY";
-        return SqliteKeyCollation.FromName(name);
-    }
+        => SqliteKeyCollation.FromName(IndexExpressionSemantics.GetCollationName(table, column));
 
     private PreparedSchemaTree BuildSchemaTree(
         IReadOnlyList<SchemaEntry> entries,
@@ -9496,19 +9668,13 @@ internal sealed class EmbeddedFileStore : IDisposable
         EmbeddedIndex index)
     {
         ArgumentNullException.ThrowIfNull(index);
-        if (string.IsNullOrWhiteSpace(index.Name))
-            throw new EmbeddedSqlException($"The managed file engine cannot persist an unnamed index on table '{tableName}'.");
-        if (index.Columns.Count == 0)
-            throw new EmbeddedSqlException($"The managed file engine cannot persist index '{index.Name}' because it has no key columns.");
+        IndexExpressionSemantics.ValidateDefinition(tableName, table, index);
+        IndexExpressionSemantics.ValidateRoundTrip(tableName, table, index);
 
         foreach (var column in index.Columns)
         {
-            if (column.ColumnIndex < 0 || column.ColumnIndex >= table.Columns.Length)
-            {
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist index '{index.Name}' because it has an invalid column reference.");
-            }
-            if (!string.Equals(table.Columns[column.ColumnIndex], column.Name, StringComparison.OrdinalIgnoreCase))
+            if (!column.IsExpression
+                && !string.Equals(table.Columns[column.ColumnIndex], column.Name, StringComparison.OrdinalIgnoreCase))
             {
                 throw new EmbeddedSqlException(
                     $"The managed file engine cannot persist index '{index.Name}' because its column metadata is inconsistent.");
@@ -9545,32 +9711,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         string tableName,
         EmbeddedTable table,
         CreateIndexStatement statement)
-    {
-        if (statement.Columns.Count == 0)
-            throw new EmbeddedSqlException($"Stored index '{statement.Name}' has no key columns.");
-
-        var columns = new EmbeddedIndexColumn[statement.Columns.Count];
-        for (var index = 0; index < statement.Columns.Count; index++)
-        {
-            var column = statement.Columns[index];
-            var columnIndex = Array.FindIndex(
-                table.Columns,
-                name => string.Equals(name, column.Name, StringComparison.OrdinalIgnoreCase));
-            if (columnIndex < 0)
-            {
-                throw new EmbeddedSqlException(
-                    $"Stored index '{statement.Name}' references missing column '{column.Name}' on table '{tableName}'.");
-            }
-
-            columns[index] = new EmbeddedIndexColumn(
-                table.Columns[columnIndex],
-                columnIndex,
-                column.Collation ?? table.ColumnDefinitions[columnIndex].Collation,
-                column.Descending);
-        }
-
-        return new EmbeddedIndex(statement.Name, statement.Unique, columns);
-    }
+        => EmbeddedIndexFactory.Create(tableName, table, statement);
 
     private void ValidateStoredIndex(
         SchemaEntry entry,
@@ -9932,19 +10073,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     }
 
     private static string BuildCreateIndexSql(string tableName, EmbeddedIndex index)
-    {
-        var columns = index.Columns.Select(column =>
-        {
-            var definition = QuoteIdentifier(column.Name);
-            if (column.Collation is { } collation)
-                definition += " COLLATE " + collation;
-            if (column.Descending)
-                definition += " DESC";
-            return definition;
-        });
-        var unique = index.Unique ? "UNIQUE " : string.Empty;
-        return $"CREATE {unique}INDEX {QuoteIdentifier(index.Name)} ON {QuoteIdentifier(tableName)} ({string.Join(", ", columns)})";
-    }
+        => IndexSqlFormatter.BuildCreateIndexSql(tableName, index);
 
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";

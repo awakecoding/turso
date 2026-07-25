@@ -33,10 +33,12 @@ public sealed class ResumableStatement : IDisposable
     private readonly int[] _cursorPositions;
     private readonly SqlValue[]?[] _materializedRows;
     private readonly long[] _materializedRowIds;
+    private readonly IReadOnlyList<SqlValue[]>?[] _joinCursorRows;
     private readonly SorterRuntime?[] _sorters;
     private readonly object?[] _accumulatorContexts;
     private readonly bool[] _accumulatorInitialized;
     private readonly List<SqlValue[]>?[] _distinctSets;
+    private readonly int[] _rowSetPositions;
     private readonly WorkTableRuntime?[] _workTables;
     private readonly IReadOnlyList<VdbeCursorSource?>? _cursorSources;
     private readonly IReadOnlyList<VdbeWriteTarget?>? _writeTargets;
@@ -76,10 +78,12 @@ public sealed class ResumableStatement : IDisposable
         _cursorPositions = new int[program.CursorCount];
         _materializedRows = new SqlValue[program.CursorCount][];
         _materializedRowIds = new long[program.CursorCount];
+        _joinCursorRows = new IReadOnlyList<SqlValue[]>?[program.CursorCount];
         _sorters = new SorterRuntime?[program.SorterCount];
         _accumulatorContexts = new object?[program.AccumulatorCount];
         _accumulatorInitialized = new bool[program.AccumulatorCount];
         _distinctSets = new List<SqlValue[]>?[program.DistinctSetCount];
+        _rowSetPositions = new int[program.DistinctSetCount];
         _workTables = new WorkTableRuntime?[program.WorkTableCount];
         _cursorSources = cursorSources;
         _writeTargets = writeTargets;
@@ -199,6 +203,16 @@ public sealed class ResumableStatement : IDisposable
                     _materializedRows[open.Cursor.Index] = null;
                     AdvanceInstructionPointer();
                     break;
+                case OpenJoinCursorInstruction openJoin:
+                    {
+                        var rows = openJoin.Plan.Materialize();
+                        OpenCursor(openJoin.Cursor);
+                        _joinCursorRows[openJoin.Cursor.Index] = rows;
+                        _cursorPositions[openJoin.Cursor.Index] = -1;
+                        _materializedRows[openJoin.Cursor.Index] = null;
+                        AdvanceInstructionPointer();
+                        break;
+                    }
                 case OpenWriteCursorInstruction openWrite:
                     OpenCursor(openWrite.Cursor);
                     _cursorPositions[openWrite.Cursor.Index] = -1;
@@ -207,6 +221,7 @@ public sealed class ResumableStatement : IDisposable
                     break;
                 case CloseCursorInstruction close:
                     CloseCursor(close.Cursor);
+                    _joinCursorRows[close.Cursor.Index] = null;
                     AdvanceInstructionPointer();
                     break;
                 case RewindCursorInstruction rewind:
@@ -265,6 +280,39 @@ public sealed class ResumableStatement : IDisposable
                             AdvanceInstructionPointer();
                         else
                             _instructionPointer = filterRegisters.FalseTarget;
+
+                        break;
+                    }
+                case ProjectRegistersInstruction project:
+                    {
+                        var input = ReadRegisters(project.Input);
+                        var output = project.Transform(input)
+                            ?? throw new InvalidOperationException("A register projection returned null.");
+                        if (output.Length != project.Output.Count)
+                        {
+                            throw new InvalidOperationException(
+                                $"A register projection declared {project.Output.Count} outputs but returned {output.Length}.");
+                        }
+
+                        Array.Copy(output, 0, _registers, project.Output.Start.Index, output.Length);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case DistinctFilterInstruction distinctFilter:
+                    {
+                        var candidate = ReadRegisters(distinctFilter.Values);
+                        if (RowSetContains(
+                                distinctFilter.DistinctSetIndex,
+                                candidate,
+                                distinctFilter.Equality))
+                        {
+                            _instructionPointer = distinctFilter.DuplicateTarget;
+                        }
+                        else
+                        {
+                            (_distinctSets[distinctFilter.DistinctSetIndex] ??= []).Add(candidate);
+                            AdvanceInstructionPointer();
+                        }
 
                         break;
                     }
@@ -466,6 +514,38 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case RowSetRewindInstruction rowSetRewind:
+                    {
+                        var set = _distinctSets[rowSetRewind.RowSetIndex];
+                        _rowSetPositions[rowSetRewind.RowSetIndex] = 0;
+                        if (set is null || set.Count == 0)
+                        {
+                            _instructionPointer = rowSetRewind.EmptyTarget;
+                            break;
+                        }
+
+                        CopyRowSetRow(set[0], rowSetRewind.Destination);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case RowSetNextInstruction rowSetNext:
+                    {
+                        var set = _distinctSets[rowSetNext.RowSetIndex]
+                            ?? throw new InvalidOperationException(
+                                $"Cannot advance unopened row set {rowSetNext.RowSetIndex}.");
+                        var position = checked(++_rowSetPositions[rowSetNext.RowSetIndex]);
+                        if (position < set.Count)
+                        {
+                            CopyRowSetRow(set[position], rowSetNext.Destination);
+                            _instructionPointer = rowSetNext.LoopTarget;
+                        }
+                        else
+                        {
+                            AdvanceInstructionPointer();
+                        }
+
+                        break;
+                    }
                 case CompoundResultRowInstruction compoundRow:
                     {
                         // Emit the candidate only when it satisfies the membership condition against every
@@ -506,6 +586,66 @@ public sealed class ResumableStatement : IDisposable
                         _currentRow = Array.AsReadOnly(candidate);
                         State = ResumableStatementState.Row;
                         return ResumableStatementStepResult.Row;
+                    }
+                case GuardedRowInstruction guardedRow:
+                    {
+                        var candidate = ReadRegisters(guardedRow.Values);
+                        var accepted = true;
+                        foreach (var guard in guardedRow.Guards)
+                        {
+                            switch (guard)
+                            {
+                                case DistinctRowGuard distinctGuard:
+                                    accepted = TryInsertRowSet(
+                                        distinctGuard.RowSetIndex,
+                                        candidate,
+                                        distinctGuard.Equality);
+                                    break;
+                                case MembershipRowGuard membershipGuard:
+                                    foreach (var rowSetIndex in membershipGuard.RowSetIndices)
+                                    {
+                                        var contained = RowSetContains(
+                                            rowSetIndex,
+                                            candidate,
+                                            membershipGuard.Equality);
+                                        var required =
+                                            membershipGuard.Mode == CompoundMembershipMode.PresentInAll;
+                                        if (contained != required)
+                                        {
+                                            accepted = false;
+                                            break;
+                                        }
+                                    }
+
+                                    break;
+                                default:
+                                    throw new InvalidOperationException(
+                                        $"Validated guarded row contains unsupported guard {guard.GetType().Name}.");
+                            }
+
+                            if (!accepted)
+                                break;
+                        }
+
+                        AdvanceInstructionPointer();
+                        if (!accepted)
+                            break;
+
+                        switch (guardedRow.Destination)
+                        {
+                            case ResultRowDestination:
+                                _currentRow = Array.AsReadOnly(candidate);
+                                State = ResumableStatementState.Row;
+                                return ResumableStatementStepResult.Row;
+                            case RowSetDestination destination:
+                                TryInsertRowSet(destination.RowSetIndex, candidate, destination.Equality);
+                                break;
+                            default:
+                                throw new InvalidOperationException(
+                                    $"Validated guarded row contains unsupported destination {guardedRow.Destination.GetType().Name}.");
+                        }
+
+                        break;
                     }
                 case OffsetGateInstruction offsetGate:
                     {
@@ -606,12 +746,22 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case WorkTableExpandGenerationInstruction expandGeneration:
+                    {
+                        var runtime = RequireOpenWorkTable(expandGeneration.WorkTable);
+                        runtime.ExpandGeneration(
+                            ReadRegisters(expandGeneration.Source),
+                            expandGeneration.Transform);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
                 case CloseWorkTableInstruction closeWorkTable:
                     CloseWorkTable(closeWorkTable.WorkTable);
                     AdvanceInstructionPointer();
                     break;
                 case HaltInstruction:
                     Array.Clear(_openCursors);
+                    Array.Clear(_joinCursorRows);
                     AdvanceInstructionPointer();
                     State = ResumableStatementState.Done;
                     return ResumableStatementStepResult.Done;
@@ -642,10 +792,12 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_cursorPositions);
         Array.Clear(_materializedRows);
         Array.Clear(_materializedRowIds);
+        Array.Clear(_joinCursorRows);
         Array.Clear(_sorters);
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
+        Array.Clear(_rowSetPositions);
         Array.Clear(_workTables);
         _transaction.Reset();
         _currentRow = null;
@@ -704,10 +856,12 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_registers);
         Array.Clear(_openCursors);
         Array.Clear(_materializedRows);
+        Array.Clear(_joinCursorRows);
         Array.Clear(_sorters);
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
+        Array.Clear(_rowSetPositions);
         Array.Clear(_workTables);
         _transaction.Reset();
         _binding = null;
@@ -819,6 +973,9 @@ public sealed class ResumableStatement : IDisposable
     // scanned UPDATE/DELETE rows) or, failing that, its read source.
     private int CursorRowCount(Cursor cursor)
     {
+        if (_joinCursorRows[cursor.Index] is { } joinedRows)
+            return joinedRows.Count;
+
         var writeTarget = WriteTargetOrNull(cursor);
         return writeTarget is not null
             ? writeTarget.RowCount
@@ -855,11 +1012,20 @@ public sealed class ResumableStatement : IDisposable
         if (writeTarget?.GetRow is { } getRow)
             return getRow(position);
 
+        if (_joinCursorRows[cursor.Index] is { } joinedRows)
+            return joinedRows[position];
+
         return RequireCursorSource(cursor).Rows[position];
     }
 
     private long CurrentCursorRowId(Cursor cursor)
     {
+        if (_joinCursorRows[cursor.Index] is not null)
+        {
+            throw new InvalidOperationException(
+                $"Join cursor {cursor.Index} exposes source rowids as hidden columns, not as one cursor rowid.");
+        }
+
         if (_materializedRows[cursor.Index] is not null)
             return _materializedRowIds[cursor.Index];
 
@@ -904,6 +1070,26 @@ public sealed class ResumableStatement : IDisposable
         }
 
         return false;
+    }
+
+    private bool TryInsertRowSet(int rowSetIndex, SqlValue[] candidate, VdbeRowEquality equality)
+    {
+        if (RowSetContains(rowSetIndex, candidate, equality))
+            return false;
+
+        (_distinctSets[rowSetIndex] ??= []).Add(candidate);
+        return true;
+    }
+
+    private void CopyRowSetRow(SqlValue[] row, RegisterRange destination)
+    {
+        if (row.Length != destination.Count)
+        {
+            throw new InvalidOperationException(
+                $"Row-set row has {row.Length} columns but destination has {destination.Count} registers.");
+        }
+
+        Array.Copy(row, 0, _registers, destination.Start.Index, row.Length);
     }
 
     private void AdvanceInstructionPointer()
@@ -1029,6 +1215,7 @@ public sealed class ResumableStatement : IDisposable
         private readonly VdbeRowEquality? _equality;
         private readonly Queue<(SqlValue[] Row, int Depth)> _frontier = new();
         private readonly List<SqlValue[]>? _seen;
+        private readonly List<SqlValue[]> _generation = [];
         private int _admitted;
         private bool _hasCurrent;
         private int _currentDepth;
@@ -1095,6 +1282,41 @@ public sealed class ResumableStatement : IDisposable
             {
                 if (child is null)
                     throw new InvalidOperationException("A recursive transform must not return a null row.");
+
+                RequireWidth(child);
+                TryAdmit(child, childDepth);
+            }
+        }
+
+        public void ExpandGeneration(
+            SqlValue[] frontierRow,
+            VdbeRecursiveGenerationTransform transform)
+        {
+            if (!_hasCurrent)
+            {
+                throw new InvalidOperationException(
+                    "Work table has no current row to expand; a WorkTableStep must dequeue a row before WorkTableExpandGeneration.");
+            }
+
+            if (_currentDepth >= _maxDepth)
+                return;
+
+            RequireWidth(frontierRow);
+            _generation.Add([.. frontierRow]);
+            if (_frontier.TryPeek(out var next) && next.Depth == _currentDepth)
+                return;
+
+            var frontier = _generation.ToArray();
+            _generation.Clear();
+            var children = transform(frontier)
+                ?? throw new InvalidOperationException(
+                    "A recursive generation transform must not return a null row list.");
+            var childDepth = checked(_currentDepth + 1);
+            foreach (var child in children)
+            {
+                if (child is null)
+                    throw new InvalidOperationException(
+                        "A recursive generation transform must not return a null row.");
 
                 RequireWidth(child);
                 TryAdmit(child, childDepth);

@@ -232,6 +232,88 @@ public class JoinOpcodeExecutionTests
         Assert.Throws<ObjectDisposedException>(() => statement.StepResumable());
     }
 
+    [Test]
+    public void MaterializingJoinCursorYieldsResumesAndRebuildsLiveRowsAfterReset()
+    {
+        var leftRows = new List<SqlValue[]>
+        {
+            new[] { SqlValue.Integer(1) },
+            new[] { SqlValue.Integer(2) },
+        };
+        var rightRows = new List<SqlValue[]>
+        {
+            new[] { SqlValue.Integer(10) },
+        };
+        var rightRowIds = new List<long> { 21 };
+        var plan = new VdbeJoinPlan(
+            new VdbeJoinOperatorPlan(
+                new VdbeJoinScanPlan("l", 1, new VdbeCursorSource(leftRows, [11, 12])),
+                new VdbeJoinScanPlan("r", 1, new VdbeCursorSource(rightRows, rightRowIds)),
+                VdbeJoinKind.Inner,
+                condition: null),
+            "2-way INNER join");
+        VdbeInstruction[] instructions =
+        [
+            new OpenJoinCursorInstruction(new Cursor(0), plan),
+            new RewindCursorInstruction(new Cursor(0), new ProgramCounter(7)),
+            new ColumnInstruction(new Cursor(0), 0, new Register(0)),
+            new ColumnInstruction(new Cursor(0), 1, new Register(1)),
+            new YieldInstruction(),
+            new ResultRowInstruction(new RegisterRange(new Register(0), 2)),
+            new NextInstruction(new Cursor(0), new ProgramCounter(2)),
+            new CloseCursorInstruction(new Cursor(0)),
+            new HaltInstruction(),
+        ];
+        using var statement = new ResumableStatement(new VdbeProgram(2, cursorCount: 1, instructions));
+
+        DrainYielding(statement).Select(row => (row[0].AsInteger(), row[1].AsInteger()))
+            .Should().Equal((1, 10), (2, 10));
+
+        rightRows.Add([SqlValue.Integer(20)]);
+        rightRowIds.Add(22);
+        statement.Reset();
+
+        DrainYielding(statement).Select(row => (row[0].AsInteger(), row[1].AsInteger()))
+            .Should().Equal((1, 10), (1, 20), (2, 10), (2, 20));
+    }
+
+    [Test]
+    public void ProjectRegistersPublishesNoPartialOutputWhenTheTransformFails()
+    {
+        var failure = new InvalidOperationException("projection failed");
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Integer(7)),
+            new LoadConstantInstruction(new Register(1), SqlValue.Integer(99)),
+            new ProjectRegistersInstruction(
+                new RegisterRange(new Register(0), 1),
+                new RegisterRange(new Register(1), 1),
+                _ => throw failure,
+                "project"),
+            new HaltInstruction(),
+        ];
+        using var statement = new ResumableStatement(new VdbeProgram(2, cursorCount: 0, instructions));
+
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable()).Should().BeSameAs(failure);
+        statement.GetRegister(new Register(1)).Should().Be(SqlValue.Integer(99));
+    }
+
+    [Test]
+    public void JoinPlanRejectsFilteringAfterARawRowCap()
+    {
+        var root = new VdbeJoinOperatorPlan(
+            new VdbeJoinScanPlan("l", 1, Rows([1])),
+            new VdbeJoinScanPlan("r", 1, Rows([1])),
+            VdbeJoinKind.Inner,
+            condition: null);
+
+        Assert.Throws<ArgumentException>(() => new VdbeJoinPlan(
+            root,
+            "join",
+            filter: _ => true,
+            maximumRows: 1));
+    }
+
     // 0 LoadConstant r0=<seed> / 1 FilterRegisters r[0..0] -> 3 / 2 ResultRow r[0..0] / 3 Halt.
     // A true predicate falls through to the ResultRow; a false predicate jumps past it to Halt.
     private static VdbeProgram SingleRegisterFilter(VdbeRowPredicate predicate, SqlValue seed)
@@ -317,5 +399,26 @@ public class JoinOpcodeExecutionTests
         }
 
         return rows;
+    }
+
+    private static List<SqlValue[]> DrainYielding(ResumableStatement statement)
+    {
+        var rows = new List<SqlValue[]>();
+        while (true)
+        {
+            switch (statement.StepResumable())
+            {
+                case ResumableStatementStepResult.Yielded:
+                    statement.Resume();
+                    break;
+                case ResumableStatementStepResult.Row:
+                    rows.Add([.. statement.CurrentRow!]);
+                    break;
+                case ResumableStatementStepResult.Done:
+                    return rows;
+                default:
+                    throw new InvalidOperationException("Unknown step result.");
+            }
+        }
     }
 }
