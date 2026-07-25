@@ -443,6 +443,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 - Managed `ATTACH` supports file-backed aliases, filename expressions and parameters, `file:` URIs with `mode=ro|rw|rwc`, inherited page encryption, same-cipher hexadecimal `KEY` overrides, same-database SELECT/DML/CTE/subquery routing, and transactions/savepoints that modify at most one persistent database. A transaction may also modify its connection-private TEMP catalog. Statements whose reads span multiple database schemas and transactions that attempt to write a second persistent database are rejected before the unsafe operation because independent WAL files cannot be committed atomically. Attached in-memory databases, URI options other than `mode`, cross-database views/triggers, and plaintext-to-encrypted `KEY` attachment without a primary cipher remain unsupported.
 - Managed pooling retains at most 32 idle physical connections per canonical file/read-only key and at most 64 keys. `:memory:`, `Mode=Memory`, shared-memory, encrypted, native, remote/replica, and connections with custom functions, aggregates, or collations are not pooled. Returning a pooled connection closes readers and blobs, rolls back transactions, invalidates prepared commands, detaches databases, destroys the TEMP catalog, and resets connection-local pragmas and row-id state. Renting it refreshes the managed catalog from durable storage before reuse.
 - File-backed managed indexes preserve explicit, `UNIQUE`, and composite `PRIMARY KEY` origin and term metadata, including mixed `ASC`/`DESC` order and SQLite's built-in `BINARY`, `NOCASE`, and `RTRIM` collations. Rich index mutations use an atomic full-tree rewrite; the bounded in-place path remains limited to ascending `BINARY` terms. Application-defined index collations remain rejected before publication because their ordering cannot be reconstructed safely on reopen.
+- Managed SELECT sources accept SQLite's `INDEXED BY index-name` and `NOT INDEXED` clauses after an optional alias. `INDEXED BY` forces the named index, including constraint-owned, expression, collated, descending, partial, and `WITHOUT ROWID` secondary indexes; a missing or wrong-table index fails instead of silently choosing another route, and a partial index fails with `no query solution` unless the query predicates safely imply its `WHERE` clause for that join side. `NOT INDEXED` suppresses managed secondary-index selection while retaining SQLite's rowid/primary-key table semantics.
 - `SqliteConnection.ClearPool(connection)` retires the file/read-only pool selected by that connection string, and `SqliteConnection.ClearAllPools()` retires every managed pool. Idle handles are disposed immediately; rented handles are disposed instead of being reused when returned, so clearing is safe while connections are open.
 - `TursoConnection` uses the same contract when `Pooling=True` is explicitly selected and exposes corresponding `TursoConnection.ClearPool(connection)` and `TursoConnection.ClearAllPools()` methods.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
@@ -458,7 +459,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 - Managed file persistence reads and writes SQLite-compatible `WITHOUT ROWID` tables with composite `ASC`/`DESC` primary keys, built-in `BINARY`/`NOCASE`/`RTRIM` collations, VIRTUAL and STORED generated columns, explicit secondary indexes, implicit `UNIQUE` indexes, expression key terms, and partial-index `WHERE` predicates. Secondary-index records carry the required primary-key suffix, and managed files round-trip through ordinary SQLite in WAL or DELETE mode, backup, ATTACH, pooling, encryption, and page-size migration. Index expressions may use the managed engine's deterministic built-ins; parameters, subqueries, aggregate/window or non-deterministic functions, registered scalar-function overrides, application-defined collations, cross-table references, and schema forms that cannot round-trip through `sqlite_schema` fail before publication.
 - Managed `SqliteBlob` supports fixed-length reads and bounded writes for rowid tables in `main` and named attached databases. Use the database-name constructor for attachments. Blob writes participate in transactions subject to the managed `ATTACH` single-write-database boundary. A handle is invalidated if its row changes, and an open attached handle blocks `DETACH`.
 - Resizing, writable blobs on tables with `UPDATE` triggers, and `WITHOUT ROWID` tables are rejected before changing data. Attached databases inherit the primary managed file system, including encryption, and blob changes remain durable after reopen.
-- Native providers may expose virtual-table modules supplied by their native extension build. The managed provider has no safe module registration, lifecycle, planner, or execution interface, so `CREATE VIRTUAL TABLE` is rejected during parsing before schema mutation; it never fabricates FTS or other module support.
+- Native providers may expose virtual-table modules supplied by their native extension build. The managed provider has no safe module registration, lifecycle, planner, or execution interface, so `CREATE VIRTUAL TABLE` is rejected during parsing before schema mutation; it never fabricates FTS or other module support. The managed engine's built-in three-argument `generate_series(start, stop, step)` row source is the only executable table-valued FROM source and supports ordinary table aliases. Other `module_name(...)` source forms are rejected during parsing, including inside CTAS, before query execution or catalog mutation.
 - The managed engine does not implement experimental MVCC or vector-search functions. `PRAGMA journal_mode = mvcc` and functions such as `vector32()` fail rather than enabling partial behavior.
 - Local managed `OpenAsync` and command/reader async methods run blocking work
   off the caller thread and cooperatively observe cancellation tokens and
@@ -473,6 +474,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 | `CREATE TABLE AS SELECT` | Atomic materialization from SELECT, VALUES, compound queries, or CTEs. The destination may be `temp`, `main`, or an attachment, and its single source schema may differ from the destination. Result names use SQLite `:N` de-duplication, declared types use SQLite expression-affinity names (`INT`, `NUM`, `REAL`, `TEXT`, or empty), rowids start at 1 in result order, and empty results retain declared columns. Publication occurs only after query completion and cancellation checks. | Explicit destination column definitions, `STRICT`/`WITHOUT ROWID` CTAS options, queries reading more than one database schema, or inheritance of source constraints, generated-column status, foreign keys, indexes, or triggers. Failure/cancellation leaves no destination object. |
 | STRICT tables | `INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB`, and `ANY`; lossless affinity conversion followed by storage-class enforcement on INSERT, UPDATE, generated values, defaults, and trigger writes. `ANY` preserves the incoming storage class. STRICT metadata survives WAL/DELETE reopen, backup, and DELETE-mode page-size migration, appears in regenerated `sqlite_schema.sql`, and is reported by `PRAGMA table_list`. | Missing types, names outside the six SQLite STRICT types, or values that cannot be losslessly stored in the declared type. Errors occur before catalog/data publication. |
 | Virtual tables | None in the managed provider. Capability reporting keeps managed extension/module support disabled. | Every `CREATE VIRTUAL TABLE` form is rejected before mutation because no managed module callbacks or planner/executor contract exists. |
+| Table-valued FROM sources | Built-in `generate_series(start, stop, step)` with an optional alias. | Every other `module_name(...)` source is rejected during parsing because no managed module planner/executor contract exists; CTAS therefore fails before destination publication. |
 
 ### Managed query-plan diagnostics
 
@@ -484,20 +486,23 @@ late-bound, so their values are not embedded in the VDBE dump and rebinding does
 change an otherwise identical compiled shape.
 
 `EXPLAIN QUERY PLAN` keeps SQLite's public `id`, `parent`, `notused`, and `detail`
-columns but reports the managed execution boundary, not SQLite optimizer internals. It
-returns one deterministic row: the first three columns are `0`, and `detail` is either
-`MANAGED COMPILED VDBE` or `MANAGED EVALUATOR FALLBACK`. All parameters must be bound
-before stepping; their values are used to choose the same route as normal execution but
-are never rendered in the plan row. Planning never runs the emitted program, evaluator,
-or DML write target. Direct SELECT and DML plans stepped with a cancellation-capable
-token report evaluator fallback, matching their runtime cancellation boundaries. CTE
-plans report evaluator fallback because execution materializes CTE inputs before any
-later compiled phase. Unsupported non-query/non-DML statements fail explicitly.
+columns and reports the managed execution boundary rather than fabricated SQLite
+optimizer internals. Most statements return one deterministic row whose first three
+columns are `0` and whose `detail` is `MANAGED COMPILED VDBE` or
+`MANAGED EVALUATOR FALLBACK`. When the managed engine has selected or been forced to use
+a real single-table index row source, the detail instead reports `SCAN` or `SEARCH`,
+the source qualifier, and `USING INDEX index-name`. Hinted joins stay evaluator-owned
+until a join compiler can represent their per-source index order, so their plan remains
+`MANAGED EVALUATOR FALLBACK` rather than claiming an ignored index.
 
-These rows intentionally do not claim table scans, index choices, costs, cardinalities,
-or other planner details that the managed engine does not expose. SQLite's column shape
-is the compatibility contract; the two managed `detail` strings and fixed IDs are the
-stable managed contract.
+All parameters must be bound before stepping; their values are used to choose the same
+route as normal execution but are never rendered in the plan row. Planning never runs
+the emitted program, evaluator, user callbacks, or DML write target. Direct SELECT and
+DML plans stepped with a cancellation-capable token report evaluator fallback when that
+is their runtime boundary. CTE plans report evaluator fallback because execution
+materializes CTE inputs before any later compiled phase. Unsupported
+non-query/non-DML statements fail explicitly. The managed plan does not claim costs,
+cardinalities, covering status, or index choices that execution does not actually use.
 
 ## Entity Framework Core
 

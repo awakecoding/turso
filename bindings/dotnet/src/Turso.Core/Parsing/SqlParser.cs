@@ -1833,8 +1833,17 @@ internal sealed class SqlParser
         }
 
         var name = ParseSchemaQualifiedName();
+        if (_lexer.Current.Kind != TokenKind.LeftParen)
+        {
+            var alias = ParseTableAlias();
+            return new NamedTableSource(name, alias, ParseTableIndexDirective());
+        }
         if (!string.Equals(name, "generate_series", StringComparison.OrdinalIgnoreCase))
-            return new NamedTableSource(name, ParseTableAlias());
+        {
+            throw Error(
+                $"Managed table-valued source '{name}' is not supported: "
+                + "no module registration, planner, or execution contract is available.");
+        }
 
         Expect(TokenKind.LeftParen);
         var start = ParseExpression();
@@ -1843,7 +1852,7 @@ internal sealed class SqlParser
         Expect(TokenKind.Comma);
         var step = ParseExpression();
         Expect(TokenKind.RightParen);
-        return new GenerateSeriesSource(start, stop, step);
+        return new GenerateSeriesSource(start, stop, step, ParseTableAlias());
     }
 
     private string? ParseTableAlias()
@@ -1856,6 +1865,22 @@ internal sealed class SqlParser
         return null;
     }
 
+    private TableIndexDirective? ParseTableIndexDirective()
+    {
+        if (ConsumeKeyword("INDEXED"))
+        {
+            ExpectKeyword("BY");
+            return new IndexedByDirective(ExpectIdentifier());
+        }
+        if (ConsumeKeyword("NOT"))
+        {
+            ExpectKeyword("INDEXED");
+            return new NotIndexedDirective();
+        }
+
+        return null;
+    }
+
     private static bool IsTableSourceClauseKeyword(string keyword)
     {
         return keyword.Equals("CROSS", StringComparison.OrdinalIgnoreCase)
@@ -1863,11 +1888,13 @@ internal sealed class SqlParser
             || keyword.Equals("FULL", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("GROUP", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("HAVING", StringComparison.OrdinalIgnoreCase)
+            || keyword.Equals("INDEXED", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("INNER", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("JOIN", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("LIMIT", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("LEFT", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("NATURAL", StringComparison.OrdinalIgnoreCase)
+            || keyword.Equals("NOT", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("ON", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("ORDER", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("OUTER", StringComparison.OrdinalIgnoreCase)

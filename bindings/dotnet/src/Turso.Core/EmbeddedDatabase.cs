@@ -304,6 +304,8 @@ public sealed class EmbeddedDatabase : IDisposable
         EmbeddedIndex Index,
         bool Search);
 
+    private sealed record IndexConstraint(Expression Expression, bool RequiresNullRejection);
+
     internal sealed record QueryContext(
         Dictionary<string, EmbeddedTable> Tables,
         IReadOnlyDictionary<string, SourceData> CommonTableExpressions,
@@ -840,11 +842,27 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         lock (_gate)
         {
-            return DescribeQuery(statement, new QueryContext(
+            var context = new QueryContext(
                 _tables,
                 new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
                 _views,
-                _triggers));
+                _triggers);
+            ValidateQueryIndexDirectives(statement, context);
+            return DescribeQuery(statement, context);
+        }
+    }
+
+    internal string[] DescribeColumns(QueryStatement statement, SchemaCatalog catalog)
+    {
+        lock (_gate)
+        {
+            var context = new QueryContext(
+                catalog.Tables,
+                new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
+                catalog.Views,
+                catalog.Triggers);
+            ValidateQueryIndexDirectives(statement, context);
+            return DescribeQuery(statement, context);
         }
     }
 
@@ -6781,6 +6799,7 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         context.CancellationToken.ThrowIfCancellationRequested();
+        ValidateSelectIndexDirectives(select, context);
         ValidateGroupByCollations(select.GroupBy);
         var canUseCompiledRoute = !context.CancellationToken.CanBeCanceled
             || IsAggregateSelect(select);
@@ -11259,6 +11278,8 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         if (source is not NamedTableSource named)
             return null;
+        if (named.IndexDirective is IndexedByDirective)
+            return null;
         if (IsSchemaTable(named.Name)
             || context.CommonTableExpressions.ContainsKey(named.Name)
             || TryGetView(context, named.Name, out _))
@@ -12040,6 +12061,7 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context)
     {
         var compilationContext = EnsureAutoIncrementStatementState(context);
+        ValidateStatementIndexDirectives(statement.Inner, compilationContext);
         if (statement.Inner is SelectStatement plannedSelect
             && HasExplainSafeBounds(plannedSelect)
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
@@ -12135,6 +12157,7 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context)
     {
         var compilationContext = EnsureAutoIncrementStatementState(context);
+        ValidateStatementIndexDirectives(statement.Inner, compilationContext);
         if (statement.Inner is SelectStatement plannedSelect
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
         {
@@ -12555,6 +12578,497 @@ public sealed class EmbeddedDatabase : IDisposable
         return builder.ToString();
     }
 
+    private void ValidateStatementIndexDirectives(ParsedStatement statement, QueryContext context)
+    {
+        switch (statement)
+        {
+            case QueryStatement query:
+                ValidateQueryIndexDirectives(query, context);
+                break;
+            case InsertStatement { Source: { } source }:
+                ValidateQueryIndexDirectives(source, context);
+                break;
+            case WithDmlStatement with:
+                ValidateWithIndexDirectives(
+                    with.CommonTableExpressions,
+                    context,
+                    scoped => ValidateStatementIndexDirectives(with.Dml, scoped));
+                break;
+        }
+    }
+
+    private void ValidateQueryIndexDirectives(QueryStatement statement, QueryContext context)
+    {
+        switch (statement)
+        {
+            case SelectStatement select:
+                ValidateSelectIndexDirectives(select, context);
+                break;
+            case CompoundSelectStatement compound:
+                foreach (var term in compound.Terms)
+                    ValidateQueryIndexDirectives(term, context);
+                foreach (var order in compound.OrderBy)
+                    ValidateExpressionIndexDirectives(order.Expression, context);
+                ValidateExpressionIndexDirectives(compound.Limit, context);
+                ValidateExpressionIndexDirectives(compound.Offset, context);
+                break;
+            case WithSelectStatement with:
+                ValidateWithIndexDirectives(
+                    with.CommonTableExpressions,
+                    context,
+                    scoped => ValidateQueryIndexDirectives(with.Query, scoped));
+                break;
+            case ValuesClause values:
+                foreach (var expression in values.Rows.SelectMany(row => row))
+                    ValidateExpressionIndexDirectives(expression, context);
+                break;
+        }
+    }
+
+    private void ValidateWithIndexDirectives(
+        IReadOnlyList<CommonTableExpression> expressions,
+        QueryContext context,
+        Action<QueryContext> validateBody)
+    {
+        var commonTableExpressions = new Dictionary<string, SourceData>(
+            context.CommonTableExpressions,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var expression in expressions)
+        {
+            commonTableExpressions[expression.Name] = new SourceData([], []);
+            ValidateQueryIndexDirectives(
+                expression.Query,
+                context with { CommonTableExpressions = commonTableExpressions });
+        }
+
+        validateBody(context with { CommonTableExpressions = commonTableExpressions });
+    }
+
+    private void ValidateSelectIndexDirectives(SelectStatement statement, QueryContext context)
+    {
+        var whereTerms = statement.Where is null
+            ? []
+            : IndexExpressionSemantics.SplitConjuncts(statement.Where);
+        ValidateTableSourceIndexDirectives(
+            statement.Source,
+            whereTerms,
+            inheritedJoinConstraints: [],
+            nullSupplying: false,
+            allowUnqualified: CountTableSourceLeaves(statement.Source) <= 1,
+            context);
+        foreach (var projection in statement.Projections)
+            ValidateExpressionIndexDirectives(projection.Expression, context);
+        ValidateExpressionIndexDirectives(statement.Where, context);
+        foreach (var expression in statement.GroupBy)
+            ValidateExpressionIndexDirectives(expression, context);
+        ValidateExpressionIndexDirectives(statement.Having, context);
+        foreach (var window in statement.NamedWindows)
+            ValidateWindowIndexDirectives(window.Specification, context);
+        foreach (var order in statement.OrderBy)
+            ValidateExpressionIndexDirectives(order.Expression, context);
+        ValidateExpressionIndexDirectives(statement.Limit, context);
+        ValidateExpressionIndexDirectives(statement.Offset, context);
+    }
+
+    private void ValidateTableSourceIndexDirectives(
+        TableSource? source,
+        IReadOnlyList<Expression> whereTerms,
+        IReadOnlyList<IndexConstraint> inheritedJoinConstraints,
+        bool nullSupplying,
+        bool allowUnqualified,
+        QueryContext context)
+    {
+        switch (source)
+        {
+            case null:
+                return;
+            case GenerateSeriesSource series:
+                ValidateExpressionIndexDirectives(series.Start, context);
+                ValidateExpressionIndexDirectives(series.Stop, context);
+                ValidateExpressionIndexDirectives(series.Step, context);
+                return;
+            case NamedTableSource named:
+                var constraints = inheritedJoinConstraints
+                    .Concat(whereTerms.Select(expression =>
+                        new IndexConstraint(expression, RequiresNullRejection: nullSupplying)))
+                    .ToArray();
+                ValidateNamedTableIndexDirective(named, constraints, allowUnqualified, context);
+                if (TryGetView(context, named.Name, out var view)
+                    && named.IndexDirective is not IndexedByDirective)
+                {
+                    ValidateQueryIndexDirectives(
+                        view.Query,
+                        EnterView(context, view.Name));
+                }
+                return;
+            case DerivedTableSource derived:
+                ValidateQueryIndexDirectives(derived.Query, context);
+                return;
+            case JoinTableSource join:
+                ValidateExpressionIndexDirectives(join.Condition, context);
+                var joinTerms = join.Condition is null
+                    ? []
+                    : IndexExpressionSemantics.SplitConjuncts(join.Condition);
+                var leftBecomesNullSupplying = join.Kind is JoinKind.Right or JoinKind.Full;
+                var rightBecomesNullSupplying = join.Kind is JoinKind.Left or JoinKind.Full;
+                // Predicates inherited from above an outer-join boundary run after this
+                // side can be null-extended. Only this join's own ON terms may filter its
+                // non-preserved input without first proving null rejection.
+                var leftJoinConstraints = RequireNullRejection(
+                    inheritedJoinConstraints,
+                    leftBecomesNullSupplying);
+                var rightJoinConstraints = RequireNullRejection(
+                    inheritedJoinConstraints,
+                    rightBecomesNullSupplying);
+                if (join.Kind is JoinKind.Inner or JoinKind.Right)
+                {
+                    leftJoinConstraints =
+                    [
+                        .. leftJoinConstraints,
+                        .. joinTerms.Select(expression =>
+                            new IndexConstraint(expression, RequiresNullRejection: false)),
+                    ];
+                }
+                if (join.Kind is JoinKind.Inner or JoinKind.Left)
+                {
+                    rightJoinConstraints =
+                    [
+                        .. rightJoinConstraints,
+                        .. joinTerms.Select(expression =>
+                            new IndexConstraint(expression, RequiresNullRejection: false)),
+                    ];
+                }
+
+                ValidateTableSourceIndexDirectives(
+                    join.Left,
+                    whereTerms,
+                    leftJoinConstraints,
+                    nullSupplying || leftBecomesNullSupplying,
+                    allowUnqualified,
+                    context);
+                ValidateTableSourceIndexDirectives(
+                    join.Right,
+                    whereTerms,
+                    rightJoinConstraints,
+                    nullSupplying || rightBecomesNullSupplying,
+                    allowUnqualified,
+                    context);
+                return;
+            default:
+                throw new InvalidOperationException($"Unknown table source {source.GetType().Name}.");
+        }
+    }
+
+    private static IReadOnlyList<IndexConstraint> RequireNullRejection(
+        IReadOnlyList<IndexConstraint> constraints,
+        bool required)
+    {
+        if (!required || constraints.All(constraint => constraint.RequiresNullRejection))
+            return constraints;
+
+        return constraints
+            .Select(constraint => constraint.RequiresNullRejection
+                ? constraint
+                : constraint with { RequiresNullRejection = true })
+            .ToArray();
+    }
+
+    private void ValidateExpressionIndexDirectives(Expression? expression, QueryContext context)
+    {
+        switch (expression)
+        {
+            case null or LiteralExpression or CurrentTimeExpression or ParameterExpression
+                or ColumnExpression or StarExpression or QualifiedStarExpression:
+                return;
+            case RowValueExpression row:
+                foreach (var value in row.Values)
+                    ValidateExpressionIndexDirectives(value, context);
+                return;
+            case FunctionExpression function:
+                foreach (var argument in function.Arguments)
+                    ValidateExpressionIndexDirectives(argument, context);
+                ValidateExpressionIndexDirectives(function.Filter, context);
+                ValidateWindowIndexDirectives(function.Window, context);
+                return;
+            case ScalarSubqueryExpression scalar:
+                ValidateQueryIndexDirectives(scalar.Query, context);
+                return;
+            case ExistsExpression exists:
+                ValidateQueryIndexDirectives(exists.Query, context);
+                return;
+            case InSubqueryExpression @in:
+                ValidateExpressionIndexDirectives(@in.Value, context);
+                ValidateQueryIndexDirectives(@in.Query, context);
+                return;
+            case CollationExpression collation:
+                ValidateExpressionIndexDirectives(collation.Expression, context);
+                return;
+            case CastExpression cast:
+                ValidateExpressionIndexDirectives(cast.Expression, context);
+                return;
+            case CaseExpression @case:
+                ValidateExpressionIndexDirectives(@case.Operand, context);
+                foreach (var clause in @case.Clauses)
+                {
+                    ValidateExpressionIndexDirectives(clause.When, context);
+                    ValidateExpressionIndexDirectives(clause.Then, context);
+                }
+                ValidateExpressionIndexDirectives(@case.Else, context);
+                return;
+            case LikeExpression like:
+                ValidateExpressionIndexDirectives(like.Value, context);
+                ValidateExpressionIndexDirectives(like.Pattern, context);
+                ValidateExpressionIndexDirectives(like.Escape, context);
+                return;
+            case GlobExpression glob:
+                ValidateExpressionIndexDirectives(glob.Value, context);
+                ValidateExpressionIndexDirectives(glob.Pattern, context);
+                return;
+            case InExpression @in:
+                ValidateExpressionIndexDirectives(@in.Value, context);
+                foreach (var value in @in.Values)
+                    ValidateExpressionIndexDirectives(value, context);
+                return;
+            case BetweenExpression between:
+                ValidateExpressionIndexDirectives(between.Value, context);
+                ValidateExpressionIndexDirectives(between.Lower, context);
+                ValidateExpressionIndexDirectives(between.Upper, context);
+                return;
+            case UnaryExpression unary:
+                ValidateExpressionIndexDirectives(unary.Operand, context);
+                return;
+            case BinaryExpression binary:
+                ValidateExpressionIndexDirectives(binary.Left, context);
+                ValidateExpressionIndexDirectives(binary.Right, context);
+                return;
+            default:
+                throw new InvalidOperationException($"Unknown expression {expression.GetType().Name}.");
+        }
+    }
+
+    private void ValidateWindowIndexDirectives(WindowSpecification? window, QueryContext context)
+    {
+        if (window is null)
+            return;
+        foreach (var partition in window.PartitionBy)
+            ValidateExpressionIndexDirectives(partition, context);
+        foreach (var order in window.OrderBy)
+            ValidateExpressionIndexDirectives(order.Expression, context);
+        ValidateExpressionIndexDirectives(window.Frame?.Start.Offset, context);
+        ValidateExpressionIndexDirectives(window.Frame?.End.Offset, context);
+    }
+
+    private void ValidateNamedTableIndexDirective(
+        NamedTableSource source,
+        IReadOnlyList<IndexConstraint> constraints,
+        bool allowUnqualified,
+        QueryContext context)
+    {
+        if (source.IndexDirective is not IndexedByDirective indexedBy)
+            return;
+        if (IsSchemaTable(source.Name)
+            || context.CommonTableExpressions.ContainsKey(source.Name)
+            || TryGetView(context, source.Name, out _))
+        {
+            throw new EmbeddedSqlException($"no such index: {indexedBy.IndexName}");
+        }
+        if (!context.Tables.TryGetValue(source.Name, out var table))
+            return;
+
+        var index = table.Indexes.FirstOrDefault(candidate =>
+            string.Equals(candidate.Name, indexedBy.IndexName, StringComparison.OrdinalIgnoreCase));
+        if (index is null)
+            throw new EmbeddedSqlException($"no such index: {indexedBy.IndexName}");
+        if (index.Where is null)
+            return;
+
+        var registeredPredicateFunction = IndexExpressionSemantics.ContainsFunction(
+            index.Where,
+            IsRegisteredScalarFunction);
+        if (registeredPredicateFunction
+            || !SourcePredicatesImplyIndex(
+                constraints,
+                index.Where,
+                source,
+                allowUnqualified))
+        {
+            throw new EmbeddedSqlException("no query solution");
+        }
+    }
+
+    private static bool SourcePredicatesImplyIndex(
+        IReadOnlyList<IndexConstraint> constraints,
+        Expression indexPredicate,
+        NamedTableSource source,
+        bool allowUnqualified)
+    {
+        foreach (var required in IndexExpressionSemantics.SplitConjuncts(indexPredicate))
+        {
+            var matched = constraints.Any(constraint =>
+                ExpressionColumnsBelongToSource(constraint.Expression, source, allowUnqualified)
+                && IndexExpressionSemantics.PredicateTermsEqual(constraint.Expression, required)
+                && (!constraint.RequiresNullRejection
+                    || IsDirectNullRejectingPredicate(
+                        constraint.Expression,
+                        source,
+                        allowUnqualified)));
+            if (!matched)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool ExpressionColumnsBelongToSource(
+        Expression expression,
+        NamedTableSource source,
+        bool allowUnqualified)
+    {
+        return expression switch
+        {
+            ColumnExpression column => ColumnBelongsToSource(column, source, allowUnqualified),
+            RowValueExpression row => row.Values.All(value =>
+                ExpressionColumnsBelongToSource(value, source, allowUnqualified)),
+            FunctionExpression function => function.Arguments.All(argument =>
+                    ExpressionColumnsBelongToSource(argument, source, allowUnqualified))
+                && (function.Filter is null
+                    || ExpressionColumnsBelongToSource(function.Filter, source, allowUnqualified))
+                && WindowColumnsBelongToSource(function.Window, source, allowUnqualified),
+            ScalarSubqueryExpression or ExistsExpression or InSubqueryExpression => false,
+            CollationExpression collation =>
+                ExpressionColumnsBelongToSource(collation.Expression, source, allowUnqualified),
+            CastExpression cast =>
+                ExpressionColumnsBelongToSource(cast.Expression, source, allowUnqualified),
+            CaseExpression @case =>
+                (@case.Operand is null
+                    || ExpressionColumnsBelongToSource(@case.Operand, source, allowUnqualified))
+                && @case.Clauses.All(clause =>
+                    ExpressionColumnsBelongToSource(clause.When, source, allowUnqualified)
+                    && ExpressionColumnsBelongToSource(clause.Then, source, allowUnqualified))
+                && (@case.Else is null
+                    || ExpressionColumnsBelongToSource(@case.Else, source, allowUnqualified)),
+            LikeExpression like =>
+                ExpressionColumnsBelongToSource(like.Value, source, allowUnqualified)
+                && ExpressionColumnsBelongToSource(like.Pattern, source, allowUnqualified)
+                && (like.Escape is null
+                    || ExpressionColumnsBelongToSource(like.Escape, source, allowUnqualified)),
+            GlobExpression glob =>
+                ExpressionColumnsBelongToSource(glob.Value, source, allowUnqualified)
+                && ExpressionColumnsBelongToSource(glob.Pattern, source, allowUnqualified),
+            InExpression @in =>
+                ExpressionColumnsBelongToSource(@in.Value, source, allowUnqualified)
+                && @in.Values.All(value =>
+                    ExpressionColumnsBelongToSource(value, source, allowUnqualified)),
+            BetweenExpression between =>
+                ExpressionColumnsBelongToSource(between.Value, source, allowUnqualified)
+                && ExpressionColumnsBelongToSource(between.Lower, source, allowUnqualified)
+                && ExpressionColumnsBelongToSource(between.Upper, source, allowUnqualified),
+            UnaryExpression unary =>
+                ExpressionColumnsBelongToSource(unary.Operand, source, allowUnqualified),
+            BinaryExpression binary =>
+                ExpressionColumnsBelongToSource(binary.Left, source, allowUnqualified)
+                && ExpressionColumnsBelongToSource(binary.Right, source, allowUnqualified),
+            QualifiedStarExpression => false,
+            _ => true,
+        };
+    }
+
+    private static bool WindowColumnsBelongToSource(
+        WindowSpecification? window,
+        NamedTableSource source,
+        bool allowUnqualified)
+    {
+        if (window is null)
+            return true;
+
+        return window.PartitionBy.All(expression =>
+                ExpressionColumnsBelongToSource(expression, source, allowUnqualified))
+            && window.OrderBy.All(term =>
+                ExpressionColumnsBelongToSource(term.Expression, source, allowUnqualified))
+            && (window.Frame?.Start.Offset is null
+                || ExpressionColumnsBelongToSource(window.Frame.Start.Offset, source, allowUnqualified))
+            && (window.Frame?.End.Offset is null
+                || ExpressionColumnsBelongToSource(window.Frame.End.Offset, source, allowUnqualified));
+    }
+
+    private static bool IsDirectNullRejectingPredicate(
+        Expression expression,
+        NamedTableSource source,
+        bool allowUnqualified)
+    {
+        return expression switch
+        {
+            BinaryExpression binary when binary.Operator is BinaryOperator.Equal
+                or BinaryOperator.NotEqual
+                or BinaryOperator.LessThan
+                or BinaryOperator.LessThanOrEqual
+                or BinaryOperator.GreaterThan
+                or BinaryOperator.GreaterThanOrEqual =>
+                IsDirectSourceValue(binary.Left, source, allowUnqualified)
+                || IsDirectSourceValue(binary.Right, source, allowUnqualified),
+            BinaryExpression { Operator: BinaryOperator.Is } binary =>
+                IsDirectSourceValue(binary.Left, source, allowUnqualified)
+                    && binary.Right is LiteralExpression { Value.Kind: not SqlValueKind.Null }
+                || IsDirectSourceValue(binary.Right, source, allowUnqualified)
+                    && binary.Left is LiteralExpression { Value.Kind: not SqlValueKind.Null },
+            BinaryExpression { Operator: BinaryOperator.IsNot } binary =>
+                IsDirectSourceValue(binary.Left, source, allowUnqualified)
+                    && binary.Right is LiteralExpression { Value.Kind: SqlValueKind.Null }
+                || IsDirectSourceValue(binary.Right, source, allowUnqualified)
+                    && binary.Left is LiteralExpression { Value.Kind: SqlValueKind.Null },
+            BetweenExpression between =>
+                IsDirectSourceValue(between.Value, source, allowUnqualified),
+            InExpression @in =>
+                IsDirectSourceValue(@in.Value, source, allowUnqualified),
+            LikeExpression like =>
+                IsDirectSourceValue(like.Value, source, allowUnqualified),
+            GlobExpression glob =>
+                IsDirectSourceValue(glob.Value, source, allowUnqualified),
+            UnaryExpression { Operator: UnaryOperator.Not } unary =>
+                IsDirectNullRejectingPredicate(unary.Operand, source, allowUnqualified),
+            _ => false,
+        };
+    }
+
+    private static bool IsDirectSourceValue(
+        Expression expression,
+        NamedTableSource source,
+        bool allowUnqualified)
+    {
+        return expression switch
+        {
+            ColumnExpression column => ColumnBelongsToSource(column, source, allowUnqualified),
+            CollationExpression collation =>
+                IsDirectSourceValue(collation.Expression, source, allowUnqualified),
+            CastExpression cast => IsDirectSourceValue(cast.Expression, source, allowUnqualified),
+            UnaryExpression { Operator: UnaryOperator.Plus or UnaryOperator.Negate or UnaryOperator.BitwiseNot } unary =>
+                IsDirectSourceValue(unary.Operand, source, allowUnqualified),
+            _ => false,
+        };
+    }
+
+    private static bool ColumnBelongsToSource(
+        ColumnExpression column,
+        NamedTableSource source,
+        bool allowUnqualified)
+    {
+        if (column.Qualifier is null)
+            return allowUnqualified;
+
+        var qualifier = source.Alias ?? source.Name;
+        return string.Equals(column.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int CountTableSourceLeaves(TableSource? source)
+    {
+        return source switch
+        {
+            null => 0,
+            JoinTableSource join => CountTableSourceLeaves(join.Left) + CountTableSourceLeaves(join.Right),
+            _ => 1,
+        };
+    }
+
     private ManagedIndexScanPlan? TryPlanManagedIndexScan(
         SelectStatement statement,
         QueryContext context)
@@ -12567,6 +13081,11 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             return null;
         }
+
+        if (source.IndexDirective is NotIndexedDirective)
+            return null;
+        if (source.IndexDirective is IndexedByDirective)
+            return CreateForcedIndexScanPlan(source, table, statement.Where);
 
         foreach (var index in table.Indexes.OrderBy(candidate => candidate.Name, StringComparer.OrdinalIgnoreCase))
         {
@@ -12583,16 +13102,64 @@ public sealed class EmbeddedDatabase : IDisposable
 
             var leading = index.Columns[0];
             var search = WhereUsesIndexTerm(statement.Where, table, leading);
-            var ordered = statement.OrderBy.Count > 0
-                && statement.OrderBy[0].Ordinal is null
-                && statement.OrderBy[0].NullPlacement == NullPlacement.Default
-                && statement.OrderBy[0].Descending == leading.Descending
-                && QueryExpressionMatchesIndexTerm(statement.OrderBy[0].Expression, table, leading);
+            var ordered = OrderByUsesIndex(statement.OrderBy, table, index);
             if (search || ordered)
                 return new ManagedIndexScanPlan(source, table, index, search);
         }
 
         return null;
+    }
+
+    private static ManagedIndexScanPlan CreateForcedIndexScanPlan(
+        NamedTableSource source,
+        EmbeddedTable table,
+        Expression? where)
+    {
+        var indexedBy = source.IndexDirective as IndexedByDirective
+            ?? throw new InvalidOperationException("A forced index scan requires an INDEXED BY directive.");
+        var index = table.Indexes.FirstOrDefault(candidate =>
+            string.Equals(candidate.Name, indexedBy.IndexName, StringComparison.OrdinalIgnoreCase))
+            ?? throw new EmbeddedSqlException($"no such index: {indexedBy.IndexName}");
+        return new ManagedIndexScanPlan(
+            source,
+            table,
+            index,
+            WhereUsesIndexTerm(where, table, index.Columns[0]));
+    }
+
+    private static bool OrderByUsesIndex(
+        IReadOnlyList<OrderByTerm> orderBy,
+        EmbeddedTable table,
+        EmbeddedIndex index)
+    {
+        if (orderBy.Count == 0 || orderBy.Count > index.Columns.Count)
+            return false;
+
+        for (var position = 0; position < orderBy.Count; position++)
+        {
+            var order = orderBy[position];
+            var indexed = index.Columns[position];
+            if (order.Ordinal is not null
+                || order.Descending != indexed.Descending
+                || !NullPlacementMatchesIndex(order)
+                || !QueryExpressionMatchesIndexTerm(order.Expression, table, indexed))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool NullPlacementMatchesIndex(OrderByTerm order)
+    {
+        return order.NullPlacement switch
+        {
+            NullPlacement.Default => true,
+            NullPlacement.First => !order.Descending,
+            NullPlacement.Last => order.Descending,
+            _ => throw new InvalidOperationException($"Unknown NULL placement {order.NullPlacement}."),
+        };
     }
 
     private bool IndexUsesRegisteredFunctions(EmbeddedIndex index)
@@ -12764,6 +13331,8 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        context.CancellationToken.ThrowIfCancellationRequested();
+        ValidateSelectIndexDirectives(statement, context);
         statement = ResolveNamedWindows(statement);
         context = EnterCollationSource(context, statement.Source);
         ValidateGroupByCollations(statement.GroupBy);
@@ -14818,8 +15387,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 return BuildOutputColumns(named.Alias ?? view.Name, ResolveViewColumns(view, EnterView(context, view.Name)));
             case NamedTableSource named:
                 return BuildOutputColumns(named.Alias ?? named.Name, GetTable(named, context.Tables).Columns);
-            case GenerateSeriesSource:
-                return [new OutputColumn(null, "value", 0)];
+            case GenerateSeriesSource series:
+                return BuildOutputColumns(series.Alias ?? "generate_series", ["value"]);
             case DerivedTableSource derived:
                 return BuildOutputColumns(derived.Alias, DescribeQuery(derived.Query, context));
             case JoinTableSource join:
@@ -14986,6 +15555,14 @@ public sealed class EmbeddedDatabase : IDisposable
                 => GetCommonTableExpressionRows(named, commonTableExpression, outerRow, maximumRows),
             NamedTableSource named when TryGetView(context, named.Name, out var view)
                 => GetViewRows(named, view, parameters, context, maximumRows, outerRow),
+            NamedTableSource { IndexDirective: IndexedByDirective } named
+                => GetManagedIndexRows(
+                    CreateForcedIndexScanPlan(
+                        named,
+                        GetTable(named, context.Tables),
+                        where: null),
+                    context,
+                    outerRow),
             NamedTableSource named => GetNamedTableRows(named, context, maximumRows, outerRow),
             GenerateSeriesSource series => GetSeriesRows(series, parameters, context, maximumRows, outerRow),
             DerivedTableSource derived => GetDerivedTableRows(derived, parameters, context, outerRow, maximumRows),
@@ -15323,7 +15900,9 @@ public sealed class EmbeddedDatabase : IDisposable
             NamedTableSource named => BuildQualifiedColumns(
                 named.Alias ?? named.Name,
                 GetTable(named, context.Tables).Columns),
-            GenerateSeriesSource => new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+            GenerateSeriesSource series => BuildQualifiedColumns(
+                series.Alias ?? "generate_series",
+                ["value"]),
             DerivedTableSource derived when derived.Alias is not null
                 => BuildQualifiedColumns(derived.Alias, DescribeQuery(derived.Query, context)),
             DerivedTableSource => new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
@@ -15869,12 +16448,20 @@ public sealed class EmbeddedDatabase : IDisposable
         if (step == 0)
             throw new EmbeddedSqlException("generate_series() step must not be zero");
 
+        var qualifier = source.Alias ?? "generate_series";
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, ["value"]);
+        var outputColumns = BuildOutputColumns(qualifier, ["value"]);
         var rows = new List<SourceRow>();
         if (step > 0)
         {
             for (var current = start; current <= stop && (maximumRows is null || rows.Count < maximumRows.Value);)
             {
-                rows.Add(new SourceRow(["value"], [SqlValue.Integer(current)], Parent: outerRow));
+                rows.Add(new SourceRow(
+                    ["value"],
+                    [SqlValue.Integer(current)],
+                    qualifiedColumns,
+                    outerRow,
+                    outputColumns));
                 if (current > long.MaxValue - step)
                     break;
 
@@ -15885,7 +16472,12 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             for (var current = start; current >= stop && (maximumRows is null || rows.Count < maximumRows.Value);)
             {
-                rows.Add(new SourceRow(["value"], [SqlValue.Integer(current)], Parent: outerRow));
+                rows.Add(new SourceRow(
+                    ["value"],
+                    [SqlValue.Integer(current)],
+                    qualifiedColumns,
+                    outerRow,
+                    outputColumns));
                 if (current < long.MinValue - step)
                     break;
 
@@ -16150,7 +16742,13 @@ public sealed class EmbeddedDatabase : IDisposable
                     DescribeViewAffinities(view, EnterView(context, view.Name), commonTableExpressions),
                     named.Alias ?? view.Name),
             NamedTableSource named => GetTableAffinityColumns(named, context.Tables),
-            GenerateSeriesSource => [new QueryAffinityColumn(null, "value", ColumnAffinity.Integer)],
+            GenerateSeriesSource series =>
+            [
+                new QueryAffinityColumn(
+                    series.Alias ?? "generate_series",
+                    "value",
+                    ColumnAffinity.Integer),
+            ],
             DerivedTableSource derived => QualifyAffinityColumns(
                 DescribeQueryAffinities(derived.Query, context, commonTableExpressions),
                 derived.Alias),
@@ -27434,19 +28032,8 @@ public sealed class EmbeddedConnection : IDisposable
 
         return transactionState is null
             ? routed.Database.DescribeColumns(query)
-            : DescribeQueryColumns(query, transactionState.Catalog);
+            : routed.Database.DescribeColumns(query, transactionState.Catalog);
     }
-
-    private static string[] DescribeQueryColumns(
-        QueryStatement query,
-        EmbeddedDatabase.SchemaCatalog catalog)
-        => EmbeddedDatabase.DescribeQuery(
-            query,
-            new EmbeddedDatabase.QueryContext(
-                catalog.Tables,
-                new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
-                catalog.Views,
-                catalog.Triggers));
 
     private void CreateSavepoint(string name)
     {

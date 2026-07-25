@@ -302,7 +302,7 @@ internal static class IndexExpressionSemantics
         {
             if (!queryTerms.Any(candidate =>
                     UsesOnlySourceColumns(candidate, tableName, alias)
-                    && ExpressionsEqual(candidate, required)))
+                    && PredicateTermsEqual(candidate, required)))
                 return false;
         }
 
@@ -356,6 +356,17 @@ internal static class IndexExpressionSemantics
                 UsesOnlySourceColumns(value, tableName, alias)),
             _ => true,
         };
+    }
+
+    public static bool PredicateTermsEqual(Expression candidate, Expression required)
+    {
+        if (ExpressionsEqual(candidate, required))
+            return true;
+
+        return candidate is BinaryExpression { Operator: BinaryOperator.Equal } candidateEqual
+            && required is BinaryExpression { Operator: BinaryOperator.Equal } requiredEqual
+            && ExpressionsEqual(candidateEqual.Left, requiredEqual.Right)
+            && ExpressionsEqual(candidateEqual.Right, requiredEqual.Left);
     }
 
     public static bool ContainsFunction(
@@ -521,7 +532,7 @@ internal static class IndexExpressionSemantics
         }
     }
 
-    private static IReadOnlyList<Expression> SplitConjuncts(Expression expression)
+    public static IReadOnlyList<Expression> SplitConjuncts(Expression expression)
     {
         var terms = new List<Expression>();
         Add(expression, terms);
