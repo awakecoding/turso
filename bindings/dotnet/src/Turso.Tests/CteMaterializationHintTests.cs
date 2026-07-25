@@ -141,6 +141,25 @@ public sealed class CteMaterializationHintTests
     }
 
     [Test]
+    public void CtePrefixedReplaceMatchesSqlite()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE target(id INTEGER PRIMARY KEY, value INTEGER)",
+            "INSERT INTO target VALUES (1, 10), (2, 20)",
+        ];
+
+        AssertDmlMatchesSqlite(
+            setup,
+            """
+            WITH source(id, value) AS (VALUES (2, 200), (3, 30))
+            REPLACE INTO target SELECT id, value FROM source
+            RETURNING id, value;
+            """,
+            "SELECT id, value FROM target ORDER BY id;");
+    }
+
+    [Test]
     public void ManagedSqliteFacadeClassifiesHintedCteDmlAndReturningAsWrites()
     {
         using var connection = new ManagedSqlite.SqliteConnection(

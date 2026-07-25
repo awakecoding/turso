@@ -77,6 +77,19 @@ public sealed class FromSourcePlannerParityTests
     }
 
     [Test]
+    public void QuotedAliasesMatchingIndexDirectiveKeywordsMatchSqlite()
+    {
+        AssertMatchesSqlite(
+            RichIndexSetup,
+            """
+            SELECT "indexed".id
+            FROM items AS "indexed"
+            WHERE "indexed".active = 1
+            ORDER BY "indexed".id;
+            """);
+    }
+
+    [Test]
     public void AutomaticOrderingPlanRequiresEveryTermCollationDirectionAndNullPlacement()
     {
         using var database = new EmbeddedDatabase();

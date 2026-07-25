@@ -7,6 +7,38 @@ namespace Turso.Tests;
 public class VdbeProgramTests
 {
     [Test]
+    public void PublicOpcodeValuesAndConstructorRemainCompatible()
+    {
+        ((int)VdbeOpcode.OpenJoinCursor).Should().Be(7);
+        ((int)VdbeOpcode.Next).Should().Be(17);
+        ((int)VdbeOpcode.AggStep).Should().Be(32);
+        ((int)VdbeOpcode.Halt).Should().Be(57);
+
+        typeof(VdbeProgram).GetConstructor(
+            [
+                typeof(int),
+                typeof(int),
+                typeof(IEnumerable<VdbeInstruction>),
+                typeof(int),
+                typeof(int),
+                typeof(int),
+                typeof(int),
+                typeof(int),
+            ]).Should().NotBeNull();
+
+        var program = new VdbeProgram(
+            0,
+            0,
+            [new HaltInstruction()],
+            0,
+            0,
+            0,
+            0,
+            0);
+        program.WindowBufferCount.Should().Be(0);
+    }
+
+    [Test]
     public void ProgramValidatesTypedOperandsAndOwnsItsInstructionSequence()
     {
         VdbeInstruction[] instructions =

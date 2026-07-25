@@ -352,7 +352,8 @@ public sealed partial class EmbeddedDatabase
             beforeTriggers.Concat(afterTriggers));
         if (context.RecursiveTriggersEnabled
             && (statement.ConflictAlgorithm == InsertConflictAlgorithm.Replace
-                || table.HasNonDefaultConflictAlgorithms))
+                || table.HasNonDefaultConflictAlgorithms)
+            && !context.InheritedTriggerConflict)
         {
             var beforeDelete = GetRowTriggers(
                 context,
@@ -515,11 +516,6 @@ public sealed partial class EmbeddedDatabase
     {
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
-        if (context.ConflictAlgorithmOverride == InsertConflictAlgorithm.Replace)
-        {
-            throw new EmbeddedSqlException(
-                "Managed trigger UPDATE does not support an outer OR REPLACE conflict policy.");
-        }
         var beforeTriggers = GetRowTriggers(
             context,
             statement.TableName,
@@ -616,6 +612,7 @@ public sealed partial class EmbeddedDatabase
                     [position]);
             }
             catch (EmbeddedSqlException exception)
+                when (exception is not EmbeddedStatementAbortException)
             {
                 var algorithm = ResolveConstraintConflictAlgorithm(
                     exception,
@@ -2765,8 +2762,8 @@ public sealed partial class EmbeddedDatabase
                 new UpdateStatement(insert.TableName, update.Assignments, update.Where)));
         }
 
-        var mayReplace = insert.ConflictAlgorithm == InsertConflictAlgorithm.Replace
-            || context.ConflictAlgorithmOverride == InsertConflictAlgorithm.Replace
+        var mayReplace = !context.InheritedTriggerConflict
+            && insert.ConflictAlgorithm == InsertConflictAlgorithm.Replace
             || context.Tables.TryGetValue(insert.TableName, out var table)
                 && table.HasNonDefaultConflictAlgorithms;
         if (context.RecursiveTriggersEnabled && mayReplace)

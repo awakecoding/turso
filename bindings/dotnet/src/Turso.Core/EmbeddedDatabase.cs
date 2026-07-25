@@ -406,6 +406,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         TriggerRowFrame? TriggerRow = null,
         TriggerStatementState? TriggerState = null,
         InsertConflictAlgorithm? ConflictAlgorithmOverride = null,
+        bool InheritedTriggerConflict = false,
         bool IndexExpression = false,
         CancellationToken CancellationToken = default,
         bool SchemaValidation = false,
@@ -414,7 +415,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlyList<IReadOnlyDictionary<string, string?>>? OuterCollationScopes = null,
         InsertConflictAlgorithm? TriggerConflictAlgorithm = null,
         bool PreserveUpsertFail = false,
-        StatementExecutionState? StatementState = null);
+        StatementExecutionState? StatementState = null,
+        bool CompilationEnabled = true);
 
     internal sealed class StatementExecutionState(long lastInsertRowId)
     {
@@ -734,7 +736,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool recursiveTriggersEnabled = false,
         bool deferForeignKeys = false,
         bool inTransaction = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool compilationEnabled = true)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -750,7 +753,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 recursiveTriggersEnabled,
                 deferForeignKeys,
                 inTransaction,
-                cancellationToken));
+                cancellationToken,
+                compilationEnabled));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -771,7 +775,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         recursiveTriggersEnabled,
                         deferForeignKeys,
                         inTransaction,
-                        cancellationToken);
+                        cancellationToken,
+                        compilationEnabled);
                 }
                 catch (EmbeddedConflictFailException)
                 {
@@ -823,7 +828,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         recursiveTriggersEnabled,
                         deferForeignKeys,
                         inTransaction,
-                        cancellationToken);
+                        cancellationToken,
+                        compilationEnabled);
                 }
                 catch (EmbeddedConflictFailException)
                 {
@@ -857,7 +863,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     recursiveTriggersEnabled,
                     deferForeignKeys,
                     inTransaction,
-                    cancellationToken);
+                    cancellationToken,
+                    compilationEnabled);
 
             var working = new SchemaCatalog(_tables, _views, _triggers).Clone();
             ExecutionResult result;
@@ -872,7 +879,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     recursiveTriggersEnabled,
                     deferForeignKeys,
                     inTransaction,
-                    cancellationToken);
+                    cancellationToken,
+                    compilationEnabled);
             }
             catch (EmbeddedConflictFailException)
             {
@@ -1712,7 +1720,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool recursiveTriggersEnabled = false,
         bool deferForeignKeys = false,
         bool inTransaction = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool compilationEnabled = true)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -1729,7 +1738,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 recursiveTriggersEnabled,
                 deferForeignKeys,
                 inTransaction,
-                cancellationToken));
+                cancellationToken,
+                compilationEnabled));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1749,7 +1759,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             RecursiveTriggersEnabled: recursiveTriggersEnabled,
             ForeignKeyStatement: foreignKeysEnabled ? new ForeignKeyStatementState() : null,
             CancellationToken: cancellationToken,
-            StatementState: new StatementExecutionState(lastInsertRowId));
+            StatementState: new StatementExecutionState(lastInsertRowId),
+            CompilationEnabled: compilationEnabled);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
@@ -2876,8 +2887,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 throw new EmbeddedSqlException($"cannot create INSTEAD OF trigger on table: {statement.TableName}");
             if (!targetsView)
                 throw new EmbeddedSqlException($"no such view: {statement.TableName}");
-            if (statement.Event != TriggerEvent.Insert)
-                throw new EmbeddedSqlException("Managed INSTEAD OF triggers currently support INSERT events only.");
         }
         else
         {
@@ -2901,7 +2910,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
             statement.Body,
             statement.Sql,
             declarationOrder);
-        ValidateTriggerSchema(definition, context, context.CancellationToken);
         catalog.Triggers.Add(statement.Name, definition);
         return new ExecutionResult([], [], 0, true);
     }
@@ -3756,6 +3764,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             && context.ConflictAlgorithmOverride is { } conflictOverride)
         {
             statement = statement with { ConflictAlgorithm = conflictOverride };
+            context = context with { InheritedTriggerConflict = true };
         }
         var mayReplaceRows = statement.ConflictAlgorithm == InsertConflictAlgorithm.Replace
             || context.Tables.TryGetValue(statement.TableName, out var triggerTable)
@@ -5178,6 +5187,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (table.HasRowid)
                 {
                     lastInsertRowId = candidateRowId;
+                    SetLastInsertRowId(context, candidateRowId);
                     context = context with { LastInsertRowId = candidateRowId };
                 }
                 affectedLastInsertRowIds.Add(context.LastInsertRowId);
@@ -7716,19 +7726,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IReadOnlySet<int> assignedColumns,
         IReadOnlyList<int> updatedPositions)
     {
-        foreach (var (childTableName, childTable) in context.Tables)
+        for (var updatedIndex = 0; updatedIndex < updatedPositions.Count; updatedIndex++)
         {
-            foreach (var foreignKey in childTable.ForeignKeys.Reverse())
+            var position = updatedPositions[updatedIndex];
+            foreach (var (childTableName, childTable) in context.Tables)
             {
-                if (!string.Equals(foreignKey.ParentTable, tableName, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var parent = ResolveForeignKeyParent(context.Tables, childTableName, foreignKey);
-                if (!parent.ColumnIndices.Any(assignedColumns.Contains))
-                    continue;
-
-                foreach (var position in updatedPositions)
+                foreach (var foreignKey in childTable.ForeignKeys.Reverse())
                 {
+                    if (!string.Equals(
+                            foreignKey.ParentTable,
+                            tableName,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var parent = ResolveForeignKeyParent(context.Tables, childTableName, foreignKey);
+                    if (!parent.ColumnIndices.Any(assignedColumns.Contains))
+                        continue;
+
                     var oldValues = GetForeignKeyValues(originalRows[position], parent.ColumnIndices);
                     var newValues = GetForeignKeyValues(postUpdateRows[position], parent.ColumnIndices);
                     if (ForeignKeyValuesEqual(parent, oldValues, newValues))
@@ -8037,8 +8053,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
         catch (EmbeddedConflictFailException exception)
         {
+            if (IsFailingTriggerRaise(exception))
+            {
+                throw;
+            }
+
             throw DemoteUpsertFail(exception, actionContext);
         }
+    }
+
+    private static bool IsFailingTriggerRaise(EmbeddedConflictFailException exception)
+    {
+        Exception? current = exception;
+        while (current is EmbeddedConflictFailException)
+            current = current.InnerException;
+
+        return current is EmbeddedTriggerRaiseException
+        {
+            Algorithm: InsertConflictAlgorithm.Fail,
+        };
     }
 
     private static EmbeddedUpsertConflictFailException PromoteUpsertFail(
@@ -9067,41 +9100,41 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 var output = new List<SqlValue>();
                 try
                 {
-                foreach (var projection in returning)
-                {
-                    switch (projection.Expression)
+                    foreach (var projection in returning)
                     {
-                        case StarExpression:
-                            for (var index = 0; index < table.Columns.Length; index++)
-                                output.Add(rowValues[index]);
-                            break;
-                        case QualifiedStarExpression qualifiedStar:
-                            if (!string.Equals(qualifiedStar.Qualifier, tableName, StringComparison.OrdinalIgnoreCase))
-                                throw new EmbeddedSqlException($"no such table: {qualifiedStar.Qualifier}");
-                            for (var index = 0; index < table.Columns.Length; index++)
-                                output.Add(rowValues[index]);
-                            break;
-                        default:
-                            output.Add(Evaluate(projection.Expression, parameters, source, evaluationContext));
-                            break;
+                        switch (projection.Expression)
+                        {
+                            case StarExpression:
+                                for (var index = 0; index < table.Columns.Length; index++)
+                                    output.Add(rowValues[index]);
+                                break;
+                            case QualifiedStarExpression qualifiedStar:
+                                if (!string.Equals(qualifiedStar.Qualifier, tableName, StringComparison.OrdinalIgnoreCase))
+                                    throw new EmbeddedSqlException($"no such table: {qualifiedStar.Qualifier}");
+                                for (var index = 0; index < table.Columns.Length; index++)
+                                    output.Add(rowValues[index]);
+                                break;
+                            default:
+                                output.Add(Evaluate(projection.Expression, parameters, source, evaluationContext));
+                                break;
+                        }
                     }
                 }
-            }
-            catch (Exception exception) when (
-                rowFailureLastInsertRowIds is not null
-                && rowIndex < rowFailureLastInsertRowIds.Count
-                && rowFailureLastInsertRowIds[rowIndex].HasValue
-                && exception is not OperationCanceledException
-                && exception is not EmbeddedConflictFailException
-                && exception is not EmbeddedConflictRollbackException
-                && exception is not EmbeddedStatementAbortException
-                && exception is not EmbeddedStatementFailureException)
-            {
-                var failureLastInsertRowId = rowFailureLastInsertRowIds[rowIndex]!.Value;
-                if (exception is EmbeddedSqlException sqlException)
-                    throw new EmbeddedStatementAbortException(sqlException, failureLastInsertRowId);
-                throw new EmbeddedStatementFailureException(exception, failureLastInsertRowId);
-            }
+                catch (Exception exception) when (
+                    rowFailureLastInsertRowIds is not null
+                    && rowIndex < rowFailureLastInsertRowIds.Count
+                    && rowFailureLastInsertRowIds[rowIndex].HasValue
+                    && exception is not OperationCanceledException
+                    && exception is not EmbeddedConflictFailException
+                    && exception is not EmbeddedConflictRollbackException
+                    && exception is not EmbeddedStatementAbortException
+                    && exception is not EmbeddedStatementFailureException)
+                {
+                    var failureLastInsertRowId = rowFailureLastInsertRowIds[rowIndex]!.Value;
+                    if (exception is EmbeddedSqlException sqlException)
+                        throw new EmbeddedStatementAbortException(sqlException, failureLastInsertRowId);
+                    throw new EmbeddedStatementFailureException(exception, failureLastInsertRowId);
+                }
 
                 resultRows.Add(output.ToArray());
             }
@@ -13122,7 +13155,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         // Only engage for a SELECT that actually projects a window call; every other shape is
         // owned by the scan/aggregate/sorted/join routes or the evaluator.
-        if (!select.Projections.Any(projection => ContainsWindowFunction(projection.Expression)))
+        if (!context.CompilationEnabled
+            || context.CancellationToken.CanBeCanceled
+            || !select.Projections.Any(projection => ContainsWindowFunction(projection.Expression)))
             return false;
 
         // Reshaping/dedup clauses stay on the evaluator so this route owns only the pure
@@ -13175,6 +13210,60 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (windowFunctions.Count == 0)
             return false;
 
+        if (windowFunctions.Any(function =>
+                !IsBuiltInAggregate(function)
+                && TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
+            || select.Projections.Any(projection =>
+                IndexExpressionSemantics.ContainsFunction(
+                    projection.Expression,
+                    IsRegisteredScalarFunction))
+            || select.Where is not null
+                && IndexExpressionSemantics.ContainsFunction(
+                    select.Where,
+                    IsRegisteredScalarFunction)
+            || resolvedOrderBy.Any(term =>
+                IndexExpressionSemantics.ContainsFunction(
+                    term.Expression,
+                    IsRegisteredScalarFunction))
+            || windowFunctions.Any(function =>
+                function.Arguments.Any(argument =>
+                    IndexExpressionSemantics.ContainsFunction(
+                        argument,
+                        IsRegisteredScalarFunction))
+                || function.Filter is not null
+                    && IndexExpressionSemantics.ContainsFunction(
+                        function.Filter,
+                        IsRegisteredScalarFunction)
+                || function.Window!.PartitionBy.Any(expression =>
+                    IndexExpressionSemantics.ContainsFunction(
+                        expression,
+                        IsRegisteredScalarFunction))
+                || function.Window!.OrderBy.Any(term =>
+                    IndexExpressionSemantics.ContainsFunction(
+                        term.Expression,
+                        IsRegisteredScalarFunction))
+                || function.Window!.PartitionBy.Any(expression =>
+                    ContainsEffectiveCustomCollation(expression, context))
+                || function.Window!.OrderBy.Any(term =>
+                    ContainsEffectiveCustomCollation(term.Expression, context)))
+            || resolvedOrderBy.Any(term =>
+                ContainsEffectiveCustomCollation(term.Expression, context)))
+        {
+            return false;
+        }
+
+        // A top-level ordering over the same partition keys can interleave a partition
+        // when it applies a different collation. Keep that observable ordering on the
+        // evaluator rather than relying on the buffered pass to reproduce it.
+        if (windowFunctions.Any(function =>
+                HasMismatchedWindowPartitionOrder(
+                    function.Window!.PartitionBy,
+                    resolvedOrderBy,
+                    context)))
+        {
+            return false;
+        }
+
         var target = targetOverride ?? ResolveScanTarget(select.Source, context);
         if (target is null || target.Columns.Length == 0)
             return false;
@@ -13215,6 +13304,37 @@ public sealed partial class EmbeddedDatabase : IDisposable
             LimitOffsetProgramBuilder.Apply(program, offset, limit),
             [new VdbeCursorSource(target.Rows)]);
         return true;
+    }
+
+    private bool HasMismatchedWindowPartitionOrder(
+        IReadOnlyList<Expression> partitionBy,
+        IReadOnlyList<OrderByTerm> orderBy,
+        QueryContext context)
+    {
+        if (partitionBy.Count == 0 || orderBy.Count < partitionBy.Count)
+            return false;
+
+        for (var index = 0; index < partitionBy.Count; index++)
+        {
+            if (UnwrapCollation(partitionBy[index]) is not ColumnExpression partition
+                || UnwrapCollation(orderBy[index].Expression) is not ColumnExpression top
+                || !string.Equals(
+                    partition.Name,
+                    top.Name,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (!CollationsEquivalent(
+                    GetEffectiveCollation(partitionBy[index], context),
+                    GetEffectiveCollation(orderBy[index].Expression, context)))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // The streaming running-frame lowering. It reuses the evaluator's own accumulation
@@ -19804,7 +19924,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             RaiseAction.Rollback => new EmbeddedConflictRollbackException(error),
             RaiseAction.Abort => error,
             RaiseAction.Fail => new EmbeddedConflictFailException(
-                error,
+                new EmbeddedTriggerRaiseException(message, InsertConflictAlgorithm.Fail),
                 context.TriggerState?.LiveLastInsertRowId ?? context.LastInsertRowId),
             _ => new InvalidOperationException($"Unknown RAISE action {expression.Action}."),
         };
@@ -28889,7 +29009,9 @@ public sealed class EmbeddedConnection : IDisposable
                                 _recursiveTriggers,
                                 _deferForeignKeys,
                                 inTransaction: false,
-                                cancellationToken);
+                                cancellationToken,
+                                compilationEnabled: !routed.IsAttached
+                                    && !ReferenceEquals(routed.Database, _tempDatabase));
                         }
                         else
                         {
@@ -28905,7 +29027,9 @@ public sealed class EmbeddedConnection : IDisposable
                                 _recursiveTriggers,
                                 _deferForeignKeys,
                                 inTransaction: true,
-                                cancellationToken);
+                                cancellationToken,
+                                compilationEnabled: !routed.IsAttached
+                                    && !ReferenceEquals(routed.Database, _tempDatabase));
                             if (EmbeddedDatabase.MayMutate(routed.Statement))
                                 cancellationToken.ThrowIfCancellationRequested();
                         }

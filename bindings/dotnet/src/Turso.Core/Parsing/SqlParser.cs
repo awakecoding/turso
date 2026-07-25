@@ -1391,6 +1391,10 @@ internal sealed class SqlParser
         var commonTableExpressions = ParseCommonTableExpressions();
         if (ConsumeKeyword("INSERT"))
             return new WithDmlStatement(commonTableExpressions, ParseInsert());
+        if (ConsumeKeyword("REPLACE"))
+            return new WithDmlStatement(
+                commonTableExpressions,
+                ParseInsert(InsertConflictAlgorithm.Replace));
         if (ConsumeKeyword("UPDATE"))
             return new WithDmlStatement(commonTableExpressions, ParseUpdate());
         if (ConsumeKeyword("DELETE"))
@@ -1398,7 +1402,8 @@ internal sealed class SqlParser
         if (IsQueryStart())
             return new WithSelectStatement(commonTableExpressions, ParseQuery());
 
-        throw Error("Expected a SELECT, INSERT, UPDATE, or DELETE statement after the common table expression.");
+        throw Error(
+            "Expected a SELECT, INSERT, REPLACE, UPDATE, or DELETE statement after the common table expression.");
     }
 
     private IReadOnlyList<CommonTableExpression> ParseCommonTableExpressions()
@@ -1932,7 +1937,8 @@ internal sealed class SqlParser
     {
         if (ConsumeKeyword("AS"))
             return ExpectIdentifier();
-        if (_lexer.Current.Kind == TokenKind.Identifier && !IsTableSourceClauseKeyword(_lexer.Current.Text))
+        if (_lexer.Current.Kind == TokenKind.Identifier
+            && (_lexer.Current.IsQuoted || !IsTableSourceClauseKeyword(_lexer.Current.Text)))
             return ExpectIdentifier();
 
         return null;
@@ -2285,6 +2291,7 @@ internal sealed class SqlParser
             case TokenKind.Identifier:
                 _lexer.Next();
                 if (_inTriggerBody
+                    && !token.IsQuoted
                     && string.Equals(token.Text, "RAISE", StringComparison.OrdinalIgnoreCase)
                     && Consume(TokenKind.LeftParen))
                 {

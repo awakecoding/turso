@@ -433,11 +433,11 @@ public class AggregateOpcodeExecutionTests
     [Test]
     public void NewAggregateOpcodesPreserveExistingNumericValues()
     {
-        ((int)VdbeOpcode.Next).Should().Be(14);
-        ((int)VdbeOpcode.RowSetInsert).Should().Be(35);
-        ((int)VdbeOpcode.Halt).Should().Be(50);
-        ((int)VdbeOpcode.GroupKey).Should().Be(51);
-        ((int)VdbeOpcode.DistinctGate).Should().Be(52);
+        ((int)VdbeOpcode.Next).Should().Be(17);
+        ((int)VdbeOpcode.RowSetInsert).Should().Be(38);
+        ((int)VdbeOpcode.Halt).Should().Be(57);
+        ((int)VdbeOpcode.GroupKey).Should().Be(58);
+        ((int)VdbeOpcode.DistinctGate).Should().Be(59);
     }
 
     // Loads saved/current keys, compares them with SameGroup, and returns the value the

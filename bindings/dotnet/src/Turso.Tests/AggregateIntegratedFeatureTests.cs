@@ -241,9 +241,7 @@ public sealed class AggregateIntegratedFeatureTests
             .Select(row => row[0].AsInteger())
             .Should().Equal(10, 17, 22);
         aggregateCalls.Should().Equal(10, 10, 7, 10, 7, 5);
-        ReadRows(connection, "EXPLAIN " + window)
-            .Select(row => row[1].AsText())
-            .Should().Contain("AggFinalize");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + window));
         ReadRows(connection, "EXPLAIN QUERY PLAN " + window)[0][3]
             .AsText()
             .Should().Contain("USING INDEX values_amount_partial");
@@ -258,9 +256,7 @@ public sealed class AggregateIntegratedFeatureTests
             .Select(row => row[0].AsInteger())
             .Should().Equal(10, 17, 22);
         aggregateCalls.Should().Equal(10, 10, 7, 10, 7, 5);
-        ReadRows(connection, "EXPLAIN " + namedWindow)
-            .Select(row => row[1].AsText())
-            .Should().Contain("AggFinalize");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + namedWindow));
     }
 
     [Test]

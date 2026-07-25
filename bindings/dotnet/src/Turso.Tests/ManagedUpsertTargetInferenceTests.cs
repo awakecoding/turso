@@ -2302,6 +2302,58 @@ public sealed class ManagedUpsertTargetInferenceTests
     }
 
     [Test]
+    public void ForeignKeyActionsDoNotAdvanceLaterParentRowsBeforeFail()
+    {
+        string[] setup =
+        [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY, parent_key TEXT UNIQUE)",
+            "CREATE TABLE first_child(parent_key TEXT REFERENCES parent(parent_key) ON UPDATE CASCADE)",
+            "CREATE TABLE second_child(parent_key TEXT REFERENCES parent(parent_key) ON UPDATE CASCADE)",
+            "CREATE TABLE audit(value TEXT UNIQUE)",
+            "INSERT INTO parent VALUES (1, 'one'), (2, 'two')",
+            "INSERT INTO first_child VALUES ('one'), ('two')",
+            "INSERT INTO second_child VALUES ('one'), ('two')",
+            "INSERT INTO audit VALUES ('duplicate')",
+            """
+            CREATE TRIGGER second_child_update AFTER UPDATE ON second_child
+            WHEN NEW.parent_key = 'two-next'
+            BEGIN
+                INSERT OR FAIL INTO audit VALUES ('prefix'), ('duplicate');
+            END
+            """,
+        ];
+        const string update = "UPDATE parent SET parent_key = parent_key || '-next'";
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, update))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, update))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        foreach (var (table, columns) in new[]
+                 {
+                     ("parent", "id, parent_key"),
+                     ("first_child", "parent_key"),
+                     ("second_child", "parent_key"),
+                     ("audit", "value"),
+                 })
+        {
+            AssertOutputsEqual(
+                QueryManaged(managed, $"SELECT {columns} FROM {table} ORDER BY 1"),
+                QuerySqlite(sqlite, $"SELECT {columns} FROM {table} ORDER BY 1"));
+        }
+    }
+
+    [Test]
     public void StandardInsertTriggerFailureRecordsTheOuterInsertRowid()
     {
         string[] setup =
