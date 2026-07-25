@@ -71,6 +71,33 @@ public class RecursiveCteProgramBuilderTests
     }
 
     [Test]
+    public void GenerationTransformReceivesTheWholeFrontierAndReplaysAfterReset()
+    {
+        var generations = new List<long[]>();
+        VdbeRecursiveGenerationTransform expand = rows =>
+        {
+            generations.Add(rows.Select(row => row[0].AsInteger()).ToArray());
+            return rows.Select(row => new[] { SqlValue.Integer(row[0].AsInteger() + 10) }).ToArray();
+        };
+        var program = RecursiveCteProgramBuilder.BuildUnionAllGenerations(
+            [[SqlValue.Integer(1)], [SqlValue.Integer(2)]],
+            expand,
+            maxRows: 10,
+            maxDepth: 1);
+        using var statement = new ResumableStatement(program);
+
+        Integers(Drain(statement)).Should().Equal(1, 2, 11, 12);
+        generations.Should().ContainSingle().Which.Should().Equal(1, 2);
+        program.Instructions.Select(instruction => instruction.Opcode)
+            .Should().Contain(VdbeOpcode.WorkTableExpandGeneration);
+
+        statement.Reset();
+        Integers(Drain(statement)).Should().Equal(1, 2, 11, 12);
+        generations.Should().HaveCount(2);
+        generations[1].Should().Equal(1, 2);
+    }
+
+    [Test]
     public void EmitsMultipleAnchorsBreadthFirstBeforeTheirDescendants()
     {
         var program = RecursiveCteProgramBuilder.BuildUnionAll(

@@ -1005,7 +1005,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             using var indexes = indexCommand.ExecuteReader();
             while (indexes.Read())
             {
-                if (indexes.GetInt64(2) == 0)
+                if (indexes.GetInt64(2) == 0 || indexes.GetInt64(4) != 0)
                     continue;
 
                 var indexName = indexes.GetString(1);
@@ -1014,7 +1014,10 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
                 using var indexInfo = infoCommand.ExecuteReader();
                 var indexedColumns = new List<string>();
                 while (indexInfo.Read())
-                    indexedColumns.Add(indexInfo.GetString(2));
+                {
+                    if (!indexInfo.IsDBNull(2))
+                        indexedColumns.Add(indexInfo.GetString(2));
+                }
 
                 if (indexedColumns.Count == 1 && columns.TryGetValue(indexedColumns[0], out var column))
                     columns[indexedColumns[0]] = column with { IsUnique = true };

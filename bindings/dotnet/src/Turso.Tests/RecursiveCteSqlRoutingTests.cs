@@ -3,11 +3,9 @@ using Turso.Core;
 
 namespace Turso.Tests;
 
-// Proves that EmbeddedDatabase routes the exact linear recursive-CTE subset -- a single recursive term
-// whose sole FROM source is the CTE itself (no join/derived/subquery self-reference), with no DISTINCT and
-// no ORDER BY, joined to a non-empty anchor by a uniform UNION or UNION ALL, and with no compound-level
-// ORDER BY/LIMIT/OFFSET -- through the real RecursiveCteProgramBuilder worktable bytecode (OpenWorkTable,
-// SeedWorkTable, and the WorkTableStep/ResultRow/WorkTableExpand drain loop) while keeping the results
+// Proves that EmbeddedDatabase routes safe single-term recursive CTEs, including base-table joins and
+// recursive-term DISTINCT, through the real RecursiveCteProgramBuilder generation-worktable bytecode while
+// keeping results
 // byte-identical to the tree-walking evaluator. As in the compound and aggregate routing tests, EXPLAIN is
 // the ground truth for "was this lowered to bytecode?": a routed recursion whose outer query is a bare
 // SELECT * FROM cte dumps the worktable opcode stream, while every deliberate fallback shape throws because
@@ -50,7 +48,7 @@ public class RecursiveCteSqlRoutingTests
             .And.Contain("SeedWorkTable")
             .And.Contain("WorkTableStep")
             .And.Contain("ResultRow")
-            .And.Contain("WorkTableExpand")
+            .And.Contain("WorkTableExpandGeneration")
             .And.Contain("CloseWorkTable")
             .And.Contain("Halt");
     }
@@ -203,28 +201,24 @@ public class RecursiveCteSqlRoutingTests
     }
 
     [Test]
-    public void JoinedRecursiveTermFallsBackToEvaluator()
+    public void JoinedRecursiveTermRoutesThroughGenerationExpansion()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE edges(src INTEGER, dst INTEGER);");
         Execute(connection, "INSERT INTO edges VALUES (1, 2), (2, 3), (3, 1), (3, 4);");
 
-        // The recursive term joins the CTE to a base table, so its source is not the bare CTE -- it stays on
-        // the evaluator (whose whole-working-set join semantics the per-row transform cannot reproduce).
         Column0(ReadRows(connection, "WITH RECURSIVE reach(n) AS (SELECT 1 UNION SELECT dst FROM edges JOIN reach ON src = n) SELECT n FROM reach ORDER BY n;"))
             .Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2), SqlValue.Integer(3), SqlValue.Integer(4));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN WITH RECURSIVE reach(n) AS (SELECT 1 UNION SELECT dst FROM edges JOIN reach ON src = n) SELECT * FROM reach;"));
+        Opcodes(ReadRows(connection, "EXPLAIN WITH RECURSIVE reach(n) AS (SELECT 1 UNION SELECT dst FROM edges JOIN reach ON src = n) SELECT * FROM reach;"))
+            .Should().Contain("WorkTableExpandGeneration");
     }
 
     [Test]
-    public void DistinctRecursiveTermFallsBackToEvaluator()
+    public void DistinctRecursiveTermRoutesThroughGenerationExpansion()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
-        // A DISTINCT recursive term would let whole-working-set evaluation diverge from per-frontier-row
-        // expansion, so even with a bare SELECT * outer it stays on the evaluator and EXPLAIN declines.
         Column0(ReadRows(connection, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT DISTINCT x + 1 FROM c WHERE x < 4) SELECT * FROM c;"))
             .Should().Equal(
                 SqlValue.Integer(1),
@@ -232,8 +226,8 @@ public class RecursiveCteSqlRoutingTests
                 SqlValue.Integer(3),
                 SqlValue.Integer(4));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT DISTINCT x + 1 FROM c WHERE x < 4) SELECT * FROM c;"));
+        Opcodes(ReadRows(connection, "EXPLAIN WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT DISTINCT x + 1 FROM c WHERE x < 4) SELECT * FROM c;"))
+            .Should().Contain("WorkTableExpandGeneration");
     }
 
     [Test]

@@ -1087,18 +1087,59 @@ public class EmbeddedEngineTests
     }
 
     [Test]
-    public void PartialAndExpressionIndexesAreRejectedExplicitly()
+    public void PartialAndExpressionIndexesEnforceProjectedKeysAndExposeMetadata()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(a TEXT, active INTEGER);");
+        Execute(
+            connection,
+            "CREATE UNIQUE INDEX idx ON t(lower(a) COLLATE NOCASE DESC) WHERE active = 1;");
+        Execute(connection, "INSERT INTO t VALUES ('Alpha', 0), ('alpha', 0), ('Alpha', 1);");
+
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "INSERT INTO t VALUES ('ALPHA', 1);"))!
+            .Message.Should().Be("UNIQUE constraint failed: index 'idx'");
+
+        using (var list = connection.Prepare("PRAGMA index_list(t);"))
+        {
+            list.Step().Should().Be(StatementStepResult.Row);
+            list.GetValue(4).Should().Be(SqlValue.Integer(1));
+        }
+        using (var info = connection.Prepare("PRAGMA index_info(idx);"))
+        {
+            info.Step().Should().Be(StatementStepResult.Row);
+            info.GetValue(1).Should().Be(SqlValue.Integer(-2));
+            info.GetValue(2).Should().Be(SqlValue.Null);
+        }
+        using var schema = connection.Prepare("SELECT sql FROM sqlite_schema WHERE name = 'idx';");
+        schema.Step().Should().Be(StatementStepResult.Row);
+        schema.GetValue(0).AsText().Should().Be(
+            "CREATE UNIQUE INDEX \"idx\" ON \"t\" (lower(a) COLLATE NOCASE DESC) WHERE active = 1");
+    }
+
+    [Test]
+    public void PartialAndExpressionIndexesRejectUnsafeDefinitionsBeforePublication()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(a INTEGER, b INTEGER);");
+        connection.RegisterScalarFunction("managed_value", 1, values => values[0]);
 
-        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX idx ON t(a) WHERE a > 0;"))!
-            .Message.Should().Contain("Partial indexes are not supported");
-        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX idx ON t(a + b);"))!
-            .Message.Should().Contain("Expression indexes are not supported");
-        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX idx ON t(lower(a));"))!
-            .Message.Should().Contain("Expression indexes are not supported");
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX random_idx ON t(random());"))!
+            .Message.Should().Contain("non-deterministic");
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX udf_idx ON t(managed_value(a));"))!
+            .Message.Should().Contain("non-deterministic");
+        using (var parameterIndex = connection.Prepare("CREATE INDEX parameter_idx ON t(a) WHERE b = ?1;"))
+        {
+            parameterIndex.Bind(1, SqlValue.Integer(1));
+            Assert.Throws<EmbeddedSqlException>(() => parameterIndex.Step())!
+                .Message.Should().Contain("parameters are prohibited");
+        }
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "CREATE INDEX collated_idx ON t(a + b COLLATE custom);"))!
+            .Message.Should().Contain("not a supported SQLite built-in collation");
+
+        using var list = connection.Prepare("PRAGMA index_list(t);");
+        list.Step().Should().Be(StatementStepResult.Done);
     }
 
     [Test]

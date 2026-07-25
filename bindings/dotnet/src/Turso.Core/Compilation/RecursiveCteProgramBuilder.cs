@@ -5,8 +5,8 @@ namespace Turso.Core.Compilation;
 /// <summary>
 /// Lowers a bounded, linear recursive common table expression directly onto the resumable state machine:
 /// it emits a runnable <see cref="VdbeProgram"/> that seeds a recursive <see cref="WorkTable"/> with the
-/// anchor rows and then drains and re-feeds its FIFO frontier through a caller-supplied
-/// <see cref="VdbeRecursiveTransform"/>, so a <c>WITH RECURSIVE cte AS (anchor UNION [ALL] recursive)</c>
+/// anchor rows and then drains and re-feeds its FIFO frontier through a caller-supplied row or generation
+/// transform, so a <c>WITH RECURSIVE cte AS (anchor UNION [ALL] recursive)</c>
 /// executes as real, observably looping bytecode rather than a precomputed result set replayed by the
 /// tree-walking evaluator. It is the recursion sibling of <see cref="ValuesProgramBuilder"/> (which streams
 /// fixed rows) and <see cref="CompoundProgramBuilder"/> (which sequences term streams).
@@ -21,13 +21,13 @@ namespace Turso.Core.Compilation;
 ///                …                                  (remaining anchor rows)
 ///   loopTop      WorkTableStep wt -> r[0..W-1], goto done if drained
 ///                ResultRow r[0..W-1]
-///                WorkTableExpand wt, transform, r[0..W-1]
+///                WorkTableExpand[Generation] wt, transform, r[0..W-1]
 ///                Goto loopTop
 ///   done         CloseWorkTable wt
 ///                Halt
 /// </code>
 /// The recursion — FIFO (breadth-first) ordering, re-feeding descendants, de-duplication, depth bounding,
-/// and the total-row cap — is performed by the interpreter's <c>WorkTableStep</c>/<c>WorkTableExpand</c>
+/// and the total-row cap — is performed by the interpreter's worktable step/expand
 /// loop, one generation at a time, not by any single opcode. The anchor generation surfaces first (in seed
 /// order), then all of its children, then their children, exactly mirroring the evaluator's level-by-level
 /// working-set iteration for a linear recursive term.
@@ -38,8 +38,9 @@ namespace Turso.Core.Compilation;
 /// theirs: each seed cell is a literal (<see cref="LoadConstantInstruction"/>) or a late-bound parameter
 /// (<see cref="LoadParameterInstruction"/>), so a parameterized anchor re-executes with fresh bindings after
 /// a <see cref="ResumableStatement.Reset"/>/<see cref="ResumableStatement.Rebind"/> without recompilation;
-/// the recursive term is the <see cref="VdbeRecursiveTransform"/>, which computes one generation from a
-/// single frontier row; and <c>UNION</c> de-duplication is a caller-supplied <see cref="VdbeRowEquality"/>.
+/// the recursive term is either a <see cref="VdbeRecursiveTransform"/> over one row or a
+/// <see cref="VdbeRecursiveGenerationTransform"/> over the complete frontier; and <c>UNION</c>
+/// de-duplication is a caller-supplied <see cref="VdbeRowEquality"/>.
 /// Both guards are mandatory and make the recursion safe by construction: <c>maxRows</c> caps
 /// total admitted rows (throwing <see cref="RecursiveWorkTableOverflowException"/> on overflow, so an
 /// unbounded <c>UNION ALL</c> fails loudly) and <c>maxDepth</c> bounds the recursion depth of the slice.
@@ -65,7 +66,14 @@ public static class RecursiveCteProgramBuilder
         VdbeRecursiveTransform transform,
         int maxRows,
         int maxDepth)
-        => BuildCells(ToConstantCellRows(seedRows), transform, WorkTableDedupMode.KeepAll, equality: null, maxRows, maxDepth);
+        => BuildCells(
+            ToConstantCellRows(seedRows),
+            RequireRowTransform(transform),
+            generationTransform: null,
+            WorkTableDedupMode.KeepAll,
+            equality: null,
+            maxRows,
+            maxDepth);
 
     /// <summary>
     /// Builds a bounded recursive program with <c>UNION</c>/<c>DISTINCT</c> semantics from constant anchor
@@ -81,7 +89,54 @@ public static class RecursiveCteProgramBuilder
         int maxDepth)
     {
         ArgumentNullException.ThrowIfNull(rowEquality);
-        return BuildCells(ToConstantCellRows(seedRows), transform, WorkTableDedupMode.Distinct, rowEquality, maxRows, maxDepth);
+        return BuildCells(
+            ToConstantCellRows(seedRows),
+            RequireRowTransform(transform),
+            generationTransform: null,
+            WorkTableDedupMode.Distinct,
+            rowEquality,
+            maxRows,
+            maxDepth);
+    }
+
+    /// <summary>
+    /// Builds a bounded <c>UNION ALL</c> recursive program whose transform runs once per complete
+    /// breadth-first generation rather than once per row.
+    /// </summary>
+    public static VdbeProgram BuildUnionAllGenerations(
+        IReadOnlyList<IReadOnlyList<SqlValue>> seedRows,
+        VdbeRecursiveGenerationTransform transform,
+        int maxRows,
+        int maxDepth)
+        => BuildCells(
+            ToConstantCellRows(seedRows),
+            rowTransform: null,
+            RequireGenerationTransform(transform),
+            WorkTableDedupMode.KeepAll,
+            equality: null,
+            maxRows,
+            maxDepth);
+
+    /// <summary>
+    /// Builds a bounded <c>UNION</c> recursive program whose transform runs once per complete
+    /// breadth-first generation.
+    /// </summary>
+    public static VdbeProgram BuildUnionDistinctGenerations(
+        IReadOnlyList<IReadOnlyList<SqlValue>> seedRows,
+        VdbeRecursiveGenerationTransform transform,
+        VdbeRowEquality rowEquality,
+        int maxRows,
+        int maxDepth)
+    {
+        ArgumentNullException.ThrowIfNull(rowEquality);
+        return BuildCells(
+            ToConstantCellRows(seedRows),
+            rowTransform: null,
+            RequireGenerationTransform(transform),
+            WorkTableDedupMode.Distinct,
+            rowEquality,
+            maxRows,
+            maxDepth);
     }
 
     /// <summary>
@@ -94,7 +149,14 @@ public static class RecursiveCteProgramBuilder
         VdbeRecursiveTransform transform,
         int maxRows,
         int maxDepth)
-        => BuildCells(seedRows, transform, WorkTableDedupMode.KeepAll, equality: null, maxRows, maxDepth);
+        => BuildCells(
+            seedRows,
+            RequireRowTransform(transform),
+            generationTransform: null,
+            WorkTableDedupMode.KeepAll,
+            equality: null,
+            maxRows,
+            maxDepth);
 
     /// <summary>
     /// Builds the same program as <see cref="BuildUnionDistinct(IReadOnlyList{IReadOnlyList{SqlValue}}, VdbeRecursiveTransform, VdbeRowEquality, int, int)"/>
@@ -108,7 +170,14 @@ public static class RecursiveCteProgramBuilder
         int maxDepth)
     {
         ArgumentNullException.ThrowIfNull(rowEquality);
-        return BuildCells(seedRows, transform, WorkTableDedupMode.Distinct, rowEquality, maxRows, maxDepth);
+        return BuildCells(
+            seedRows,
+            RequireRowTransform(transform),
+            generationTransform: null,
+            WorkTableDedupMode.Distinct,
+            rowEquality,
+            maxRows,
+            maxDepth);
     }
 
     // Wraps a constant-only anchor row list as ValuesCell rows so the constant and parameter paths share
@@ -134,14 +203,19 @@ public static class RecursiveCteProgramBuilder
 
     private static VdbeProgram BuildCells(
         IReadOnlyList<IReadOnlyList<ValuesCell>> seedRows,
-        VdbeRecursiveTransform transform,
+        VdbeRecursiveTransform? rowTransform,
+        VdbeRecursiveGenerationTransform? generationTransform,
         WorkTableDedupMode mode,
         VdbeRowEquality? equality,
         int maxRows,
         int maxDepth)
     {
         ArgumentNullException.ThrowIfNull(seedRows);
-        ArgumentNullException.ThrowIfNull(transform);
+        if ((rowTransform is null) == (generationTransform is null))
+        {
+            throw new ArgumentException(
+                "A recursive program needs exactly one row or generation transform.");
+        }
         if (seedRows.Count == 0)
             throw new ArgumentException("A recursive program needs at least one anchor row.", nameof(seedRows));
         if (maxRows <= 0)
@@ -208,7 +282,9 @@ public static class RecursiveCteProgramBuilder
         var doneTarget = new ProgramCounter(loopTop + 4);
         instructions.Add(new WorkTableStepInstruction(workTable, outputRange, doneTarget));
         instructions.Add(new ResultRowInstruction(outputRange));
-        instructions.Add(new WorkTableExpandInstruction(workTable, transform, outputRange));
+        instructions.Add(rowTransform is not null
+            ? new WorkTableExpandInstruction(workTable, rowTransform, outputRange)
+            : new WorkTableExpandGenerationInstruction(workTable, generationTransform!, outputRange));
         instructions.Add(new GotoInstruction(new ProgramCounter(loopTop)));
         instructions.Add(new CloseWorkTableInstruction(workTable));
         instructions.Add(new HaltInstruction());
@@ -219,5 +295,18 @@ public static class RecursiveCteProgramBuilder
             instructions,
             parameterSlotCount: maxSlot + 1,
             workTableCount: 1);
+    }
+
+    private static VdbeRecursiveTransform RequireRowTransform(VdbeRecursiveTransform transform)
+    {
+        ArgumentNullException.ThrowIfNull(transform);
+        return transform;
+    }
+
+    private static VdbeRecursiveGenerationTransform RequireGenerationTransform(
+        VdbeRecursiveGenerationTransform transform)
+    {
+        ArgumentNullException.ThrowIfNull(transform);
+        return transform;
     }
 }

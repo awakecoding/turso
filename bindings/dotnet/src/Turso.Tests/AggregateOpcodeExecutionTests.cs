@@ -382,6 +382,55 @@ public class AggregateOpcodeExecutionTests
     }
 
     [Test]
+    public void FailedAggregateStepRequiresResetBeforeRetry()
+    {
+        var failOnce = true;
+        var aggregate = new VdbeAggregate
+        {
+            Name = "fail-once",
+            CreateContext = static () => new List<SqlValue>(),
+            Accumulate = (context, arguments) =>
+            {
+                var values = (List<SqlValue>)context!;
+                values.Add(arguments[0]);
+                if (failOnce)
+                {
+                    failOnce = false;
+                    throw new InvalidOperationException("aggregate step failed");
+                }
+
+                return values;
+            },
+            Finalize = context => SqlValue.Integer(((List<SqlValue>)context!).Count),
+        };
+        var program = new VdbeProgram(
+            registerCount: 2,
+            cursorCount: 0,
+            [
+                new LoadConstantInstruction(new Register(0), SqlValue.Integer(1)),
+                new AggStepInstruction(
+                    new Accumulator(0),
+                    aggregate,
+                    new RegisterRange(new Register(0), 1)),
+                new AggFinalizeInstruction(new Accumulator(0), aggregate, new Register(1)),
+                new ResultRowInstruction(new RegisterRange(new Register(1), 1)),
+                new HaltInstruction(),
+            ],
+            accumulatorCount: 1);
+        using var statement = new ResumableStatement(program);
+
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable())!
+            .Message.Should().Be("aggregate step failed");
+        statement.State.Should().Be(ResumableStatementState.Faulted);
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable())!
+            .Message.Should().Contain("Call Reset");
+
+        statement.Reset();
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+        statement.CurrentRow.Should().Equal(SqlValue.Integer(1));
+    }
+
+    [Test]
     public void NewAggregateOpcodesPreserveExistingNumericValues()
     {
         ((int)VdbeOpcode.Next).Should().Be(14);

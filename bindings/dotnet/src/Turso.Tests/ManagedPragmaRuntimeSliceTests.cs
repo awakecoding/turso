@@ -303,7 +303,14 @@ public sealed class ManagedPragmaRuntimeSliceTests
         unsupported.Should().Throw<EmbeddedSqlException>()
             .WithMessage("Unsupported PRAGMA automatic_index. At SQL offset *");
 
-        var unsupportedSchema = () => connection.Prepare("PRAGMA temp.table_list;");
+        using (var tempTableList = connection.Prepare("PRAGMA temp.table_list;"))
+        {
+            tempTableList.Step().Should().Be(StatementStepResult.Row);
+            tempTableList.GetValue(0).Should().Be(SqlValue.Text("temp"));
+            tempTableList.GetValue(1).Should().Be(SqlValue.Text("sqlite_temp_schema"));
+        }
+
+        var unsupportedSchema = () => connection.Prepare("PRAGMA temp.journal_mode;");
         unsupportedSchema.Should().Throw<EmbeddedSqlException>()
             .WithMessage("Unsupported PRAGMA database temp. At SQL offset *");
     }

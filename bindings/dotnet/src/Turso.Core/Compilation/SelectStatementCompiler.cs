@@ -25,6 +25,7 @@ internal sealed class SelectStatementCompiler
     private readonly Func<FunctionExpression, VdbeScalarFunction?> _compileScalarFunction;
     private readonly VdbeNumericAffinity _numericAffinity;
     private readonly VdbeNumericAffinity _moduloAffinity;
+    private readonly VdbeNumericAffinity _integerAffinity;
 
     public SelectStatementCompiler(
         Func<Expression, bool> isConstant,
@@ -35,7 +36,8 @@ internal sealed class SelectStatementCompiler
         Func<SelectStatement, ScanTarget, VdbeRowEquality?> compileDistinctEquality,
         Func<FunctionExpression, VdbeScalarFunction?> compileScalarFunction,
         VdbeNumericAffinity numericAffinity,
-        VdbeNumericAffinity moduloAffinity)
+        VdbeNumericAffinity moduloAffinity,
+        VdbeNumericAffinity integerAffinity)
     {
         ArgumentNullException.ThrowIfNull(isConstant);
         ArgumentNullException.ThrowIfNull(fold);
@@ -46,6 +48,7 @@ internal sealed class SelectStatementCompiler
         ArgumentNullException.ThrowIfNull(compileScalarFunction);
         ArgumentNullException.ThrowIfNull(numericAffinity);
         ArgumentNullException.ThrowIfNull(moduloAffinity);
+        ArgumentNullException.ThrowIfNull(integerAffinity);
         _isConstant = isConstant;
         _fold = fold;
         _resolveScanTarget = resolveScanTarget;
@@ -55,6 +58,7 @@ internal sealed class SelectStatementCompiler
         _compileScalarFunction = compileScalarFunction;
         _numericAffinity = numericAffinity;
         _moduloAffinity = moduloAffinity;
+        _integerAffinity = integerAffinity;
     }
 
     public bool TryCompile(SelectStatement statement, out CompiledSelect compiled)
@@ -166,7 +170,12 @@ internal sealed class SelectStatementCompiler
         var closeAddr = nextAddr + 1;
         var instructions = new List<VdbeInstruction>(closeAddr + 2)
         {
-            new OpenReadCursorInstruction(cursor, target.TableName, target.Columns.Length),
+            new OpenReadCursorInstruction(
+                cursor,
+                target.IndexName is null
+                    ? target.TableName
+                    : $"{target.TableName} USING INDEX {target.IndexName}",
+                target.Columns.Length),
             new RewindCursorInstruction(cursor, new ProgramCounter(closeAddr)),
         };
 
@@ -222,7 +231,8 @@ internal sealed class SelectStatementCompiler
             _fold,
             _compileScalarFunction,
             _numericAffinity,
-            _moduloAffinity);
+            _moduloAffinity,
+            _integerAffinity);
 
     internal static bool TryExpandProjections(
         IReadOnlyList<Projection> source,
@@ -290,6 +300,7 @@ internal sealed class SelectStatementCompiler
         private readonly Func<FunctionExpression, VdbeScalarFunction?> _compileScalarFunction;
         private readonly VdbeNumericAffinity _numericAffinity;
         private readonly VdbeNumericAffinity _moduloAffinity;
+        private readonly VdbeNumericAffinity _integerAffinity;
         private readonly Dictionary<int, int> _parameterSlots = [];
         private readonly List<int> _parameterIndices = [];
         private int _nextRegister;
@@ -303,7 +314,8 @@ internal sealed class SelectStatementCompiler
             Func<Expression, SqlValue> fold,
             Func<FunctionExpression, VdbeScalarFunction?> compileScalarFunction,
             VdbeNumericAffinity numericAffinity,
-            VdbeNumericAffinity moduloAffinity)
+            VdbeNumericAffinity moduloAffinity,
+            VdbeNumericAffinity integerAffinity)
         {
             _target = target;
             _cursor = cursor;
@@ -314,6 +326,7 @@ internal sealed class SelectStatementCompiler
             _compileScalarFunction = compileScalarFunction;
             _numericAffinity = numericAffinity;
             _moduloAffinity = moduloAffinity;
+            _integerAffinity = integerAffinity;
         }
 
         public int RegisterCount => _nextRegister;
@@ -360,12 +373,21 @@ internal sealed class SelectStatementCompiler
                         return false;
                     }
 
-                    var affinity = arithmetic == ArithmeticOperator.Modulo ? _moduloAffinity : _numericAffinity;
+                    var affinity = GetAffinity(arithmetic);
                     _instructions.Add(new NumericAffinityInstruction(operands.Start, affinity));
                     _instructions.Add(new NumericAffinityInstruction(
                         new Register(operands.Start.Index + 1),
                         affinity));
                     _instructions.Add(new ArithmeticInstruction(destination, arithmetic, operands));
+                    return true;
+                case UnaryExpression unary when TryMapArithmeticOperator(unary.Operator, out var unaryArithmetic):
+                    var operand = Allocate(1);
+                    if (!TryEmit(unary.Operand, operand.Start))
+                        return false;
+
+                    if (unaryArithmetic != ArithmeticOperator.Identity)
+                        _instructions.Add(new NumericAffinityInstruction(operand.Start, GetAffinity(unaryArithmetic)));
+                    _instructions.Add(new ArithmeticInstruction(destination, unaryArithmetic, operand));
                     return true;
                 case FunctionExpression function:
                     var scalar = _compileScalarFunction(function);
@@ -429,10 +451,55 @@ internal sealed class SelectStatementCompiler
                 case BinaryOperator.Modulo:
                     arithmetic = ArithmeticOperator.Modulo;
                     return true;
+                case BinaryOperator.BitwiseAnd:
+                    arithmetic = ArithmeticOperator.BitwiseAnd;
+                    return true;
+                case BinaryOperator.BitwiseOr:
+                    arithmetic = ArithmeticOperator.BitwiseOr;
+                    return true;
+                case BinaryOperator.ShiftLeft:
+                    arithmetic = ArithmeticOperator.ShiftLeft;
+                    return true;
+                case BinaryOperator.ShiftRight:
+                    arithmetic = ArithmeticOperator.ShiftRight;
+                    return true;
                 default:
                     arithmetic = default;
                     return false;
             }
+        }
+
+        private static bool TryMapArithmeticOperator(UnaryOperator op, out ArithmeticOperator arithmetic)
+        {
+            switch (op)
+            {
+                case UnaryOperator.Plus:
+                    arithmetic = ArithmeticOperator.Identity;
+                    return true;
+                case UnaryOperator.Negate:
+                    arithmetic = ArithmeticOperator.Negate;
+                    return true;
+                case UnaryOperator.BitwiseNot:
+                    arithmetic = ArithmeticOperator.BitwiseNot;
+                    return true;
+                default:
+                    arithmetic = default;
+                    return false;
+            }
+        }
+
+        private VdbeNumericAffinity GetAffinity(ArithmeticOperator op)
+        {
+            return op switch
+            {
+                ArithmeticOperator.Modulo => _moduloAffinity,
+                ArithmeticOperator.BitwiseAnd
+                    or ArithmeticOperator.BitwiseOr
+                    or ArithmeticOperator.ShiftLeft
+                    or ArithmeticOperator.ShiftRight
+                    or ArithmeticOperator.BitwiseNot => _integerAffinity,
+                _ => _numericAffinity,
+            };
         }
     }
 }

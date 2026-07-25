@@ -16,13 +16,19 @@ namespace Turso.Core.Compilation;
 /// the reference does not name a column of this table.
 /// </param>
 /// <param name="RowIds">The optional hidden rowids aligned with <paramref name="Rows"/>.</param>
+/// <param name="IndexName">The selected logical index, when the rows are in index order.</param>
+/// <param name="ColumnDefinitions">The immutable column metadata aligned with <paramref name="Columns"/>.</param>
+/// <param name="QualifiedColumnDefinitions">Column metadata keyed by qualified SQL name.</param>
 internal sealed record ScanTarget(
     string TableName,
     string Qualifier,
     string[] Columns,
     IReadOnlyList<SqlValue[]> Rows,
     Func<string, int?> ResolveColumnIndex,
-    IReadOnlyList<long>? RowIds = null)
+    IReadOnlyList<long>? RowIds = null,
+    string? IndexName = null,
+    IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null,
+    IReadOnlyDictionary<string, EmbeddedColumn>? QualifiedColumnDefinitions = null)
 {
     public bool HasRowId => RowIds is not null;
 }

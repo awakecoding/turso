@@ -124,42 +124,50 @@ internal sealed class SqlParser
     private ParsedStatement ParseVacuum()
     {
         if (_lexer.Current.Kind is TokenKind.Semicolon or TokenKind.End)
-            return new VacuumStatement(null);
+            return new VacuumStatement(null, null);
+
+        if (ConsumeKeyword("INTO"))
+            return new VacuumStatement(null, ParseExpression());
 
         var schema = ExpectIdentifier();
-        if (!schema.Equals("main", StringComparison.OrdinalIgnoreCase))
-            throw Error($"Unsupported VACUUM database {schema}.");
-        return new VacuumStatement(schema);
+        return new VacuumStatement(
+            schema,
+            ConsumeKeyword("INTO") ? ParseExpression() : null);
     }
 
     private ParsedStatement ParsePragma()
     {
         var name = ExpectIdentifier();
+        string? schema = null;
         if (Consume(TokenKind.Dot))
         {
-            var schema = name;
+            schema = name;
             name = ExpectIdentifier();
-            if (!schema.Equals("main", StringComparison.OrdinalIgnoreCase))
-                throw Error($"Unsupported PRAGMA database {schema}.");
         }
 
         if (name.Equals("table_info", StringComparison.OrdinalIgnoreCase))
-            return new PragmaTableInfoStatement(ParsePragmaObjectName());
+            return new PragmaTableInfoStatement(ParsePragmaObjectName(schema));
         if (name.Equals("table_xinfo", StringComparison.OrdinalIgnoreCase))
-            return new PragmaTableXInfoStatement(ParsePragmaObjectName());
+            return new PragmaTableXInfoStatement(ParsePragmaObjectName(schema));
         if (name.Equals("index_list", StringComparison.OrdinalIgnoreCase))
-            return new PragmaIndexListStatement(ParsePragmaObjectName());
+            return new PragmaIndexListStatement(ParsePragmaObjectName(schema));
         if (name.Equals("index_info", StringComparison.OrdinalIgnoreCase))
-            return new PragmaIndexInfoStatement(ParsePragmaObjectName());
+            return new PragmaIndexInfoStatement(ParsePragmaObjectName(schema));
+        if (name.Equals("index_xinfo", StringComparison.OrdinalIgnoreCase))
+            return new PragmaIndexXInfoStatement(ParsePragmaObjectName(schema));
         if (name.Equals("foreign_key_list", StringComparison.OrdinalIgnoreCase))
-            return new PragmaForeignKeyListStatement(ParsePragmaObjectName());
+            return new PragmaForeignKeyListStatement(ParsePragmaObjectName(schema));
         if (name.Equals("foreign_key_check", StringComparison.OrdinalIgnoreCase))
-            return new PragmaForeignKeyCheckStatement(ParseOptionalPragmaObjectName(name));
+            return new PragmaForeignKeyCheckStatement(
+                ParseOptionalPragmaObjectName(name, schema),
+                schema);
         if (name.Equals("table_list", StringComparison.OrdinalIgnoreCase))
         {
             RequireReadOnlyPragma(name);
-            return new PragmaTableListStatement();
+            return new PragmaTableListStatement(schema);
         }
+        if (schema is not null && !schema.Equals("main", StringComparison.OrdinalIgnoreCase))
+            throw Error($"Unsupported PRAGMA database {schema}.");
         if (name.Equals("database_list", StringComparison.OrdinalIgnoreCase))
         {
             RequireReadOnlyPragma(name);
@@ -204,21 +212,34 @@ internal sealed class SqlParser
         throw Error($"Unsupported PRAGMA {name}.");
     }
 
-    private string ParsePragmaObjectName()
+    private string ParsePragmaObjectName(string? pragmaSchema)
     {
         Expect(TokenKind.LeftParen);
-        var objectName = ExpectIdentifier();
+        var objectName = ParseSchemaQualifiedName();
         Expect(TokenKind.RightParen);
-        return objectName;
+        if (ManagedSchemaName.TrySplit(objectName, out var objectSchema, out var localName))
+        {
+            if (pragmaSchema is not null
+                && !pragmaSchema.Equals(objectSchema, StringComparison.OrdinalIgnoreCase))
+            {
+                throw Error("PRAGMA database qualifiers do not match.");
+            }
+
+            return objectName;
+        }
+
+        return pragmaSchema is null
+            ? objectName
+            : ManagedSchemaName.Create(pragmaSchema, localName);
     }
 
-    private string? ParseOptionalPragmaObjectName(string name)
+    private string? ParseOptionalPragmaObjectName(string name, string? pragmaSchema)
     {
         if (_lexer.Current.Kind is TokenKind.Semicolon or TokenKind.End)
             return null;
         if (_lexer.Current.Kind != TokenKind.LeftParen)
             throw Error($"PRAGMA {name} requires a parenthesized table name.");
-        return ParsePragmaObjectName();
+        return ParsePragmaObjectName(pragmaSchema);
     }
 
     private void RequireReadOnlyPragma(string name)
@@ -361,6 +382,16 @@ internal sealed class SqlParser
 
     private ParsedStatement ParseCreate()
     {
+        var temporary = ConsumeKeyword("TEMP") || ConsumeKeyword("TEMPORARY");
+        if (temporary)
+        {
+            if (CurrentIsKeyword("VIEW") || CurrentIsKeyword("TRIGGER"))
+                throw Error("Temporary triggers and views are not supported by the managed engine.");
+            if (!CurrentIsKeyword("TABLE"))
+                throw Error("Only temporary tables are supported by the managed engine.");
+
+            return ParseCreateTable(temporary: true);
+        }
         if (ConsumeKeyword("UNIQUE"))
         {
             ExpectKeyword("INDEX");
@@ -370,15 +401,20 @@ internal sealed class SqlParser
             return ParseCreateIndex(unique: false);
         if (ConsumeKeyword("VIEW"))
             return ParseCreateView();
-        if (CurrentIsKeyword("TEMP") || CurrentIsKeyword("TEMPORARY"))
-            throw Error("Temporary triggers and views are not supported.");
         if (ConsumeKeyword("TRIGGER"))
             return ParseCreateTrigger();
+        if (ConsumeKeyword("VIRTUAL"))
+        {
+            ExpectKeyword("TABLE");
+            throw Error(
+                "Managed virtual tables are not supported: no module registration, planner, or execution contract is available. "
+                + "Managed CREATE VIRTUAL TABLE modules are not supported.");
+        }
 
-        return ParseCreateTable();
+        return ParseCreateTable(temporary: false);
     }
 
-    private ParsedStatement ParseCreateTable()
+    private ParsedStatement ParseCreateTable(bool temporary)
     {
         ExpectKeyword("TABLE");
         var ifNotExists = false;
@@ -390,6 +426,22 @@ internal sealed class SqlParser
         }
 
         var name = ParseSchemaQualifiedName();
+        if (temporary
+            && ManagedSchemaName.TrySplit(name, out var schema, out _)
+            && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            throw Error("temporary table name must be unqualified");
+        }
+        if (temporary && !ManagedSchemaName.TrySplit(name, out _, out _))
+            name = ManagedSchemaName.Create("temp", name);
+        if (ConsumeKeyword("AS"))
+        {
+            if (!IsQueryStart())
+                throw Error("Expected a SELECT query after AS.");
+
+            return new CreateTableAsSelectStatement(name, ParseQuery(), ifNotExists, temporary);
+        }
+
         Expect(TokenKind.LeftParen);
         var columns = new List<EmbeddedColumn>();
         IReadOnlyList<TablePrimaryKeyColumn>? tablePrimaryKey = null;
@@ -444,15 +496,37 @@ internal sealed class SqlParser
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
 
-        // WITHOUT ROWID makes the PRIMARY KEY the physical key; the trailing clause is only
-        // valid after the closing parenthesis, matching SQLite's grammar.
         var withoutRowid = false;
-        if (ConsumeKeyword("WITHOUT"))
+        var strict = false;
+        var optionRequired = false;
+        while (true)
         {
-            if (!ConsumeKeyword("ROWID"))
-                throw Error("Expected ROWID after WITHOUT.");
+            if (ConsumeKeyword("WITHOUT"))
+            {
+                if (withoutRowid)
+                    throw Error("WITHOUT ROWID may only be specified once.");
+                if (!ConsumeKeyword("ROWID"))
+                    throw Error("Expected ROWID after WITHOUT.");
 
-            withoutRowid = true;
+                withoutRowid = true;
+            }
+            else if (ConsumeKeyword("STRICT"))
+            {
+                if (strict)
+                    throw Error("STRICT may only be specified once.");
+
+                strict = true;
+            }
+            else
+            {
+                if (optionRequired)
+                    throw Error("Expected STRICT or WITHOUT ROWID after ','.");
+                break;
+            }
+
+            optionRequired = Consume(TokenKind.Comma);
+            if (!optionRequired)
+                break;
         }
 
         return new CreateTableStatement(
@@ -466,7 +540,8 @@ internal sealed class SqlParser
             tablePrimaryKeyConflictAlgorithm,
             tablePrimaryKeyConstraintName,
             tablePrimaryKeyDeclarationOrder,
-            tableForeignKeys);
+            tableForeignKeys,
+            strict);
     }
 
     private abstract record TableConstraint;
@@ -498,13 +573,13 @@ internal sealed class SqlParser
         if (ConsumeKeyword("PRIMARY"))
         {
             ExpectKeyword("KEY");
-            var keyColumns = ParseTableConstraintColumns();
+            var keyColumns = ParseTableConstraintColumns(allowAutoIncrement: true);
             return new PrimaryKeyTableConstraint(constraintName, keyColumns, ParseConflictClause());
         }
 
         if (ConsumeKeyword("UNIQUE"))
         {
-            var keyColumns = ParseTableConstraintColumns();
+            var keyColumns = ParseTableConstraintColumns(allowAutoIncrement: false);
             return new UniqueTableConstraint(constraintName, keyColumns, ParseConflictClause());
         }
 
@@ -525,7 +600,7 @@ internal sealed class SqlParser
         throw Error("Expected PRIMARY KEY, UNIQUE, CHECK, or FOREIGN KEY after table constraint name.");
     }
 
-    private IReadOnlyList<TablePrimaryKeyColumn> ParseTableConstraintColumns()
+    private IReadOnlyList<TablePrimaryKeyColumn> ParseTableConstraintColumns(bool allowAutoIncrement)
     {
         Expect(TokenKind.LeftParen);
         var columns = new List<TablePrimaryKeyColumn>();
@@ -540,7 +615,8 @@ internal sealed class SqlParser
             if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
                 descending = true;
 
-            columns.Add(new TablePrimaryKeyColumn(columnName, descending, collation));
+            var autoIncrement = allowAutoIncrement && ConsumeKeyword("AUTOINCREMENT");
+            columns.Add(new TablePrimaryKeyColumn(columnName, descending, collation, autoIncrement));
         }
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
@@ -679,30 +755,51 @@ internal sealed class SqlParser
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
 
-        if (CurrentIsKeyword("WHERE"))
-            throw Error("Partial indexes are not supported.");
+        Expression? where = null;
+        string? whereSql = null;
+        if (ConsumeKeyword("WHERE"))
+        {
+            var startOffset = _lexer.Current.Offset;
+            where = ParseExpression();
+            whereSql = _sql[startOffset.._lexer.Current.Offset].Trim();
+            if (whereSql.Length == 0)
+                throw Error("Partial index WHERE clause requires an expression.");
+        }
 
-        return new CreateIndexStatement(name, tableName, columns, unique, ifNotExists);
+        return new CreateIndexStatement(name, tableName, columns, unique, ifNotExists, where, whereSql);
     }
 
     private IndexedColumnDefinition ParseIndexedColumn()
     {
-        if (_lexer.Current.Kind != TokenKind.Identifier)
-            throw Error("Expression indexes are not supported.");
-
-        var name = ExpectIdentifier();
-        string? collation = null;
-        if (ConsumeKeyword("COLLATE"))
-            collation = ExpectIdentifier();
+        var startOffset = _lexer.Current.Offset;
+        var expression = ParseExpression();
+        var expressionSql = _sql[startOffset.._lexer.Current.Offset].Trim();
+        if (expressionSql.Length == 0)
+            throw Error("Index requires an expression.");
 
         var descending = false;
         if (!ConsumeKeyword("ASC") && ConsumeKeyword("DESC"))
             descending = true;
 
         if (_lexer.Current.Kind is not TokenKind.Comma and not TokenKind.RightParen)
-            throw Error("Expression indexes are not supported.");
+            throw Error("Unexpected token in index expression.");
 
-        return new IndexedColumnDefinition(name, collation, descending);
+        string? collation = null;
+        if (expression is CollationExpression collated)
+        {
+            collation = collated.Name;
+            expression = collated.Expression;
+        }
+
+        if (expression is ColumnExpression { Qualifier: null } column)
+            return new IndexedColumnDefinition(column.Name, collation, descending);
+
+        return new IndexedColumnDefinition(
+            Name: null,
+            collation,
+            descending,
+            expression,
+            expressionSql);
     }
 
     private ParsedStatement ParseAlterTable()
@@ -726,8 +823,13 @@ internal sealed class SqlParser
             ExpectKeyword("TO");
             return new AlterTableRenameStatement(tableName, ExpectIdentifier());
         }
+        if (ConsumeKeyword("DROP"))
+        {
+            ConsumeKeyword("COLUMN");
+            return new AlterTableDropColumnStatement(tableName, ExpectIdentifier());
+        }
 
-        throw Error("Expected ADD or RENAME after ALTER TABLE.");
+        throw Error("Expected ADD, DROP, or RENAME after ALTER TABLE.");
     }
 
     private ParsedStatement ParseDrop()
@@ -986,41 +1088,45 @@ internal sealed class SqlParser
         var target = new List<UpsertTargetColumn>();
         do
         {
-            var name = ExpectIdentifier();
-            string? collation = null;
-            if (ConsumeKeyword("COLLATE"))
-                collation = ExpectIdentifier();
-            if (CurrentIsKeyword("ASC") || CurrentIsKeyword("DESC"))
-                throw Error("UPSERT conflict targets with sort order are not supported.");
-
-            target.Add(new UpsertTargetColumn(name, collation));
+            var term = ParseIndexedColumn();
+            target.Add(new UpsertTargetColumn(
+                term.Name,
+                term.Collation,
+                term.Descending,
+                term.Expression,
+                term.ExpressionSql));
         }
         while (Consume(TokenKind.Comma));
         Expect(TokenKind.RightParen);
 
+        Expression? targetWhere = null;
+        string? targetWhereSql = null;
         if (ConsumeKeyword("WHERE"))
-            throw Error("UPSERT conflict-target WHERE clauses are not supported.");
+        {
+            var startOffset = _lexer.Current.Offset;
+            targetWhere = ParseExpression();
+            targetWhereSql = _sql[startOffset.._lexer.Current.Offset].Trim();
+            if (targetWhereSql.Length == 0)
+                throw Error("UPSERT conflict-target WHERE clause requires an expression.");
+        }
 
         ExpectKeyword("DO");
         if (ConsumeKeyword("NOTHING"))
-            return new UpsertClause(target, new DoNothingUpsertAction());
+            return new UpsertClause(target, new DoNothingUpsertAction(), targetWhere, targetWhereSql);
 
         ExpectKeyword("UPDATE");
         ExpectKeyword("SET");
-        var assignments = new List<ColumnAssignment>();
-        do
-        {
-            var column = ExpectIdentifier();
-            Expect(TokenKind.Equal);
-            assignments.Add(new ColumnAssignment(column, ParseExpression()));
-        }
-        while (Consume(TokenKind.Comma));
+        var assignments = ParseAssignments();
 
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
             where = ParseExpression();
 
-        return new UpsertClause(target, new DoUpdateUpsertAction(assignments, where));
+        return new UpsertClause(
+            target,
+            new DoUpdateUpsertAction(assignments, where),
+            targetWhere,
+            targetWhereSql);
     }
 
     private ParsedStatement ParseUpdate()
@@ -1031,17 +1137,7 @@ internal sealed class SqlParser
         var tableName = ParseSchemaQualifiedName();
         RejectUnsupportedDmlTargetSuffix("UPDATE");
         ExpectKeyword("SET");
-        var assignments = new List<ColumnAssignment>();
-        do
-        {
-            if (_lexer.Current.Kind == TokenKind.LeftParen)
-                throw Error("Managed UPDATE does not support row-value assignments.");
-
-            var column = ExpectIdentifier();
-            Expect(TokenKind.Equal);
-            assignments.Add(new ColumnAssignment(column, ParseExpression()));
-        }
-        while (Consume(TokenKind.Comma));
+        var assignments = ParseAssignments();
 
         if (CurrentIsKeyword("FROM"))
             throw Error("Managed UPDATE FROM is not supported.");
@@ -1053,6 +1149,40 @@ internal sealed class SqlParser
         var returning = ParseReturning();
         var (orderBy, limit, offset) = ParseLimitedDmlTail("UPDATE");
         return new UpdateStatement(tableName, assignments, where, returning, orderBy, limit, offset);
+    }
+
+    private IReadOnlyList<ColumnAssignment> ParseAssignments()
+    {
+        var assignments = new List<ColumnAssignment>();
+        do
+        {
+            string[] columns;
+            var isRowAssignment = Consume(TokenKind.LeftParen);
+            if (isRowAssignment)
+            {
+                columns = ParseIdentifierList();
+                Expect(TokenKind.RightParen);
+            }
+            else
+            {
+                columns = [ExpectIdentifier()];
+            }
+
+            Expect(TokenKind.Equal);
+            var value = ParseExpression();
+            for (var index = 0; index < columns.Length; index++)
+            {
+                assignments.Add(new ColumnAssignment(
+                    columns[index],
+                    value,
+                    index,
+                    columns.Length,
+                    isRowAssignment));
+            }
+        }
+        while (Consume(TokenKind.Comma));
+
+        return assignments;
     }
 
     private ParsedStatement ParseDelete()
@@ -1272,7 +1402,28 @@ internal sealed class SqlParser
         if (ConsumeKeyword("HAVING"))
             having = ParseExpression();
 
-        return new SelectStatement(distinct, projections, source, where, groupBy, having, [], null, null);
+        var namedWindows = ParseNamedWindows();
+        return new SelectStatement(distinct, projections, source, where, groupBy, having, namedWindows, [], null, null);
+    }
+
+    private IReadOnlyList<NamedWindowDefinition> ParseNamedWindows()
+    {
+        if (!ConsumeKeyword("WINDOW"))
+            return [];
+
+        var windows = new List<NamedWindowDefinition>();
+        do
+        {
+            var name = ExpectIdentifier();
+            ExpectKeyword("AS");
+            Expect(TokenKind.LeftParen);
+            var specification = ParseWindowSpecification();
+            Expect(TokenKind.RightParen);
+            windows.Add(new NamedWindowDefinition(name, specification));
+        }
+        while (Consume(TokenKind.Comma));
+
+        return windows;
     }
 
     private (IReadOnlyList<OrderByTerm> OrderBy, Expression? Limit, Expression? Offset) ParseOrderByAndLimit()
@@ -1453,9 +1604,34 @@ internal sealed class SqlParser
             return null;
 
         if (_lexer.Current.Kind != TokenKind.LeftParen)
-            throw Error("Named windows are not supported; OVER must be followed by an inline window definition.");
+        {
+            return new WindowSpecification(
+                ExpectIdentifier(),
+                [],
+                [],
+                null,
+                IsNamedReference: true);
+        }
 
         Expect(TokenKind.LeftParen);
+        var specification = ParseWindowSpecification();
+        Expect(TokenKind.RightParen);
+        return specification;
+    }
+
+    private WindowSpecification ParseWindowSpecification()
+    {
+        string? baseWindowName = null;
+        if (_lexer.Current.Kind == TokenKind.Identifier
+            && !CurrentIsKeyword("PARTITION")
+            && !CurrentIsKeyword("ORDER")
+            && !CurrentIsKeyword("ROWS")
+            && !CurrentIsKeyword("RANGE")
+            && !CurrentIsKeyword("GROUPS")
+            && !CurrentIsKeyword("EXCLUDE"))
+        {
+            baseWindowName = ExpectIdentifier();
+        }
 
         var partitionBy = new List<Expression>();
         if (ConsumeKeyword("PARTITION"))
@@ -1480,15 +1656,19 @@ internal sealed class SqlParser
         }
 
         var frame = ParseWindowFrame();
-        Expect(TokenKind.RightParen);
-        return new WindowSpecification(partitionBy, orderBy, frame);
+        return new WindowSpecification(baseWindowName, partitionBy, orderBy, frame);
     }
 
     private WindowFrame? ParseWindowFrame()
     {
-        if (CurrentIsKeyword("RANGE") || CurrentIsKeyword("GROUPS"))
-            throw Error("Only ROWS window frames are supported.");
-        if (!ConsumeKeyword("ROWS"))
+        WindowFrameMode mode;
+        if (ConsumeKeyword("ROWS"))
+            mode = WindowFrameMode.Rows;
+        else if (ConsumeKeyword("RANGE"))
+            mode = WindowFrameMode.Range;
+        else if (ConsumeKeyword("GROUPS"))
+            mode = WindowFrameMode.Groups;
+        else
             return null;
 
         FrameBound start;
@@ -1505,11 +1685,30 @@ internal sealed class SqlParser
             end = new FrameBound(FrameBoundKind.CurrentRow, null);
         }
 
-        if (CurrentIsKeyword("EXCLUDE"))
-            throw Error("EXCLUDE clauses in window frames are not supported.");
-
         ValidateFrameBounds(start, end);
-        return new WindowFrame(start, end);
+        return new WindowFrame(mode, start, end, ParseFrameExclusion());
+    }
+
+    private FrameExclusion ParseFrameExclusion()
+    {
+        if (!ConsumeKeyword("EXCLUDE"))
+            return FrameExclusion.NoOthers;
+        if (ConsumeKeyword("NO"))
+        {
+            ExpectKeyword("OTHERS");
+            return FrameExclusion.NoOthers;
+        }
+        if (ConsumeKeyword("CURRENT"))
+        {
+            ExpectKeyword("ROW");
+            return FrameExclusion.CurrentRow;
+        }
+        if (ConsumeKeyword("GROUP"))
+            return FrameExclusion.Group;
+        if (ConsumeKeyword("TIES"))
+            return FrameExclusion.Ties;
+
+        throw Error("Expected NO OTHERS, CURRENT ROW, GROUP, or TIES after EXCLUDE.");
     }
 
     private FrameBound ParseFrameBound()
@@ -1677,7 +1876,8 @@ internal sealed class SqlParser
             || keyword.Equals("INTERSECT", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("UNION", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("USING", StringComparison.OrdinalIgnoreCase)
-            || keyword.Equals("WHERE", StringComparison.OrdinalIgnoreCase);
+            || keyword.Equals("WHERE", StringComparison.OrdinalIgnoreCase)
+            || keyword.Equals("WINDOW", StringComparison.OrdinalIgnoreCase);
     }
 
     private bool IsQueryStart()
@@ -1723,24 +1923,29 @@ internal sealed class SqlParser
 
     private Expression ParseComparison()
     {
-        var expression = ParseAddSubtract();
+        var expression = ParseRelational();
         while (true)
         {
             if (ConsumeKeyword("IS"))
             {
                 var isNot = ConsumeKeyword("NOT");
+                var distinct = ConsumeKeyword("DISTINCT");
+                if (distinct)
+                    ExpectKeyword("FROM");
                 expression = new BinaryExpression(
                     expression,
-                    isNot ? BinaryOperator.IsNot : BinaryOperator.Is,
-                    ParseAddSubtract());
+                    distinct
+                        ? isNot ? BinaryOperator.Is : BinaryOperator.IsNot
+                        : isNot ? BinaryOperator.IsNot : BinaryOperator.Is,
+                    ParseRelational());
                 continue;
             }
             var negated = ConsumeKeyword("NOT");
             if (ConsumeKeyword("BETWEEN"))
             {
-                var lower = ParseAddSubtract();
+                var lower = ParseRelational();
                 ExpectKeyword("AND");
-                expression = new BetweenExpression(expression, lower, ParseAddSubtract(), negated);
+                expression = new BetweenExpression(expression, lower, ParseRelational(), negated);
                 continue;
             }
             if (ConsumeKeyword("IN"))
@@ -1768,27 +1973,66 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("LIKE"))
             {
-                var pattern = ParseAddSubtract();
+                var pattern = ParseRelational();
                 Expression? escape = null;
                 if (ConsumeKeyword("ESCAPE"))
-                    escape = ParseAddSubtract();
+                    escape = ParseRelational();
 
                 expression = new LikeExpression(expression, pattern, escape, negated);
                 continue;
             }
             if (ConsumeKeyword("GLOB"))
             {
-                expression = new GlobExpression(expression, ParseAddSubtract(), negated);
+                expression = new GlobExpression(expression, ParseRelational(), negated);
+                continue;
+            }
+            if (CurrentIsKeyword("REGEXP") || CurrentIsKeyword("MATCH"))
+            {
+                var functionName = _lexer.Current.Text.ToUpperInvariant();
+                _lexer.Next();
+                Expression function = new FunctionExpression(
+                    functionName,
+                    [ParseRelational(), expression],
+                    CountStar: false);
+                expression = negated
+                    ? new UnaryExpression(UnaryOperator.Not, function)
+                    : function;
                 continue;
             }
             if (negated)
-                throw Error("Expected BETWEEN, IN, LIKE, or GLOB after NOT.");
-            if (!TryParseComparisonOperator(out var operation))
+                throw Error("Expected BETWEEN, IN, LIKE, GLOB, REGEXP, or MATCH after NOT.");
+            if (!TryParseEqualityOperator(out var operation))
                 return expression;
 
-            expression = new BinaryExpression(expression, operation, ParseAddSubtract());
+            expression = new BinaryExpression(expression, operation, ParseRelational());
         }
+    }
 
+    private Expression ParseRelational()
+    {
+        var expression = ParseBitwise();
+        while (TryParseRelationalOperator(out var operation))
+            expression = new BinaryExpression(expression, operation, ParseBitwise());
+
+        return expression;
+    }
+
+    private Expression ParseBitwise()
+    {
+        var expression = ParseAddSubtract();
+        while (true)
+        {
+            if (Consume(TokenKind.BitwiseAnd))
+                expression = new BinaryExpression(expression, BinaryOperator.BitwiseAnd, ParseAddSubtract());
+            else if (Consume(TokenKind.BitwiseOr))
+                expression = new BinaryExpression(expression, BinaryOperator.BitwiseOr, ParseAddSubtract());
+            else if (Consume(TokenKind.ShiftLeft))
+                expression = new BinaryExpression(expression, BinaryOperator.ShiftLeft, ParseAddSubtract());
+            else if (Consume(TokenKind.ShiftRight))
+                expression = new BinaryExpression(expression, BinaryOperator.ShiftRight, ParseAddSubtract());
+            else
+                return expression;
+        }
     }
 
     private Expression ParseAddSubtract()
@@ -1839,11 +2083,49 @@ internal sealed class SqlParser
 
     private Expression ParseCollation()
     {
-        var expression = ParsePrimary();
+        var expression = ParseUnary();
         while (ConsumeKeyword("COLLATE"))
             expression = new CollationExpression(expression, ExpectIdentifier());
 
         return expression;
+    }
+
+    private Expression ParseUnary()
+    {
+        if (Consume(TokenKind.Plus))
+            return new UnaryExpression(UnaryOperator.Plus, ParseUnary());
+        if (Consume(TokenKind.Minus))
+        {
+            if (_lexer.Current is { Kind: TokenKind.Integer, Text: "9223372036854775808" })
+            {
+                _lexer.Next();
+                return new LiteralExpression(SqlValue.Integer(long.MinValue));
+            }
+
+            return new UnaryExpression(UnaryOperator.Negate, ParseUnary());
+        }
+        if (Consume(TokenKind.BitwiseNot))
+            return new UnaryExpression(UnaryOperator.BitwiseNot, ParseUnary());
+
+        return ParsePrimary();
+    }
+
+    private Expression ParseSignedPrimary()
+    {
+        if (Consume(TokenKind.Plus))
+            return new UnaryExpression(UnaryOperator.Plus, ParseSignedPrimary());
+        if (Consume(TokenKind.Minus))
+        {
+            if (_lexer.Current is { Kind: TokenKind.Integer, Text: "9223372036854775808" })
+            {
+                _lexer.Next();
+                return new LiteralExpression(SqlValue.Integer(long.MinValue));
+            }
+
+            return new UnaryExpression(UnaryOperator.Negate, ParseSignedPrimary());
+        }
+
+        return ParsePrimary();
     }
 
     private Expression ParsePrimary()
@@ -1858,22 +2140,20 @@ internal sealed class SqlParser
             }
 
             var expression = ParseExpression();
+            if (Consume(TokenKind.Comma))
+            {
+                var values = new List<Expression> { expression, ParseExpression() };
+                while (Consume(TokenKind.Comma))
+                    values.Add(ParseExpression());
+                Expect(TokenKind.RightParen);
+                return new RowValueExpression(values);
+            }
+
             Expect(TokenKind.RightParen);
             return expression;
         }
         if (ConsumeKeyword("EXISTS"))
             return new ExistsExpression(ParseParenthesizedQuery(), Negated: false);
-        if (Consume(TokenKind.Minus))
-        {
-            if (_lexer.Current is { Kind: TokenKind.Integer, Text: "9223372036854775808" })
-            {
-                _lexer.Next();
-                return new LiteralExpression(SqlValue.Integer(long.MinValue));
-            }
-
-            var value = ParsePrimary();
-            return new BinaryExpression(new LiteralExpression(SqlValue.Integer(0)), BinaryOperator.Subtract, value);
-        }
 
         var token = _lexer.Current;
         switch (token.Kind)
@@ -2038,7 +2318,7 @@ internal sealed class SqlParser
         throw Error($"Parameter {token} was not found.");
     }
 
-    private bool TryParseComparisonOperator(out BinaryOperator operation)
+    private bool TryParseEqualityOperator(out BinaryOperator operation)
     {
         if (Consume(TokenKind.Equal))
         {
@@ -2050,6 +2330,13 @@ internal sealed class SqlParser
             operation = BinaryOperator.NotEqual;
             return true;
         }
+
+        operation = default;
+        return false;
+    }
+
+    private bool TryParseRelationalOperator(out BinaryOperator operation)
+    {
         if (Consume(TokenKind.LessThan))
         {
             operation = BinaryOperator.LessThan;
@@ -2091,6 +2378,7 @@ internal sealed class SqlParser
 
         var primaryKey = false;
         var primaryKeyDescending = false;
+        var autoIncrement = false;
         var notNull = false;
         var unique = false;
         SqlValue? defaultValue = null;
@@ -2139,11 +2427,11 @@ internal sealed class SqlParser
             }
             if (ConsumeKeyword("AUTOINCREMENT"))
             {
-                // AUTOINCREMENT requires sqlite_sequence semantics (monotonic rowids that
-                // never reuse a value). The managed engine does not implement that table,
-                // so the keyword is rejected rather than silently downgraded to plain
-                // rowid assignment, which would diverge from SQLite.
-                throw Error("AUTOINCREMENT is not supported: the managed engine does not implement sqlite_sequence semantics");
+                if (!primaryKey || autoIncrement)
+                    throw Error("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+
+                autoIncrement = true;
+                continue;
             }
             if (ConsumeKeyword("NOT"))
             {
@@ -2181,7 +2469,7 @@ internal sealed class SqlParser
                 var startOffset = _lexer.Current.Offset;
                 var expression = _lexer.Current.Kind == TokenKind.LeftParen
                     ? ParseExpression()
-                    : ParsePrimary();
+                    : ParseSignedPrimary();
                 var endOffset = _lexer.Current.Offset;
                 defaultSql = _sql[startOffset..endOffset].Trim();
                 if (TryGetLiteralDefault(expression, out var literalValue))
@@ -2262,6 +2550,7 @@ internal sealed class SqlParser
             nullConstraintName,
             explicitNull,
             generationAlways,
+            autoIncrement,
             foreignKeys.Skip(1).ToArray());
     }
 
@@ -2357,6 +2646,7 @@ internal sealed class SqlParser
     private static bool IsColumnConstraintKeyword(string keyword)
     {
         return keyword.Equals("AS", StringComparison.OrdinalIgnoreCase)
+            || keyword.Equals("AUTOINCREMENT", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("CHECK", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("COLLATE", StringComparison.OrdinalIgnoreCase)
             || keyword.Equals("CONSTRAINT", StringComparison.OrdinalIgnoreCase)
@@ -2378,13 +2668,11 @@ internal sealed class SqlParser
             return true;
         }
 
-        if (expression is BinaryExpression
+        if (expression is UnaryExpression
             {
-                Left: LiteralExpression { Value.Kind: SqlValueKind.Integer } zero,
-                Operator: BinaryOperator.Subtract,
-                Right: LiteralExpression right,
-            }
-            && zero.Value.AsInteger() == 0)
+                Operator: UnaryOperator.Negate,
+                Operand: LiteralExpression right,
+            })
         {
             value = right.Value.Kind switch
             {
@@ -2393,6 +2681,15 @@ internal sealed class SqlParser
                 _ => default,
             };
             return right.Value.Kind is SqlValueKind.Integer or SqlValueKind.Real;
+        }
+        if (expression is UnaryExpression
+            {
+                Operator: UnaryOperator.Plus,
+                Operand: LiteralExpression positive,
+            })
+        {
+            value = positive.Value;
+            return true;
         }
 
         value = default;

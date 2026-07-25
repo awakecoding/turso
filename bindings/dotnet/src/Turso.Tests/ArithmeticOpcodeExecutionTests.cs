@@ -90,6 +90,38 @@ public class ArithmeticOpcodeExecutionTests
         EvalUnary(ArithmeticOperator.Identity, SqlValue.Real(1.25)).Should().Be(SqlValue.Real(1.25));
     }
 
+    [Test]
+    public void IdentityPreservesTextAndBlobStorageClasses()
+    {
+        EvalUnary(ArithmeticOperator.Identity, SqlValue.Text("10")).Should().Be(SqlValue.Text("10"));
+        EvalUnary(ArithmeticOperator.Identity, SqlValue.Blob([0x31, 0x30]))
+            .Should().Be(SqlValue.Blob([0x31, 0x30]));
+    }
+
+    [Test]
+    public void BitwiseOperatorsUseSignedIntegerSemantics()
+    {
+        EvalBinary(ArithmeticOperator.BitwiseAnd, SqlValue.Integer(10), SqlValue.Integer(3))
+            .Should().Be(SqlValue.Integer(2));
+        EvalBinary(ArithmeticOperator.BitwiseOr, SqlValue.Integer(8), SqlValue.Integer(3))
+            .Should().Be(SqlValue.Integer(11));
+        EvalUnary(ArithmeticOperator.BitwiseNot, SqlValue.Integer(10))
+            .Should().Be(SqlValue.Integer(-11));
+    }
+
+    [Test]
+    public void ShiftOperatorsSaturateAndReverseNegativeCounts()
+    {
+        EvalBinary(ArithmeticOperator.ShiftLeft, SqlValue.Integer(8), SqlValue.Integer(-1))
+            .Should().Be(SqlValue.Integer(4));
+        EvalBinary(ArithmeticOperator.ShiftRight, SqlValue.Integer(8), SqlValue.Integer(-1))
+            .Should().Be(SqlValue.Integer(16));
+        EvalBinary(ArithmeticOperator.ShiftLeft, SqlValue.Integer(1), SqlValue.Integer(64))
+            .Should().Be(SqlValue.Integer(0));
+        EvalBinary(ArithmeticOperator.ShiftRight, SqlValue.Integer(-1), SqlValue.Integer(64))
+            .Should().Be(SqlValue.Integer(-1));
+    }
+
     // ---- NULL propagation ----------------------------------------------------------------------------
 
     [Test]

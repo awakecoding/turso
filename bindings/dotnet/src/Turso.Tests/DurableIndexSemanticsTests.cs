@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Data.Common;
+using System.Globalization;
 using AwesomeAssertions;
 using MsData = Microsoft.Data.Sqlite;
 using Turso.Core;
@@ -162,6 +164,346 @@ public sealed class DurableIndexSemanticsTests
     }
 
     [Test]
+    public void PartialExpressionAffinityCollationAndNullSemanticsMatchSqlite()
+    {
+        const string setup =
+            """
+            CREATE TABLE terms(
+                id INTEGER PRIMARY KEY,
+                bucket INTEGER,
+                value TEXT,
+                note TEXT,
+                enabled INTEGER
+            );
+            CREATE UNIQUE INDEX terms_expr ON terms(
+                (CAST(value AS INTEGER) + bucket) DESC,
+                lower(note) COLLATE NOCASE ASC
+            ) WHERE enabled = 1;
+            INSERT INTO terms VALUES
+                (1, 1, '2', 'Alpha', 1),
+                (2, 2, '1', 'alpha', 0),
+                (3, 3, NULL, NULL, 1),
+                (4, 4, NULL, NULL, 1),
+                (7, 10, '1', 'Ä', 1);
+            INSERT INTO terms VALUES (5, 2, '1', 'ALPHA', 1)
+            ON CONFLICT(
+                (CAST(value AS INTEGER) + bucket) DESC,
+                lower(note) COLLATE NOCASE
+            ) WHERE enabled = 1
+            DO UPDATE SET note = 'updated';
+            INSERT INTO terms VALUES (6, 2, '1', 'Alpha', 1);
+            """;
+        const string query =
+            """
+            SELECT id,
+                   typeof(CAST(value AS INTEGER) + bucket),
+                   CAST(value AS INTEGER) + bucket,
+                   lower(note),
+                   enabled
+            FROM terms
+            ORDER BY (CAST(value AS INTEGER) + bucket) DESC NULLS LAST,
+                     lower(note) COLLATE NOCASE,
+                     id;
+            """;
+
+        using var managed = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        managed.Open();
+        managed.ExecuteNonQuery(setup);
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        Execute(sqlite, setup);
+
+        ReadProviderRows(managed, query).Should().Equal(ReadProviderRows(sqlite, query));
+        ReadProviderRows(managed, "PRAGMA index_xinfo(terms_expr);")
+            .Should().Equal(ReadProviderRows(sqlite, "PRAGMA index_xinfo(terms_expr);"));
+
+        Action managedConflict = () => managed.ExecuteNonQuery(
+            "UPDATE terms SET note = 'alpha' WHERE id = 1;");
+        Action sqliteConflict = () => Execute(sqlite, "UPDATE terms SET note = 'alpha' WHERE id = 1;");
+        managedConflict.Should().Throw<Exception>().WithMessage("*UNIQUE constraint failed*");
+        sqliteConflict.Should().Throw<Exception>().WithMessage("*UNIQUE constraint failed*");
+    }
+
+    [Test]
+    public void PartialExpressionIndexRoundTripsAndStaysAtomicAcrossConflictAndGeneratedPaths()
+    {
+        var path = CreateDatabasePath("partial-expression");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    PRAGMA foreign_keys = ON;
+                    CREATE TABLE parent(
+                        id INTEGER PRIMARY KEY,
+                        code TEXT,
+                        active INTEGER,
+                        normalized TEXT GENERATED ALWAYS AS (lower(code)) VIRTUAL
+                    );
+                    CREATE UNIQUE INDEX parent_expr ON parent(
+                        (lower(code) || ':' || normalized) COLLATE NOCASE DESC
+                    ) WHERE active = 1;
+                    CREATE TABLE child(
+                        parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+                        payload TEXT
+                    );
+                    CREATE INDEX child_expr
+                    ON child(parent_id + length(payload))
+                    WHERE parent_id > 0;
+                    CREATE TABLE ingress(id INTEGER);
+                    CREATE TRIGGER ingress_after_insert AFTER INSERT ON ingress BEGIN
+                        INSERT INTO parent(id, code, active) VALUES (8, 'alpha', 1);
+                    END;
+                    INSERT INTO parent(id, code, active) VALUES
+                        (1, 'Alpha', 1),
+                        (2, 'alpha', 0),
+                        (3, 'alpha', 0);
+                    INSERT INTO child VALUES (1, 'owned');
+                    """);
+                Execute(
+                    connection,
+                    "INSERT OR IGNORE INTO parent(id, code, active) VALUES (7, 'ALPHA', 1);");
+                ReadValue(connection, "SELECT count(*) FROM parent WHERE active = 1;")
+                    .Should().Be(SqlValue.Integer(1));
+                Action triggerConflict = () => Execute(connection, "INSERT INTO ingress VALUES (1);");
+                triggerConflict.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed: index 'parent_expr'*");
+                ReadValue(connection, "SELECT count(*) FROM ingress;").Should().Be(SqlValue.Integer(0));
+
+                Action conflictingUpdate = () => Execute(
+                    connection,
+                    "UPDATE parent SET active = 1 WHERE id = 2;");
+                conflictingUpdate.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed: index 'parent_expr'*");
+                ReadValue(connection, "SELECT active FROM parent WHERE id = 2;")
+                    .Should().Be(SqlValue.Integer(0));
+
+                Execute(
+                    connection,
+                    """
+                    INSERT INTO parent(id, code, active) VALUES (4, 'ALPHA', 1)
+                    ON CONFLICT((lower(code) || ':' || normalized) COLLATE NOCASE DESC)
+                    WHERE active = 1
+                    DO UPDATE SET code = excluded.code;
+                    """);
+                Query(connection, "SELECT id, code FROM parent WHERE active = 1;")
+                    .Should().ContainSingle()
+                    .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Text("ALPHA"));
+
+                Execute(
+                    connection,
+                    "INSERT OR REPLACE INTO parent(id, code, active) VALUES (5, 'alpha', 1);");
+                ReadValue(connection, "SELECT count(*) FROM child;").Should().Be(SqlValue.Integer(0));
+                Query(connection, "SELECT id FROM parent WHERE active = 1;")
+                    .Should().ContainSingle()
+                    .Which.Should().Equal(SqlValue.Integer(5));
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                ReadValue(connection, "SELECT count(*) FROM parent;").Should().Be(SqlValue.Integer(3));
+                Query(connection, "PRAGMA index_info(parent_expr);").Single()[1]
+                    .Should().Be(SqlValue.Integer(-2));
+                Query(connection, "PRAGMA index_list(parent);").Single(row => row[1].AsText() == "parent_expr")[4]
+                    .Should().Be(SqlValue.Integer(1));
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            QueryIntegers(
+                    sqlite,
+                    """
+                    SELECT id FROM parent INDEXED BY parent_expr
+                    WHERE active = 1
+                      AND (lower(code) || ':' || normalized) COLLATE NOCASE = 'alpha:alpha';
+                    """)
+                .Should().Equal(5);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void WithoutRowidPartialExpressionIndexPersistsPrimaryKeySuffixes()
+    {
+        var path = CreateDatabasePath("partial-expression-without-rowid");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE entry(
+                        tenant TEXT COLLATE NOCASE,
+                        id INTEGER,
+                        value TEXT,
+                        active INTEGER,
+                        PRIMARY KEY(tenant DESC, id ASC)
+                    ) WITHOUT ROWID;
+                    CREATE UNIQUE INDEX entry_expr
+                    ON entry(lower(value) COLLATE NOCASE DESC)
+                    WHERE active = 1;
+                    INSERT INTO entry VALUES
+                        ('beta', 2, 'Alpha', 1),
+                        ('alpha', 1, 'alpha', 0),
+                        ('gamma', 3, NULL, 1);
+                    """);
+
+                Action duplicate = () => Execute(
+                    connection,
+                    "UPDATE entry SET active = 1 WHERE tenant = 'alpha';");
+                duplicate.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed: index 'entry_expr'*");
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                var xinfo = Query(connection, "PRAGMA index_xinfo(entry_expr);");
+                xinfo[0].Should().Equal(
+                    SqlValue.Integer(0),
+                    SqlValue.Integer(-2),
+                    SqlValue.Null,
+                    SqlValue.Integer(1),
+                    SqlValue.Text("NOCASE"),
+                    SqlValue.Integer(1));
+                xinfo.Skip(1).Select(row => (row[2].AsText(), row[5].AsInteger()))
+                    .Should().Equal(("tenant", 0L), ("id", 0L));
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            QueryIntegers(
+                    sqlite,
+                    """
+                    SELECT id FROM entry INDEXED BY entry_expr
+                    WHERE active = 1 AND lower(value) COLLATE NOCASE = 'alpha';
+                    """)
+                .Should().Equal(2);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void PartialExpressionIndexSupportsOverflowPayloads()
+    {
+        var path = CreateDatabasePath("partial-expression-overflow");
+        var first = new string('A', 5_000);
+        var second = new string('B', 6_000);
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "PRAGMA page_size=512; VACUUM;");
+                Execute(connection, "CREATE TABLE payload(id INTEGER PRIMARY KEY, value TEXT, active INTEGER);");
+                Execute(
+                    connection,
+                    "CREATE INDEX payload_expr ON payload(lower(value) || value DESC) WHERE active = 1;");
+                using (var insert = connection.Prepare("INSERT INTO payload VALUES (1, ?1, 1), (2, ?2, 0);"))
+                {
+                    insert.Bind(1, SqlValue.Text(first));
+                    insert.Bind(2, SqlValue.Text(second));
+                    insert.Step().Should().Be(StatementStepResult.Done);
+                }
+                using var update = connection.Prepare("UPDATE payload SET value = ?1 WHERE id = 1;");
+                update.Bind(1, SqlValue.Text(second));
+                update.Step().Should().Be(StatementStepResult.Done);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                ReadValue(connection, "SELECT length(value) FROM payload WHERE id = 1;")
+                    .Should().Be(SqlValue.Integer(6_000));
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Convert.ToInt64(Scalar(
+                sqlite,
+                "SELECT count(*) FROM payload INDEXED BY payload_expr WHERE active = 1;")).Should().Be(1);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void BitwisePartialExpressionIndexRoundTripsAndRejectsRowValuesBeforePublication()
+    {
+        var path = CreateDatabasePath("partial-bitwise-expression");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE items(id INTEGER PRIMARY KEY,flags INTEGER,kind INTEGER,payload TEXT);
+                    INSERT INTO items VALUES (1,1,2,'one'),(2,2,3,'two'),(3,3,4,'three');
+                    CREATE INDEX items_bits
+                        ON items(((flags << 4) | kind) DESC)
+                        WHERE (flags & 1) = 1;
+                    """);
+
+                Action rowValue = () => Execute(
+                    connection,
+                    "CREATE INDEX rejected_row_value ON items((flags,kind));");
+                rowValue.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*expression is prohibited in index expressions*");
+                Query(connection, "PRAGMA index_list(items);").Select(row => row[1].AsText())
+                    .Should().Contain("items_bits").And.NotContain("rejected_row_value");
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Query(
+                        connection,
+                        """
+                        SELECT id FROM items
+                        WHERE (flags & 1) = 1
+                        ORDER BY ((flags << 4) | kind) DESC
+                        """)
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(3, 1);
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name='items_bits';")
+                .Should().Contain("(flags << 4) | kind")
+                .And.Contain("WHERE (flags & 1) = 1");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void Utf16RTrimIndexUsesSqliteUtf8CollationOrder()
     {
         var path = CreateDatabasePath("utf16-rtrim");
@@ -207,6 +549,61 @@ public sealed class DurableIndexSemanticsTests
             while (reader.Read())
                 values.Add(reader.GetString(0));
             values.Should().Equal("z ", "ÿ", "Ā", "", "𐀀");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void OpensAndMutatesSqliteCreatedPartialExpressionIndexes()
+    {
+        var path = CreateDatabasePath("sqlite-created-partial-expression");
+        try
+        {
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False"))
+            {
+                sqlite.Open();
+                Execute(
+                    sqlite,
+                    """
+                    PRAGMA journal_mode=DELETE;
+                    CREATE TABLE external(id INTEGER PRIMARY KEY, value TEXT, active INTEGER);
+                    CREATE UNIQUE INDEX external_expr
+                    ON external(lower(value) COLLATE NOCASE DESC)
+                    WHERE active = 1;
+                    INSERT INTO external VALUES
+                        (1, 'Alpha', 1),
+                        (2, 'alpha', 0);
+                    """);
+            }
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                ReadValue(connection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("delete"));
+                Action duplicate = () => Execute(
+                    connection,
+                    "UPDATE external SET active = 1 WHERE id = 2;");
+                duplicate.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed: index 'external_expr'*");
+                Execute(connection, "UPDATE external SET value = 'Beta' WHERE id = 1;");
+                Execute(connection, "UPDATE external SET active = 1 WHERE id = 2;");
+            }
+
+            using var reopened = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            reopened.Open();
+            ScalarText(reopened, "PRAGMA integrity_check;").Should().Be("ok");
+            QueryIntegers(
+                    reopened,
+                    """
+                    SELECT id FROM external INDEXED BY external_expr
+                    WHERE active = 1
+                    ORDER BY lower(value) COLLATE NOCASE DESC;
+                    """)
+                .Should().Equal(1, 2);
         }
         finally
         {
@@ -303,6 +700,9 @@ public sealed class DurableIndexSemanticsTests
                 Execute(
                     connection,
                     "CREATE INDEX items_order ON items(bucket COLLATE NOCASE DESC, padded COLLATE RTRIM ASC);");
+                Execute(
+                    connection,
+                    "CREATE INDEX items_expr ON items(lower(bucket) || ':' || padded) WHERE (id % 2) = 0;");
                 ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
                 Execute(connection, "PRAGMA page_size=512; VACUUM;");
                 Execute(
@@ -340,6 +740,9 @@ public sealed class DurableIndexSemanticsTests
             Convert.ToInt64(Scalar(
                 sqlite,
                 "SELECT COUNT(*) FROM items INDEXED BY items_order;")).Should().Be(1_200);
+            Convert.ToInt64(Scalar(
+                sqlite,
+                "SELECT COUNT(*) FROM items INDEXED BY items_expr WHERE (id % 2) = 0;")).Should().Be(600);
         }
         finally
         {
@@ -423,6 +826,70 @@ public sealed class DurableIndexSemanticsTests
         }
     }
 
+    [Test]
+    public void LimitedRowAssignmentsKeepPartialExpressionIndexesAtomic()
+    {
+        var path = CreateDatabasePath("limited-dml-partial-row-assignment");
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(
+                    connection,
+                    """
+                    CREATE TABLE items(
+                        id INTEGER PRIMARY KEY,
+                        active INTEGER,
+                        left_value INTEGER,
+                        right_value INTEGER
+                    );
+                    INSERT INTO items VALUES (1,1,1,2),(2,1,3,4),(3,0,1,2);
+                    CREATE UNIQUE INDEX items_active_key
+                        ON items((left_value << 8) | right_value)
+                        WHERE active = 1;
+                    UPDATE items
+                    SET (left_value,right_value)=(right_value,left_value)
+                    WHERE active = 1
+                    ORDER BY id
+                    LIMIT 2;
+                    """);
+
+                Query(connection, "SELECT id,left_value,right_value FROM items ORDER BY id;")
+                    .Select(row => string.Join(':', row.Select(value => value.AsInteger())))
+                    .Should().Equal("1:2:1", "2:4:3", "3:1:2");
+
+                Action conflict = () => Execute(
+                    connection,
+                    """
+                    UPDATE items
+                    SET (left_value,right_value)=(9,9)
+                    WHERE active = 1
+                    ORDER BY id
+                    LIMIT 2;
+                    """);
+                conflict.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("UNIQUE constraint failed: index 'items_active_key'");
+                Query(connection, "SELECT id,left_value,right_value FROM items ORDER BY id;")
+                    .Select(row => string.Join(':', row.Select(value => value.AsInteger())))
+                    .Should().Equal("1:2:1", "2:4:3", "3:1:2");
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Convert.ToInt64(Scalar(
+                    sqlite,
+                    "SELECT count(*) FROM items INDEXED BY items_active_key WHERE active = 1;"))
+                .Should().Be(2);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void FailedRichIndexRewriteRecoversAtomicallyInWalAndDeleteModes(bool deleteMode)
@@ -437,6 +904,9 @@ public sealed class DurableIndexSemanticsTests
             Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT);");
             Execute(connection, BuildSimpleRows(1, 120));
             Execute(connection, "CREATE UNIQUE INDEX items_value ON items(value COLLATE NOCASE DESC);");
+            Execute(
+                connection,
+                "CREATE UNIQUE INDEX items_expr ON items(lower(value) || ':' || id) WHERE id <= 80;");
             if (deleteMode)
                 ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
 
@@ -453,7 +923,7 @@ public sealed class DurableIndexSemanticsTests
                 .Should().Be(SqlValue.Text("value-00017"));
             Query(connection, "PRAGMA index_list(items);")
                 .Select(row => row[1].AsText())
-                .Should().Contain("items_value");
+                .Should().Contain(["items_value", "items_expr"]);
             Execute(connection, "UPDATE items SET value = 'changed-' || id WHERE id <= 40;");
         }
 
@@ -479,6 +949,9 @@ public sealed class DurableIndexSemanticsTests
             Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT);");
             Execute(connection, BuildSimpleRows(1, 80));
             Execute(connection, "CREATE INDEX items_value ON items(value COLLATE RTRIM DESC);");
+            Execute(
+                connection,
+                "CREATE INDEX items_expr ON items(lower(value) || ':' || id) WHERE (id % 2) = 0;");
             if (deleteMode)
                 ReadValue(connection, "PRAGMA journal_mode=DELETE;").Should().Be(SqlValue.Text("delete"));
             Execute(connection, "UPDATE items SET value = value || ' ' WHERE id <= 20;");
@@ -489,7 +962,11 @@ public sealed class DurableIndexSemanticsTests
         ReadValue(reopenedConnection, "SELECT COUNT(*) FROM items;").Should().Be(SqlValue.Integer(80));
         Query(reopenedConnection, "PRAGMA index_list(items);")
             .Select(row => row[1].AsText())
-            .Should().Contain("items_value");
+            .Should().Contain(["items_value", "items_expr"]);
+        ReadValue(
+                reopenedConnection,
+                "SELECT COUNT(*) FROM items WHERE (id % 2) = 0 AND lower(value) || ':' || id IS NOT NULL;")
+            .Should().Be(SqlValue.Integer(40));
     }
 
     [Test]
@@ -510,6 +987,7 @@ public sealed class DurableIndexSemanticsTests
                 """
                 CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT, suffix TEXT);
                 CREATE UNIQUE INDEX items_value ON items(value COLLATE NOCASE DESC, suffix COLLATE RTRIM ASC);
+                CREATE INDEX items_expr ON items(lower(value) || ':' || length(suffix)) WHERE id > 0;
                 INSERT INTO items VALUES (1, 'Alpha', 'x ');
                 """);
             writer.Close();
@@ -521,6 +999,9 @@ public sealed class DurableIndexSemanticsTests
                 stale.ExecuteScalar<string>(
                     "SELECT sql FROM sqlite_master WHERE name = 'items_value';")
                     .Should().Contain("COLLATE NOCASE DESC").And.Contain("COLLATE RTRIM");
+                stale.ExecuteScalar<string>(
+                    "SELECT sql FROM sqlite_master WHERE name = 'items_expr';")
+                    .Should().Contain("lower(value)").And.Contain("WHERE id > 0");
             }
 
             using (var destination = OpenManaged(destinationPath, pooling: false))
@@ -542,6 +1023,11 @@ public sealed class DurableIndexSemanticsTests
                 main.ExecuteScalar<string>(
                     "SELECT sql FROM aux.sqlite_master WHERE name = 'items_value';")
                     .Should().Contain("COLLATE NOCASE DESC");
+                main.ExecuteScalar<long>(
+                    """
+                    SELECT count(*) FROM aux.items
+                    WHERE id > 0 AND lower(value) || ':' || length(suffix) = 'alpha:2';
+                    """).Should().Be(1);
                 Action duplicate = () => main.ExecuteNonQuery(
                     "INSERT INTO aux.items VALUES (3, 'alpha', 'x   ');");
                 duplicate.Should().Throw<SqliteException>()
@@ -553,6 +1039,12 @@ public sealed class DurableIndexSemanticsTests
                 $"Data Source={destinationPath};Pooling=False");
             sqlite.Open();
             ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            Convert.ToInt64(Scalar(
+                sqlite,
+                """
+                SELECT count(*) FROM items INDEXED BY items_expr
+                WHERE id > 0 AND lower(value) || ':' || length(suffix) = 'alpha:2';
+                """)).Should().Be(1);
         }
         finally
         {
@@ -576,11 +1068,28 @@ public sealed class DurableIndexSemanticsTests
             database.RegisterCollation(
                 "reverse_text",
                 (left, right) => string.CompareOrdinal(right, left));
+            database.RegisterScalarFunction("managed_index_value", 1, values => values[0]);
+            database.RegisterScalarFunction("lower", 1, values => values[0]);
             Execute(connection, "CREATE TABLE retained(id INTEGER PRIMARY KEY, value TEXT);");
             Execute(connection, "INSERT INTO retained VALUES (1, 'durable');");
             var writesBeforeReject = faults.GetOperationCount(FileSystemOperation.Write);
             faults.FailNext(FileSystemOperation.Write);
 
+            Action random = () => Execute(
+                connection,
+                "CREATE INDEX rejected_random ON retained(random());");
+            random.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*non-deterministic functions*");
+            Action udf = () => Execute(
+                connection,
+                "CREATE INDEX rejected_udf ON retained(managed_index_value(value));");
+            udf.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*non-deterministic functions*");
+            Action overrideBuiltin = () => Execute(
+                connection,
+                "CREATE INDEX rejected_override ON retained(lower(value));");
+            overrideBuiltin.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*application-defined functions are prohibited*");
             Action create = () => Execute(
                 connection,
                 "CREATE INDEX rejected_custom ON retained(value COLLATE reverse_text);");
@@ -754,6 +1263,26 @@ public sealed class DurableIndexSemanticsTests
         while (reader.Read())
             values.Add(reader.GetInt64(0));
         return values.ToArray();
+    }
+
+    private static string[] ReadProviderRows(DbConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        using var reader = command.ExecuteReader();
+        var rows = new List<string>();
+        while (reader.Read())
+        {
+            rows.Add(string.Join(
+                "|",
+                Enumerable.Range(0, reader.FieldCount).Select(index =>
+                    reader.IsDBNull(index)
+                        ? "<null>"
+                        : Convert.ToString(reader.GetValue(index), CultureInfo.InvariantCulture)
+                            ?? string.Empty)));
+        }
+
+        return rows.ToArray();
     }
 
     private static object? Scalar(MsData.SqliteConnection connection, string sql)

@@ -315,7 +315,7 @@ public sealed class ManagedJournalPageMigrationTests
     }
 
     [Test]
-    public void FormatTransitionsRejectTransactionsAndAttachments()
+    public void FormatTransitionsRejectTransactionsAndJournalModeAttachmentsWhileVacuumTargetsSchemas()
     {
         var fileSystem = new InMemoryFileSystem();
         using var database = EmbeddedDatabase.OpenFile("transition-busy.db", fileSystem);
@@ -331,8 +331,8 @@ public sealed class ManagedJournalPageMigrationTests
         Execute(connection, "ATTACH 'attached.db' AS other;");
         Assert.Throws<EmbeddedSqlException>(() => ReadValue(connection, "PRAGMA journal_mode=DELETE;"))!
             .Message.Should().Contain("attached databases");
-        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "VACUUM;"))!
-            .Message.Should().Contain("attached databases");
+        Execute(connection, "VACUUM main;");
+        Execute(connection, "VACUUM other;");
     }
 
     [Test]

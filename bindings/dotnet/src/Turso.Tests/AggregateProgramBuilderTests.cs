@@ -599,6 +599,77 @@ public class AggregateProgramBuilderTests
     }
 
     [Test]
+    public void CompoundTermsResetCompletedAggregateContexts()
+    {
+        VdbeProgram Build(string table) => AggregateProgramBuilder.BuildRowScalar(
+            table,
+            tableColumnCount: 1,
+            collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
+            outputs:
+            [
+                CollectedRowsAggregate(
+                    "count",
+                    rows => SqlValue.Integer(rows.Count)),
+            ]);
+        var combined = CompoundProgramBuilder.BuildUnionAll(
+        [
+            new CompoundTerm(Build("first"), [Rows([1])]),
+            new CompoundTerm(Build("second"), [Rows([2])]),
+        ]);
+
+        var secondOpen = combined.Program.Instructions
+            .Select((instruction, index) => (instruction, index))
+            .Single(entry => entry.instruction is OpenReadCursorInstruction { Cursor.Index: 1 })
+            .index;
+        combined.Program.Instructions[secondOpen - 1]
+            .Should().BeOfType<AggResetInstruction>()
+            .Which.Accumulator.Should().Be(new Accumulator(0));
+
+        RunToCompletion(combined.Program, combined.CursorSources)
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(1, 1);
+    }
+
+    [Test]
+    public void SetOperationsRelocateGroupedAggregateState()
+    {
+        static VdbeProgram Build() => AggregateProgramBuilder.BuildRowGrouped(
+            "t",
+            tableColumnCount: 1,
+            groupKeyCount: 1,
+            groupKeyProjector: row => [row[0]],
+            groupEquality: (left, right) => left[0].Equals(right[0]),
+            collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
+            outputs:
+            [
+                CollectedRowsAggregate("key", rows => rows[0][0]),
+                CollectedRowsAggregate("count", rows => SqlValue.Integer(rows.Count)),
+            ],
+            orderKeys: [],
+            outputOrderComparer: (left, right) =>
+                left[0].AsInteger().CompareTo(right[0].AsInteger()),
+            groupHasher: key => key[0].GetHashCode());
+        static CompoundTerm Term(VdbeCursorSource source) =>
+            new(Build(), [source]);
+        static bool Equality(SqlValue[] left, SqlValue[] right) =>
+            left.SequenceEqual(right);
+
+        var intersect = CompoundProgramBuilder.BuildIntersect(
+            [Term(Rows([1], [2])), Term(Rows([2], [3]))],
+            Equality);
+        RunToCompletion(intersect.Program, intersect.CursorSources)
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(2), SqlValue.Integer(1));
+
+        var except = CompoundProgramBuilder.BuildExcept(
+            [Term(Rows([1], [2])), Term(Rows([2], [3]))],
+            Equality);
+        RunToCompletion(except.Program, except.CursorSources)
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
+    }
+
+    [Test]
     public void BuildGroupedValidatesItsArguments()
     {
         var order = AggregateTestSupport.OrderByColumns(0);
@@ -687,6 +758,14 @@ public class AggregateProgramBuilderTests
     private static List<SqlValue[]> Run(VdbeProgram program, VdbeCursorSource source)
     {
         using var statement = new ResumableStatement(program, [source]);
+        return Drain(statement);
+    }
+
+    private static List<SqlValue[]> RunToCompletion(
+        VdbeProgram program,
+        IReadOnlyList<VdbeCursorSource> sources)
+    {
+        using var statement = new ResumableStatement(program, sources);
         return Drain(statement);
     }
 

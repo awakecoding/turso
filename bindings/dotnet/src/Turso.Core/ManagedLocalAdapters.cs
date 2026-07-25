@@ -720,6 +720,7 @@ internal static class ManagedSnapshot
             }
 
             var schema = ReadSchema(source);
+            var sourceHasSqliteSequence = HasSqliteSequence(source);
             var pragmaHeader = ReadPragmaHeader(source);
             if (ForeignKeysEnabled(destination))
             {
@@ -732,11 +733,17 @@ internal static class ManagedSnapshot
                 Execute(destination, "BEGIN;");
                 destinationTransactionStarted = true;
                 ClearSchema(destination);
+                if (sourceHasSqliteSequence)
+                    EnsureSqliteSequence(destination);
+                else
+                    ClearSqliteSequence(destination);
                 foreach (var entry in schema.Where(entry => entry.Type == "table"))
                     Execute(destination, entry.Sql);
 
                 foreach (var table in schema.Where(entry => entry.Type == "table"))
                     CopyRows(source, destination, table);
+                if (sourceHasSqliteSequence)
+                    CopySqliteSequence(source, destination);
 
                 foreach (var entry in schema.Where(entry => entry.Type is "index" or "view" or "trigger"))
                     Execute(destination, entry.Sql);
@@ -805,6 +812,50 @@ internal static class ManagedSnapshot
         }
 
         return schema;
+    }
+
+    private static bool HasSqliteSequence(IManagedConnectionAdapter connection)
+    {
+        using var statement = connection.Prepare(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence';");
+        if (statement.Step() != StatementStepResult.Row)
+            throw new InvalidOperationException("sqlite_master did not return a sqlite_sequence count.");
+        return statement.GetValue(0).AsInteger() != 0;
+    }
+
+    private static void EnsureSqliteSequence(IManagedConnectionAdapter destination)
+    {
+        if (HasSqliteSequence(destination))
+            return;
+
+        Execute(
+            destination,
+            "CREATE TABLE __turso_snapshot_sequence_seed(id INTEGER PRIMARY KEY AUTOINCREMENT);");
+        Execute(destination, "DROP TABLE __turso_snapshot_sequence_seed;");
+    }
+
+    private static void ClearSqliteSequence(IManagedConnectionAdapter destination)
+    {
+        if (HasSqliteSequence(destination))
+            Execute(destination, "DELETE FROM sqlite_sequence;");
+    }
+
+    private static void CopySqliteSequence(
+        IManagedConnectionAdapter source,
+        IManagedConnectionAdapter destination)
+    {
+        Execute(destination, "DELETE FROM sqlite_sequence;");
+        using var select = source.Prepare(
+            "SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;");
+        while (select.Step() == StatementStepResult.Row)
+        {
+            using var insert = destination.Prepare(
+                "INSERT INTO sqlite_sequence(rowid, name, seq) VALUES ($p0, $p1, $p2);");
+            insert.Bind(1, select.GetValue(0));
+            insert.Bind(2, select.GetValue(1));
+            insert.Bind(3, select.GetValue(2));
+            Execute(insert);
+        }
     }
 
     private static SnapshotPragmaHeader ReadPragmaHeader(IManagedConnectionAdapter source)
