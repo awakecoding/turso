@@ -364,6 +364,45 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
+    public void RecursiveCancellationRollsBackEveryNestedFrameAndTheTransaction()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var callbacks = new List<long>();
+        using var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "cancel_at_three",
+            1,
+            values =>
+            {
+                var value = values[0].AsInteger();
+                callbacks.Add(value);
+                if (value == 3)
+                    cancellation.Cancel();
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "PRAGMA recursive_triggers = ON");
+        Execute(connection, "CREATE TABLE prior(id INTEGER)");
+        Execute(connection, "CREATE TABLE data(id INTEGER)");
+        Execute(
+            connection,
+            "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 5 BEGIN "
+                + "SELECT cancel_at_three(NEW.id); "
+                + "INSERT INTO data VALUES (NEW.id + 1); END");
+        Execute(connection, "BEGIN");
+        Execute(connection, "INSERT INTO prior VALUES (99)");
+
+        using (var statement = connection.Prepare("INSERT INTO data VALUES (1)"))
+            Assert.Throws<OperationCanceledException>(() => statement.Step(cancellation.Token));
+
+        callbacks.Should().Equal(1, 2, 3);
+        ReadRows(connection, "SELECT id FROM prior").Should().BeEmpty();
+        ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "ROLLBACK"))!
+            .Message.Should().Be("cannot rollback - no transaction is active");
+    }
+
+    [Test]
     public void FileTriggersPreserveRowSemanticsAndOrderAcrossReopenAndPageMigration()
     {
         var fileSystem = new InMemoryFileSystem();
@@ -410,6 +449,82 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
+    public void RecursiveFileTriggersSurviveReopenAndPageMigration()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var database = EmbeddedDatabase.OpenFile("recursive-triggers.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE data(id INTEGER PRIMARY KEY)");
+            Execute(connection, "CREATE TABLE trace(id INTEGER)");
+            Execute(
+                connection,
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 3 BEGIN "
+                    + "INSERT INTO trace VALUES (NEW.id); "
+                    + "INSERT INTO data VALUES (NEW.id + 1); END");
+            Execute(connection, "PRAGMA recursive_triggers = ON");
+            Execute(connection, "INSERT INTO data VALUES (1)");
+            Execute(connection, "PRAGMA journal_mode = DELETE");
+            Execute(connection, "PRAGMA page_size = 8192");
+            Execute(connection, "VACUUM");
+        }
+
+        using (var database = EmbeddedDatabase.OpenFile("recursive-triggers.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            ReadRows(connection, "PRAGMA page_size").Should().ContainSingle()
+                .Which[0].AsInteger().Should().Be(8192);
+            Execute(connection, "DELETE FROM data");
+            Execute(connection, "DELETE FROM trace");
+            Execute(connection, "PRAGMA recursive_triggers = ON");
+            Execute(connection, "INSERT INTO data VALUES (1)");
+            ReadRows(connection, "SELECT id FROM data ORDER BY id")
+                .Select(row => row[0].AsInteger())
+                .Should().Equal(1, 2, 3);
+            ReadRows(connection, "SELECT id FROM trace ORDER BY rowid")
+                .Select(row => row[0].AsInteger())
+                .Should().Equal(1, 2);
+        }
+    }
+
+    [Test]
+    public void RecursiveFileMutationRecoversAfterInjectedFlushFailure()
+    {
+        const string path = "recursive-trigger-failure.db";
+        var inner = new InMemoryFileSystem();
+        var fileSystem = new FlushFailingFileSystem(inner, path);
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "PRAGMA journal_mode = DELETE");
+            Execute(connection, "CREATE TABLE data(id INTEGER PRIMARY KEY)");
+            Execute(connection, "CREATE TABLE trace(id INTEGER)");
+            Execute(
+                connection,
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 3 BEGIN "
+                    + "INSERT INTO trace VALUES (NEW.id); "
+                    + "INSERT INTO data VALUES (NEW.id + 1); END");
+            Execute(connection, "PRAGMA recursive_triggers = ON");
+
+            fileSystem.ArmFlushFailure();
+            Assert.Throws<IOException>(() => Execute(connection, "INSERT INTO data VALUES (1)"));
+        }
+
+        fileSystem.Disarm();
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+            ReadRows(connection, "SELECT id FROM trace").Should().BeEmpty();
+            Execute(connection, "PRAGMA recursive_triggers = ON");
+            Execute(connection, "INSERT INTO data VALUES (1)");
+            ReadRows(connection, "SELECT id FROM data ORDER BY id")
+                .Select(row => row[0].AsInteger())
+                .Should().Equal(1, 2, 3);
+        }
+    }
+
+    [Test]
     public void AttachedPersistentTriggersStayWithinTheirDatabase()
     {
         var fileSystem = new InMemoryFileSystem();
@@ -436,6 +551,49 @@ public sealed class ManagedTriggerRowSemanticsTests
         crossDatabase.Should().Throw<EmbeddedSqlException>();
         Execute(connection, "INSERT INTO main.data VALUES (8)");
         ReadRows(connection, "SELECT id FROM aux.trace").Should().ContainSingle();
+    }
+
+    [Test]
+    public void RecursiveAttachedAndTempTriggersRemainSchemaLocal()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("recursive-schema-main.db", fileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE main.data(id INTEGER PRIMARY KEY)");
+        Execute(connection, "CREATE TABLE main.trace(id INTEGER)");
+        Execute(connection, "ATTACH DATABASE 'recursive-schema-aux.db' AS aux");
+        Execute(connection, "CREATE TABLE aux.data(id INTEGER PRIMARY KEY)");
+        Execute(connection, "CREATE TABLE aux.trace(id INTEGER)");
+        Execute(
+            connection,
+            "CREATE TRIGGER aux.data_inserted AFTER INSERT ON aux.data WHEN NEW.id < 3 BEGIN "
+                + "INSERT INTO trace VALUES (NEW.id); "
+                + "INSERT INTO data VALUES (NEW.id + 1); END");
+        Execute(connection, "CREATE TEMP TABLE temp_data(id INTEGER PRIMARY KEY)");
+        Execute(connection, "CREATE TEMP TABLE temp_trace(id INTEGER)");
+        Execute(
+            connection,
+            "CREATE TRIGGER temp.temp_data_inserted AFTER INSERT ON temp.temp_data WHEN NEW.id < 3 BEGIN "
+                + "INSERT INTO temp_trace VALUES (NEW.id); "
+                + "INSERT INTO temp_data VALUES (NEW.id + 1); END");
+        Execute(connection, "PRAGMA recursive_triggers = ON");
+        Execute(connection, "INSERT INTO aux.data VALUES (1)");
+        Execute(connection, "INSERT INTO temp.temp_data VALUES (1)");
+
+        ReadRows(connection, "SELECT id FROM main.data").Should().BeEmpty();
+        ReadRows(connection, "SELECT id FROM main.trace").Should().BeEmpty();
+        ReadRows(connection, "SELECT id FROM aux.data ORDER BY id")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(1, 2, 3);
+        ReadRows(connection, "SELECT id FROM aux.trace ORDER BY rowid")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(1, 2);
+        ReadRows(connection, "SELECT id FROM temp.temp_data ORDER BY id")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(1, 2, 3);
+        ReadRows(connection, "SELECT id FROM temp.temp_trace ORDER BY rowid")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(1, 2);
     }
 
     [Test]
@@ -540,6 +698,914 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
+    public void RecursivePragmaControlsFiniteSelfRecursionAndDepthFirstOrder()
+    {
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE data(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE trace(value TEXT)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 3 BEGIN "
+                    + "INSERT INTO trace VALUES ('enter:' || NEW.id); "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "INSERT INTO trace VALUES ('exit:' || NEW.id); END",
+                "INSERT INTO data VALUES (1)",
+                "INSERT INTO trace VALUES ('off-count:' || (SELECT count(*) FROM data))",
+                "DELETE FROM data",
+                "PRAGMA recursive_triggers = ON",
+                "INSERT INTO data VALUES (1)",
+            ],
+            "SELECT value FROM trace ORDER BY rowid");
+    }
+
+    [Test]
+    public void RecursiveManagedCallbacksRemainOnTheCallingThread()
+    {
+        var callingThread = Environment.CurrentManagedThreadId;
+        var callbackThreads = new List<int>();
+        using var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "capture_thread",
+            1,
+            values =>
+            {
+                callbackThreads.Add(Environment.CurrentManagedThreadId);
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "PRAGMA recursive_triggers = ON");
+        Execute(connection, "CREATE TABLE data(id INTEGER)");
+        Execute(connection, "CREATE TABLE standalone(id INTEGER)");
+        Execute(
+            connection,
+            "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 3 BEGIN "
+                + "SELECT capture_thread(NEW.id); "
+                + "INSERT INTO data VALUES (NEW.id + 1); END");
+
+        Execute(connection, "INSERT INTO data VALUES (1)");
+        Execute(connection, "INSERT INTO standalone VALUES (capture_thread(99))");
+
+        callbackThreads.Should().OnlyContain(thread => thread == callingThread);
+        callbackThreads.Should().HaveCount(3);
+    }
+
+    [Test]
+    public void RecursiveCallbackReentryFailsWithoutDeadlocking()
+    {
+        using var database = new EmbeddedDatabase();
+        EmbeddedConnection? connection = null;
+        database.RegisterScalarFunction(
+            "reenter",
+            1,
+            values =>
+            {
+                using var statement = connection!.Prepare("SELECT count(*) FROM data");
+                _ = statement.Step();
+                return values[0];
+            });
+        connection = database.Connect();
+        using (connection)
+        {
+            Execute(connection, "PRAGMA recursive_triggers = ON");
+            Execute(connection, "CREATE TABLE data(id INTEGER)");
+            Execute(
+                connection,
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data BEGIN "
+                    + "SELECT reenter(NEW.id); END");
+
+            Assert.Throws<EmbeddedSqlException>(
+                    () => Execute(connection, "INSERT INTO data VALUES (1)"))!
+                .Message.Should().Contain("reentrant managed database use");
+            ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+
+            database.RegisterScalarFunction(
+                "reenter_task",
+                1,
+                values => Task.Run(() =>
+                {
+                    using var statement = connection.Prepare("SELECT count(*) FROM data");
+                    _ = statement.Step();
+                    return values[0];
+                }).GetAwaiter().GetResult());
+            Execute(connection, "DROP TRIGGER data_inserted");
+            Execute(
+                connection,
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data BEGIN "
+                    + "SELECT reenter_task(NEW.id); END");
+            Assert.Throws<EmbeddedSqlException>(
+                    () => Execute(connection, "INSERT INTO data VALUES (2)"))!
+                .Message.Should().Contain("reentrant managed database use");
+            ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+
+            database.RegisterScalarFunction(
+                "register_reentry",
+                1,
+                values =>
+                {
+                    connection.RegisterScalarFunction("leaked", 0, _ => SqlValue.Integer(1));
+                    return values[0];
+                });
+            Execute(connection, "DROP TRIGGER data_inserted");
+            Execute(
+                connection,
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data BEGIN "
+                    + "SELECT register_reentry(NEW.id); END");
+            Assert.Throws<EmbeddedSqlException>(
+                    () => Execute(connection, "INSERT INTO data VALUES (3)"))!
+                .Message.Should().Contain("reentrant managed database use");
+            Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "SELECT leaked()"));
+
+            using var otherDatabase = new EmbeddedDatabase();
+            using var otherConnection = otherDatabase.Connect();
+            Execute(otherConnection, "CREATE TABLE other_data(id INTEGER)");
+            database.RegisterScalarFunction(
+                "write_other",
+                1,
+                values =>
+                {
+                    Execute(otherConnection, $"INSERT INTO other_data VALUES ({values[0].AsInteger()})");
+                    return values[0];
+                });
+            Execute(connection, "DROP TRIGGER data_inserted");
+            Execute(
+                connection,
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data BEGIN "
+                    + "SELECT write_other(NEW.id); END");
+            Execute(connection, "INSERT INTO data VALUES (4)");
+            ReadRows(otherConnection, "SELECT id FROM other_data").Should().ContainSingle()
+                .Which[0].AsInteger().Should().Be(4);
+        }
+    }
+
+    [Test]
+    public void RecursiveIndirectTriggersPreserveNestedStatementOrder()
+    {
+        AssertMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE left_data(id INTEGER)",
+                "CREATE TABLE right_data(id INTEGER)",
+                "CREATE TABLE trace(value TEXT)",
+                "CREATE TRIGGER left_after AFTER INSERT ON left_data WHEN NEW.id < 5 BEGIN "
+                    + "INSERT INTO trace VALUES ('L+' || NEW.id); "
+                    + "INSERT INTO right_data VALUES (NEW.id + 1); "
+                    + "INSERT INTO trace VALUES ('L-' || NEW.id); END",
+                "CREATE TRIGGER right_after AFTER INSERT ON right_data WHEN NEW.id < 5 BEGIN "
+                    + "INSERT INTO trace VALUES ('R+' || NEW.id); "
+                    + "INSERT INTO left_data VALUES (NEW.id + 1); "
+                    + "INSERT INTO trace VALUES ('R-' || NEW.id); END",
+                "INSERT INTO left_data VALUES (1)",
+            ],
+            "SELECT value FROM trace ORDER BY rowid");
+    }
+
+    [Test]
+    public void RecursiveInsertSelectPredicateTerminatesLikeSqlite()
+    {
+        AssertMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data BEGIN "
+                    + "INSERT INTO data SELECT NEW.id + 1 WHERE NEW.id < 3; END",
+                "INSERT INTO data VALUES (1)",
+            ],
+            "SELECT id FROM data ORDER BY id");
+    }
+
+    [Test]
+    public void RecursiveIgnoreConflictTerminatesLikeSqlite()
+    {
+        AssertMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data BEGIN "
+                    + "INSERT OR IGNORE INTO data VALUES (NEW.id); END",
+                "INSERT INTO data VALUES (1)",
+            ],
+            "SELECT id FROM data");
+    }
+
+    [Test]
+    public void RecursiveDepthLimitUsesSqliteErrorAndRollsBackAutocommit()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*), last_insert_rowid() FROM data");
+    }
+
+    [Test]
+    public void RecursiveDepthErrorPreservesTheSqliteTransactionPrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*), min(id), max(id), last_insert_rowid() FROM data");
+    }
+
+    [Test]
+    public void RecursiveDepthPrefixIgnoresUnrelatedForeignKeyMode()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*), min(id), max(id) FROM data");
+    }
+
+    [Test]
+    public void RecursiveDepthErrorHonorsUnreachableRaiseAbortStatementJournal()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "SELECT CASE WHEN 0 THEN RAISE(ABORT, 'unreachable') END; "
+                    + "INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*) FROM data");
+    }
+
+    [Test]
+    public void RecursiveDepthErrorPreflightsNestedAbortPrograms()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TABLE later(id INTEGER)",
+                "CREATE TRIGGER later_inserted AFTER INSERT ON later BEGIN "
+                    + "SELECT RAISE(ABORT, 'later-abort'); END",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "INSERT INTO later VALUES (NEW.id); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT (SELECT count(*) FROM data), (SELECT count(*) FROM later)");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "SELECT abs(-9223372036854775808); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*) FROM data");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "SELECT CASE WHEN 0 THEN 'invalid' ->> '$' END; END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*) FROM data");
+    }
+
+    [Test]
+    public void RecursiveExpressionJournalClassificationMatchesSqlite()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "SELECT CURRENT_TIMESTAMP; END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*) FROM data");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "SELECT coalesce(NEW.id, 0); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*) FROM data");
+    }
+
+    [Test]
+    public void RecursiveDefaultsAndViewsParticipateInAbortPreflight()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TABLE target(id INTEGER, value INTEGER "
+                    + "DEFAULT (abs(-9223372036854775808)))",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "INSERT INTO target(id) VALUES (NEW.id); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT (SELECT count(*) FROM data), (SELECT count(*) FROM target)");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE VIEW aborting_view AS SELECT abs(-9223372036854775808) AS value",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "SELECT value FROM aborting_view; END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*) FROM data");
+    }
+
+    [Test]
+    public void RecursiveBeforeTriggerDepthUsesOuterStatementJournal()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE outer_data(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE side_data(id INTEGER)",
+                "CREATE TRIGGER side_inserted AFTER INSERT ON side_data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO side_data VALUES (NEW.id + 1); END",
+                "CREATE TRIGGER outer_before BEFORE INSERT ON outer_data "
+                    + "BEGIN INSERT INTO side_data VALUES (1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO outer_data VALUES (1)",
+            "SELECT (SELECT count(*) FROM outer_data), (SELECT count(*) FROM side_data)");
+    }
+
+    [Test]
+    public void RecursivePreflightUsesOuterConflictPolicy()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE source(id INTEGER)",
+                "CREATE TABLE loop_data(id INTEGER PRIMARY KEY)",
+                "CREATE TRIGGER loop_before BEFORE INSERT ON loop_data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT OR IGNORE INTO loop_data VALUES (NEW.id + 1); END",
+                "CREATE TRIGGER source_before BEFORE INSERT ON source "
+                    + "BEGIN INSERT OR IGNORE INTO loop_data VALUES (1); END",
+                "BEGIN",
+            ],
+            "INSERT OR ABORT INTO source VALUES (1)",
+            "SELECT (SELECT count(*) FROM source), (SELECT count(*) FROM loop_data)");
+    }
+
+    [Test]
+    public void RecursiveNestedTriggersRetainEffectiveIgnorePolicy()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE source(id INTEGER)",
+                "CREATE TABLE loop_data(id INTEGER PRIMARY KEY)",
+                "CREATE TRIGGER loop_inserted AFTER INSERT ON loop_data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO loop_data VALUES (NEW.id + 1); END",
+                "CREATE TRIGGER source_inserted AFTER INSERT ON source "
+                    + "BEGIN INSERT OR IGNORE INTO loop_data VALUES (1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO source VALUES (1)",
+            "SELECT (SELECT count(*) FROM source), (SELECT count(*) FROM loop_data)");
+    }
+
+    [Test]
+    public void RecursiveGeneratedAndForeignKeyProgramsOpenStatementJournal()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER, computed INTEGER AS (abs(id)) STORED)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data(id) VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data(id) VALUES (1)",
+            "SELECT count(*) FROM data");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL "
+                    + "REFERENCES parent(id) ON DELETE SET NULL)",
+                "CREATE TABLE data(id INTEGER)",
+                "INSERT INTO parent VALUES (1)",
+                "INSERT INTO child VALUES (1, 1)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO data VALUES (NEW.id + 1); "
+                    + "DELETE FROM parent WHERE id = 1; END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT (SELECT count(*) FROM data), "
+                + "(SELECT count(*) FROM parent), (SELECT count(*) FROM child)");
+    }
+
+    [Test]
+    public void RecursiveForeignKeyCascadeInterruptionRollsBackParentAndChild()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER "
+                    + "REFERENCES parent(id) ON UPDATE CASCADE)",
+                "CREATE TABLE side_data(id INTEGER)",
+                "INSERT INTO parent VALUES (1)",
+                "INSERT INTO child VALUES (1, 1)",
+                "CREATE TRIGGER side_inserted AFTER INSERT ON side_data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO side_data VALUES (NEW.id + 1); END",
+                "CREATE TRIGGER child_before BEFORE UPDATE ON child "
+                    + "BEGIN INSERT INTO side_data VALUES (1); END",
+                "BEGIN",
+            ],
+            "UPDATE parent SET id = 2 WHERE id = 1",
+            "SELECT (SELECT id FROM parent), (SELECT parent_id FROM child), "
+                + "(SELECT count(*) FROM side_data)");
+    }
+
+    [Test]
+    public void RecursiveDepthErrorPreservesDeferredForeignKeyPrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE data(id INTEGER, parent_id INTEGER REFERENCES parent(id) "
+                    + "DEFERRABLE INITIALLY DEFERRED)",
+                "INSERT INTO parent VALUES (1)",
+                "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1, 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1, 1)",
+            "SELECT count(*), min(id), max(id) FROM data");
+    }
+
+    [Test]
+    public void RecursiveNoOpDepthErrorDoesNotReserveATransactionWriteDatabase()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using var database = EmbeddedDatabase.OpenFile("recursive-noop-main.db", fileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "ATTACH DATABASE 'recursive-noop-aux.db' AS aux");
+        Execute(connection, "CREATE TABLE aux.data(id INTEGER)");
+        Execute(connection, "CREATE VIEW projected AS SELECT 1 AS id");
+        Execute(
+            connection,
+            "CREATE TRIGGER projected_insert INSTEAD OF INSERT ON projected WHEN NEW.id < 2000 "
+                + "BEGIN INSERT INTO projected VALUES (NEW.id + 1); END");
+        Execute(connection, "PRAGMA recursive_triggers = ON");
+        Execute(connection, "BEGIN");
+
+        Assert.Throws<EmbeddedSqlException>(
+                () => Execute(connection, "INSERT INTO projected VALUES (1)"))!
+            .Message.Should().Be("too many levels of trigger recursion");
+        Execute(connection, "INSERT INTO aux.data VALUES (7)");
+        Execute(connection, "COMMIT");
+        ReadRows(connection, "SELECT id FROM aux.data").Should().ContainSingle()
+            .Which[0].AsInteger().Should().Be(7);
+    }
+
+    [Test]
+    public void RecursiveDepthErrorRollsBackConstrainedTransactionStatement()
+    {
+        using var database = new EmbeddedDatabase();
+        using var managed = database.Connect();
+        using var sqlite = OpenSqlite();
+        var setup = new[]
+        {
+            "PRAGMA recursive_triggers = ON",
+            "CREATE TABLE data(id INTEGER PRIMARY KEY)",
+            "CREATE TRIGGER data_after AFTER INSERT ON data WHEN NEW.id < 2000 "
+                + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+            "BEGIN",
+        };
+        foreach (var sql in setup)
+        {
+            Execute(managed, sql);
+            Execute(sqlite, sql);
+        }
+
+        var managedError = Assert.Throws<EmbeddedSqlException>(
+            () => Execute(managed, "INSERT INTO data VALUES (1)"));
+        var sqliteError = Assert.Throws<MsData.SqliteException>(
+            () => Execute(sqlite, "INSERT INTO data VALUES (1)"));
+        sqliteError!.Message.Should().Contain(managedError!.Message);
+        Execute(managed, "COMMIT");
+        Execute(sqlite, "COMMIT");
+        AssertQueriesMatch(managed, sqlite, "SELECT count(*), last_insert_rowid() FROM data");
+    }
+
+    [Test]
+    public void RecursiveDeleteDepthErrorPreservesTheSqlitePrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY)",
+                "WITH RECURSIVE numbers(id) AS ("
+                    + "VALUES(1) UNION ALL SELECT id + 1 FROM numbers WHERE id < 1101"
+                    + ") INSERT INTO data SELECT id FROM numbers",
+                "CREATE TRIGGER data_deleted AFTER DELETE ON data WHEN OLD.id > 1 BEGIN "
+                    + "DELETE FROM data WHERE id = OLD.id - 1; END",
+            ],
+            "DELETE FROM data WHERE id = 1101",
+            "SELECT count(*), min(id), max(id) FROM data");
+    }
+
+    [Test]
+    public void RecursiveIgnoreConstraintDepthErrorPreservesTheSqlitePrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY ON CONFLICT IGNORE)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*), min(id), max(id) FROM data");
+    }
+
+    [Test]
+    public void RecursiveRollbackConstraintDepthErrorPreservesTheSqlitePrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*), min(id), max(id) FROM data");
+    }
+
+    [Test]
+    public void RecursiveValidStrictDepthErrorPreservesTheSqlitePrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER) STRICT",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT count(*), min(id), max(id) FROM data");
+    }
+
+    [Test]
+    public void RecursiveReplaceNotNullAndGeneratedUniqueUseStatementRollback()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER, required TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'value')",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1, NULL); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data VALUES (1, NULL)",
+            "SELECT count(*) FROM data");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER, seed INTEGER, computed INTEGER AS (seed) STORED, "
+                    + "UNIQUE(computed))",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data(id, seed) VALUES (NEW.id + 1, NEW.seed + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO data(id, seed) VALUES (1, 1)",
+            "SELECT count(*) FROM data");
+    }
+
+    [Test]
+    public void RecursiveNonKeyUpdateDepthErrorPreservesTheSqlitePrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE unrelated_parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE unrelated_child(id INTEGER PRIMARY KEY, parent_id INTEGER "
+                    + "REFERENCES unrelated_parent(id))",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY, value INTEGER)",
+                "INSERT INTO data VALUES (1, 0)",
+                "CREATE TRIGGER data_updated AFTER UPDATE OF value ON data WHEN NEW.value < 2000 BEGIN "
+                    + "UPDATE data SET value = NEW.value + 1 WHERE id = NEW.id; END",
+                "BEGIN",
+            ],
+            "UPDATE data SET value = 1 WHERE id = 1",
+            "SELECT id, value FROM data");
+    }
+
+    [Test]
+    public void RecursivePartialUniquePredicateUsesStatementRollback()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY, flag INTEGER)",
+                "CREATE UNIQUE INDEX data_positive ON data(id) WHERE flag > 0",
+                "INSERT INTO data VALUES (1, 0)",
+                "CREATE TRIGGER data_updated AFTER UPDATE OF flag ON data WHEN NEW.flag < 2000 BEGIN "
+                    + "UPDATE data SET flag = NEW.flag + 1 WHERE id = NEW.id; END",
+                "BEGIN",
+            ],
+            "UPDATE data SET flag = 1 WHERE id = 1",
+            "SELECT id, flag FROM data");
+    }
+
+    [Test]
+    public void RecursiveUpsertSideEffectsParticipateInStatementRollback()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE source(id INTEGER)",
+                "CREATE TABLE target(id INTEGER PRIMARY KEY, required TEXT NOT NULL)",
+                "CREATE TRIGGER source_inserted AFTER INSERT ON source WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO target VALUES (NEW.id, 'value') "
+                    + "ON CONFLICT(id) DO UPDATE SET required = excluded.required; "
+                    + "INSERT INTO source VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT INTO source VALUES (1)",
+            "SELECT (SELECT count(*) FROM source), (SELECT count(*) FROM target)");
+    }
+
+    [Test]
+    public void RecursiveUnreachableUpsertUpdateUsesAbortPolicy()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE source(id INTEGER)",
+                "CREATE TABLE target(id INTEGER PRIMARY KEY ON CONFLICT IGNORE, "
+                    + "value INTEGER NOT NULL ON CONFLICT IGNORE)",
+                "INSERT INTO target VALUES (1, 1)",
+                "CREATE TRIGGER source_inserted AFTER INSERT ON source WHEN NEW.id < 2000 BEGIN "
+                    + "INSERT INTO source VALUES (NEW.id + 1); "
+                    + "INSERT OR IGNORE INTO target VALUES (1, 1) "
+                    + "ON CONFLICT(id) DO UPDATE SET value = NULL; END",
+                "BEGIN",
+            ],
+            "INSERT INTO source VALUES (1)",
+            "SELECT (SELECT count(*) FROM source), (SELECT value FROM target)");
+    }
+
+    [Test]
+    public void RecursiveCheckIgnorePreservesTheSqlitePrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER CHECK(id > 0))",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 2000 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+            ],
+            "INSERT OR IGNORE INTO data VALUES (1)",
+            "SELECT count(*), min(id), max(id) FROM data");
+    }
+
+    [Test]
+    public void RecursiveRowImagesCoverGeneratedWithoutRowidAndViewRows()
+    {
+        AssertMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE trace(value TEXT)",
+                "CREATE TABLE row_data(id INTEGER PRIMARY KEY, seed INTEGER, "
+                    + "doubled INTEGER AS (seed * 2) STORED)",
+                "CREATE TRIGGER row_inserted AFTER INSERT ON row_data WHEN NEW.seed < 3 BEGIN "
+                    + "INSERT INTO trace VALUES ('I:' || NEW.rowid || ':' || NEW.seed || ':' || NEW.doubled); "
+                    + "INSERT INTO row_data(seed) VALUES (NEW.seed + 1); END",
+                "CREATE TRIGGER row_updated AFTER UPDATE OF seed ON row_data WHEN NEW.seed < 5 BEGIN "
+                    + "INSERT INTO trace VALUES ('U:' || OLD.rowid || ':' || OLD.seed || ':' "
+                    + "|| NEW.rowid || ':' || NEW.seed || ':' || NEW.doubled); "
+                    + "UPDATE row_data SET seed = NEW.seed + 1 WHERE rowid = NEW.rowid; END",
+                "INSERT INTO row_data(seed) VALUES (1)",
+                "UPDATE row_data SET seed = 3 WHERE id = 1",
+                "CREATE TABLE keyed_data(key TEXT PRIMARY KEY, seed INTEGER, "
+                    + "doubled INTEGER AS (seed * 2) STORED) WITHOUT ROWID",
+                "CREATE TRIGGER keyed_inserted AFTER INSERT ON keyed_data WHEN NEW.seed < 3 BEGIN "
+                    + "INSERT INTO trace VALUES ('W:' || NEW.key || ':' || NEW.seed || ':' || NEW.doubled); "
+                    + "INSERT INTO keyed_data(key, seed) VALUES (NEW.key || NEW.seed, NEW.seed + 1); END",
+                "INSERT INTO keyed_data(key, seed) VALUES ('k', 1)",
+                "CREATE VIEW projected AS SELECT key, seed, doubled FROM keyed_data",
+                "CREATE TRIGGER projected_insert INSTEAD OF INSERT ON projected WHEN NEW.seed < 3 BEGIN "
+                    + "INSERT INTO trace VALUES ('V:' || NEW.key || ':' || NEW.seed || ':' || NEW.doubled); "
+                    + "INSERT INTO projected(key, seed) VALUES (NEW.key || 'v', NEW.seed + 1); END",
+                "INSERT INTO projected(key, seed) VALUES ('v', 1)",
+            ],
+            "SELECT value FROM trace ORDER BY rowid");
+    }
+
+    [Test]
+    public void RecursiveLastInsertRowidAndAutoIncrementSequenceMatchSqlite()
+    {
+        AssertMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY AUTOINCREMENT, parent INTEGER)",
+                "CREATE TABLE trace(depth INTEGER, seen INTEGER, last_id INTEGER)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 3 BEGIN "
+                    + "INSERT INTO trace VALUES (NEW.id, NEW.rowid, last_insert_rowid()); "
+                    + "INSERT INTO data(parent) VALUES (NEW.id); "
+                    + "INSERT INTO trace VALUES (-NEW.id, NEW.rowid, last_insert_rowid()); END",
+                "INSERT INTO data(parent) VALUES (NULL)",
+            ],
+            "SELECT 'data', id, parent, NULL FROM data "
+                + "UNION ALL SELECT 'log', depth, seen, last_id FROM trace "
+                + "UNION ALL SELECT 'outer', last_insert_rowid(), NULL, NULL "
+                + "UNION ALL SELECT 'sequence', seq, NULL, NULL FROM sqlite_sequence WHERE name = 'data' "
+                + "ORDER BY 1, 2");
+    }
+
+    [Test]
+    public void RecursiveRaiseFailPreservesTheSqliteMutationPrefix()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE data(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE trace(id INTEGER)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 4 BEGIN "
+                    + "INSERT INTO trace VALUES (NEW.id); "
+                    + "SELECT CASE WHEN NEW.id = 3 THEN RAISE(FAIL, 'recursive-stop') END; "
+                    + "INSERT INTO data VALUES (NEW.id + 1); END",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT 'data', id FROM data "
+                + "UNION ALL SELECT 'trace', id FROM trace "
+                + "UNION ALL SELECT 'last', last_insert_rowid() ORDER BY 1, 2");
+    }
+
+    [Test]
+    public void RecursiveConflictOverrideAndReplaceDeleteProgramsMatchSqlite()
+    {
+        AssertMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE source(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE sink(id INTEGER PRIMARY KEY)",
+                "INSERT INTO sink VALUES (2)",
+                "CREATE TRIGGER source_inserted AFTER INSERT ON source WHEN NEW.id < 3 BEGIN "
+                    + "INSERT INTO sink VALUES (NEW.id); "
+                    + "INSERT INTO source VALUES (NEW.id + 1); END",
+                "INSERT OR IGNORE INTO source VALUES (1)",
+                "CREATE TABLE replace_data(id INTEGER PRIMARY KEY, value TEXT UNIQUE)",
+                "CREATE TABLE replace_trace(id INTEGER)",
+                "CREATE TRIGGER replace_deleted AFTER DELETE ON replace_data BEGIN "
+                    + "INSERT INTO replace_trace VALUES (OLD.id); END",
+                "CREATE TRIGGER replace_trace_inserted AFTER INSERT ON replace_trace WHEN NEW.id < 3 BEGIN "
+                    + "INSERT INTO replace_trace VALUES (NEW.id + 1); END",
+                "INSERT INTO replace_data VALUES (1, 'same')",
+                "INSERT OR REPLACE INTO replace_data VALUES (9, 'same')",
+            ],
+            "SELECT 'source', id FROM source "
+                + "UNION ALL SELECT 'sink', id FROM sink "
+                + "UNION ALL SELECT 'replace', id FROM replace_data "
+                + "UNION ALL SELECT 'deleted', id FROM replace_trace ORDER BY 1, 2");
+    }
+
+    [Test]
+    public void RecursiveForeignKeyActionsAndDeferredChecksMatchSqlite()
+    {
+        AssertMatchesSqlite(
+            [
+                "PRAGMA foreign_keys = ON",
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER "
+                    + "REFERENCES parent(id) ON DELETE CASCADE)",
+                "CREATE TABLE trace(value TEXT)",
+                "CREATE TRIGGER child_deleted AFTER DELETE ON child WHEN OLD.id < 12 BEGIN "
+                    + "INSERT INTO trace VALUES ('C:' || OLD.id); "
+                    + "INSERT INTO parent VALUES (OLD.id + 1); "
+                    + "INSERT INTO child VALUES (OLD.id + 10, OLD.id + 1); "
+                    + "DELETE FROM parent WHERE id = OLD.id + 1; END",
+                "INSERT INTO parent VALUES (1)",
+                "INSERT INTO child VALUES (1, 1)",
+                "DELETE FROM parent WHERE id = 1",
+                "CREATE TABLE deferred_parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE deferred_child(id INTEGER PRIMARY KEY, parent_id INTEGER "
+                    + "REFERENCES deferred_parent(id) DEFERRABLE INITIALLY DEFERRED)",
+                "CREATE TRIGGER deferred_parent_inserted AFTER INSERT ON deferred_parent "
+                    + "WHEN NEW.id < 3 BEGIN "
+                    + "INSERT INTO deferred_child VALUES (NEW.id, NEW.id + 1); "
+                    + "INSERT INTO deferred_parent VALUES (NEW.id + 1); END",
+                "BEGIN",
+                "INSERT INTO deferred_parent VALUES (1)",
+                "COMMIT",
+            ],
+            "SELECT 'trace', value, NULL FROM trace "
+                + "UNION ALL SELECT 'parent', id, NULL FROM parent "
+                + "UNION ALL SELECT 'child', id, parent_id FROM child "
+                + "UNION ALL SELECT 'deferred-parent', id, NULL FROM deferred_parent "
+                + "UNION ALL SELECT 'deferred-child', id, parent_id FROM deferred_child ORDER BY 1, 2");
+    }
+
+    [Test]
+    public void RecursiveAbortAndSavepointRollbackUseSqliteScopes()
+    {
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE prior(id INTEGER)",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TABLE trace(id INTEGER)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 4 BEGIN "
+                    + "INSERT INTO trace VALUES (NEW.id); "
+                    + "SELECT CASE WHEN NEW.id = 3 THEN RAISE(ABORT, 'recursive-abort') END; "
+                    + "INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+                "INSERT INTO prior VALUES (99)",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT 'prior', id FROM prior "
+                + "UNION ALL SELECT 'data', id FROM data "
+                + "UNION ALL SELECT 'trace', id FROM trace ORDER BY 1, 2");
+
+        AssertMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE prior(id INTEGER)",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 3 "
+                    + "BEGIN INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+                "INSERT INTO prior VALUES (99)",
+                "SAVEPOINT recursive_write",
+                "INSERT INTO data VALUES (1)",
+                "ROLLBACK TO recursive_write",
+                "RELEASE recursive_write",
+                "COMMIT",
+            ],
+            "SELECT 'prior', id FROM prior UNION ALL SELECT 'data', id FROM data ORDER BY 1, 2");
+
+        AssertErrorAndStateMatchesSqlite(
+            [
+                "PRAGMA recursive_triggers = ON",
+                "CREATE TABLE prior(id INTEGER)",
+                "CREATE TABLE data(id INTEGER)",
+                "CREATE TRIGGER data_inserted AFTER INSERT ON data WHEN NEW.id < 4 BEGIN "
+                    + "SELECT CASE WHEN NEW.id = 3 THEN RAISE(ROLLBACK, 'recursive-rollback') END; "
+                    + "INSERT INTO data VALUES (NEW.id + 1); END",
+                "BEGIN",
+                "INSERT INTO prior VALUES (99)",
+            ],
+            "INSERT INTO data VALUES (1)",
+            "SELECT 'prior', id FROM prior UNION ALL SELECT 'data', id FROM data ORDER BY 1, 2");
+    }
+
+    [Test]
     public void RecursiveCyclesAreRejectedBeforeCallbacksOrMutation()
     {
         var callbacks = 0;
@@ -560,6 +1626,47 @@ public sealed class ManagedTriggerRowSemanticsTests
                 + "SELECT mark(NEW.id); INSERT INTO data VALUES (NEW.id + 1); END");
         Execute(connection, "PRAGMA recursive_triggers = ON");
 
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "INSERT INTO data VALUES (1)"))!
+            .Message.Should().Be("too many levels of trigger recursion");
+        callbacks.Should().Be(0);
+        ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+
+        Execute(connection, "DROP TRIGGER data_after");
+        Execute(
+            connection,
+            "CREATE TRIGGER data_after AFTER INSERT ON data WHEN 1 BEGIN "
+                + "SELECT mark(NEW.id); INSERT INTO data VALUES (NEW.id + 1); END");
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "INSERT INTO data VALUES (1)"))!
+            .Message.Should().Be("too many levels of trigger recursion");
+        callbacks.Should().Be(0);
+        ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+
+        Execute(connection, "DROP TRIGGER data_after");
+        Execute(
+            connection,
+            "CREATE TRIGGER data_after AFTER INSERT ON data WHEN 1 = 1 BEGIN "
+                + "SELECT mark(NEW.id); INSERT INTO data VALUES (NEW.id + 1); END");
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "INSERT INTO data VALUES (1)"))!
+            .Message.Should().Be("too many levels of trigger recursion");
+        callbacks.Should().Be(0);
+        ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+
+        Execute(connection, "DROP TRIGGER data_after");
+        Execute(
+            connection,
+            "CREATE TRIGGER data_after AFTER INSERT ON data BEGIN "
+                + "SELECT mark(NEW.id); "
+                + "INSERT INTO data SELECT NEW.id + 1 WHERE 1; END");
+        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "INSERT INTO data VALUES (1)"))!
+            .Message.Should().Be("too many levels of trigger recursion");
+        callbacks.Should().Be(0);
+        ReadRows(connection, "SELECT id FROM data").Should().BeEmpty();
+
+        Execute(connection, "DROP TRIGGER data_after");
+        Execute(
+            connection,
+            "CREATE TRIGGER data_after AFTER INSERT ON data WHEN (1 COLLATE BINARY) BEGIN "
+                + "SELECT mark(NEW.id); INSERT INTO data VALUES (NEW.id + 1); END");
         Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "INSERT INTO data VALUES (1)"))!
             .Message.Should().Be("too many levels of trigger recursion");
         callbacks.Should().Be(0);
@@ -1697,6 +2804,52 @@ public sealed class ManagedTriggerRowSemanticsTests
                 break;
             default:
                 throw new AssertionException($"Unsupported SQLite value type {sqlite.GetType().Name}.");
+        }
+    }
+
+    private sealed class FlushFailingFileSystem(IFileSystem inner, string targetPath) : IFileSystem
+    {
+        private int _armed;
+
+        public bool FileExists(string path) => inner.FileExists(path);
+
+        public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
+            => new FailureFile(this, inner.OpenFile(path, mode, readOnly), path == targetPath);
+
+        public void DeleteFile(string path) => inner.DeleteFile(path);
+
+        public void ArmFlushFailure() => Volatile.Write(ref _armed, 1);
+
+        public void Disarm() => Volatile.Write(ref _armed, 0);
+
+        private void FailIfArmed(bool isTarget)
+        {
+            if (isTarget && Interlocked.Exchange(ref _armed, 0) == 1)
+                throw new IOException("Injected recursive trigger flush failure.");
+        }
+
+        private sealed class FailureFile(
+            FlushFailingFileSystem owner,
+            IFile innerFile,
+            bool isTarget) : IFile
+        {
+            public long Length => innerFile.Length;
+
+            public bool IsReadOnly => innerFile.IsReadOnly;
+
+            public int Read(long position, Span<byte> destination) => innerFile.Read(position, destination);
+
+            public void Write(long position, ReadOnlySpan<byte> source) => innerFile.Write(position, source);
+
+            public void SetLength(long length) => innerFile.SetLength(length);
+
+            public void FlushToDisk()
+            {
+                owner.FailIfArmed(isTarget);
+                innerFile.FlushToDisk();
+            }
+
+            public void Dispose() => innerFile.Dispose();
         }
     }
 }

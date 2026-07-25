@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Numerics;
 using System.Runtime.CompilerServices;
@@ -151,6 +152,30 @@ internal sealed class EmbeddedTriggerRaiseException : EmbeddedSqlException
     public InsertConflictAlgorithm Algorithm { get; }
 }
 
+internal sealed class EmbeddedTriggerDepthException : EmbeddedSqlException
+{
+    public EmbeddedTriggerDepthException(long lastInsertRowId, bool preserveChanges = false)
+        : base("too many levels of trigger recursion")
+    {
+        LastInsertRowId = lastInsertRowId;
+        PreserveChanges = preserveChanges;
+    }
+
+    public EmbeddedTriggerDepthException(
+        EmbeddedTriggerDepthException exception,
+        long lastInsertRowId,
+        bool? preserveChanges = null)
+        : base(exception.Message, exception)
+    {
+        LastInsertRowId = lastInsertRowId;
+        PreserveChanges = preserveChanges ?? exception.PreserveChanges;
+    }
+
+    public long LastInsertRowId { get; }
+
+    public bool PreserveChanges { get; }
+}
+
 /// <summary>
 /// Reports that a catalog mutation reached its durable WAL commit marker, but
 /// subsequent checkpoint maintenance failed. Retrying the mutation would apply
@@ -173,10 +198,14 @@ public sealed class EmbeddedPostCommitMaintenanceException : EmbeddedSqlExceptio
 
 public sealed partial class EmbeddedDatabase : IDisposable
 {
-    // Trigger bodies currently recurse through the managed evaluator, so fail before
-    // exhausting the CLR stack while preserving practical recursive-trigger chains.
-    private const int MaximumTriggerDepth = 64;
+    private const int MaximumTriggerDepth = 1_000;
     private const int MaximumForeignKeyActionDepth = 1_000;
+    private const int RecursiveTriggerStackSize = 32 * 1024 * 1024;
+    [ThreadStatic]
+    private static bool s_hasRecursiveTriggerStack;
+    [ThreadStatic]
+    private static RecursiveTriggerCallbackDispatcher? s_recursiveTriggerCallbackDispatcher;
+    private static readonly AsyncLocal<EmbeddedDatabase?> RecursiveTriggerCallbackDatabase = new();
     internal const string SqliteSequenceTableName = "sqlite_sequence";
     private static readonly ConditionalWeakTable<IFileSystem, FileCatalogWriteLockScope> FileCatalogWriteLocks = new();
     private readonly object _gate = new();
@@ -272,6 +301,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     /// <summary>Releases the backing file store, if any.</summary>
     public void Dispose()
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         lock (_gate)
             _fileStore?.Dispose();
     }
@@ -340,6 +370,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private sealed record GroupedResult(SourceRow Representative, IReadOnlyList<SourceRow> Rows, SqlValue[] Values);
 
     private sealed record LimitedDmlCandidate(int Position, SqlValue[] OrderValues);
+
+    private enum TriggerMutationKind
+    {
+        Insert,
+        Update,
+        Delete,
+    }
 
     private sealed record ManagedIndexScanPlan(
         NamedTableSource Source,
@@ -562,6 +599,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     internal void CopyFunctionAndCollationRegistriesTo(EmbeddedDatabase target)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentNullException.ThrowIfNull(target);
 
         KeyValuePair<(string Name, int Arity), Func<IReadOnlyList<SqlValue>, SqlValue>>[] scalarFunctions;
@@ -584,6 +622,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     public void RegisterScalarFunction(string name, int arity, Func<IReadOnlyList<SqlValue>, SqlValue> function)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         if (arity < -1)
             throw new ArgumentOutOfRangeException(nameof(arity));
@@ -597,6 +636,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     public bool UnregisterScalarFunction(string name, int arity)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         if (arity < -1)
             throw new ArgumentOutOfRangeException(nameof(arity));
@@ -609,6 +649,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     public int UnregisterScalarFunctions(string name)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
         lock (_gate)
@@ -631,6 +672,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Func<SqlValue, IReadOnlyList<SqlValue>, SqlValue> step,
         Func<SqlValue, SqlValue> finalize)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         if (arity < -1)
             throw new ArgumentOutOfRangeException(nameof(arity));
@@ -645,6 +687,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     public int UnregisterAggregateFunctions(string name)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
         lock (_gate)
@@ -662,6 +705,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     public void RegisterCollation(string name, Func<string, string, int> compare)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(compare);
 
@@ -673,6 +717,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     public bool UnregisterCollation(string name)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
         lock (_gate)
@@ -691,6 +736,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool inTransaction = false,
         CancellationToken cancellationToken = default)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
+        if (RequiresRecursiveTriggerStack(
+                statement,
+                recursiveTriggersEnabled,
+                hasTriggers: true))
+        {
+            return ExecuteWithRecursiveTriggerStack(() => Execute(
+                statement,
+                parameters,
+                lastInsertRowId,
+                foreignKeysEnabled,
+                recursiveTriggersEnabled,
+                deferForeignKeys,
+                inTransaction,
+                cancellationToken));
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
@@ -1652,6 +1714,24 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool inTransaction = false,
         CancellationToken cancellationToken = default)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
+        if (RequiresRecursiveTriggerStack(
+                statement,
+                recursiveTriggersEnabled,
+                catalog.Triggers.Count != 0))
+        {
+            return ExecuteWithRecursiveTriggerStack(() => Execute(
+                statement,
+                parameters,
+                catalog,
+                lastInsertRowId,
+                foreignKeysEnabled,
+                recursiveTriggersEnabled,
+                deferForeignKeys,
+                inTransaction,
+                cancellationToken));
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
         if (_readOnly && MayMutate(statement))
             throw new EmbeddedSqlException("attempt to write a readonly database");
@@ -3762,6 +3842,320 @@ public sealed partial class EmbeddedDatabase : IDisposable
             () => PerformInsert(statement, parameters, context));
     }
 
+    private static bool RequiresRecursiveTriggerStack(
+        ParsedStatement statement,
+        bool recursiveTriggersEnabled,
+        bool hasTriggers)
+        => recursiveTriggersEnabled
+            && hasTriggers
+            && !s_hasRecursiveTriggerStack
+            && statement is InsertStatement or UpdateStatement or DeleteStatement or WithDmlStatement;
+
+    private T ExecuteWithRecursiveTriggerStack<T>(Func<T> operation)
+    {
+        // A SQL trigger level spans several managed calls. Use a bounded larger stack so
+        // SQLite's 1,000-level limit surfaces as a SQL error instead of terminating the process.
+        T result = default!;
+        ExceptionDispatchInfo? failure = null;
+        using var callbacks = new RecursiveTriggerCallbackDispatcher(this);
+        using var completed = new ManualResetEventSlim();
+        var thread = new Thread(
+            () =>
+            {
+                s_hasRecursiveTriggerStack = true;
+                s_recursiveTriggerCallbackDispatcher = callbacks;
+                try
+                {
+                    result = operation();
+                }
+                catch (Exception exception)
+                {
+                    failure = ExceptionDispatchInfo.Capture(exception);
+                }
+                finally
+                {
+                    s_recursiveTriggerCallbackDispatcher = null;
+                    s_hasRecursiveTriggerStack = false;
+                    completed.Set();
+                }
+            },
+            RecursiveTriggerStackSize)
+        {
+            IsBackground = true,
+            Name = "Turso recursive trigger",
+        };
+        thread.Start();
+        callbacks.RunUntil(completed);
+        thread.Join();
+        failure?.Throw();
+        return result;
+    }
+
+    private T InvokeManagedCallback<T>(Func<T> callback)
+        => s_recursiveTriggerCallbackDispatcher is { } dispatcher
+            ? dispatcher.Invoke(callback)
+            : callback();
+
+    private void ThrowIfRecursiveTriggerCallbackReentry()
+    {
+        if (ReferenceEquals(RecursiveTriggerCallbackDatabase.Value, this))
+            ThrowRecursiveTriggerCallbackReentry();
+    }
+
+    internal static bool IsRecursiveTriggerCallbackDatabase(EmbeddedDatabase database)
+        => ReferenceEquals(RecursiveTriggerCallbackDatabase.Value, database);
+
+    internal static void ThrowRecursiveTriggerCallbackReentry()
+    {
+        throw new EmbeddedSqlException(
+            "reentrant managed database use from a recursive trigger callback is not supported");
+    }
+
+    private sealed class RecursiveTriggerCallbackDispatcher(
+        EmbeddedDatabase database) : IDisposable
+    {
+        private readonly ConcurrentQueue<Action> _pending = new();
+        private readonly AutoResetEvent _pendingAvailable = new(initialState: false);
+
+        public T Invoke<T>(Func<T> callback)
+        {
+            T result = default!;
+            ExceptionDispatchInfo? failure = null;
+            using var completed = new ManualResetEventSlim();
+            _pending.Enqueue(() =>
+            {
+                var previousDatabase = RecursiveTriggerCallbackDatabase.Value;
+                RecursiveTriggerCallbackDatabase.Value = database;
+                try
+                {
+                    result = callback();
+                }
+                catch (Exception exception)
+                {
+                    failure = ExceptionDispatchInfo.Capture(exception);
+                }
+                finally
+                {
+                    RecursiveTriggerCallbackDatabase.Value = previousDatabase;
+                    completed.Set();
+                }
+            });
+            _pendingAvailable.Set();
+            completed.Wait();
+            failure?.Throw();
+            return result;
+        }
+
+        public void RunUntil(ManualResetEventSlim workerCompleted)
+        {
+            var waitHandles = new[] { _pendingAvailable, workerCompleted.WaitHandle };
+            while (true)
+            {
+                Drain();
+                if (workerCompleted.IsSet)
+                {
+                    Drain();
+                    return;
+                }
+
+                _ = WaitHandle.WaitAny(waitHandles);
+            }
+        }
+
+        private void Drain()
+        {
+            while (_pending.TryDequeue(out var callback))
+                callback();
+        }
+
+        public void Dispose() => _pendingAvailable.Dispose();
+    }
+
+    private void MarkTriggerStatementRollbackRequirement(
+        QueryContext context,
+        EmbeddedTable table,
+        TriggerMutationKind mutationKind,
+        UpdatePlan? updatePlan = null)
+    {
+        if (context.TriggerState is not { } state || state.RequiresStatementRollback)
+            return;
+
+        state.RequiresStatementRollback = TriggerMutationRequiresStatementRollback(
+            context,
+            table,
+            mutationKind,
+            updatePlan);
+    }
+
+    private bool TriggerMutationRequiresStatementRollback(
+        QueryContext context,
+        EmbeddedTable table,
+        TriggerMutationKind mutationKind,
+        UpdatePlan? updatePlan = null)
+    {
+        var assignedColumns = updatePlan?.ColumnAssignments
+            .Select(assignment => assignment.Index)
+            .ToHashSet();
+        var affectsEveryColumn = mutationKind == TriggerMutationKind.Insert;
+        bool AffectsColumn(int index)
+            => affectsEveryColumn || assignedColumns!.Contains(index);
+        bool AffectsNamedColumn(string name)
+            => table.TryGetColumnIndex(name, out var index)
+                && (AffectsColumn(index)
+                    || mutationKind == TriggerMutationKind.Update
+                        && table.ColumnDefinitions[index].IsGenerated
+                        && assignedColumns!.Count != 0);
+        var affectsRowid = updatePlan?.RowidAssignment is not null;
+        var referencesAsParent = context.Tables.Values
+            .SelectMany(candidate => candidate.ForeignKeys)
+            .Where(foreignKey => string.Equals(
+                foreignKey.ParentTable,
+                table.Name,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var hasRelevantForeignKeys = context.ForeignKeysEnabled
+            && (mutationKind switch
+            {
+                TriggerMutationKind.Insert => table.ForeignKeys.Any(foreignKey =>
+                    ForeignKeyCanAbortStatement(
+                        context,
+                        foreignKey,
+                        ForeignKeyAction.NoAction)),
+                TriggerMutationKind.Delete => referencesAsParent.Any(foreignKey =>
+                    ForeignKeyCanAbortStatement(
+                        context,
+                        foreignKey,
+                        foreignKey.OnDelete)),
+                TriggerMutationKind.Update => table.ForeignKeys.Any(foreignKey =>
+                        foreignKey.ChildColumns.Any(AffectsNamedColumn)
+                        && ForeignKeyCanAbortStatement(
+                            context,
+                            foreignKey,
+                            ForeignKeyAction.NoAction))
+                    || referencesAsParent.Any(foreignKey =>
+                        (foreignKey.ParentColumns.Count == 0
+                            ? affectsRowid
+                                || table.PrimaryKeyColumns.Any(primaryKey =>
+                                    AffectsColumn(primaryKey.Index))
+                            : foreignKey.ParentColumns.Any(AffectsNamedColumn))
+                        && ForeignKeyCanAbortStatement(
+                            context,
+                            foreignKey,
+                            foreignKey.OnUpdate)),
+                _ => throw new InvalidOperationException(
+                    $"Unknown trigger mutation kind {mutationKind}."),
+            });
+        if (mutationKind == TriggerMutationKind.Delete)
+            return hasRelevantForeignKeys;
+        bool AffectsIndex(EmbeddedIndex index)
+            => index.Columns.Any(column =>
+                    column.IsExpression
+                    || column.ColumnIndex >= 0 && AffectsColumn(column.ColumnIndex))
+                || index.Where is not null
+                    && EnumerateTriggerColumnExpressions(index.Where).Any(column =>
+                        AffectsNamedColumn(column.UnqualifiedName ?? column.Name))
+                || table.HasGeneratedColumns
+                    && (affectsEveryColumn || assignedColumns!.Count != 0);
+        var checkConstraintsRequireRollback =
+            (affectsEveryColumn || assignedColumns!.Count != 0)
+            && (table.CheckConstraints.Any(check =>
+                    NotNullConstraintRequiresStatementRollback(
+                        context.ConflictAlgorithmOverride,
+                        check.ConflictAlgorithm))
+                || table.ColumnDefinitions.Any(column =>
+                    (affectsEveryColumn
+                        || AffectsNamedColumn(column.Name)
+                        || mutationKind == TriggerMutationKind.Update
+                            && column.IsGenerated
+                            && assignedColumns!.Count != 0)
+                    && column.CheckConstraints.Any(check =>
+                        NotNullConstraintRequiresStatementRollback(
+                            context.ConflictAlgorithmOverride,
+                            check.ConflictAlgorithm))));
+
+        // SQLite opens a statement journal when a trigger program can abort on an
+        // enforced constraint. A depth error then rolls back the statement, while an
+        // unconstrained program inside a transaction retains its completed prefix.
+        return table.PrimaryKeyColumns.Any(primaryKey =>
+                AffectsColumn(primaryKey.Index) || affectsRowid)
+                && ConstraintRequiresStatementRollback(
+                    context.ConflictAlgorithmOverride,
+                    table.PrimaryKeyConflictAlgorithm)
+            || table.TableUniqueConstraints.Any(constraint => constraint.Columns.Any(column =>
+                    AffectsNamedColumn(column.Name))
+                &&
+                ConstraintRequiresStatementRollback(
+                    context.ConflictAlgorithmOverride,
+                    constraint.ConflictAlgorithm))
+            || checkConstraintsRequireRollback
+            || table.ColumnDefinitions.Any(column =>
+                table.TryGetColumnIndex(column.Name, out var columnIndex)
+                && (AffectsColumn(columnIndex)
+                    || mutationKind == TriggerMutationKind.Update
+                        && column.IsGenerated
+                        && assignedColumns!.Count != 0)
+                && (column.NotNull
+                    && NotNullConstraintRequiresStatementRollback(
+                        context.ConflictAlgorithmOverride,
+                        column.NotNullConflictAlgorithm)
+                || column.Unique
+                    && ConstraintRequiresStatementRollback(
+                        context.ConflictAlgorithmOverride,
+                        column.UniqueConflictAlgorithm)))
+            || table.ColumnDefinitions.Any(column =>
+                column.IsGenerated
+                && (affectsEveryColumn || assignedColumns!.Count != 0)
+                && TriggerExpressionCanAbort(column.GenerationExpression))
+            || table.Indexes.Any(index =>
+                index.Unique
+                && index.Origin == EmbeddedIndexOrigin.Explicit
+                && AffectsIndex(index)
+                && ConstraintRequiresStatementRollback(
+                    context.ConflictAlgorithmOverride,
+                    index.ConflictAlgorithm))
+            || table.Indexes.Any(index =>
+                AffectsIndex(index)
+                && (TriggerExpressionCanAbort(index.Where)
+                    || index.Columns.Any(column =>
+                        TriggerExpressionCanAbort(column.Expression))))
+            || hasRelevantForeignKeys;
+    }
+
+    private static bool ForeignKeyCanAbortStatement(
+        QueryContext context,
+        ForeignKeyDefinition foreignKey,
+        ForeignKeyAction action)
+    {
+        if (action == ForeignKeyAction.Restrict)
+            return true;
+        if (action == ForeignKeyAction.NoAction)
+        {
+            return !context.InTransaction
+                || !context.DeferForeignKeys
+                    && foreignKey.Deferral != ForeignKeyDeferral.InitiallyDeferred;
+        }
+        if (action is ForeignKeyAction.Cascade
+            or ForeignKeyAction.SetNull
+            or ForeignKeyAction.SetDefault)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    private static bool ConstraintRequiresStatementRollback(
+        InsertConflictAlgorithm? statementAlgorithm,
+        InsertConflictAlgorithm? constraintAlgorithm)
+        => (statementAlgorithm ?? constraintAlgorithm) is null
+            or InsertConflictAlgorithm.Abort;
+
+    private static bool NotNullConstraintRequiresStatementRollback(
+        InsertConflictAlgorithm? statementAlgorithm,
+        InsertConflictAlgorithm? constraintAlgorithm)
+        => (statementAlgorithm ?? constraintAlgorithm) is null
+            or InsertConflictAlgorithm.Abort
+            or InsertConflictAlgorithm.Replace;
+
     private static ExecutionResult ExecuteDmlWithAutoIncrementState(
         QueryContext context,
         Func<QueryContext, ExecutionResult> execute)
@@ -4835,6 +5229,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ValidatePrimaryKey(statement.TableName, table, updatedRows);
                 ValidateUniqueIndexes(statement.TableName, table, updatedRows);
                 var originalRows = table.Rows.Select(row => row.ToArray()).ToArray();
+                MarkTriggerStatementRollbackRequirement(
+                    updateContext,
+                    table,
+                    TriggerMutationKind.Update,
+                    updatePlan);
                 ApplyUpsertRows(table, updatedRows, updatedRowIds);
                 ValidateForeignKeysAfterUpdate(
                     updateContext,
@@ -6271,6 +6670,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         List<long> insertedRowIds)
     {
         ValidateInserts(context, tableName, table, rowsToInsert, insertedRowIds);
+        MarkTriggerStatementRollbackRequirement(
+            context,
+            table,
+            TriggerMutationKind.Insert);
         table.Rows.AddRange(rowsToInsert);
         table.RowIds.AddRange(insertedRowIds);
         SortWithoutRowid(table);
@@ -7185,6 +7588,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ValidateUniqueIndexes(tableName, table, rows);
         var originalRowSnapshot = originalRows.Select(row => row.ToArray()).ToArray();
         var postUpdateRowSnapshot = rows.ToArray();
+        MarkTriggerStatementRollbackRequirement(
+            context,
+            table,
+            TriggerMutationKind.Update,
+            plan);
         beforeMutation?.Invoke();
         var originalRowIds = table.HasRowid
             ? updatedPositions.Select(position => table.RowIds[position]).ToArray()
@@ -8724,7 +9132,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return performBase();
 
         if (triggers.Count > 0 && context.TriggerDepth >= MaximumTriggerDepth)
-            throw new EmbeddedSqlException("too many levels of trigger recursion");
+        {
+            throw new EmbeddedTriggerDepthException(
+                context.TriggerState?.LiveLastInsertRowId ?? context.LastInsertRowId);
+        }
 
         ExecutionResult PerformAndFire()
         {
@@ -8802,6 +9213,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 RestoreTables(context.Tables, backup);
                 throw;
             }
+            throw;
+        }
+        catch (EmbeddedTriggerDepthException)
+        {
             throw;
         }
         catch
@@ -21348,10 +21763,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var arguments = function.Arguments
                 .Select(argument => Evaluate(argument, parameters, row, context))
                 .ToArray();
-            accumulator = aggregate.Step(accumulator, arguments);
+            accumulator = InvokeManagedCallback(() => aggregate.Step(accumulator, arguments));
         }
 
-        return aggregate.Finalize(accumulator);
+        return InvokeManagedCallback(() => aggregate.Finalize(accumulator));
     }
 
     private SqlValue EvaluatePercentileAggregate(
@@ -21593,7 +22008,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (!context.IndexExpression
             && (_scalarFunctions.TryGetValue((normalizedName, arguments.Length), out var managedFunction)
                 || _scalarFunctions.TryGetValue((normalizedName, -1), out managedFunction)))
-            return managedFunction(arguments);
+        {
+            return InvokeManagedCallback(() => managedFunction(arguments));
+        }
 
         return function.Name.ToUpperInvariant() switch
         {
@@ -23457,7 +23874,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase))
                 return SqliteIndexRecordComparer.CompareRTrimText(left.AsText(), right.AsText());
             if (_collations.TryGetValue(collation, out var compare))
-                return compare(left.AsText(), right.AsText());
+            {
+                return InvokeManagedCallback(
+                    () => compare(left.AsText(), right.AsText()));
+            }
 
             throw new EmbeddedSqlException($"no such collation sequence: {collation}");
         }
@@ -24862,10 +25282,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (!input.Included)
                     continue;
 
-                accumulator = aggregate.Step(accumulator, [.. input.Arguments]);
+                accumulator = InvokeManagedCallback(
+                    () => aggregate.Step(accumulator, [.. input.Arguments]));
             }
 
-            return aggregate.Finalize(accumulator);
+            return InvokeManagedCallback(() => aggregate.Finalize(accumulator));
         }
 
         var argumentNames = Enumerable.Range(0, function.Arguments.Count)
@@ -28147,6 +28568,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public EmbeddedStatement Prepare(string sql)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         var parameterMap = SqlParameterMap.Parse(sql);
         return new EmbeddedStatement(this, SqlParser.Parse(sql, parameterMap), parameterMap);
@@ -28154,12 +28576,14 @@ public sealed class EmbeddedConnection : IDisposable
 
     public IReadOnlyList<EmbeddedStatement> PrepareScript(string sql)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         return SqlScript.Split(sql).Select(Prepare).ToArray();
     }
 
     public void ResetForPooling()
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         ReleaseAllStatementReaders();
         ResetTransactionState();
@@ -28179,6 +28603,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public void RegisterScalarFunction(string name, int arity, Func<IReadOnlyList<SqlValue>, SqlValue> function)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         _database.RegisterScalarFunction(name, arity, function);
         _tempDatabase.RegisterScalarFunction(name, arity, function);
@@ -28188,6 +28613,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public bool UnregisterScalarFunction(string name, int arity)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         var removed = _database.UnregisterScalarFunction(name, arity);
         _tempDatabase.UnregisterScalarFunction(name, arity);
@@ -28199,6 +28625,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public int UnregisterScalarFunctions(string name)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         var removed = _database.UnregisterScalarFunctions(name);
         _tempDatabase.UnregisterScalarFunctions(name);
@@ -28215,6 +28642,7 @@ public sealed class EmbeddedConnection : IDisposable
         Func<SqlValue, IReadOnlyList<SqlValue>, SqlValue> step,
         Func<SqlValue, SqlValue> finalize)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         _database.RegisterAggregateFunction(name, arity, seed, step, finalize);
         _tempDatabase.RegisterAggregateFunction(name, arity, seed, step, finalize);
@@ -28224,6 +28652,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public int UnregisterAggregateFunctions(string name)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         var removed = _database.UnregisterAggregateFunctions(name);
         _tempDatabase.UnregisterAggregateFunctions(name);
@@ -28235,6 +28664,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public void RegisterCollation(string name, Func<string, string, int> compare)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         _database.RegisterCollation(name, compare);
         _tempDatabase.RegisterCollation(name, compare);
@@ -28244,6 +28674,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public bool UnregisterCollation(string name)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         var removed = _database.UnregisterCollation(name);
         _tempDatabase.UnregisterCollation(name);
@@ -28255,18 +28686,21 @@ public sealed class EmbeddedConnection : IDisposable
 
     internal IDisposable OpenBlobMutationLease(string databaseName, string tableName, long rowId)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         return ResolveBlobDatabase(databaseName).OpenBlobMutationLease(tableName, rowId);
     }
 
     internal long GetBlobMutationGeneration(string databaseName, string tableName, long rowId)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         return ResolveBlobDatabase(databaseName).GetBlobMutationGeneration(tableName, rowId);
     }
 
     internal bool HasUpdateTrigger(string databaseName, string tableName)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         var database = ResolveBlobDatabase(databaseName);
         var catalog = GetTransactionState(database)?.Catalog;
@@ -28281,6 +28715,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     public void Dispose()
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ReleaseAllStatementReaders();
         ResetTransactionState();
         foreach (var attachment in _attachedDatabases.Values)
@@ -28332,6 +28767,7 @@ public sealed class EmbeddedConnection : IDisposable
         SqlValue[] parameters,
         CancellationToken cancellationToken = default)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
         cancellationToken.ThrowIfCancellationRequested();
         if (_transactionMutationDatabase is not null && EmbeddedDatabase.MayMutate(statement))
@@ -28550,6 +28986,30 @@ public sealed class EmbeddedConnection : IDisposable
                             deferredBefore);
                         transactionState.Catalog = statementCatalog
                             ?? throw new InvalidOperationException("A partial transactional mutation lost its statement catalog.");
+                        transactionState.HasChanges = true;
+                        if (!ReferenceEquals(routed.Database, _tempDatabase))
+                            _transactionWriteDatabase = routed.Database;
+                    }
+                    if (ReferenceEquals(routed.Database, _tempDatabase))
+                        _tempInitialized = true;
+
+                    throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
+                }
+                catch (EmbeddedTriggerDepthException exception)
+                {
+                    _lastInsertRowId = exception.LastInsertRowId;
+                    if (transactionState is not null && exception.PreserveChanges)
+                    {
+                        UpdatePendingDeferredForeignKeys(
+                            routed.Database,
+                            transactionState,
+                            statementCatalog
+                                ?? throw new InvalidOperationException(
+                                    "A partial recursive trigger mutation lost its statement catalog."),
+                            deferredBefore);
+                        transactionState.Catalog = statementCatalog
+                            ?? throw new InvalidOperationException(
+                                "A partial recursive trigger mutation lost its statement catalog.");
                         transactionState.HasChanges = true;
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
@@ -30809,6 +31269,7 @@ public sealed class EmbeddedConnection : IDisposable
 
     internal string[] DescribeColumns(ParsedStatement statement)
     {
+        ThrowIfRecursiveTriggerCallbackReentry();
         if (statement is ExplainStatement)
             return EmbeddedDatabase.ExplainColumns();
         if (statement is ExplainQueryPlanStatement)
@@ -30982,6 +31443,17 @@ public sealed class EmbeddedConnection : IDisposable
         bool HasSnapshotPragmaHeader,
         bool ForceFullCatalogRewrite,
         IReadOnlySet<EmbeddedDatabase.ForeignKeyViolation> PendingDeferredViolations);
+
+    private void ThrowIfRecursiveTriggerCallbackReentry()
+    {
+        if (EmbeddedDatabase.IsRecursiveTriggerCallbackDatabase(_database)
+            || EmbeddedDatabase.IsRecursiveTriggerCallbackDatabase(_tempDatabase)
+            || _attachedDatabases.Values.Any(attachment =>
+                EmbeddedDatabase.IsRecursiveTriggerCallbackDatabase(attachment.Database)))
+        {
+            EmbeddedDatabase.ThrowRecursiveTriggerCallbackReentry();
+        }
+    }
 
     private void ThrowIfDisposed()
     {

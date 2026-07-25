@@ -9,6 +9,8 @@ public sealed partial class EmbeddedDatabase
         public bool Changed { get; set; }
 
         public long LiveLastInsertRowId { get; set; } = lastInsertRowId;
+
+        public bool RequiresStatementRollback { get; set; }
     }
 
     private sealed record TriggerRowIdentity(long? RowId, SqlValue[] PrimaryKey);
@@ -106,13 +108,11 @@ public sealed partial class EmbeddedDatabase
             {
                 continue;
             }
-            if (context.RecursiveTriggersEnabled
-                && context.ActiveTriggers?.Contains(trigger.Name) == true)
-            {
-                throw new EmbeddedSqlException("too many levels of trigger recursion");
-            }
             if (context.TriggerDepth >= MaximumTriggerDepth)
-                throw new EmbeddedSqlException("too many levels of trigger recursion");
+            {
+                throw new EmbeddedTriggerDepthException(
+                    context.TriggerState?.LiveLastInsertRowId ?? context.LastInsertRowId);
+            }
 
             var activeTriggers = context.ActiveTriggers is null
                 ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -157,6 +157,10 @@ public sealed partial class EmbeddedDatabase
             catch (EmbeddedConflictFailException exception)
             {
                 throw new EmbeddedConflictFailException(exception, savedLastInsertRowId);
+            }
+            catch (EmbeddedTriggerDepthException exception)
+            {
+                throw new EmbeddedTriggerDepthException(exception, savedLastInsertRowId);
             }
             catch (TriggerIgnoreException)
             {
@@ -278,6 +282,19 @@ public sealed partial class EmbeddedDatabase
                 new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception),
                 state.LiveLastInsertRowId);
         }
+        catch (EmbeddedTriggerDepthException exception)
+        {
+            if (context.InTransaction && !state.RequiresStatementRollback)
+            {
+                throw new EmbeddedTriggerDepthException(
+                    exception,
+                    exception.LastInsertRowId,
+                    preserveChanges: state.Changed);
+            }
+
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
         catch (EmbeddedSqlException exception)
         {
             RestoreTables(context.Tables, backup);
@@ -299,6 +316,15 @@ public sealed partial class EmbeddedDatabase
     {
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+        MarkTriggerStatementRollbackRequirement(
+            context,
+            table,
+            TriggerMutationKind.Insert);
+        if (context.TriggerState is { } insertState
+            && TriggerInsertUsesAbortCapableDefault(statement, table))
+        {
+            insertState.RequiresStatementRollback = true;
+        }
         if (context.ForeignKeysEnabled
             && (statement.ConflictAlgorithm == InsertConflictAlgorithm.Replace
                 || table.HasNonDefaultConflictAlgorithms))
@@ -512,6 +538,11 @@ public sealed partial class EmbeddedDatabase
             TriggerEvent.Update,
             beforeTriggers.Concat(afterTriggers));
         var plan = PrepareUpdate(statement, table, context);
+        MarkTriggerStatementRollbackRequirement(
+            context,
+            table,
+            TriggerMutationKind.Update,
+            plan);
         var selectedPositions = statement.Limit is null
             ? null
             : SelectLimitedDmlPositions(
@@ -651,6 +682,10 @@ public sealed partial class EmbeddedDatabase
     {
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+        MarkTriggerStatementRollbackRequirement(
+            context,
+            table,
+            TriggerMutationKind.Delete);
 
         var beforeTriggers = GetRowTriggers(
             context,
@@ -806,6 +841,10 @@ public sealed partial class EmbeddedDatabase
     {
         var originalRows = table.Rows.Select(row => row.ToArray()).ToArray();
         var deletedRowId = table.HasRowid ? table.RowIds[position] : position + 1;
+        MarkTriggerStatementRollbackRequirement(
+            context,
+            table,
+            TriggerMutationKind.Delete);
         table.Rows.RemoveAt(position);
         if (position < table.RowIds.Count)
             table.RowIds.RemoveAt(position);
@@ -1041,6 +1080,15 @@ public sealed partial class EmbeddedDatabase
             table,
             statement.Upsert);
         var insertPlan = PrepareInsert(statement, table, context);
+        MarkTriggerStatementRollbackRequirement(
+            context,
+            table,
+            TriggerMutationKind.Insert);
+        if (context.TriggerState is { } insertState
+            && TriggerInsertUsesAbortCapableDefault(statement, table))
+        {
+            insertState.RequiresStatementRollback = true;
+        }
         var updateAction = statement.Upsert.Action as DoUpdateUpsertAction;
         var doUpdateContext = context with
         {
@@ -1059,6 +1107,11 @@ public sealed partial class EmbeddedDatabase
                 updateAction.Assignments,
                 Where: null);
             updatePlan = PrepareUpdate(updateStatement, table, doUpdateContext);
+            MarkTriggerStatementRollbackRequirement(
+                doUpdateContext,
+                table,
+                TriggerMutationKind.Update,
+                updatePlan);
             if (updatePlan.RowidAssignment is not null
                 || updatePlan.ColumnAssignments.Any(
                     assignment => assignment.Index == table.RowidAliasColumnIndex))
@@ -1632,8 +1685,13 @@ public sealed partial class EmbeddedDatabase
     {
         var programs = triggers.ToArray();
         ValidateTriggerBodyTargets(context, programs);
+        if (context.TriggerState is { } state
+            && TriggerGraphRequiresStatementRollback(context, programs))
+        {
+            state.RequiresStatementRollback = true;
+        }
         if (context.RecursiveTriggersEnabled)
-            RejectRecursiveTriggerCycles(context, programs);
+            RejectUnboundedRecursiveTriggerCycles(context, programs);
         foreach (var trigger in programs)
         {
             if (trigger.Timing == TriggerTiming.Before
@@ -2138,10 +2196,299 @@ public sealed partial class EmbeddedDatabase
         return false;
     }
 
-    private void RejectRecursiveTriggerCycles(
+    private static bool TriggerContainsAbortCapableExpression(TriggerDefinition trigger)
+        => TriggerExpressionCanAbort(trigger.When)
+            || trigger.Body.Any(TriggerStatementExpressionCanAbort);
+
+    private static bool TriggerStatementExpressionCanAbort(ParsedStatement statement)
+        => statement switch
+        {
+            InsertStatement insert => insert.Rows.SelectMany(row => row).Any(TriggerExpressionCanAbort)
+                || TriggerQueryCanAbort(insert.Source)
+                || insert.Returning?.Any(projection =>
+                    TriggerExpressionCanAbort(projection.Expression)) == true
+                || insert.Upsert?.Target.Any(target =>
+                    TriggerExpressionCanAbort(target.Expression)) == true
+                || TriggerExpressionCanAbort(insert.Upsert?.TargetWhere)
+                || insert.Upsert?.Action is DoUpdateUpsertAction update
+                    && (update.Assignments.Any(assignment =>
+                            TriggerExpressionCanAbort(assignment.Value))
+                        || TriggerExpressionCanAbort(update.Where)),
+            UpdateStatement update => update.Assignments.Any(assignment =>
+                    TriggerExpressionCanAbort(assignment.Value))
+                || TriggerExpressionCanAbort(update.Where)
+                || update.Returning?.Any(projection =>
+                    TriggerExpressionCanAbort(projection.Expression)) == true
+                || update.EffectiveOrderBy.Any(term =>
+                    TriggerExpressionCanAbort(term.Expression))
+                || TriggerExpressionCanAbort(update.Limit)
+                || TriggerExpressionCanAbort(update.Offset),
+            DeleteStatement delete => TriggerExpressionCanAbort(delete.Where)
+                || delete.Returning?.Any(projection =>
+                    TriggerExpressionCanAbort(projection.Expression)) == true
+                || delete.EffectiveOrderBy.Any(term =>
+                    TriggerExpressionCanAbort(term.Expression))
+                || TriggerExpressionCanAbort(delete.Limit)
+                || TriggerExpressionCanAbort(delete.Offset),
+            QueryStatement query => TriggerQueryCanAbort(query),
+            _ => false,
+        };
+
+    private static bool TriggerQueryCanAbort(QueryStatement? query)
+        => query switch
+        {
+            null => false,
+            SelectStatement select => select.Projections.Any(projection =>
+                    TriggerExpressionCanAbort(projection.Expression))
+                || TriggerSourceCanAbort(select.Source)
+                || TriggerExpressionCanAbort(select.Where)
+                || select.GroupBy.Any(TriggerExpressionCanAbort)
+                || TriggerExpressionCanAbort(select.Having)
+                || select.NamedWindows.Any(window =>
+                    TriggerWindowCanAbort(window.Specification))
+                || select.OrderBy.Any(term =>
+                    TriggerExpressionCanAbort(term.Expression))
+                || TriggerExpressionCanAbort(select.Limit)
+                || TriggerExpressionCanAbort(select.Offset),
+            ValuesClause values => values.Rows
+                .SelectMany(row => row)
+                .Any(TriggerExpressionCanAbort),
+            CompoundSelectStatement compound => compound.Terms.Any(TriggerQueryCanAbort)
+                || compound.OrderBy.Any(term =>
+                    TriggerExpressionCanAbort(term.Expression))
+                || TriggerExpressionCanAbort(compound.Limit)
+                || TriggerExpressionCanAbort(compound.Offset),
+            WithSelectStatement with => with.CommonTableExpressions.Any(common =>
+                    TriggerQueryCanAbort(common.Query))
+                || TriggerQueryCanAbort(with.Query),
+            _ => false,
+        };
+
+    private static bool TriggerSourceCanAbort(TableSource? source)
+        => source switch
+        {
+            null or NamedTableSource => false,
+            GenerateSeriesSource => true,
+            DerivedTableSource derived => TriggerQueryCanAbort(derived.Query),
+            JoinTableSource join => TriggerSourceCanAbort(join.Left)
+                || TriggerSourceCanAbort(join.Right)
+                || TriggerExpressionCanAbort(join.Condition),
+            _ => false,
+        };
+
+    private static bool TriggerWindowCanAbort(WindowSpecification window)
+        => window.PartitionBy.Any(TriggerExpressionCanAbort)
+            || window.OrderBy.Any(term =>
+                TriggerExpressionCanAbort(term.Expression))
+            || TriggerExpressionCanAbort(window.Frame?.Start.Offset)
+            || TriggerExpressionCanAbort(window.Frame?.End.Offset);
+
+    private static bool TriggerExpressionCanAbort(Expression? expression)
+        => expression switch
+        {
+            null or LiteralExpression or ParameterExpression
+                or ColumnExpression or StarExpression or QualifiedStarExpression => false,
+            CurrentTimeExpression => true,
+            RaiseExpression { Action: RaiseAction.Abort } => true,
+            RaiseExpression => false,
+            FunctionExpression function when function.Name.Equals(
+                    "COALESCE",
+                    StringComparison.OrdinalIgnoreCase)
+                || function.Name.Equals("IFNULL", StringComparison.OrdinalIgnoreCase)
+                => function.Arguments.Any(TriggerExpressionCanAbort),
+            FunctionExpression => true,
+            ScalarSubqueryExpression scalar => TriggerQueryCanAbort(scalar.Query),
+            ExistsExpression exists => TriggerQueryCanAbort(exists.Query),
+            InSubqueryExpression @in => TriggerExpressionCanAbort(@in.Value)
+                || TriggerQueryCanAbort(@in.Query),
+            RowValueExpression rowValue => rowValue.Values.Any(TriggerExpressionCanAbort),
+            CollationExpression collation => !collation.Name.Equals(
+                    "BINARY",
+                    StringComparison.OrdinalIgnoreCase)
+                && !collation.Name.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
+                && !collation.Name.Equals("RTRIM", StringComparison.OrdinalIgnoreCase)
+                || TriggerExpressionCanAbort(collation.Expression),
+            CastExpression cast => TriggerExpressionCanAbort(cast.Expression),
+            CaseExpression @case => TriggerExpressionCanAbort(@case.Operand)
+                || @case.Clauses.Any(clause =>
+                    TriggerExpressionCanAbort(clause.When)
+                    || TriggerExpressionCanAbort(clause.Then))
+                || TriggerExpressionCanAbort(@case.Else),
+            LikeExpression => true,
+            GlobExpression glob => TriggerExpressionCanAbort(glob.Value)
+                || TriggerExpressionCanAbort(glob.Pattern),
+            InExpression @in => TriggerExpressionCanAbort(@in.Value)
+                || @in.Values.Any(TriggerExpressionCanAbort),
+            BetweenExpression between => TriggerExpressionCanAbort(between.Value)
+                || TriggerExpressionCanAbort(between.Lower)
+                || TriggerExpressionCanAbort(between.Upper),
+            UnaryExpression unary => TriggerExpressionCanAbort(unary.Operand),
+            BinaryExpression binary => binary.Operator is BinaryOperator.JsonArrow
+                    or BinaryOperator.JsonArrowText
+                || TriggerExpressionCanAbort(binary.Left)
+                || TriggerExpressionCanAbort(binary.Right),
+            _ => false,
+        };
+
+    private bool TriggerGraphRequiresStatementRollback(
         QueryContext context,
         IReadOnlyList<TriggerDefinition> roots)
     {
+        var visited = new HashSet<(string Name, InsertConflictAlgorithm? ConflictAlgorithm)>();
+        return roots.Any(root => Visit(root, context));
+
+        bool Visit(TriggerDefinition trigger, QueryContext triggerContext)
+        {
+            var key = (
+                trigger.Name.ToUpperInvariant(),
+                triggerContext.ConflictAlgorithmOverride);
+            if (!visited.Add(key))
+                return false;
+            if (TriggerContainsAbortCapableExpression(trigger))
+                return true;
+            foreach (var statement in trigger.Body)
+            {
+                var statementContext = TriggerStatementContext(triggerContext, statement);
+                if (TriggerStatementRequiresStatementRollback(statementContext, statement))
+                    return true;
+                if (GetBodyStatementTriggers(statementContext, statement).Any(nested =>
+                        Visit(nested, statementContext)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private static QueryContext TriggerStatementContext(
+        QueryContext context,
+        ParsedStatement statement)
+        => statement is InsertStatement insert
+            ? context with
+            {
+                ConflictAlgorithmOverride =
+                    context.ConflictAlgorithmOverride ?? insert.ConflictAlgorithm,
+            }
+            : context;
+
+    private bool TriggerStatementRequiresStatementRollback(
+        QueryContext context,
+        ParsedStatement statement)
+    {
+        switch (statement)
+        {
+            case InsertStatement insert when context.Tables.TryGetValue(insert.TableName, out var insertTable):
+                var insertRequiresRollback = TriggerMutationRequiresStatementRollback(
+                    context,
+                    insertTable,
+                    TriggerMutationKind.Insert)
+                    || TriggerInsertUsesAbortCapableDefault(insert, insertTable)
+                    || TriggerQueryReferencesAbortCapableView(
+                        context,
+                        insert.Source,
+                        new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                if (insert.Upsert?.Action is not DoUpdateUpsertAction upsertUpdate)
+                    return insertRequiresRollback;
+                var updateContext = context with
+                {
+                    ConflictAlgorithmOverride = InsertConflictAlgorithm.Abort,
+                };
+                var updateStatement = new UpdateStatement(
+                    insert.TableName,
+                    upsertUpdate.Assignments,
+                    Where: null);
+                return insertRequiresRollback
+                    || TriggerMutationRequiresStatementRollback(
+                        updateContext,
+                        insertTable,
+                        TriggerMutationKind.Update,
+                        PrepareUpdate(updateStatement, insertTable, updateContext));
+            case UpdateStatement update when context.Tables.TryGetValue(update.TableName, out var updateTable):
+                return TriggerMutationRequiresStatementRollback(
+                    context,
+                    updateTable,
+                    TriggerMutationKind.Update,
+                    PrepareUpdate(update, updateTable, context));
+            case DeleteStatement delete when context.Tables.TryGetValue(delete.TableName, out var deleteTable):
+                return TriggerMutationRequiresStatementRollback(
+                    context,
+                    deleteTable,
+                    TriggerMutationKind.Delete);
+            case QueryStatement query:
+                return TriggerQueryReferencesAbortCapableView(
+                    context,
+                    query,
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            default:
+                return false;
+        }
+    }
+
+    private static bool TriggerInsertUsesAbortCapableDefault(
+        InsertStatement insert,
+        EmbeddedTable table)
+    {
+        if (insert.Columns is null)
+            return false;
+        var supplied = insert.Columns.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return table.ColumnDefinitions.Any(column =>
+            !column.IsGenerated
+            && !supplied.Contains(column.Name)
+            && TriggerExpressionCanAbort(column.DefaultExpression));
+    }
+
+    private static bool TriggerQueryReferencesAbortCapableView(
+        QueryContext context,
+        QueryStatement? query,
+        HashSet<string> visited)
+        => query switch
+        {
+            null or ValuesClause => false,
+            SelectStatement select => TriggerSourceReferencesAbortCapableView(
+                context,
+                select.Source,
+                visited),
+            CompoundSelectStatement compound => compound.Terms.Any(term =>
+                TriggerQueryReferencesAbortCapableView(context, term, visited)),
+            WithSelectStatement with => with.CommonTableExpressions.Any(common =>
+                    TriggerQueryReferencesAbortCapableView(context, common.Query, visited))
+                || TriggerQueryReferencesAbortCapableView(context, with.Query, visited),
+            _ => false,
+        };
+
+    private static bool TriggerSourceReferencesAbortCapableView(
+        QueryContext context,
+        TableSource? source,
+        HashSet<string> visited)
+        => source switch
+        {
+            null or GenerateSeriesSource => false,
+            NamedTableSource named when context.Views?.TryGetValue(named.Name, out var view) == true
+                && visited.Add(named.Name)
+                => TriggerQueryCanAbort(view.Query)
+                    || TriggerQueryReferencesAbortCapableView(context, view.Query, visited),
+            NamedTableSource => false,
+            DerivedTableSource derived => TriggerQueryReferencesAbortCapableView(
+                context,
+                derived.Query,
+                visited),
+            JoinTableSource join => TriggerSourceReferencesAbortCapableView(
+                    context,
+                    join.Left,
+                    visited)
+                || TriggerSourceReferencesAbortCapableView(context, join.Right, visited),
+            _ => false,
+        };
+
+    private void RejectUnboundedRecursiveTriggerCycles(
+        QueryContext context,
+        IReadOnlyList<TriggerDefinition> roots)
+    {
+        // Row-dependent WHEN clauses are the supported runtime termination guard.
+        // Reject unguarded cycles conservatively before callbacks or mutations instead
+        // of walking them to the runtime depth limit.
         var visiting = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var root in roots)
@@ -2153,16 +2500,82 @@ public sealed partial class EmbeddedDatabase
                 return;
             if (!visiting.Add(trigger.Name))
                 throw new EmbeddedSqlException("too many levels of trigger recursion");
-            foreach (var bodyStatement in trigger.Body)
+            if (trigger.When is null
+                || !HasRuntimeRecursionGuard(trigger.When, context))
             {
-                foreach (var nested in GetBodyStatementTriggers(context, bodyStatement))
-                    Visit(nested);
+                foreach (var bodyStatement in trigger.Body)
+                {
+                    if (HasRuntimeBodyRecursionGuard(bodyStatement, context))
+                        continue;
+                    foreach (var nested in GetBodyStatementTriggers(context, bodyStatement))
+                        Visit(nested);
+                }
             }
 
             visiting.Remove(trigger.Name);
             visited.Add(trigger.Name);
         }
     }
+
+    private bool HasRuntimeBodyRecursionGuard(
+        ParsedStatement statement,
+        QueryContext context)
+    {
+        if (statement is not InsertStatement insert)
+            return false;
+        if (insert.Source is SelectStatement { Where: { } predicate }
+            && HasRuntimeRecursionGuard(predicate, context))
+        {
+            return true;
+        }
+        if (insert.Upsert?.Action is DoNothingUpsertAction)
+            return true;
+        var effectiveConflict = context.ConflictAlgorithmOverride ?? insert.ConflictAlgorithm;
+        return effectiveConflict == InsertConflictAlgorithm.Ignore
+            && context.Tables.TryGetValue(insert.TableName, out var table)
+            && (table.PrimaryKeyColumns.Count != 0
+                || table.TableUniqueConstraints.Count != 0
+                || table.ColumnDefinitions.Any(column => column.PrimaryKey || column.Unique)
+                || table.Indexes.Any(index => index.Unique));
+    }
+
+    private bool HasRuntimeRecursionGuard(
+        Expression predicate,
+        QueryContext context)
+        => !IsStaticTriggerPredicate(predicate)
+            || !IsTrue(Evaluate(predicate, EmptyParameters, row: null, context));
+
+    private static bool IsStaticTriggerPredicate(Expression expression)
+        => expression switch
+        {
+            LiteralExpression => true,
+            UnaryExpression unary => IsStaticTriggerPredicate(unary.Operand),
+            BinaryExpression binary => IsStaticTriggerPredicate(binary.Left)
+                && IsStaticTriggerPredicate(binary.Right),
+            CollationExpression collation when collation.Name.Equals(
+                    "BINARY",
+                    StringComparison.OrdinalIgnoreCase)
+                || collation.Name.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
+                || collation.Name.Equals("RTRIM", StringComparison.OrdinalIgnoreCase)
+                => IsStaticTriggerPredicate(collation.Expression),
+            CastExpression cast => IsStaticTriggerPredicate(cast.Expression),
+            CaseExpression @case => (@case.Operand is null || IsStaticTriggerPredicate(@case.Operand))
+                && @case.Clauses.All(clause =>
+                    IsStaticTriggerPredicate(clause.When)
+                    && IsStaticTriggerPredicate(clause.Then))
+                && (@case.Else is null || IsStaticTriggerPredicate(@case.Else)),
+            BetweenExpression between => IsStaticTriggerPredicate(between.Value)
+                && IsStaticTriggerPredicate(between.Lower)
+                && IsStaticTriggerPredicate(between.Upper),
+            InExpression @in => IsStaticTriggerPredicate(@in.Value)
+                && @in.Values.All(IsStaticTriggerPredicate),
+            LikeExpression like => IsStaticTriggerPredicate(like.Value)
+                && IsStaticTriggerPredicate(like.Pattern)
+                && (like.Escape is null || IsStaticTriggerPredicate(like.Escape)),
+            GlobExpression glob => IsStaticTriggerPredicate(glob.Value)
+                && IsStaticTriggerPredicate(glob.Pattern),
+            _ => false,
+        };
 
     private IEnumerable<TriggerDefinition> GetBodyStatementTriggers(
         QueryContext context,
