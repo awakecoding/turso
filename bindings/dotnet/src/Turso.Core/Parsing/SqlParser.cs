@@ -53,6 +53,8 @@ internal sealed class SqlParser
             return ParseAlterTable();
         if (ConsumeKeyword("INSERT"))
             return ParseInsert();
+        if (ConsumeKeyword("REPLACE"))
+            return ParseInsert(InsertConflictAlgorithm.Replace);
         if (ConsumeKeyword("UPDATE"))
             return ParseUpdate();
         if (ConsumeKeyword("DELETE"))
@@ -893,27 +895,34 @@ internal sealed class SqlParser
         var ifNotExists = ParseIfNotExists();
         var name = ParseSchemaQualifiedName();
 
+        var timing = TriggerTiming.Before;
         if (ConsumeKeyword("BEFORE"))
-            throw Error("BEFORE triggers are not supported.");
-        if (ConsumeKeyword("INSTEAD"))
-            throw Error("INSTEAD OF triggers are not supported.");
-        if (!ConsumeKeyword("AFTER"))
-            throw Error("Only AFTER triggers are supported; specify the AFTER timing explicitly.");
+            timing = TriggerTiming.Before;
+        else if (ConsumeKeyword("AFTER"))
+            timing = TriggerTiming.After;
+        else if (ConsumeKeyword("INSTEAD"))
+        {
+            ExpectKeyword("OF");
+            timing = TriggerTiming.InsteadOf;
+        }
 
-        var triggerEvent = ParseTriggerEvent();
+        var (triggerEvent, updateOfColumns) = ParseTriggerEvent();
         ExpectKeyword("ON");
         var tableName = ParseSchemaQualifiedName();
 
         if (ConsumeKeyword("FOR"))
-            throw Error("FOR EACH ROW triggers are not supported.");
-        if (CurrentIsKeyword("WHEN"))
-            throw Error("WHEN clauses in triggers are not supported.");
+        {
+            ExpectKeyword("EACH");
+            ExpectKeyword("ROW");
+        }
 
-        ExpectKeyword("BEGIN");
+        Expression? when = null;
         var body = new List<ParsedStatement>();
         _inTriggerBody = true;
         try
         {
+            when = ConsumeKeyword("WHEN") ? ParseExpression() : null;
+            ExpectKeyword("BEGIN");
             while (!ConsumeKeyword("END"))
             {
                 if (_lexer.Current.Kind == TokenKind.End)
@@ -931,21 +940,31 @@ internal sealed class SqlParser
         if (body.Count == 0)
             throw Error("A trigger body must contain at least one statement.");
 
-        return new CreateTriggerStatement(name, triggerEvent, tableName, body, NormalizeObjectSql(), ifNotExists);
+        return new CreateTriggerStatement(
+            name,
+            triggerEvent,
+            tableName,
+            body,
+            NormalizeObjectSql(),
+            ifNotExists,
+            timing,
+            updateOfColumns,
+            when);
     }
 
-    private TriggerEvent ParseTriggerEvent()
+    private (TriggerEvent Event, IReadOnlyList<string>? UpdateOfColumns) ParseTriggerEvent()
     {
         if (ConsumeKeyword("INSERT"))
-            return TriggerEvent.Insert;
+            return (TriggerEvent.Insert, null);
         if (ConsumeKeyword("DELETE"))
-            return TriggerEvent.Delete;
+            return (TriggerEvent.Delete, null);
         if (ConsumeKeyword("UPDATE"))
         {
+            IReadOnlyList<string>? updateOfColumns = null;
             if (ConsumeKeyword("OF"))
-                throw Error("UPDATE OF column triggers are not supported.");
+                updateOfColumns = ParseIdentifierList();
 
-            return TriggerEvent.Update;
+            return (TriggerEvent.Update, updateOfColumns);
         }
 
         throw Error("Expected INSERT, UPDATE, or DELETE as the trigger event.");
@@ -955,12 +974,16 @@ internal sealed class SqlParser
     {
         if (ConsumeKeyword("INSERT"))
             return ParseInsert();
+        if (ConsumeKeyword("REPLACE"))
+            return ParseInsert(InsertConflictAlgorithm.Replace);
         if (ConsumeKeyword("UPDATE"))
             return ParseUpdate();
         if (ConsumeKeyword("DELETE"))
             return ParseDelete();
+        if (IsQueryStart())
+            return ParseQuery();
 
-        throw Error("Only INSERT, UPDATE, and DELETE statements are allowed in a trigger body.");
+        throw Error("Only INSERT, UPDATE, DELETE, and SELECT statements are allowed in a trigger body.");
     }
 
     private ParsedStatement ParseDropView()
@@ -1005,9 +1028,9 @@ internal sealed class SqlParser
         return text;
     }
 
-    private ParsedStatement ParseInsert()
+    private ParsedStatement ParseInsert(InsertConflictAlgorithm? impliedConflictAlgorithm = null)
     {
-        var conflictAlgorithm = ParseInsertConflictAlgorithm();
+        var conflictAlgorithm = impliedConflictAlgorithm ?? ParseInsertConflictAlgorithm();
         ExpectKeyword("INTO");
         var tableName = ParseSchemaQualifiedName();
         string[]? columns = null;
@@ -2183,14 +2206,13 @@ internal sealed class SqlParser
                 _lexer.Next();
                 return new ParameterExpression(ResolveParameterIndex(token.Text));
             case TokenKind.Identifier:
-                if (_inTriggerBody
-                    && (string.Equals(token.Text, "NEW", StringComparison.OrdinalIgnoreCase)
-                        || string.Equals(token.Text, "OLD", StringComparison.OrdinalIgnoreCase)))
-                {
-                    throw Error("NEW and OLD row references are not supported; only statement-level trigger bodies are allowed.");
-                }
-
                 _lexer.Next();
+                if (_inTriggerBody
+                    && string.Equals(token.Text, "RAISE", StringComparison.OrdinalIgnoreCase)
+                    && Consume(TokenKind.LeftParen))
+                {
+                    return ParseRaiseExpression();
+                }
                 if (Consume(TokenKind.Dot))
                 {
                     var columnName = ExpectIdentifier();
@@ -2259,6 +2281,30 @@ internal sealed class SqlParser
             default:
                 throw Error("Expected an expression.");
         }
+    }
+
+    private Expression ParseRaiseExpression()
+    {
+        InsertConflictAlgorithm algorithm;
+        if (ConsumeKeyword("ROLLBACK"))
+            algorithm = InsertConflictAlgorithm.Rollback;
+        else if (ConsumeKeyword("ABORT"))
+            algorithm = InsertConflictAlgorithm.Abort;
+        else if (ConsumeKeyword("FAIL"))
+            algorithm = InsertConflictAlgorithm.Fail;
+        else if (ConsumeKeyword("IGNORE"))
+            algorithm = InsertConflictAlgorithm.Ignore;
+        else
+            throw Error("Expected ROLLBACK, ABORT, FAIL, or IGNORE in RAISE().");
+
+        Expression? message = null;
+        if (algorithm != InsertConflictAlgorithm.Ignore)
+        {
+            Expect(TokenKind.Comma);
+            message = ParseExpression();
+        }
+        Expect(TokenKind.RightParen);
+        return new RaiseExpression(algorithm, message);
     }
 
     private QueryStatement ParseParenthesizedQuery()

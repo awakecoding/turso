@@ -66,13 +66,23 @@ internal enum TriggerEvent
     Delete,
 }
 
+internal enum TriggerTiming
+{
+    Before,
+    After,
+    InsteadOf,
+}
+
 internal sealed record CreateTriggerStatement(
     string Name,
     TriggerEvent Event,
     string TableName,
     IReadOnlyList<ParsedStatement> Body,
     string Sql,
-    bool IfNotExists) : ParsedStatement;
+    bool IfNotExists,
+    TriggerTiming Timing = TriggerTiming.After,
+    IReadOnlyList<string>? UpdateOfColumns = null,
+    Expression? When = null) : ParsedStatement;
 
 internal sealed record DropTriggerStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -87,7 +97,10 @@ internal sealed record TriggerDefinition(
     TriggerEvent Event,
     string TableName,
     IReadOnlyList<ParsedStatement> Body,
-    string Sql);
+    string Sql,
+    TriggerTiming Timing = TriggerTiming.After,
+    IReadOnlyList<string>? UpdateOfColumns = null,
+    Expression? When = null);
 
 // A parser-only separator retains whether a dot was SQL syntax rather than part of a
 // quoted identifier. Catalog object names remain ordinary strings after connection routing.
@@ -548,6 +561,10 @@ internal sealed record FunctionExpression(
     bool Distinct = false,
     Expression? Filter = null,
     WindowSpecification? Window = null) : Expression;
+
+internal sealed record RaiseExpression(
+    InsertConflictAlgorithm Algorithm,
+    Expression? Message) : Expression;
 
 internal sealed record ScalarSubqueryExpression(QueryStatement Query) : Expression;
 

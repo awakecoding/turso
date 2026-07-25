@@ -266,7 +266,7 @@ public sealed class ManagedInsertOrConflictResolutionSliceTests
     }
 
     [Test]
-    public void UnsupportedConstraintAndTriggerFormsAreRejectedBeforeWriting()
+    public void ConstraintAndTriggerFormsApplyTheirSqliteConflictBoundaries()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -288,11 +288,9 @@ public sealed class ManagedInsertOrConflictResolutionSliceTests
         Execute(
             connection,
             "CREATE TRIGGER triggered_items_insert AFTER INSERT ON triggered_items BEGIN INSERT INTO audit_items VALUES (1); END;");
-        Action trigger = () => Execute(connection, "INSERT OR ABORT INTO triggered_items VALUES (1);");
-        trigger.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*does not support target tables with INSERT triggers*");
-        ReadRows(connection, "SELECT id FROM triggered_items;").Should().BeEmpty();
-        ReadRows(connection, "SELECT value FROM audit_items;").Should().BeEmpty();
+        Execute(connection, "INSERT OR ABORT INTO triggered_items VALUES (1);");
+        AssertRows(ReadRows(connection, "SELECT id FROM triggered_items;"), [SqlValue.Integer(1)]);
+        AssertRows(ReadRows(connection, "SELECT value FROM audit_items;"), [SqlValue.Integer(1)]);
 
         Execute(connection, "CREATE TABLE required_items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);");
         Execute(connection, "INSERT OR REPLACE INTO required_items VALUES (1, 'value');");

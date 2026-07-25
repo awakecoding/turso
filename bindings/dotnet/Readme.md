@@ -391,6 +391,23 @@ mode. Supported common connection string keywords include:
 | `Sync Interval` | Retained for connection-string compatibility. Only `0` is accepted; call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly and await every operation. |
 | `Tls` | Remote `TursoConnection` only. Optional `libsql://` development override; conflicts with explicit HTTP(S) schemes fail early. |
 
+### Managed INSERT conflict and trigger semantics
+
+The managed evaluator supports `INSERT OR ROLLBACK`, `ABORT`, `FAIL`, `IGNORE`, and
+`REPLACE` for VALUES, SELECT, and CTE sources, including constraint-level policies,
+UPSERT composition, `WITHOUT ROWID`, generated/default values, partial expression
+indexes, `RETURNING`, AUTOINCREMENT, and attached/TEMP targets. Statement rollback,
+transaction rollback, retained FAIL prefixes, REPLACE delete ordering,
+`last_insert_rowid()`, and `sqlite_sequence` publication follow SQLite boundaries.
+
+Managed triggers are row-scoped. Table triggers support BEFORE and AFTER
+INSERT/UPDATE/DELETE, optional `FOR EACH ROW`, `WHEN`, `UPDATE OF`, OLD/NEW references,
+and `RAISE(ROLLBACK|ABORT|FAIL|IGNORE)`. Views support INSTEAD OF INSERT triggers.
+Trigger bodies may contain INSERT, UPDATE, DELETE, and SELECT statements; bind parameters
+and DML `RETURNING` inside trigger bodies remain unsupported. Recursive execution is
+connection-local and bounded before CLR stack exhaustion. TEMP triggers and INSTEAD OF
+UPDATE/DELETE remain unsupported.
+
 ### Managed foreign-key semantics
 
 The managed local engine supports composite child and parent keys, explicit or omitted
@@ -398,7 +415,7 @@ parent primary-key columns, UNIQUE parent keys, parent affinity and collation, g
 columns, and `WITHOUT ROWID` tables within the storage shapes supported by the managed
 pager. `ON DELETE` and `ON UPDATE` implement `CASCADE`, `SET NULL`, `SET DEFAULT`,
 `RESTRICT`, and `NO ACTION`, including bounded self-referential and multi-table cascades.
-Foreign-key actions run before the engine's existing AFTER-trigger subset, and the whole
+Foreign-key actions run before matching AFTER row triggers, and the whole
 statement (actions and trigger effects included) rolls back on failure.
 
 `DEFERRABLE INITIALLY DEFERRED` and `PRAGMA defer_foreign_keys` participate in managed
@@ -413,8 +430,7 @@ Foreign keys are always resolved within the database that owns the child table. 
 schema-qualified `REFERENCES` target is rejected, and an ATTACH transaction still may
 mutate only one database because independent files cannot be committed atomically.
 Managed schema rewriting still rejects `ALTER TABLE ADD COLUMN ... REFERENCES` and
-foreign-key-dependent column renames. Trigger forms outside the managed trigger subset
-(for example `UPDATE OF` with `OLD`/`NEW` row references) remain unsupported.
+foreign-key-dependent column renames.
 
 ### Managed local encryption format
 

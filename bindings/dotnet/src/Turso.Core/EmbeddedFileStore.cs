@@ -247,13 +247,16 @@ internal sealed class EmbeddedFileStore : IDisposable
                     views[entry.Name] = new ViewDefinition(view.Name, view.Columns, view.Query, view.Sql);
                     break;
                 case "trigger" when statement is CreateTriggerStatement trigger:
-                    ValidateStoredTrigger(entry, trigger, tables);
+                    ValidateStoredTrigger(entry, trigger, tables, views);
                     triggers[entry.Name] = new TriggerDefinition(
                         trigger.Name,
                         trigger.Event,
                         trigger.TableName,
                         trigger.Body,
-                        trigger.Sql);
+                        trigger.Sql,
+                        trigger.Timing,
+                        trigger.UpdateOfColumns,
+                        trigger.When);
                     break;
                 default:
                     throw new EmbeddedSqlException($"Stored schema entry '{entry.Name}' has an unsupported type '{entry.Type}'.");
@@ -7404,7 +7407,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             ValidateViewDefinition(catalogName, view);
 
         foreach (var (catalogName, trigger) in triggers)
-            ValidateTriggerDefinition(catalogName, trigger, tables);
+            ValidateTriggerDefinition(catalogName, trigger, tables, views);
     }
 
     private static void ValidateViewDefinition(string catalogName, ViewDefinition view)
@@ -7431,14 +7434,15 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static void ValidateTriggerDefinition(
         string catalogName,
         TriggerDefinition trigger,
-        IReadOnlyDictionary<string, EmbeddedTable> tables)
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views)
     {
         if (!string.Equals(catalogName, trigger.Name, StringComparison.OrdinalIgnoreCase))
         {
             throw new EmbeddedSqlException(
                 $"The managed file engine cannot persist trigger '{catalogName}' because its catalog key and definition name differ.");
         }
-        if (!tables.ContainsKey(trigger.TableName))
+        if (!tables.ContainsKey(trigger.TableName) && !views.ContainsKey(trigger.TableName))
         {
             throw new EmbeddedSqlException(
                 $"The managed file engine cannot persist trigger '{catalogName}' because its table '{trigger.TableName}' does not exist.");
@@ -7448,7 +7452,10 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (statement is not CreateTriggerStatement persisted
             || !string.Equals(persisted.Name, trigger.Name, StringComparison.OrdinalIgnoreCase)
             || persisted.Event != trigger.Event
+            || persisted.Timing != trigger.Timing
             || !string.Equals(persisted.TableName, trigger.TableName, StringComparison.OrdinalIgnoreCase)
+            || !SameColumnList(persisted.UpdateOfColumns, trigger.UpdateOfColumns)
+            || (persisted.When is null) != (trigger.When is null)
             || persisted.Body.Count != trigger.Body.Count
             || !HaveSameStatementKinds(persisted.Body, trigger.Body))
         {
@@ -7456,6 +7463,8 @@ internal sealed class EmbeddedFileStore : IDisposable
                 $"The managed file engine cannot persist trigger '{catalogName}' because its SQL cannot reconstruct its statement-level definition.");
         }
 
+        ValidateRuntimeIndependentTriggerExpression(catalogName, trigger.When);
+        ValidateRuntimeIndependentTriggerExpression(catalogName, persisted.When);
         ValidateRuntimeIndependentTriggerBody(catalogName, trigger.Body);
         ValidateRuntimeIndependentTriggerBody(catalogName, persisted.Body);
     }
@@ -7474,7 +7483,8 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static void ValidateStoredTrigger(
         SchemaEntry entry,
         CreateTriggerStatement trigger,
-        IReadOnlyDictionary<string, EmbeddedTable> tables)
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views)
     {
         if (!string.Equals(trigger.Name, entry.Name, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(trigger.TableName, entry.TableName, StringComparison.OrdinalIgnoreCase))
@@ -7482,12 +7492,13 @@ internal sealed class EmbeddedFileStore : IDisposable
             throw new EmbeddedSqlException(
                 $"Stored schema entry for trigger '{entry.Name}' does not match its CREATE TRIGGER definition.");
         }
-        if (!tables.ContainsKey(trigger.TableName))
+        if (!tables.ContainsKey(trigger.TableName) && !views.ContainsKey(trigger.TableName))
         {
             throw new EmbeddedSqlException(
                 $"Stored trigger '{entry.Name}' references missing table '{trigger.TableName}'.");
         }
 
+        ValidateRuntimeIndependentTriggerExpression(entry.Name, trigger.When);
         ValidateRuntimeIndependentTriggerBody(entry.Name, trigger.Body);
     }
 
@@ -7533,6 +7544,17 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"The managed file engine cannot persist trigger '{name}' because it uses {dependency}. "
                     + "File-backed schema definitions cannot retain bind parameters, managed callbacks, or custom collations across reopen.");
             }
+        }
+    }
+
+    private static void ValidateRuntimeIndependentTriggerExpression(string name, Expression? expression)
+    {
+        var dependency = FindRuntimeDependency(expression);
+        if (dependency is not null)
+        {
+            throw new EmbeddedSqlException(
+                $"The managed file engine cannot persist trigger '{name}' because it uses {dependency}. "
+                + "File-backed schema definitions cannot retain bind parameters, managed callbacks, or custom collations across reopen.");
         }
     }
 
@@ -7596,6 +7618,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             DeleteStatement delete => FirstRuntimeDependency(
                 FindRuntimeDependency(delete.Where),
                 FindRuntimeDependency(delete.Returning)),
+            QueryStatement query => FindRuntimeDependency(query),
             _ => $"unsupported trigger body statement {statement.GetType().Name}",
         };
     }
@@ -7608,6 +7631,7 @@ internal sealed class EmbeddedFileStore : IDisposable
             ParameterExpression => "a bind parameter",
             RowValueExpression rowValue => FindRuntimeDependency(rowValue.Values),
             FunctionExpression function => $"function {function.Name}()",
+            RaiseExpression raise => FindRuntimeDependency(raise.Message),
             ScalarSubqueryExpression subquery => FindRuntimeDependency(subquery.Query),
             ExistsExpression exists => FindRuntimeDependency(exists.Query),
             CollationExpression collation => $"explicit collation '{collation.Name}'",

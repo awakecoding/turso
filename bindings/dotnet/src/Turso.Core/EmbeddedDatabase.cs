@@ -111,6 +111,17 @@ internal sealed class EmbeddedStatementAbortException : EmbeddedSqlException
     public long LastInsertRowId { get; }
 }
 
+internal sealed class EmbeddedTriggerRaiseException : EmbeddedSqlException
+{
+    public EmbeddedTriggerRaiseException(string message, InsertConflictAlgorithm algorithm)
+        : base(message, algorithm)
+    {
+        Algorithm = algorithm;
+    }
+
+    public InsertConflictAlgorithm Algorithm { get; }
+}
+
 /// <summary>
 /// Reports that a catalog mutation reached its durable WAL commit marker, but
 /// subsequent checkpoint maintenance failed. Retrying the mutation would apply
@@ -133,7 +144,10 @@ public sealed class EmbeddedPostCommitMaintenanceException : EmbeddedSqlExceptio
 
 public sealed class EmbeddedDatabase : IDisposable
 {
-    private const int MaximumTriggerDepth = 1_000;
+    // Trigger bodies currently recurse through the managed evaluator, so fail before
+    // exhausting the CLR stack while preserving practical recursive-trigger chains.
+    private const int MaximumTriggerDepth = 64;
+    private const int MaximumForeignKeyActionDepth = 1_000;
     internal const string SqliteSequenceTableName = "sqlite_sequence";
     private static readonly ConditionalWeakTable<IFileSystem, FileCatalogWriteLockScope> FileCatalogWriteLocks = new();
     private readonly object _gate = new();
@@ -323,7 +337,15 @@ public sealed class EmbeddedDatabase : IDisposable
         ForeignKeyStatementState? ForeignKeyStatement = null,
         bool IndexExpression = false,
         CancellationToken CancellationToken = default,
-        bool SchemaValidation = false);
+        bool SchemaValidation = false,
+        StatementExecutionState? StatementState = null,
+        SourceRow? TriggerRow = null,
+        InsertConflictAlgorithm? TriggerConflictAlgorithm = null);
+
+    internal sealed class StatementExecutionState(long lastInsertRowId)
+    {
+        public long LastInsertRowId { get; set; } = lastInsertRowId;
+    }
 
     internal sealed class ForeignKeyStatementState
     {
@@ -1502,7 +1524,8 @@ public sealed class EmbeddedDatabase : IDisposable
             InTransaction: inTransaction,
             RecursiveTriggersEnabled: recursiveTriggersEnabled,
             ForeignKeyStatement: foreignKeysEnabled ? new ForeignKeyStatementState() : null,
-            CancellationToken: cancellationToken);
+            CancellationToken: cancellationToken,
+            StatementState: new StatementExecutionState(lastInsertRowId));
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
@@ -1519,7 +1542,7 @@ public sealed class EmbeddedDatabase : IDisposable
             DropIndexStatement dropIndex => ExecuteDropIndex(dropIndex, tables),
             CreateViewStatement createView => ExecuteCreateView(createView, catalog),
             DropViewStatement dropView => ExecuteDropView(dropView, catalog),
-            CreateTriggerStatement createTrigger => ExecuteCreateTrigger(createTrigger, catalog),
+            CreateTriggerStatement createTrigger => ExecuteCreateTrigger(createTrigger, catalog, context),
             DropTriggerStatement dropTrigger => ExecuteDropTrigger(dropTrigger, catalog),
             AlterTableAddColumnStatement addColumn => ExecuteAlterTableAddColumn(addColumn, parameters, context),
             AlterTableRenameStatement rename => ExecuteAlterTableRename(rename, catalog),
@@ -2336,7 +2359,10 @@ public sealed class EmbeddedDatabase : IDisposable
         throw new EmbeddedSqlException($"no such view: {statement.Name}");
     }
 
-    private static ExecutionResult ExecuteCreateTrigger(CreateTriggerStatement statement, SchemaCatalog catalog)
+    private ExecutionResult ExecuteCreateTrigger(
+        CreateTriggerStatement statement,
+        SchemaCatalog catalog,
+        QueryContext context)
     {
         var tables = catalog.Tables;
         if (IsSqliteSequenceTable(statement.Name))
@@ -2355,16 +2381,34 @@ public sealed class EmbeddedDatabase : IDisposable
         if (TryFindIndex(tables, statement.Name, out _, out _))
             throw new EmbeddedSqlException($"there is already an index named {statement.Name}");
 
-        if (catalog.Views.ContainsKey(statement.TableName))
-            throw new EmbeddedSqlException($"cannot create trigger on view: {statement.TableName}");
+        var targetIsView = catalog.Views.ContainsKey(statement.TableName);
+        if (targetIsView && statement.Timing != TriggerTiming.InsteadOf)
+            throw new EmbeddedSqlException($"cannot create {statement.Timing.ToString().ToUpperInvariant()} trigger on view: {statement.TableName}");
+        if (!targetIsView && statement.Timing == TriggerTiming.InsteadOf)
+            throw new EmbeddedSqlException($"cannot create INSTEAD OF trigger on table: {statement.TableName}");
+        if (targetIsView
+            && statement.Timing == TriggerTiming.InsteadOf
+            && statement.Event != TriggerEvent.Insert)
+        {
+            throw new EmbeddedSqlException(
+                "Managed INSTEAD OF triggers currently support INSERT events only.");
+        }
         if (IsSqliteSequenceTable(statement.TableName) && tables.ContainsKey(statement.TableName))
             throw new EmbeddedSqlException("cannot create trigger on system table");
-        if (!tables.ContainsKey(statement.TableName))
+        if (!tables.ContainsKey(statement.TableName) && !targetIsView)
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
-        catalog.Triggers.Add(
+        var definition = new TriggerDefinition(
             statement.Name,
-            new TriggerDefinition(statement.Name, statement.Event, statement.TableName, statement.Body, statement.Sql));
+            statement.Event,
+            statement.TableName,
+            statement.Body,
+            statement.Sql,
+            statement.Timing,
+            statement.UpdateOfColumns,
+            statement.When);
+        ValidateTriggerSchema(definition, context, context.CancellationToken);
+        catalog.Triggers.Add(statement.Name, definition);
         return new ExecutionResult([], [], 0, true);
     }
 
@@ -2534,19 +2578,59 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         CancellationToken cancellationToken)
     {
-        if (!context.Tables.TryGetValue(trigger.TableName, out var triggerTable))
+        string[] triggerColumns;
+        EmbeddedColumn[]? triggerColumnDefinitions;
+        var triggerHasRowid = false;
+        if (context.Tables.TryGetValue(trigger.TableName, out var triggerTable))
+        {
+            triggerColumns = triggerTable.Columns;
+            triggerColumnDefinitions = triggerTable.ColumnDefinitions;
+            triggerHasRowid = triggerTable.HasRowid;
+        }
+        else if (context.Views is not null
+                 && context.Views.TryGetValue(trigger.TableName, out var triggerView))
+        {
+            triggerColumns = ResolveViewColumns(triggerView, EnterView(context, triggerView.Name));
+            triggerColumnDefinitions = null;
+        }
+        else
+        {
             throw new EmbeddedSqlException($"no such table: {trigger.TableName}");
+        }
 
         var triggerQualifiedColumns = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        for (var columnIndex = 0; columnIndex < triggerTable.Columns.Length; columnIndex++)
+        var triggerQualifiedDefinitions = new Dictionary<string, EmbeddedColumn>(StringComparer.OrdinalIgnoreCase);
+        var triggerValues = new List<SqlValue>();
+        var triggerDefinitions = new List<EmbeddedColumn?>();
+        var triggerRowIds = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+        void AddPseudoRow(string qualifier)
         {
-            triggerQualifiedColumns.Add($"OLD.{triggerTable.Columns[columnIndex]}", columnIndex);
-            triggerQualifiedColumns.Add($"NEW.{triggerTable.Columns[columnIndex]}", columnIndex);
+            var offset = triggerValues.Count;
+            for (var columnIndex = 0; columnIndex < triggerColumns.Length; columnIndex++)
+            {
+                var qualifiedName = $"{qualifier}.{triggerColumns[columnIndex]}";
+                triggerQualifiedColumns.Add(qualifiedName, offset + columnIndex);
+                triggerValues.Add(SqlValue.Null);
+                var definition = triggerColumnDefinitions?[columnIndex];
+                triggerDefinitions.Add(definition);
+                if (definition is not null)
+                    triggerQualifiedDefinitions.Add(qualifiedName, definition);
+            }
+            triggerRowIds.Add(qualifier, triggerHasRowid ? 0 : null);
         }
+        if (trigger.Event != TriggerEvent.Insert)
+            AddPseudoRow("OLD");
+        if (trigger.Event != TriggerEvent.Delete)
+            AddPseudoRow("NEW");
+
         var triggerRow = new SourceRow(
-            triggerTable.Columns,
-            Enumerable.Repeat(SqlValue.Null, triggerTable.Columns.Length).ToArray(),
-            triggerQualifiedColumns);
+            [],
+            triggerValues.ToArray(),
+            triggerQualifiedColumns,
+            QualifiedRowIds: triggerRowIds,
+            ColumnDefinitions: triggerDefinitions,
+            QualifiedColumnDefinitions: triggerQualifiedDefinitions);
+        ValidateExpressionSchema(trigger.When, triggerRow, context, cancellationToken);
 
         foreach (var statement in trigger.Body)
         {
@@ -2561,6 +2645,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     break;
                 case DeleteStatement delete:
                     ValidateTriggerDelete(delete, context, triggerRow, cancellationToken);
+                    break;
+                case QueryStatement query:
+                    ValidateQuerySchema(query, context, triggerRow, cancellationToken);
                     break;
                 default:
                     throw new EmbeddedSqlException(
@@ -2939,6 +3026,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     }
                 }
                 return;
+            case RaiseExpression raise:
+                ValidateExpressionSchema(raise.Message, row, context, cancellationToken);
+                return;
             case ScalarSubqueryExpression scalar:
                 ValidateQuerySchema(scalar.Query, context, row, cancellationToken);
                 return;
@@ -2997,28 +3087,82 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
-        if (statement.ConflictAlgorithm is { } algorithm)
+        if (context.InsideTrigger && context.TriggerConflictAlgorithm is { } triggerAlgorithm)
+            statement = statement with { ConflictAlgorithm = triggerAlgorithm };
+
+        if (!context.Tables.ContainsKey(statement.TableName)
+            && context.Views is not null
+            && context.Views.TryGetValue(statement.TableName, out var view))
         {
             return context.ForeignKeysEnabled
                 ? ExecuteWithForeignKeyStatement(
                     context,
-                    () => ExecuteConflictResolvedInsert(statement, algorithm, parameters, context))
-                : ExecuteConflictResolvedInsert(statement, algorithm, parameters, context);
+                    () => ExecuteInsteadOfInsert(statement, view, parameters, context))
+                : ExecuteInsteadOfInsert(statement, view, parameters, context);
         }
+
         if (statement.Upsert is not null)
         {
             return context.ForeignKeysEnabled
                 ? ExecuteWithForeignKeyStatement(context, () => ExecuteUpsert(statement, parameters, context))
                 : ExecuteUpsert(statement, parameters, context);
         }
+        if (statement.ConflictAlgorithm is { } algorithm)
+        {
+            return context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(
+                    context,
+                    () => ExecuteConflictResolvedInsert(
+                        statement,
+                        algorithm,
+                        parameters,
+                        context,
+                        statementPolicyExplicit: true))
+                : ExecuteConflictResolvedInsert(
+                    statement,
+                    algorithm,
+                    parameters,
+                    context,
+                    statementPolicyExplicit: true);
+        }
         if (context.Tables.TryGetValue(statement.TableName, out var table)
             && table.HasNonDefaultConflictAlgorithms)
         {
-            return ExecuteWithTriggers(
-                statement.TableName,
-                TriggerEvent.Insert,
+            return context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(
+                    context,
+                    () => ExecuteConflictResolvedInsert(
+                        statement,
+                        InsertConflictAlgorithm.Abort,
+                        parameters,
+                        context,
+                        statementPolicyExplicit: false))
+                : ExecuteConflictResolvedInsert(
+                    statement,
+                    InsertConflictAlgorithm.Abort,
+                    parameters,
+                    context,
+                    statementPolicyExplicit: false);
+        }
+
+        if (GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert, TriggerTiming.Before).Count > 0
+            || GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert, TriggerTiming.After).Count > 0)
+        {
+            return context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(
                 context,
-                () => ExecuteConstraintResolvedInsert(statement, table, parameters, context));
+                () => ExecuteConflictResolvedInsert(
+                    statement,
+                    InsertConflictAlgorithm.Abort,
+                    parameters,
+                    context,
+                    statementPolicyExplicit: false))
+                : ExecuteConflictResolvedInsert(
+                statement,
+                InsertConflictAlgorithm.Abort,
+                parameters,
+                context,
+                statementPolicyExplicit: false);
         }
 
         return ExecuteWithTriggers(
@@ -3044,22 +3188,59 @@ public sealed class EmbeddedDatabase : IDisposable
             : result;
     }
 
-    private ExecutionResult ExecuteConstraintResolvedInsert(
+    private ExecutionResult ExecuteConflictResolvedInsert(
         InsertStatement statement,
-        EmbeddedTable table,
+        InsertConflictAlgorithm algorithm,
         SqlValue[] parameters,
-        QueryContext context)
+        QueryContext context,
+        bool statementPolicyExplicit)
     {
-        if (context.CommonTableExpressions.Count != 0)
+        if (statement.Upsert is not null)
         {
             throw new EmbeddedSqlException(
-                "Managed constraint-level conflict resolution does not support CTE sources.");
+                "Managed INSERT OR conflict resolution cannot be combined with an ON CONFLICT UPSERT clause.");
         }
+        if (!context.Tables.TryGetValue(statement.TableName, out var table))
+            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
+        ValidateInsertReturning(statement, table, context);
+        var triggerContext = context with
+        {
+            TriggerConflictAlgorithm = statementPolicyExplicit ? algorithm : null,
+        };
+        var beforeTriggers = GetMatchingTriggers(
+            triggerContext,
+            statement.TableName,
+            TriggerEvent.Insert,
+            TriggerTiming.Before);
+        var afterTriggers = GetMatchingTriggers(
+            triggerContext,
+            statement.TableName,
+            TriggerEvent.Insert,
+            TriggerTiming.After);
+        var beforeDeleteTriggers = triggerContext.RecursiveTriggersEnabled
+            ? GetMatchingTriggers(
+                triggerContext,
+                statement.TableName,
+                TriggerEvent.Delete,
+                TriggerTiming.Before)
+            : [];
+        var afterDeleteTriggers = triggerContext.RecursiveTriggersEnabled
+            ? GetMatchingTriggers(
+                triggerContext,
+                statement.TableName,
+                TriggerEvent.Delete,
+                TriggerTiming.After)
+            : [];
         var sourceRows = statement.Source is null
             ? null
-            : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
-        var backup = CloneTables(context.Tables);
+            : ExecuteQuery(
+                statement.Source,
+                parameters,
+                triggerContext,
+                triggerContext.TriggerRow).Rows;
+        var backup = CloneTables(triggerContext.Tables);
+        var initialLastInsertRowId = GetLastInsertRowId(triggerContext);
         var insertedRows = new List<SqlValue[]>();
         var insertedRowIds = new List<long>();
         try
@@ -3084,8 +3265,309 @@ public sealed class EmbeddedDatabase : IDisposable
                 insertedRows,
                 insertedRowIds,
                 parameters,
-                context,
-                lastInsertRowId);
+                triggerContext,
+                lastInsertRowId,
+                updateLastInsertRowIdPerRow: table.HasRowid);
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
+        }
+        catch (EmbeddedConflictRollbackException)
+        {
+            RestoreTables(triggerContext.Tables, backup);
+            throw;
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Ignore)
+        {
+            throw;
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Fail)
+        {
+            throw new EmbeddedConflictFailException(
+                exception,
+                GetLastInsertRowId(triggerContext));
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Rollback)
+        {
+            RestoreTables(triggerContext.Tables, backup);
+            throw new EmbeddedConflictRollbackException(
+                exception,
+                GetLastInsertRowId(triggerContext));
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            var failedLastInsertRowId = GetLastInsertRowId(triggerContext);
+            RestoreTables(triggerContext.Tables, backup);
+            if (failedLastInsertRowId != initialLastInsertRowId)
+                throw new EmbeddedStatementAbortException(exception, failedLastInsertRowId);
+            throw;
+        }
+        catch
+        {
+            RestoreTables(triggerContext.Tables, backup);
+            throw;
+        }
+
+        void InsertExpressions(Expression[] values)
+        {
+            var plan = PrepareInsert(statement, table, triggerContext);
+            var deferredRowId = table.HasRowid && beforeTriggers.Count > 0
+                ? new DeferredInsertRowId()
+                : null;
+            InsertCandidate(() => BuildInsertRow(
+                statement,
+                table,
+                plan,
+                values,
+                parameters,
+                triggerContext,
+                allowExistingRowid: true,
+                validateChecks: false,
+                applyNotNullReplacement: false,
+                deferredRowId: deferredRowId), deferredRowId);
+        }
+
+        void InsertValues(IReadOnlyList<SqlValue> values)
+        {
+            var plan = PrepareInsert(statement, table, triggerContext);
+            var deferredRowId = table.HasRowid && beforeTriggers.Count > 0
+                ? new DeferredInsertRowId()
+                : null;
+            InsertCandidate(() => BuildInsertRow(
+                statement,
+                table,
+                plan,
+                values,
+                parameters,
+                triggerContext,
+                allowExistingRowid: true,
+                validateChecks: false,
+                applyNotNullReplacement: false,
+                deferredRowId: deferredRowId), deferredRowId);
+        }
+
+        void InsertCandidate(
+            Func<(SqlValue[] Row, long RowId)> build,
+            DeferredInsertRowId? deferredRowId)
+        {
+            SqlValue[] row;
+            long rowId;
+            try
+            {
+                (row, rowId) = build();
+            }
+            catch (EmbeddedSqlException exception) when (IsConflictAlgorithmConstraint(exception))
+            {
+                var effectiveAlgorithm = statementPolicyExplicit
+                    ? algorithm
+                    : exception.ConflictAlgorithm ?? InsertConflictAlgorithm.Abort;
+                switch (effectiveAlgorithm)
+                {
+                    case InsertConflictAlgorithm.Ignore:
+                        return;
+                    case InsertConflictAlgorithm.Fail:
+                        throw new EmbeddedConflictFailException(
+                            exception,
+                            GetLastInsertRowId(triggerContext));
+                    case InsertConflictAlgorithm.Rollback:
+                        throw new EmbeddedConflictRollbackException(
+                            exception,
+                            GetLastInsertRowId(triggerContext));
+                    default:
+                        throw;
+                }
+            }
+
+            var frame = new TriggerRowFrame(null, null, row, table.HasRowid ? rowId : null);
+            try
+            {
+                if (beforeTriggers.Count > 0 && FireTriggers(beforeTriggers, triggerContext, frame))
+                    return;
+
+                ApplyNotNullReplacement(statement, table, row, triggerContext);
+                if (deferredRowId is not null)
+                {
+                    rowId = FinalizeDeferredInsertRowId(
+                        statement,
+                        table,
+                        row,
+                        parameters,
+                        triggerContext,
+                        deferredRowId);
+                    frame = new TriggerRowFrame(null, null, row, rowId);
+                }
+                ValidateCheckConstraints(
+                    statement.TableName,
+                    table,
+                    row,
+                    rowId,
+                    parameters,
+                    triggerContext);
+                if (algorithm == InsertConflictAlgorithm.Replace)
+                {
+                    CommitReplacement(
+                        triggerContext,
+                        statement.TableName,
+                        table,
+                        row,
+                        rowId,
+                        beforeDeleteTriggers,
+                        afterDeleteTriggers);
+                }
+                else
+                {
+                    CommitInserts(triggerContext, statement.TableName, table, [row], [rowId]);
+                }
+            }
+            catch (EmbeddedTriggerRaiseException exception)
+            {
+                HandleRaise(exception);
+                return;
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                var effectiveAlgorithm = statementPolicyExplicit
+                    ? algorithm
+                    : exception.ConflictAlgorithm ?? InsertConflictAlgorithm.Abort;
+                if (!IsConflictAlgorithmConstraint(exception))
+                    throw;
+
+                switch (effectiveAlgorithm)
+                {
+                    case InsertConflictAlgorithm.Ignore:
+                        return;
+                    case InsertConflictAlgorithm.Fail:
+                        throw new EmbeddedConflictFailException(
+                            exception,
+                            GetLastInsertRowId(triggerContext));
+                    case InsertConflictAlgorithm.Rollback:
+                        throw new EmbeddedConflictRollbackException(
+                            exception,
+                            GetLastInsertRowId(triggerContext));
+                    case InsertConflictAlgorithm.Abort:
+                        throw;
+                    case InsertConflictAlgorithm.Replace
+                        when !statementPolicyExplicit
+                            && exception.Message.StartsWith(
+                            "UNIQUE constraint failed:",
+                            StringComparison.Ordinal):
+                        CommitReplacement(
+                            triggerContext,
+                            statement.TableName,
+                            table,
+                            row,
+                            rowId,
+                            beforeDeleteTriggers,
+                            afterDeleteTriggers);
+                        break;
+                    case InsertConflictAlgorithm.Replace:
+                        throw;
+                    default:
+                        throw new InvalidOperationException("Unknown INSERT conflict algorithm.");
+                }
+            }
+
+            insertedRows.Add(row);
+            insertedRowIds.Add(rowId);
+            if (table.HasRowid)
+                SetLastInsertRowId(triggerContext, rowId);
+            try
+            {
+                if (afterTriggers.Count > 0)
+                    _ = FireTriggers(afterTriggers, triggerContext, frame);
+            }
+            catch (EmbeddedTriggerRaiseException exception)
+            {
+                HandleRaise(exception);
+            }
+        }
+
+        void HandleRaise(EmbeddedTriggerRaiseException exception)
+        {
+            switch (exception.Algorithm)
+            {
+                case InsertConflictAlgorithm.Ignore:
+                    return;
+                case InsertConflictAlgorithm.Fail:
+                    throw new EmbeddedConflictFailException(
+                        exception,
+                        GetLastInsertRowId(triggerContext));
+                case InsertConflictAlgorithm.Rollback:
+                    throw new EmbeddedConflictRollbackException(
+                        exception,
+                        GetLastInsertRowId(triggerContext));
+                case InsertConflictAlgorithm.Abort:
+                    throw exception;
+                default:
+                    throw new InvalidOperationException("REPLACE is not valid in RAISE().");
+            }
+        }
+    }
+
+    private ExecutionResult ExecuteInsteadOfInsert(
+        InsertStatement statement,
+        ViewDefinition view,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        if (statement.Upsert is not null)
+            throw new EmbeddedSqlException("cannot UPSERT a view");
+
+        var triggers = GetMatchingTriggers(
+            context,
+            statement.TableName,
+            TriggerEvent.Insert,
+            TriggerTiming.InsteadOf);
+        if (triggers.Count == 0)
+            throw new EmbeddedSqlException($"cannot modify {statement.TableName} because it is a view");
+
+        var columns = ResolveViewColumns(view, EnterView(context, view.Name));
+        ValidateViewInsertReturning(statement, columns, context);
+        var targetColumns = statement.Columns ?? columns;
+        var targetIndices = new int[targetColumns.Length];
+        for (var index = 0; index < targetColumns.Length; index++)
+        {
+            targetIndices[index] = Array.FindIndex(
+                columns,
+                column => string.Equals(column, targetColumns[index], StringComparison.OrdinalIgnoreCase));
+            if (targetIndices[index] < 0)
+            {
+                throw new EmbeddedSqlException(
+                    $"table {statement.TableName} has no column named {targetColumns[index]}");
+            }
+        }
+
+        var triggerContext = context with
+        {
+            TriggerConflictAlgorithm = statement.ConflictAlgorithm,
+        };
+        var sourceRows = statement.Source is null
+            ? null
+            : ExecuteQuery(statement.Source, parameters, triggerContext, triggerContext.TriggerRow).Rows;
+        var backup = CloneTables(context.Tables);
+        var returnedRows = new List<SqlValue[]>();
+        var triggerInvoked = false;
+        try
+        {
+            if (sourceRows is not null)
+            {
+                foreach (var values in sourceRows)
+                    InsertValues(values);
+            }
+            else
+            {
+                foreach (var expressions in statement.Rows)
+                {
+                    var values = expressions
+                        .Select(expression => Evaluate(expression, parameters, null, triggerContext))
+                        .ToArray();
+                    InsertValues(values);
+                }
+            }
         }
         catch (EmbeddedConflictFailException)
         {
@@ -3096,369 +3578,138 @@ public sealed class EmbeddedDatabase : IDisposable
             RestoreTables(context.Tables, backup);
             throw;
         }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Fail)
+        {
+            throw new EmbeddedConflictFailException(exception, GetLastInsertRowId(context));
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Rollback)
+        {
+            RestoreTables(context.Tables, backup);
+            throw new EmbeddedConflictRollbackException(exception, GetLastInsertRowId(context));
+        }
         catch
         {
             RestoreTables(context.Tables, backup);
             throw;
         }
 
-        void InsertExpressions(Expression[] values)
+        if (statement.Returning is null)
+            return new ExecutionResult([], [], 0, triggerInvoked);
+
+        var outputColumns = BuildOutputColumns(statement.TableName, columns);
+        foreach (var projection in statement.Returning)
         {
-            var plan = PrepareInsert(statement, table, context);
-            BuildAndCommitCandidate(() => BuildInsertRow(
-                statement,
-                table,
-                plan,
-                values,
-                parameters,
-                context,
-                allowExistingRowid: true));
+            if (projection.Expression is QualifiedStarExpression)
+                throw new EmbeddedSqlException("RETURNING may not use TABLE.* wildcards");
+            if (ContainsAggregate(projection.Expression) || ContainsWindowFunction(projection.Expression))
+                throw new EmbeddedSqlException("aggregate and window functions are not allowed in RETURNING");
         }
+
+        var resultRows = new List<SqlValue[]>(returnedRows.Count);
+        foreach (var returnedRow in returnedRows)
+        {
+            var source = new SourceRow(
+                columns,
+                returnedRow,
+                BuildQualifiedColumns(statement.TableName, columns),
+                OutputColumns: outputColumns);
+            var resultRow = new List<SqlValue>();
+            foreach (var projection in statement.Returning)
+            {
+                if (projection.Expression is StarExpression)
+                    resultRow.AddRange(returnedRow);
+                else
+                    resultRow.Add(Evaluate(projection.Expression, parameters, source, context));
+            }
+            resultRows.Add(resultRow.ToArray());
+        }
+
+        return new ExecutionResult(
+            GetColumnNames(statement.Returning, outputColumns, outputColumns),
+            resultRows,
+            0,
+            triggerInvoked);
 
         void InsertValues(IReadOnlyList<SqlValue> values)
         {
-            var plan = PrepareInsert(statement, table, context);
-            BuildAndCommitCandidate(() => BuildInsertRow(
-                statement,
-                table,
-                plan,
-                values,
-                parameters,
-                context,
-                allowExistingRowid: true));
-        }
+            if (values.Count != targetIndices.Length)
+                throw new EmbeddedSqlException("table has a different number of columns");
 
-        void BuildAndCommitCandidate(Func<(SqlValue[] Row, long RowId)> build)
-        {
-            SqlValue[]? row = null;
-            var rowId = 0L;
-            try
-            {
-                (row, rowId) = build();
-                CommitInserts(context, statement.TableName, table, [row], [rowId]);
-                insertedRows.Add(row);
-                insertedRowIds.Add(rowId);
-            }
-            catch (EmbeddedSqlException exception)
-            {
-                switch (exception.ConflictAlgorithm)
-                {
-                    case InsertConflictAlgorithm.Ignore:
-                        return;
-                    case InsertConflictAlgorithm.Fail:
-                        if (insertedRows.Count > 0)
-                        {
-                            throw new EmbeddedConflictFailException(
-                                exception,
-                                table.HasRowid ? insertedRowIds[^1] : context.LastInsertRowId);
-                        }
-                        throw;
-                    case InsertConflictAlgorithm.Rollback:
-                        throw new EmbeddedConflictRollbackException(exception);
-                    case InsertConflictAlgorithm.Replace
-                        when row is not null
-                            && exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal):
-                        CommitReplacement(
-                            context,
-                            statement.TableName,
-                            table,
-                            row,
-                            rowId,
-                            deleteTriggers: [],
-                            insertTriggers: []);
-                        insertedRows.Add(row);
-                        insertedRowIds.Add(rowId);
-                        return;
-                    default:
-                        throw;
-                }
-            }
+            var row = Enumerable.Repeat(SqlValue.Null, columns.Length).ToArray();
+            for (var index = 0; index < values.Count; index++)
+                row[targetIndices[index]] = values[index];
+            triggerInvoked = true;
+            var ignored = FireTriggers(
+                triggers,
+                triggerContext,
+                new TriggerRowFrame(null, null, row, null));
+            if (!ignored)
+                returnedRows.Add(row);
         }
     }
 
-    private ExecutionResult ExecuteConflictResolvedInsert(
-        InsertStatement statement,
-        InsertConflictAlgorithm algorithm,
-        SqlValue[] parameters,
-        QueryContext context)
-    {
-        if (statement.Upsert is not null)
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSERT OR conflict resolution cannot be combined with an ON CONFLICT UPSERT clause.");
-        }
-        if (context.InsideTrigger)
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSERT OR conflict resolution is not supported inside trigger bodies.");
-        }
-        if (!context.Tables.TryGetValue(statement.TableName, out var table))
-            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
-        if (algorithm != InsertConflictAlgorithm.Replace
-            && GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert).Count > 0)
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSERT OR conflict resolution does not support target tables with INSERT triggers.");
-        }
-
-        return algorithm switch
-        {
-            InsertConflictAlgorithm.Abort => ExecuteAbortInsert(statement, parameters, context),
-            InsertConflictAlgorithm.Rollback => ExecuteRollbackInsert(statement, parameters, context),
-            InsertConflictAlgorithm.Ignore or InsertConflictAlgorithm.Fail => ExecuteRowwiseConflictInsert(
-                statement,
-                algorithm,
-                table,
-                parameters,
-                context),
-            InsertConflictAlgorithm.Replace => ExecuteReplaceInsert(statement, table, parameters, context),
-            _ => throw new InvalidOperationException("Unknown INSERT conflict algorithm."),
-        };
-    }
-
-    private ExecutionResult ExecuteAbortInsert(
-        InsertStatement statement,
-        SqlValue[] parameters,
-        QueryContext context)
-    {
-        var backup = CloneTables(context.Tables);
-        try
-        {
-            return PerformInsertEvaluated(statement, parameters, context);
-        }
-        catch
-        {
-            RestoreTables(context.Tables, backup);
-            throw;
-        }
-    }
-
-    private ExecutionResult ExecuteRollbackInsert(
-        InsertStatement statement,
-        SqlValue[] parameters,
-        QueryContext context)
-    {
-        var backup = CloneTables(context.Tables);
-        try
-        {
-            return PerformInsertEvaluated(statement, parameters, context);
-        }
-        catch (EmbeddedStatementAbortException exception)
-        {
-            RestoreTables(context.Tables, backup);
-            if (IsConflictAlgorithmConstraint(exception))
-            {
-                throw new EmbeddedConflictRollbackException(
-                    exception,
-                    exception.LastInsertRowId);
-            }
-
-            throw;
-        }
-        catch (EmbeddedSqlException exception)
-        {
-            RestoreTables(context.Tables, backup);
-            if (IsConflictAlgorithmConstraint(exception))
-                throw new EmbeddedConflictRollbackException(exception);
-
-            throw;
-        }
-        catch
-        {
-            RestoreTables(context.Tables, backup);
-            throw;
-        }
-    }
-
-    private ExecutionResult ExecuteRowwiseConflictInsert(
-        InsertStatement statement,
-        InsertConflictAlgorithm algorithm,
-        EmbeddedTable table,
-        SqlValue[] parameters,
-        QueryContext context)
-    {
-        if (context.CommonTableExpressions.Count != 0)
-        {
-            throw new EmbeddedSqlException(
-                $"Managed INSERT OR {algorithm.ToString().ToUpperInvariant()} does not support CTE sources.");
-        }
-        var sourceRows = statement.Source is null
-            ? null
-            : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
-        var backup = CloneTables(context.Tables);
-        var insertedRows = new List<SqlValue[]>();
-        var insertedRowIds = new List<long>();
-        try
-        {
-            if (sourceRows is not null)
-            {
-                foreach (var sourceRow in sourceRows)
-                    InsertConflictValues(sourceRow);
-            }
-            else
-            {
-                foreach (var values in statement.Rows)
-                    InsertConflictExpressions(values);
-            }
-
-            var lastInsertRowId = table.HasRowid && insertedRowIds.Count > 0
-                ? insertedRowIds[^1]
-                : (long?)null;
-            return BuildConflictInsertResult(
-                statement,
-                table,
-                insertedRows,
-                insertedRowIds,
-                parameters,
-                context,
-                lastInsertRowId);
-        }
-        catch (EmbeddedSqlException exception) when (
-            algorithm == InsertConflictAlgorithm.Fail && IsConflictAlgorithmConstraint(exception))
-        {
-            if (insertedRows.Count > 0)
-            {
-                throw new EmbeddedConflictFailException(
-                    exception,
-                    table.HasRowid ? insertedRowIds[^1] : context.LastInsertRowId);
-            }
-
-            throw;
-        }
-        catch
-        {
-            RestoreTables(context.Tables, backup);
-            throw;
-        }
-
-        void InsertConflictExpressions(Expression[] values)
-        {
-            var plan = PrepareInsert(statement, table, context);
-            try
-            {
-                var (row, rowId) = BuildInsertRow(statement, table, plan, values, parameters, context);
-                CommitInserts(context, statement.TableName, table, [row], [rowId]);
-                insertedRows.Add(row);
-                insertedRowIds.Add(rowId);
-            }
-            catch (EmbeddedSqlException exception)
-                when (algorithm == InsertConflictAlgorithm.Ignore && IsConflictAlgorithmConstraint(exception))
-            {
-            }
-        }
-
-        void InsertConflictValues(IReadOnlyList<SqlValue> values)
-        {
-            var plan = PrepareInsert(statement, table, context);
-            try
-            {
-                var (row, rowId) = BuildInsertRow(statement, table, plan, values, parameters, context);
-                CommitInserts(context, statement.TableName, table, [row], [rowId]);
-                insertedRows.Add(row);
-                insertedRowIds.Add(rowId);
-            }
-            catch (EmbeddedSqlException exception)
-                when (algorithm == InsertConflictAlgorithm.Ignore && IsConflictAlgorithmConstraint(exception))
-            {
-            }
-        }
-    }
-
-    private ExecutionResult ExecuteReplaceInsert(
+    private void ValidateInsertReturning(
         InsertStatement statement,
         EmbeddedTable table,
-        SqlValue[] parameters,
+        QueryContext context)
+        => ValidateTableReturning(
+            statement.Returning,
+            statement.TableName,
+            table,
+            context);
+
+    private void ValidateTableReturning(
+        IReadOnlyList<Projection>? returning,
+        string tableName,
+        EmbeddedTable table,
         QueryContext context)
     {
-        if (context.CommonTableExpressions.Count != 0)
-            throw new EmbeddedSqlException("Managed INSERT OR REPLACE does not support CTE sources.");
-        var sourceRows = statement.Source is null
-            ? null
-            : ExecuteQuery(statement.Source, parameters, context, outerRow: null).Rows;
-        var backup = CloneTables(context.Tables);
-        var insertedRows = new List<SqlValue[]>();
-        var insertedRowIds = new List<long>();
-        var deleteTriggers = context.RecursiveTriggersEnabled
-            ? GetMatchingTriggers(context, statement.TableName, TriggerEvent.Delete)
-            : Array.Empty<TriggerDefinition>();
-        var insertTriggers = GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert);
-        try
-        {
-            if (sourceRows is not null)
-            {
-                foreach (var sourceRow in sourceRows)
-                    ReplaceValues(sourceRow);
-            }
-            else
-            {
-                foreach (var values in statement.Rows)
-                    ReplaceExpressions(values);
-            }
+        if (returning is null)
+            return;
 
-            var lastInsertRowId = table.HasRowid && insertedRowIds.Count > 0
-                ? insertedRowIds[^1]
-                : (long?)null;
-            var result = BuildConflictInsertResult(
-                statement,
-                table,
-                insertedRows,
-                insertedRowIds,
-                parameters,
-                context,
-                lastInsertRowId);
-
-            return result;
-        }
-        catch
+        var row = CreateSchemaValidationRow(tableName, table, context.TriggerRow);
+        foreach (var projection in returning)
         {
-            RestoreTables(context.Tables, backup);
-            throw;
-        }
-
-        void ReplaceExpressions(Expression[] values)
-        {
-            var plan = PrepareInsert(statement, table, context);
-            var (row, rowId) = BuildInsertRow(
-                statement,
-                table,
-                plan,
-                values,
-                parameters,
-                context,
-                allowExistingRowid: true);
-            CommitReplacement(
-                context,
-                statement.TableName,
-                table,
+            if (projection.Expression is QualifiedStarExpression)
+                throw new EmbeddedSqlException("RETURNING may not use TABLE.* wildcards");
+            if (ContainsAggregate(projection.Expression) || ContainsWindowFunction(projection.Expression))
+                throw new EmbeddedSqlException("aggregate and window functions are not allowed in RETURNING");
+            ValidateExpressionSchema(
+                projection.Expression,
                 row,
-                rowId,
-                deleteTriggers,
-                insertTriggers);
-            insertedRows.Add(row);
-            insertedRowIds.Add(rowId);
+                context,
+                context.CancellationToken);
         }
+    }
 
-        void ReplaceValues(IReadOnlyList<SqlValue> values)
+    private void ValidateViewInsertReturning(
+        InsertStatement statement,
+        string[] columns,
+        QueryContext context)
+    {
+        if (statement.Returning is null)
+            return;
+
+        var outputColumns = BuildOutputColumns(statement.TableName, columns);
+        var row = new SourceRow(
+            columns,
+            Enumerable.Repeat(SqlValue.Null, columns.Length).ToArray(),
+            BuildQualifiedColumns(statement.TableName, columns),
+            context.TriggerRow,
+            outputColumns);
+        foreach (var projection in statement.Returning)
         {
-            var plan = PrepareInsert(statement, table, context);
-            var (row, rowId) = BuildInsertRow(
-                statement,
-                table,
-                plan,
-                values,
-                parameters,
-                context,
-                allowExistingRowid: true);
-            CommitReplacement(
-                context,
-                statement.TableName,
-                table,
+            if (projection.Expression is QualifiedStarExpression)
+                throw new EmbeddedSqlException("RETURNING may not use TABLE.* wildcards");
+            if (ContainsAggregate(projection.Expression) || ContainsWindowFunction(projection.Expression))
+                throw new EmbeddedSqlException("aggregate and window functions are not allowed in RETURNING");
+            ValidateExpressionSchema(
+                projection.Expression,
                 row,
-                rowId,
-                deleteTriggers,
-                insertTriggers);
-            insertedRows.Add(row);
-            insertedRowIds.Add(rowId);
+                context,
+                context.CancellationToken);
         }
     }
 
@@ -3469,7 +3720,8 @@ public sealed class EmbeddedDatabase : IDisposable
         IReadOnlyList<long> insertedRowIds,
         SqlValue[] parameters,
         QueryContext context,
-        long? lastInsertRowId)
+        long? lastInsertRowId,
+        bool updateLastInsertRowIdPerRow = false)
     {
         if (statement.Returning is not null)
         {
@@ -3483,7 +3735,8 @@ public sealed class EmbeddedDatabase : IDisposable
                 insertedRows.Count > 0,
                 parameters,
                 context,
-                lastInsertRowId);
+                lastInsertRowId,
+                updateLastInsertRowIdPerRow);
         }
 
         return new ExecutionResult([], [], insertedRows.Count, insertedRows.Count > 0)
@@ -3498,12 +3751,11 @@ public sealed class EmbeddedDatabase : IDisposable
         EmbeddedTable table,
         SqlValue[] candidate,
         long candidateRowId,
-        IReadOnlyList<TriggerDefinition> deleteTriggers,
-        IReadOnlyList<TriggerDefinition> insertTriggers)
+        IReadOnlyList<TriggerDefinition> beforeDeleteTriggers,
+        IReadOnlyList<TriggerDefinition> afterDeleteTriggers)
     {
         var conflicts = FindReplacementConflicts(table, candidate, candidateRowId);
         var conflictedRowIds = conflicts
-            .OrderBy(index => index)
             .Select(index => table.RowIds[index])
             .ToArray();
         var rows = new List<SqlValue[]>(table.Rows.Count - conflicts.Count + 1);
@@ -3532,27 +3784,85 @@ public sealed class EmbeddedDatabase : IDisposable
             if (conflictIndex < 0)
                 continue;
 
-            var originalRows = table.Rows.ToArray();
             var deletedRow = table.Rows[conflictIndex];
+            var frame = new TriggerRowFrame(
+                deletedRow,
+                table.HasRowid ? conflictedRowId : null,
+                null,
+                null);
+            if (beforeDeleteTriggers.Count > 0)
+            {
+                var ignored = FireTriggers(beforeDeleteTriggers, context, frame);
+                if (ignored)
+                    continue;
+            }
+
+            conflictIndex = table.RowIds.IndexOf(conflictedRowId);
+            if (conflictIndex < 0)
+                continue;
+            var originalRows = table.Rows.ToArray();
+            deletedRow = table.Rows[conflictIndex];
             table.Rows.RemoveAt(conflictIndex);
             table.RowIds.RemoveAt(conflictIndex);
             if (table.HasRowid)
                 RecordBlobMutation(tableName, conflictedRowId);
             ValidateForeignKeysAfterDelete(context, tableName, table, originalRows, rows, [deletedRow]);
-            if (deleteTriggers.Count > 0)
-                FireTriggers(deleteTriggers, context);
+            if (afterDeleteTriggers.Count > 0)
+            {
+                _ = FireTriggers(
+                    afterDeleteTriggers,
+                    context,
+                    frame);
+            }
         }
 
         CommitInserts(context, tableName, table, [candidate], [candidateRowId]);
-        if (insertTriggers.Count > 0)
-            FireTriggers(insertTriggers, context);
     }
 
-    private HashSet<int> FindReplacementConflicts(
+    private IReadOnlyList<int> FindReplacementConflicts(
         EmbeddedTable table,
         SqlValue[] candidate,
         long candidateRowId)
     {
+        var conflicts = new List<int>();
+        var seen = new HashSet<int>();
+        void AddConflict(int position)
+        {
+            if (seen.Add(position))
+                conflicts.Add(position);
+        }
+
+        if (table.HasRowid)
+        {
+            var rowidConflict = table.RowIds.IndexOf(candidateRowId);
+            if (rowidConflict >= 0)
+                AddConflict(rowidConflict);
+        }
+        else if (table.PrimaryKeyColumns.Count > 0)
+        {
+            var primaryKey = table.PrimaryKeyColumns
+                .Select((entry, position) => new UpsertConflictColumn(
+                    table.Columns[entry.Index],
+                    entry.Index,
+                    table.TableLevelPrimaryKey?[position].Collation
+                        ?? table.ColumnDefinitions[entry.Index].Collation))
+                .ToArray();
+            for (var position = 0; position < table.Rows.Count; position++)
+            {
+                if (RowsConflictOnConstraint(table.Rows[position], candidate, primaryKey))
+                    AddConflict(position);
+            }
+        }
+
+        foreach (var index in table.Indexes.Where(index => index.Unique).Reverse())
+        {
+            for (var position = 0; position < table.Rows.Count; position++)
+            {
+                if (RowsConflictOnIndex(table, index, table.Rows[position], candidate))
+                    AddConflict(position);
+            }
+        }
+
         var constraints = new List<IReadOnlyList<UpsertConflictColumn>>();
         for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
         {
@@ -3572,16 +3882,10 @@ public sealed class EmbeddedDatabase : IDisposable
                 .ToArray());
         }
 
-        var conflicts = new HashSet<int>();
         for (var position = 0; position < table.Rows.Count; position++)
         {
-            if (table.RowIds[position] == candidateRowId
-                || constraints.Any(constraint => RowsConflictOnConstraint(table.Rows[position], candidate, constraint))
-                || table.Indexes.Any(index =>
-                    index.Unique && RowsConflictOnIndex(table, index, table.Rows[position], candidate)))
-            {
-                conflicts.Add(position);
-            }
+            if (constraints.Any(constraint => RowsConflictOnConstraint(table.Rows[position], candidate, constraint)))
+                AddConflict(position);
         }
 
         return conflicts;
@@ -3615,25 +3919,42 @@ public sealed class EmbeddedDatabase : IDisposable
     private ExecutionResult ExecuteUpsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
         var backup = CloneTables(context.Tables);
+        var upsertContext = context with
+        {
+            TriggerConflictAlgorithm = statement.ConflictAlgorithm,
+        };
+        var initialLastInsertRowId = GetLastInsertRowId(upsertContext);
         try
         {
-            var (result, mutationEvents) = PerformUpsertEvaluated(statement, parameters, context);
-            foreach (var triggerEvent in mutationEvents)
-            {
-                var triggers = GetMatchingTriggers(context, statement.TableName, triggerEvent);
-                if (triggers.Count == 0)
-                    continue;
-
-                if (context.InsideTrigger)
-                {
-                    throw new EmbeddedSqlException(
-                        $"cannot modify {statement.TableName} within a trigger body: recursive triggers are not supported");
-                }
-
-                FireTriggers(triggers, context);
-            }
-
-            return result;
+            return PerformUpsertEvaluated(statement, parameters, upsertContext);
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Fail)
+        {
+            throw new EmbeddedConflictFailException(exception, GetLastInsertRowId(upsertContext));
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Rollback)
+        {
+            RestoreTables(context.Tables, backup);
+            throw new EmbeddedConflictRollbackException(exception, GetLastInsertRowId(upsertContext));
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
+        }
+        catch (EmbeddedConflictRollbackException)
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            var failedLastInsertRowId = GetLastInsertRowId(upsertContext);
+            RestoreTables(context.Tables, backup);
+            if (failedLastInsertRowId != initialLastInsertRowId)
+                throw new EmbeddedStatementAbortException(exception, failedLastInsertRowId);
+            throw;
         }
         catch
         {
@@ -3642,7 +3963,7 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    private (ExecutionResult Result, IReadOnlyList<TriggerEvent> MutationEvents) PerformUpsertEvaluated(
+    private ExecutionResult PerformUpsertEvaluated(
         InsertStatement statement,
         SqlValue[] parameters,
         QueryContext context)
@@ -3678,12 +3999,58 @@ public sealed class EmbeddedDatabase : IDisposable
             ValidateUpsertUpdateExpressions(statement.TableName, updateAction.Assignments, updateAction.Where);
         }
 
+        var beforeInsertTriggers = GetMatchingTriggers(
+            context,
+            statement.TableName,
+            TriggerEvent.Insert,
+            TriggerTiming.Before);
+        var afterInsertTriggers = GetMatchingTriggers(
+            context,
+            statement.TableName,
+            TriggerEvent.Insert,
+            TriggerTiming.After);
+        var beforeDeleteTriggers = context.RecursiveTriggersEnabled
+            ? GetMatchingTriggers(
+                context,
+                statement.TableName,
+                TriggerEvent.Delete,
+                TriggerTiming.Before)
+            : [];
+        var afterDeleteTriggers = context.RecursiveTriggersEnabled
+            ? GetMatchingTriggers(
+                context,
+                statement.TableName,
+                TriggerEvent.Delete,
+                TriggerTiming.After)
+            : [];
+        var updatedColumns = updateAction?.Assignments
+            .Select(assignment => assignment.Column)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var beforeUpdateTriggers = updateAction is null
+            ? []
+            : GetMatchingTriggers(
+                context,
+                statement.TableName,
+                TriggerEvent.Update,
+                TriggerTiming.Before,
+                updatedColumns);
+        var afterUpdateTriggers = updateAction is null
+            ? []
+            : GetMatchingTriggers(
+                context,
+                statement.TableName,
+                TriggerEvent.Update,
+                TriggerTiming.After,
+                updatedColumns);
         var affectedRows = new List<SqlValue[]>();
         var affectedRowIds = new List<long>();
-        var mutationEvents = new List<TriggerEvent>();
+        var affectedLastInsertRowIds = new List<long>();
         long? lastInsertRowId = null;
         foreach (var values in statement.Rows)
         {
+            var deferredRowId = table.HasRowid && beforeInsertTriggers.Count > 0
+                ? new DeferredInsertRowId()
+                : null;
             var (candidate, candidateRowId) = BuildInsertRow(
                 statement,
                 table,
@@ -3691,7 +4058,66 @@ public sealed class EmbeddedDatabase : IDisposable
                 values,
                 parameters,
                 context,
-                allowExistingRowid: true);
+                allowExistingRowid: true,
+                validateChecks: false,
+                applyNotNullReplacement: false,
+                deferredRowId: deferredRowId);
+            var insertFrame = new TriggerRowFrame(
+                null,
+                null,
+                candidate,
+                table.HasRowid ? candidateRowId : null);
+            if (beforeInsertTriggers.Count > 0
+                && FireUpsertTriggers(beforeInsertTriggers, insertFrame))
+            {
+                continue;
+            }
+
+            try
+            {
+                ApplyNotNullReplacement(statement, table, candidate, context);
+                if (deferredRowId is not null)
+                {
+                    candidateRowId = FinalizeDeferredInsertRowId(
+                        statement,
+                        table,
+                        candidate,
+                        parameters,
+                        context,
+                        deferredRowId);
+                    insertFrame = new TriggerRowFrame(null, null, candidate, candidateRowId);
+                }
+                ValidateCheckConstraints(
+                    statement.TableName,
+                    table,
+                    candidate,
+                    candidateRowId,
+                    parameters,
+                    context);
+                table.ValidateRows(statement.TableName, [candidate]);
+                ValidatePrimaryKey(statement.TableName, table, [candidate]);
+            }
+            catch (EmbeddedSqlException exception) when (IsConflictAlgorithmConstraint(exception))
+            {
+                var effectiveAlgorithm = statement.ConflictAlgorithm
+                    ?? exception.ConflictAlgorithm
+                    ?? InsertConflictAlgorithm.Abort;
+                switch (effectiveAlgorithm)
+                {
+                    case InsertConflictAlgorithm.Ignore:
+                        continue;
+                    case InsertConflictAlgorithm.Fail:
+                        throw new EmbeddedConflictFailException(
+                            exception,
+                            GetLastInsertRowId(context));
+                    case InsertConflictAlgorithm.Rollback:
+                        throw new EmbeddedConflictRollbackException(
+                            exception,
+                            GetLastInsertRowId(context));
+                    default:
+                        throw;
+                }
+            }
             var conflictPosition = FindUpsertConflictPosition(table, conflictTarget, candidate, table.Rows);
 
             if (conflictPosition < 0)
@@ -3703,27 +4129,68 @@ public sealed class EmbeddedDatabase : IDisposable
                 rowIds.AddRange(table.RowIds);
                 rowIds.Add(candidateRowId);
 
-                ValidateRowIdsUnique(statement.TableName, table, rowIds, table.RowidAliasColumnIndex);
-                table.ValidateRows(statement.TableName, rows);
-                ValidateColumnUniqueConstraints(table, rows);
-                ValidatePrimaryKey(statement.TableName, table, rows);
-                ValidateUniqueIndexes(statement.TableName, table, rows);
-                ValidateForeignKeysAfterInsert(context, statement.TableName, table, [candidate], rows);
-                ApplyUpsertRows(table, rows, rowIds);
+                try
+                {
+                    ValidateRowIdsUnique(statement.TableName, table, rowIds, table.RowidAliasColumnIndex);
+                    table.ValidateRows(statement.TableName, rows);
+                    ValidateColumnUniqueConstraints(table, rows);
+                    ValidatePrimaryKey(statement.TableName, table, rows);
+                    ValidateUniqueIndexes(statement.TableName, table, rows);
+                    ValidateForeignKeysAfterInsert(context, statement.TableName, table, [candidate], rows);
+                    ApplyUpsertRows(table, rows, rowIds);
+                }
+                catch (EmbeddedSqlException exception) when (IsConflictAlgorithmConstraint(exception))
+                {
+                    var effectiveAlgorithm = statement.ConflictAlgorithm
+                        ?? exception.ConflictAlgorithm
+                        ?? InsertConflictAlgorithm.Abort;
+                    switch (effectiveAlgorithm)
+                    {
+                        case InsertConflictAlgorithm.Ignore:
+                            continue;
+                        case InsertConflictAlgorithm.Fail:
+                            throw new EmbeddedConflictFailException(
+                                exception,
+                                GetLastInsertRowId(context));
+                        case InsertConflictAlgorithm.Rollback:
+                            throw new EmbeddedConflictRollbackException(
+                                exception,
+                                GetLastInsertRowId(context));
+                        case InsertConflictAlgorithm.Replace
+                            when exception.Message.StartsWith(
+                                "UNIQUE constraint failed:",
+                                StringComparison.Ordinal):
+                            CommitReplacement(
+                                context,
+                                statement.TableName,
+                                table,
+                                candidate,
+                                candidateRowId,
+                                beforeDeleteTriggers,
+                                afterDeleteTriggers);
+                            break;
+                        default:
+                            throw;
+                    }
+                }
 
                 affectedRows.Add(candidate);
                 affectedRowIds.Add(candidateRowId);
                 if (table.HasRowid)
+                {
                     lastInsertRowId = candidateRowId;
-                if (!mutationEvents.Contains(TriggerEvent.Insert))
-                    mutationEvents.Add(TriggerEvent.Insert);
+                    SetLastInsertRowId(context, candidateRowId);
+                }
+                if (afterInsertTriggers.Count > 0)
+                    _ = FireUpsertTriggers(afterInsertTriggers, insertFrame);
+                affectedLastInsertRowIds.Add(GetLastInsertRowId(context));
                 continue;
             }
 
             if (updateAction is null)
                 continue;
 
-            var original = table.Rows[conflictPosition];
+            var original = table.Rows[conflictPosition].ToArray();
             var originalRowId = table.RowIds[conflictPosition];
             var source = CreateUpsertSourceRow(
                 statement.TableName,
@@ -3746,10 +4213,20 @@ public sealed class EmbeddedDatabase : IDisposable
                 source,
                 parameters,
                 context);
+            var updateFrame = new TriggerRowFrame(
+                original,
+                table.HasRowid ? originalRowId : null,
+                updated,
+                table.HasRowid ? originalRowId : null);
+            if (beforeUpdateTriggers.Count > 0
+                && FireUpsertTriggers(beforeUpdateTriggers, updateFrame))
+            {
+                continue;
+            }
+
             var updatedRows = new List<SqlValue[]>(table.Rows);
             updatedRows[conflictPosition] = updated;
             var updatedRowIds = new List<long>(table.RowIds);
-
             ValidateRowIdsUnique(statement.TableName, table, updatedRowIds, updatePlan!.AliasIndex);
             table.ValidateRows(statement.TableName, updatedRows);
             ValidateColumnUniqueConstraints(table, updatedRows);
@@ -3768,22 +4245,42 @@ public sealed class EmbeddedDatabase : IDisposable
 
             affectedRows.Add(updated);
             affectedRowIds.Add(originalRowId);
-            if (!mutationEvents.Contains(TriggerEvent.Update))
-                mutationEvents.Add(TriggerEvent.Update);
+            if (afterUpdateTriggers.Count > 0)
+                _ = FireUpsertTriggers(afterUpdateTriggers, updateFrame);
+            affectedLastInsertRowIds.Add(GetLastInsertRowId(context));
         }
 
-        return (
-            BuildUpsertReturningResult(
-                statement,
-                table,
-                affectedRows,
-                affectedRowIds,
-                parameters,
-                context,
-                rowsAffected: affectedRows.Count,
-                changed: affectedRows.Count > 0,
-                lastInsertRowId: lastInsertRowId),
-            mutationEvents);
+        return BuildUpsertReturningResult(
+            statement,
+            table,
+            affectedRows,
+            affectedRowIds,
+            parameters,
+            context,
+            rowsAffected: affectedRows.Count,
+            changed: affectedRows.Count > 0,
+            lastInsertRowId: lastInsertRowId,
+            lastInsertRowIdSnapshots: affectedLastInsertRowIds);
+
+        bool FireUpsertTriggers(
+            IReadOnlyList<TriggerDefinition> triggers,
+            TriggerRowFrame frame)
+        {
+            try
+            {
+                return FireTriggers(triggers, context, frame);
+            }
+            catch (EmbeddedTriggerRaiseException exception)
+                when (exception.Algorithm == InsertConflictAlgorithm.Fail)
+            {
+                throw new EmbeddedConflictFailException(exception, GetLastInsertRowId(context));
+            }
+            catch (EmbeddedTriggerRaiseException exception)
+                when (exception.Algorithm == InsertConflictAlgorithm.Rollback)
+            {
+                throw new EmbeddedConflictRollbackException(exception, GetLastInsertRowId(context));
+            }
+        }
     }
 
     private void ApplyUpsertRows(EmbeddedTable table, List<SqlValue[]> rows, List<long> rowIds)
@@ -3804,7 +4301,8 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         int rowsAffected,
         bool changed,
-        long? lastInsertRowId)
+        long? lastInsertRowId,
+        IReadOnlyList<long> lastInsertRowIdSnapshots)
     {
         if (statement.Returning is null)
         {
@@ -3824,7 +4322,8 @@ public sealed class EmbeddedDatabase : IDisposable
             changed,
             parameters,
             context,
-            lastInsertRowId);
+            lastInsertRowId,
+            lastInsertRowIdSnapshots: lastInsertRowIdSnapshots);
     }
 
     private UpsertConflictTarget ResolveUpsertConflictTarget(
@@ -3839,7 +4338,8 @@ public sealed class EmbeddedDatabase : IDisposable
         var matches = new List<UpsertConflictTarget>();
         foreach (var index in table.Indexes)
         {
-            if (!index.Unique
+            if (index.Origin == EmbeddedIndexOrigin.PrimaryKey
+                || !index.Unique
                 || !IndexExpressionSemantics.ExpressionsEqual(upsert.TargetWhere, index.Where)
                 || !UpsertTargetMatches(table, target, index.Columns))
             {
@@ -4633,13 +5133,26 @@ public sealed class EmbeddedDatabase : IDisposable
         Expression[] valueExpressions,
         SqlValue[] parameters,
         QueryContext context,
-        bool allowExistingRowid = false)
+        bool allowExistingRowid = false,
+        bool validateChecks = true,
+        bool applyNotNullReplacement = true,
+        DeferredInsertRowId? deferredRowId = null)
     {
         var values = new SqlValue[valueExpressions.Length];
         for (var index = 0; index < valueExpressions.Length; index++)
             values[index] = Evaluate(valueExpressions[index], parameters, null, context);
 
-        return BuildInsertRow(statement, table, plan, values, parameters, context, allowExistingRowid);
+        return BuildInsertRow(
+            statement,
+            table,
+            plan,
+            values,
+            parameters,
+            context,
+            allowExistingRowid,
+            validateChecks,
+            applyNotNullReplacement,
+            deferredRowId);
     }
 
     private (SqlValue[] Row, long RowId) BuildInsertRow(
@@ -4649,7 +5162,10 @@ public sealed class EmbeddedDatabase : IDisposable
         IReadOnlyList<SqlValue> values,
         SqlValue[] parameters,
         QueryContext context,
-        bool allowExistingRowid = false)
+        bool allowExistingRowid = false,
+        bool validateChecks = true,
+        bool applyNotNullReplacement = true,
+        DeferredInsertRowId? deferredRowId = null)
     {
         if (values.Count != plan.TargetIndices.Length)
             throw new EmbeddedSqlException("table has a different number of columns");
@@ -4667,6 +5183,88 @@ public sealed class EmbeddedDatabase : IDisposable
                 row[plan.TargetIndices[index]] = value;
         }
 
+        if (applyNotNullReplacement)
+            ApplyNotNullReplacement(statement, table, row, context);
+
+        table.ApplyAffinities(row);
+
+        // The rowid pseudo-column overrides the alias column when both are supplied,
+        // matching SQLite; otherwise a rowid-alias table takes the alias column value.
+        var rowidSource = plan.RowidTargetPosition >= 0
+            ? explicitRowidValue
+            : plan.AliasIndex >= 0 ? row[plan.AliasIndex] : SqlValue.Null;
+
+        long rowid;
+        if (rowidSource.Kind == SqlValueKind.Null)
+        {
+            if (deferredRowId is not null)
+            {
+                deferredRowId.IsImplicit = true;
+                rowid = -1;
+            }
+            else
+            {
+                rowid = plan.AutoIncrement is null
+                    ? plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1
+                    : plan.AutoIncrement.NextRowId(plan.AnyRow, plan.LargestRowId);
+                plan.Used.Add(rowid);
+            }
+        }
+        else if (EmbeddedTable.TryCoerceRowid(rowidSource, out var explicitRowid))
+        {
+            rowid = explicitRowid;
+            if (deferredRowId is not null)
+            {
+                deferredRowId.ExplicitRowId = explicitRowid;
+            }
+            else
+            {
+                plan.AutoIncrement?.Observe(rowid);
+                if (!plan.Used.Add(rowid))
+                {
+                    if (!allowExistingRowid)
+                    {
+                        var conflictColumn = plan.AliasIndex >= 0 ? table.Columns[plan.AliasIndex] : "rowid";
+                        throw new EmbeddedSqlException(
+                            $"UNIQUE constraint failed: {statement.TableName}.{conflictColumn}",
+                            plan.AliasIndex >= 0
+                                ? table.RowidAliasConflictAlgorithm
+                                : null);
+                    }
+                }
+            }
+        }
+        else
+        {
+            throw new EmbeddedSqlException("datatype mismatch");
+        }
+
+        if (deferredRowId is null)
+        {
+            if (!plan.AnyRow || rowid > plan.LargestRowId)
+                plan.LargestRowId = rowid;
+            plan.AnyRow = true;
+        }
+
+        // A rowid-alias column stores exactly the rowid value.
+        if (plan.AliasIndex >= 0)
+            row[plan.AliasIndex] = SqlValue.Integer(rowid);
+
+        // Generated columns are computed after the base columns (and any rowid alias)
+        // are final, so they can reference every stored column value.
+        ComputeGeneratedColumns(table, statement.TableName, row, parameters, context);
+        if (validateChecks)
+            ValidateCheckConstraints(statement.TableName, table, row, rowid, parameters, context);
+
+        return (row, rowid);
+    }
+
+    private void ApplyNotNullReplacement(
+        InsertStatement statement,
+        EmbeddedTable table,
+        SqlValue[] row,
+        QueryContext context)
+    {
         for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
         {
             var column = table.ColumnDefinitions[columnIndex];
@@ -4684,59 +5282,40 @@ public sealed class EmbeddedDatabase : IDisposable
                 : column.DefaultValue
                     ?? throw new InvalidOperationException("Default metadata is incomplete.");
         }
+    }
 
-        table.ApplyAffinities(row);
-
-        // The rowid pseudo-column overrides the alias column when both are supplied,
-        // matching SQLite; otherwise a rowid-alias table takes the alias column value.
-        var rowidSource = plan.RowidTargetPosition >= 0
-            ? explicitRowidValue
-            : plan.AliasIndex >= 0 ? row[plan.AliasIndex] : SqlValue.Null;
-
-        long rowid;
-        if (rowidSource.Kind == SqlValueKind.Null)
+    private long FinalizeDeferredInsertRowId(
+        InsertStatement statement,
+        EmbeddedTable table,
+        SqlValue[] row,
+        SqlValue[] parameters,
+        QueryContext context,
+        DeferredInsertRowId deferredRowId)
+    {
+        var anyRow = table.RowIds.Count > 0;
+        var largestRowId = anyRow ? table.RowIds.Max() : long.MinValue;
+        var tracker = table.IsAutoIncrement
+            ? context.AutoIncrementState?.GetTracker(statement.TableName, table, context.Tables)
+                ?? throw new InvalidOperationException("AUTOINCREMENT allocation is missing statement state.")
+            : null;
+        long rowId;
+        if (deferredRowId.IsImplicit)
         {
-            rowid = plan.AutoIncrement is null
-                ? plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1
-                : plan.AutoIncrement.NextRowId(plan.AnyRow, plan.LargestRowId);
-            plan.Used.Add(rowid);
-        }
-        else if (EmbeddedTable.TryCoerceRowid(rowidSource, out var explicitRowid))
-        {
-            rowid = explicitRowid;
-            plan.AutoIncrement?.Observe(rowid);
-            if (!plan.Used.Add(rowid))
-            {
-                if (!allowExistingRowid)
-                {
-                    var conflictColumn = plan.AliasIndex >= 0 ? table.Columns[plan.AliasIndex] : "rowid";
-                    throw new EmbeddedSqlException(
-                        $"UNIQUE constraint failed: {statement.TableName}.{conflictColumn}",
-                        plan.AliasIndex >= 0
-                            ? table.RowidAliasConflictAlgorithm
-                            : null);
-                }
-            }
+            rowId = tracker is null
+                ? anyRow ? NextAutoRowId(largestRowId, new HashSet<long>(table.RowIds)) : 1
+                : tracker.NextRowId(anyRow, largestRowId);
         }
         else
         {
-            throw new EmbeddedSqlException("datatype mismatch");
+            rowId = deferredRowId.ExplicitRowId
+                ?? throw new InvalidOperationException("Deferred explicit rowid state is incomplete.");
+            tracker?.Observe(rowId);
         }
 
-        if (!plan.AnyRow || rowid > plan.LargestRowId)
-            plan.LargestRowId = rowid;
-        plan.AnyRow = true;
-
-        // A rowid-alias column stores exactly the rowid value.
-        if (plan.AliasIndex >= 0)
-            row[plan.AliasIndex] = SqlValue.Integer(rowid);
-
-        // Generated columns are computed after the base columns (and any rowid alias)
-        // are final, so they can reference every stored column value.
+        if (table.RowidAliasColumnIndex >= 0)
+            row[table.RowidAliasColumnIndex] = SqlValue.Integer(rowId);
         ComputeGeneratedColumns(table, statement.TableName, row, parameters, context);
-        ValidateCheckConstraints(statement.TableName, table, row, rowid, parameters, context);
-
-        return (row, rowid);
+        return rowId;
     }
 
     // Validates the pending inserts against the whole table, then appends them and
@@ -4818,6 +5397,13 @@ public sealed class EmbeddedDatabase : IDisposable
         public long LargestRowId { get; set; }
 
         public AutoIncrementTracker? AutoIncrement { get; init; }
+    }
+
+    private sealed class DeferredInsertRowId
+    {
+        public bool IsImplicit { get; set; }
+
+        public long? ExplicitRowId { get; set; }
     }
 
     private static long CoerceSqliteSequenceInteger(SqlValue value)
@@ -4906,11 +5492,240 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        return ExecuteWithTriggers(
+        var updatedColumns = statement.Assignments
+            .Select(assignment => assignment.Column)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var beforeTriggers = GetMatchingTriggers(
+            context,
             statement.TableName,
             TriggerEvent.Update,
+            TriggerTiming.Before,
+            updatedColumns);
+        var afterTriggers = GetMatchingTriggers(
             context,
-            () => PerformUpdate(statement, parameters, context));
+            statement.TableName,
+            TriggerEvent.Update,
+            TriggerTiming.After,
+            updatedColumns);
+        if (beforeTriggers.Count > 0 || afterTriggers.Count > 0)
+        {
+            return context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(
+                    context,
+                    () => ExecuteUpdateWithRowTriggers(
+                        statement,
+                        parameters,
+                        context,
+                        beforeTriggers,
+                        afterTriggers))
+                : ExecuteUpdateWithRowTriggers(
+                    statement,
+                    parameters,
+                    context,
+                    beforeTriggers,
+                    afterTriggers);
+        }
+
+        return context.ForeignKeysEnabled
+            ? ExecuteWithForeignKeyStatement(
+                context,
+                () => PerformUpdate(statement, parameters, context))
+            : PerformUpdate(statement, parameters, context);
+    }
+
+    private ExecutionResult ExecuteUpdateWithRowTriggers(
+        UpdateStatement statement,
+        SqlValue[] parameters,
+        QueryContext context,
+        IReadOnlyList<TriggerDefinition> beforeTriggers,
+        IReadOnlyList<TriggerDefinition> afterTriggers)
+    {
+        if (!context.Tables.TryGetValue(statement.TableName, out var table))
+            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+
+        ValidateTableReturning(statement.Returning, statement.TableName, table, context);
+        var plan = PrepareUpdate(statement, table, context);
+        var selectedPositions = statement.Limit is null
+            ? null
+            : SelectLimitedDmlPositions(
+                statement.TableName,
+                table,
+                statement.Where,
+                statement.EffectiveOrderBy,
+                statement.Limit,
+                statement.Offset,
+                statement.Assignments.Select(assignment => assignment.Value),
+                statement.Returning,
+                parameters,
+                context);
+        var selectedRowIds = new List<long>();
+        for (var position = 0; position < table.Rows.Count; position++)
+        {
+            var row = table.Rows[position];
+            var rowId = table.RowIds[position];
+            var source = new SourceRow(
+                table.Columns,
+                row,
+                BuildQualifiedColumns(statement.TableName, table.Columns),
+                RowId: table.HasRowid ? rowId : null,
+                RowIdQualifier: statement.TableName,
+                ColumnDefinitions: table.ColumnDefinitions,
+                QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
+                    statement.TableName,
+                    table.ColumnDefinitions));
+            var selected = selectedPositions is not null
+                ? selectedPositions.Contains(position)
+                : statement.Where is null || IsTrue(Evaluate(statement.Where, parameters, source, context));
+            if (selected)
+                selectedRowIds.Add(rowId);
+        }
+
+        var backup = CloneTables(context.Tables);
+        var updatedRows = new List<SqlValue[]>();
+        var updatedRowIds = new List<long>();
+        try
+        {
+            foreach (var selectedRowId in selectedRowIds)
+            {
+                var position = table.RowIds.IndexOf(selectedRowId);
+                if (position < 0)
+                    continue;
+
+                var original = table.Rows[position].ToArray();
+                SqlValue[] updated;
+                long newRowId;
+                try
+                {
+                    (updated, newRowId) = BuildUpdatedRow(
+                        statement,
+                        table,
+                        plan,
+                        original,
+                        selectedRowId,
+                        parameters,
+                        context);
+                }
+                catch (EmbeddedSqlException exception) when (IsConflictAlgorithmConstraint(exception))
+                {
+                    if (HandleUpdateConflict(exception))
+                        continue;
+                    throw;
+                }
+                var frame = new TriggerRowFrame(
+                    original,
+                    table.HasRowid ? selectedRowId : null,
+                    updated,
+                    table.HasRowid ? newRowId : null);
+                if (beforeTriggers.Count > 0 && FireTriggers(beforeTriggers, context, frame))
+                    continue;
+
+                position = table.RowIds.IndexOf(selectedRowId);
+                if (position < 0)
+                    continue;
+                var originalRows = table.Rows.Select(row => row.ToArray()).ToArray();
+                var rows = table.Rows.Select(row => row.ToArray()).ToList();
+                var rowIds = table.RowIds.ToList();
+                rows[position] = updated;
+                rowIds[position] = newRowId;
+                try
+                {
+                    CommitUpdates(
+                        context,
+                        statement.TableName,
+                        table,
+                        originalRows,
+                        rows,
+                        rowIds,
+                        plan,
+                        [position]);
+                }
+                catch (EmbeddedSqlException exception) when (IsConflictAlgorithmConstraint(exception))
+                {
+                    if (HandleUpdateConflict(exception))
+                        continue;
+                    throw;
+                }
+
+                updatedRows.Add(updated);
+                updatedRowIds.Add(newRowId);
+                if (afterTriggers.Count > 0)
+                    _ = FireTriggers(afterTriggers, context, frame);
+            }
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Fail)
+        {
+            throw new EmbeddedConflictFailException(exception, GetLastInsertRowId(context));
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Rollback)
+        {
+            RestoreTables(context.Tables, backup);
+            throw new EmbeddedConflictRollbackException(exception, GetLastInsertRowId(context));
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
+        }
+        catch (EmbeddedConflictRollbackException)
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+        catch
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+
+        if (statement.Returning is not null)
+        {
+            try
+            {
+                return BuildReturningResult(
+                    statement.Returning,
+                    statement.TableName,
+                    table,
+                    updatedRows,
+                    updatedRowIds,
+                    updatedRows.Count,
+                    updatedRows.Count > 0,
+                    parameters,
+                    context);
+            }
+            catch
+            {
+                RestoreTables(context.Tables, backup);
+                throw;
+            }
+        }
+
+        return new ExecutionResult([], [], updatedRows.Count, updatedRows.Count > 0);
+
+        bool HandleUpdateConflict(EmbeddedSqlException exception)
+        {
+            switch (exception.ConflictAlgorithm ?? InsertConflictAlgorithm.Abort)
+            {
+                case InsertConflictAlgorithm.Ignore:
+                    return true;
+                case InsertConflictAlgorithm.Fail:
+                    throw new EmbeddedConflictFailException(
+                        exception,
+                        GetLastInsertRowId(context));
+                case InsertConflictAlgorithm.Rollback:
+                    throw new EmbeddedConflictRollbackException(
+                        exception,
+                        GetLastInsertRowId(context));
+                case InsertConflictAlgorithm.Replace:
+                    throw new EmbeddedSqlException(
+                        "Managed UPDATE cannot apply schema-level ON CONFLICT REPLACE "
+                        + "until replacement deletes are supported.");
+                case InsertConflictAlgorithm.Abort:
+                    return false;
+                default:
+                    throw new InvalidOperationException("Unknown UPDATE conflict algorithm.");
+            }
+        }
     }
 
     private ExecutionResult PerformUpdate(
@@ -5863,7 +6678,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private static QueryContext EnterForeignKeyAction(QueryContext context)
     {
-        if (context.ForeignKeyActionDepth >= MaximumTriggerDepth)
+        if (context.ForeignKeyActionDepth >= MaximumForeignKeyActionDepth)
             throw new EmbeddedSqlException("too many levels of trigger recursion");
         return context with { ForeignKeyActionDepth = context.ForeignKeyActionDepth + 1 };
     }
@@ -6321,11 +7136,181 @@ public sealed class EmbeddedDatabase : IDisposable
         DeleteStatement statement,
         SqlValue[] parameters,
         QueryContext context)
-        => ExecuteWithTriggers(
+    {
+        var beforeTriggers = GetMatchingTriggers(
+            context,
+            statement.TableName,
+            TriggerEvent.Delete,
+            TriggerTiming.Before);
+        var afterTriggers = GetMatchingTriggers(
+            context,
+            statement.TableName,
+            TriggerEvent.Delete,
+            TriggerTiming.After);
+        if (beforeTriggers.Count > 0 || afterTriggers.Count > 0)
+        {
+            return context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(
+                    context,
+                    () => ExecuteDeleteWithRowTriggers(
+                        statement,
+                        parameters,
+                        context,
+                        beforeTriggers,
+                        afterTriggers))
+                : ExecuteDeleteWithRowTriggers(
+                    statement,
+                    parameters,
+                    context,
+                    beforeTriggers,
+                    afterTriggers);
+        }
+
+        return ExecuteWithTriggers(
             statement.TableName,
             TriggerEvent.Delete,
             context,
             () => PerformDelete(statement, parameters, context));
+    }
+
+    private ExecutionResult ExecuteDeleteWithRowTriggers(
+        DeleteStatement statement,
+        SqlValue[] parameters,
+        QueryContext context,
+        IReadOnlyList<TriggerDefinition> beforeTriggers,
+        IReadOnlyList<TriggerDefinition> afterTriggers)
+    {
+        if (!context.Tables.TryGetValue(statement.TableName, out var table))
+            throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+
+        ValidateTableReturning(statement.Returning, statement.TableName, table, context);
+        var selectedPositions = statement.Limit is null
+            ? null
+            : SelectLimitedDmlPositions(
+                statement.TableName,
+                table,
+                statement.Where,
+                statement.EffectiveOrderBy,
+                statement.Limit,
+                statement.Offset,
+                [],
+                statement.Returning,
+                parameters,
+                context);
+        var selectedRowIds = new List<long>();
+        for (var position = 0; position < table.Rows.Count; position++)
+        {
+            var row = table.Rows[position];
+            var rowId = table.RowIds[position];
+            var source = new SourceRow(
+                table.Columns,
+                row,
+                BuildQualifiedColumns(statement.TableName, table.Columns),
+                RowId: table.HasRowid ? rowId : null,
+                RowIdQualifier: statement.TableName,
+                ColumnDefinitions: table.ColumnDefinitions,
+                QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
+                    statement.TableName,
+                    table.ColumnDefinitions));
+            var selected = selectedPositions is not null
+                ? selectedPositions.Contains(position)
+                : statement.Where is null || IsTrue(Evaluate(statement.Where, parameters, source, context));
+            if (selected)
+                selectedRowIds.Add(rowId);
+        }
+
+        var backup = CloneTables(context.Tables);
+        var deletedRows = new List<SqlValue[]>();
+        var deletedRowIds = new List<long>();
+        try
+        {
+            foreach (var selectedRowId in selectedRowIds)
+            {
+                var position = table.RowIds.IndexOf(selectedRowId);
+                if (position < 0)
+                    continue;
+
+                var deletedRow = table.Rows[position].ToArray();
+                var frame = new TriggerRowFrame(
+                    deletedRow,
+                    table.HasRowid ? selectedRowId : null,
+                    null,
+                    null);
+                if (beforeTriggers.Count > 0 && FireTriggers(beforeTriggers, context, frame))
+                    continue;
+
+                position = table.RowIds.IndexOf(selectedRowId);
+                if (position < 0)
+                    continue;
+                var originalRows = table.Rows.Select(row => row.ToArray()).ToArray();
+                deletedRow = table.Rows[position].ToArray();
+                table.Rows.RemoveAt(position);
+                table.RowIds.RemoveAt(position);
+                ValidateForeignKeysAfterDelete(
+                    context,
+                    statement.TableName,
+                    table,
+                    originalRows,
+                    table.Rows,
+                    [deletedRow]);
+                if (table.HasRowid)
+                    RecordBlobMutation(statement.TableName, selectedRowId);
+                deletedRows.Add(deletedRow);
+                deletedRowIds.Add(selectedRowId);
+                if (afterTriggers.Count > 0)
+                    _ = FireTriggers(afterTriggers, context, frame);
+            }
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Fail)
+        {
+            throw new EmbeddedConflictFailException(exception, GetLastInsertRowId(context));
+        }
+        catch (EmbeddedTriggerRaiseException exception)
+            when (exception.Algorithm == InsertConflictAlgorithm.Rollback)
+        {
+            RestoreTables(context.Tables, backup);
+            throw new EmbeddedConflictRollbackException(exception, GetLastInsertRowId(context));
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
+        }
+        catch (EmbeddedConflictRollbackException)
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+        catch
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
+        }
+
+        if (statement.Returning is not null)
+        {
+            try
+            {
+                return BuildReturningResult(
+                    statement.Returning,
+                    statement.TableName,
+                    table,
+                    deletedRows,
+                    deletedRowIds,
+                    deletedRows.Count,
+                    deletedRows.Count > 0,
+                    parameters,
+                    context);
+            }
+            catch
+            {
+                RestoreTables(context.Tables, backup);
+                throw;
+            }
+        }
+
+        return new ExecutionResult([], [], deletedRows.Count, deletedRows.Count > 0);
+    }
 
     private ExecutionResult PerformDelete(
         DeleteStatement statement,
@@ -6463,13 +7448,17 @@ public sealed class EmbeddedDatabase : IDisposable
         bool changed,
         SqlValue[] parameters,
         QueryContext context,
-        long? lastInsertRowId = null)
+        long? lastInsertRowId = null,
+        bool updateLastInsertRowIdPerRow = false,
+        IReadOnlyList<long>? lastInsertRowIdSnapshots = null)
     {
         var outputColumns = BuildOutputColumns(tableName, table.Columns);
 
         foreach (var projection in returning)
         {
-            if (projection.Expression is StarExpression or QualifiedStarExpression)
+            if (projection.Expression is QualifiedStarExpression)
+                throw new EmbeddedSqlException("RETURNING may not use TABLE.* wildcards");
+            if (projection.Expression is StarExpression)
                 continue;
             if (ContainsAggregate(projection.Expression) || ContainsWindowFunction(projection.Expression))
                 throw new EmbeddedSqlException("aggregate and window functions are not allowed in RETURNING");
@@ -6477,37 +7466,56 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var columnNames = GetColumnNames(returning, outputColumns, outputColumns);
         var resultRows = new List<SqlValue[]>(affectedRows.Count);
-        for (var rowIndex = 0; rowIndex < affectedRows.Count; rowIndex++)
+        var savedLastInsertRowId = GetLastInsertRowId(context);
+        try
         {
-            var rowValues = affectedRows[rowIndex];
-            var source = new SourceRow(
-                table.Columns,
-                rowValues,
-                RowId: table.HasRowid && rowIndex < affectedRowIds.Count ? affectedRowIds[rowIndex] : null,
-                RowIdQualifier: tableName,
-                ColumnDefinitions: table.ColumnDefinitions);
-            var output = new List<SqlValue>();
-            foreach (var projection in returning)
+            for (var rowIndex = 0; rowIndex < affectedRows.Count; rowIndex++)
             {
-                switch (projection.Expression)
+                var rowValues = affectedRows[rowIndex];
+                if (lastInsertRowIdSnapshots is not null
+                    && rowIndex < lastInsertRowIdSnapshots.Count)
                 {
-                    case StarExpression:
-                        for (var index = 0; index < table.Columns.Length; index++)
-                            output.Add(rowValues[index]);
-                        break;
-                    case QualifiedStarExpression qualifiedStar:
-                        if (!string.Equals(qualifiedStar.Qualifier, tableName, StringComparison.OrdinalIgnoreCase))
-                            throw new EmbeddedSqlException($"no such table: {qualifiedStar.Qualifier}");
-                        for (var index = 0; index < table.Columns.Length; index++)
-                            output.Add(rowValues[index]);
-                        break;
-                    default:
-                        output.Add(Evaluate(projection.Expression, parameters, source, context));
-                        break;
+                    SetLastInsertRowId(context, lastInsertRowIdSnapshots[rowIndex]);
                 }
-            }
+                else if (updateLastInsertRowIdPerRow
+                    && table.HasRowid
+                    && rowIndex < affectedRowIds.Count)
+                {
+                    SetLastInsertRowId(context, affectedRowIds[rowIndex]);
+                }
+                var source = new SourceRow(
+                    table.Columns,
+                    rowValues,
+                    BuildQualifiedColumns(tableName, table.Columns),
+                    OutputColumns: outputColumns,
+                    RowId: table.HasRowid && rowIndex < affectedRowIds.Count ? affectedRowIds[rowIndex] : null,
+                    RowIdQualifier: tableName,
+                    ColumnDefinitions: table.ColumnDefinitions,
+                    QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
+                        tableName,
+                        table.ColumnDefinitions));
+                var output = new List<SqlValue>();
+                foreach (var projection in returning)
+                {
+                    switch (projection.Expression)
+                    {
+                        case StarExpression:
+                            for (var index = 0; index < table.Columns.Length; index++)
+                                output.Add(rowValues[index]);
+                            break;
+                        default:
+                            output.Add(Evaluate(projection.Expression, parameters, source, context));
+                            break;
+                    }
+                }
 
-            resultRows.Add(output.ToArray());
+                resultRows.Add(output.ToArray());
+            }
+        }
+        finally
+        {
+            if (context.StatementState is not null)
+                context.StatementState.LastInsertRowId = savedLastInsertRowId;
         }
 
         return new ExecutionResult(columnNames, resultRows, rowsAffected, changed)
@@ -6525,20 +7533,7 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         Func<ExecutionResult> performBase)
     {
-        var triggers = GetMatchingTriggers(context, tableName, triggerEvent);
-        if (context.InsideTrigger && !context.RecursiveTriggersEnabled && context.ActiveTriggers is not null)
-        {
-            triggers = triggers
-                .Where(trigger => !context.ActiveTriggers.Contains(trigger.Name))
-                .ToArray();
-        }
-        if (context.RecursiveTriggersEnabled
-            && context.InsideTrigger
-            && context.ActiveTriggers is not null
-            && triggers.Any(trigger => context.ActiveTriggers.Contains(trigger.Name)))
-        {
-            throw new EmbeddedSqlException("too many levels of trigger recursion");
-        }
+        var triggers = GetMatchingTriggers(context, tableName, triggerEvent, TriggerTiming.After);
         if (triggers.Count == 0 && !context.ForeignKeysEnabled)
             return performBase();
 
@@ -6549,7 +7544,7 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             var result = performBase();
             if (result.RowsAffected > 0 && triggers.Count > 0)
-                FireTriggers(triggers, context);
+                _ = FireTriggers(triggers, context, TriggerRowFrame.Empty);
             return result;
         }
 
@@ -6560,6 +7555,10 @@ public sealed class EmbeddedDatabase : IDisposable
         try
         {
             return PerformAndFire();
+        }
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
         }
         catch
         {
@@ -6621,57 +7620,176 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    private void FireTriggers(IReadOnlyList<TriggerDefinition> triggers, QueryContext context)
+    private bool FireTriggers(
+        IReadOnlyList<TriggerDefinition> triggers,
+        QueryContext context,
+        TriggerRowFrame frame)
     {
-        // Trigger bodies are independently parsed statements, so the outer statement's CTE
-        // scope is not visible to them.
+        if (triggers.Count > 0 && context.TriggerDepth >= MaximumTriggerDepth)
+            throw new EmbeddedSqlException("too many levels of trigger recursion");
+
         foreach (var trigger in triggers)
         {
             var activeTriggers = context.ActiveTriggers is null
                 ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 : new HashSet<string>(context.ActiveTriggers, StringComparer.OrdinalIgnoreCase);
             activeTriggers.Add(trigger.Name);
+            var triggerRow = CreateTriggerRow(trigger, context, frame);
             var triggerContext = context with
             {
                 CommonTableExpressions = new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
                 InsideTrigger = true,
                 ActiveTriggers = activeTriggers,
                 TriggerDepth = context.TriggerDepth + 1,
+                TriggerRow = triggerRow,
             };
-            foreach (var bodyStatement in trigger.Body)
+            var savedLastInsertRowId = GetLastInsertRowId(context);
+            try
             {
-                switch (bodyStatement)
+                if (trigger.When is not null
+                    && !IsTrue(Evaluate(trigger.When, EmptyParameters, triggerRow, triggerContext)))
                 {
-                    case InsertStatement insert:
-                        ExecuteInsert(insert, EmptyParameters, triggerContext);
-                        break;
-                    case UpdateStatement update:
-                        ExecuteUpdate(update, EmptyParameters, triggerContext);
-                        break;
-                    case DeleteStatement delete:
-                        ExecuteDelete(delete, EmptyParameters, triggerContext);
-                        break;
-                    default:
-                        throw new EmbeddedSqlException(
-                            $"unsupported trigger body statement {bodyStatement.GetType().Name}");
+                    continue;
+                }
+
+                foreach (var bodyStatement in trigger.Body)
+                {
+                    switch (bodyStatement)
+                    {
+                        case InsertStatement insert:
+                            ExecuteInsert(insert, EmptyParameters, triggerContext);
+                            break;
+                        case UpdateStatement update:
+                            ExecuteUpdate(update, EmptyParameters, triggerContext);
+                            break;
+                        case DeleteStatement delete:
+                            ExecuteDelete(delete, EmptyParameters, triggerContext);
+                            break;
+                        case QueryStatement query:
+                            ExecuteQuery(query, EmptyParameters, triggerContext, triggerRow);
+                            break;
+                        default:
+                            throw new EmbeddedSqlException(
+                                $"unsupported trigger body statement {bodyStatement.GetType().Name}");
+                    }
                 }
             }
+            catch (EmbeddedTriggerRaiseException exception)
+                when (exception.Algorithm == InsertConflictAlgorithm.Ignore)
+            {
+                return true;
+            }
+            finally
+            {
+                if (context.StatementState is not null)
+                    context.StatementState.LastInsertRowId = savedLastInsertRowId;
+            }
         }
+
+        return false;
+    }
+
+    private SourceRow? CreateTriggerRow(
+        TriggerDefinition trigger,
+        QueryContext context,
+        TriggerRowFrame frame)
+    {
+        if (frame.IsEmpty)
+            return null;
+
+        string[] columns;
+        IReadOnlyList<EmbeddedColumn?>? columnDefinitions = null;
+        var hasRowid = false;
+        if (context.Tables.TryGetValue(trigger.TableName, out var table))
+        {
+            columns = table.Columns;
+            columnDefinitions = table.ColumnDefinitions;
+            hasRowid = table.HasRowid;
+        }
+        else if (context.Views is not null
+                 && context.Views.TryGetValue(trigger.TableName, out var view))
+        {
+            columns = ResolveViewColumns(view, EnterView(context, view.Name));
+        }
+        else
+        {
+            throw new EmbeddedSqlException($"no such table: {trigger.TableName}");
+        }
+
+        var values = new List<SqlValue>();
+        var definitions = new List<EmbeddedColumn?>();
+        var qualifiedColumns = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var qualifiedDefinitions = new Dictionary<string, EmbeddedColumn>(StringComparer.OrdinalIgnoreCase);
+        var qualifiedRowIds = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+        void AddPseudoRow(string qualifier, SqlValue[]? row, long? rowId)
+        {
+            if (row is null)
+                return;
+            if (row.Length != columns.Length)
+                throw new InvalidOperationException($"Trigger row for '{trigger.Name}' has the wrong column count.");
+
+            var offset = values.Count;
+            for (var columnIndex = 0; columnIndex < columns.Length; columnIndex++)
+            {
+                var qualifiedName = $"{qualifier}.{columns[columnIndex]}";
+                qualifiedColumns.Add(qualifiedName, offset + columnIndex);
+                values.Add(row[columnIndex]);
+                var definition = columnDefinitions?[columnIndex];
+                definitions.Add(definition);
+                if (definition is not null)
+                    qualifiedDefinitions.Add(qualifiedName, definition);
+            }
+            qualifiedRowIds.Add(qualifier, hasRowid ? rowId : null);
+        }
+
+        AddPseudoRow("OLD", frame.OldRow, frame.OldRowId);
+        AddPseudoRow("NEW", frame.NewRow, frame.NewRowId);
+        return new SourceRow(
+            [],
+            values.ToArray(),
+            qualifiedColumns,
+            QualifiedRowIds: qualifiedRowIds,
+            ColumnDefinitions: definitions,
+            QualifiedColumnDefinitions: qualifiedDefinitions);
     }
 
     private static IReadOnlyList<TriggerDefinition> GetMatchingTriggers(
         QueryContext context,
         string tableName,
-        TriggerEvent triggerEvent)
+        TriggerEvent triggerEvent,
+        TriggerTiming timing,
+        IReadOnlySet<string>? updatedColumns = null)
     {
         if (context.Triggers is null || context.Triggers.Count == 0)
             return [];
 
-        return context.Triggers.Values
+        var triggers = context.Triggers.Values
             .Where(trigger => trigger.Event == triggerEvent
-                && string.Equals(trigger.TableName, tableName, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(trigger => trigger.Name, StringComparer.OrdinalIgnoreCase)
+                && trigger.Timing == timing
+                && string.Equals(trigger.TableName, tableName, StringComparison.OrdinalIgnoreCase)
+                && (trigger.UpdateOfColumns is null
+                    || updatedColumns is null
+                    || trigger.UpdateOfColumns.Any(updatedColumns.Contains)))
+            .Reverse()
             .ToArray();
+        if (context.InsideTrigger && !context.RecursiveTriggersEnabled && context.ActiveTriggers is not null)
+        {
+            triggers = triggers
+                .Where(trigger => !context.ActiveTriggers.Contains(trigger.Name))
+                .ToArray();
+        }
+        return triggers;
+    }
+
+    private readonly record struct TriggerRowFrame(
+        SqlValue[]? OldRow,
+        long? OldRowId,
+        SqlValue[]? NewRow,
+        long? NewRowId)
+    {
+        public static TriggerRowFrame Empty { get; } = new(null, null, null, null);
+
+        public bool IsEmpty => OldRow is null && NewRow is null;
     }
 
     private static void RestoreTables(
@@ -12353,6 +13471,10 @@ public sealed class EmbeddedDatabase : IDisposable
                 _ => throw new EmbeddedSqlException("WITH must precede an INSERT, UPDATE, or DELETE statement."),
             };
         }
+        catch (EmbeddedConflictFailException)
+        {
+            throw;
+        }
         catch
         {
             RestoreTables(context.Tables, backup);
@@ -14965,9 +16087,9 @@ public sealed class EmbeddedDatabase : IDisposable
             },
             ParameterExpression parameter => ReadParameter(parameters, parameter.Index),
             RowValueExpression => throw new EmbeddedSqlException("row value misused"),
-            ColumnExpression column => row?.GetValue(column)
-                ?? throw new EmbeddedSqlException($"no such column: {column.Name}"),
+            ColumnExpression column => EvaluateColumn(column, row, context),
             FunctionExpression function => EvaluateScalarFunction(function, parameters, row, context),
+            RaiseExpression raise => EvaluateRaise(raise, parameters, row, context),
             ScalarSubqueryExpression subquery => EvaluateScalarSubquery(subquery, parameters, row, context),
             ExistsExpression exists => EvaluateExists(exists, parameters, row, context),
             CollationExpression collation => Evaluate(collation.Expression, parameters, row, context),
@@ -14986,6 +16108,46 @@ public sealed class EmbeddedDatabase : IDisposable
         context.CancellationToken.ThrowIfCancellationRequested();
         return result;
     }
+
+    private static SqlValue EvaluateColumn(
+        ColumnExpression column,
+        SourceRow? row,
+        QueryContext context)
+    {
+        if (column.Qualifier is not null
+            && context.TriggerRow is not null
+            && (string.Equals(column.Qualifier, "OLD", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(column.Qualifier, "NEW", StringComparison.OrdinalIgnoreCase)))
+        {
+            return context.TriggerRow.GetValue(column);
+        }
+
+        return (row ?? context.TriggerRow)?.GetValue(column)
+            ?? throw new EmbeddedSqlException($"no such column: {column.Name}");
+    }
+
+    private SqlValue EvaluateRaise(
+        RaiseExpression raise,
+        SqlValue[] parameters,
+        SourceRow? row,
+        QueryContext context)
+    {
+        var message = raise.Message is null
+            ? string.Empty
+            : FormatRaiseMessage(Evaluate(raise.Message, parameters, row, context));
+        throw new EmbeddedTriggerRaiseException(message, raise.Algorithm);
+    }
+
+    private static string FormatRaiseMessage(SqlValue value)
+        => value.Kind switch
+        {
+            SqlValueKind.Null => string.Empty,
+            SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
+            SqlValueKind.Real => value.AsReal().ToString("R", CultureInfo.InvariantCulture),
+            SqlValueKind.Text => value.AsText(),
+            SqlValueKind.Blob => Encoding.UTF8.GetString(value.AsBlob().Span),
+            _ => throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}."),
+        };
 
     private SqlValue EvaluateScalarSubquery(
         ScalarSubqueryExpression expression,
@@ -15048,6 +16210,18 @@ public sealed class EmbeddedDatabase : IDisposable
             return EvaluateComparison(expression, parameters, row, context);
 
         var left = Evaluate(expression.Left, parameters, row, context);
+        if (expression.Operator == BinaryOperator.And
+            && left.Kind != SqlValueKind.Null
+            && !IsTrue(left))
+        {
+            return SqlValue.Integer(0);
+        }
+        if (expression.Operator == BinaryOperator.Or
+            && left.Kind != SqlValueKind.Null
+            && IsTrue(left))
+        {
+            return SqlValue.Integer(1);
+        }
         var right = Evaluate(expression.Right, parameters, row, context);
         var leftColumn = row?.GetColumnDefinition(expression.Left);
         var rightColumn = row?.GetColumnDefinition(expression.Right);
@@ -17908,7 +19082,18 @@ public sealed class EmbeddedDatabase : IDisposable
     private static SqlValue EvaluateLastInsertRowId(IReadOnlyList<SqlValue> arguments, QueryContext context)
     {
         RequireArgumentCount("last_insert_rowid", arguments, 0);
-        return SqlValue.Integer(context.LastInsertRowId);
+        return SqlValue.Integer(GetLastInsertRowId(context));
+    }
+
+    private static long GetLastInsertRowId(QueryContext context)
+        => context.StatementState?.LastInsertRowId ?? context.LastInsertRowId;
+
+    private static void SetLastInsertRowId(QueryContext context, long rowId)
+    {
+        if (context.StatementState is null)
+            throw new InvalidOperationException("INSERT execution lost its statement rowid state.");
+
+        context.StatementState.LastInsertRowId = rowId;
     }
 
     private SqlValue EvaluateNullIf(FunctionExpression function, IReadOnlyList<SqlValue> arguments)

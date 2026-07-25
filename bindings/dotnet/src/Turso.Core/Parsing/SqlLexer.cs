@@ -51,7 +51,12 @@ internal static class SqlScript
             }
             else
             {
-                header = AdvanceTriggerHeader(header, token, ref inTriggerBody, ref triggerBodyAtStatementStart);
+                header = AdvanceTriggerHeader(
+                    header,
+                    token,
+                    sql,
+                    ref inTriggerBody,
+                    ref triggerBodyAtStatementStart);
             }
 
             lexer.Next();
@@ -64,37 +69,46 @@ internal static class SqlScript
     private static TriggerHeader AdvanceTriggerHeader(
         TriggerHeader header,
         SqlToken token,
+        string sql,
         ref bool inTriggerBody,
         ref bool triggerBodyAtStatementStart)
     {
         switch (header)
         {
             case TriggerHeader.ExpectTrigger:
+                if (IsKeyword(token, "TEMP") || IsKeyword(token, "TEMPORARY"))
+                    return TriggerHeader.ExpectTrigger;
                 return IsKeyword(token, "TRIGGER") ? TriggerHeader.ExpectNameOrIf : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectNameOrIf:
                 if (IsKeyword(token, "IF"))
                     return TriggerHeader.ExpectNot;
 
-                return IsIdentifier(token) ? TriggerHeader.ExpectAfter : TriggerHeader.NotTrigger;
+                return IsIdentifier(token) ? TriggerHeader.ExpectTimingOrEvent : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectNot:
                 return IsKeyword(token, "NOT") ? TriggerHeader.ExpectExists : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectExists:
                 return IsKeyword(token, "EXISTS") ? TriggerHeader.ExpectName : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectName:
-                return IsIdentifier(token) ? TriggerHeader.ExpectAfter : TriggerHeader.NotTrigger;
-            case TriggerHeader.ExpectAfter:
-                return IsKeyword(token, "AFTER") ? TriggerHeader.ExpectEvent : TriggerHeader.NotTrigger;
+                return IsIdentifier(token) ? TriggerHeader.ExpectTimingOrEvent : TriggerHeader.NotTrigger;
+            case TriggerHeader.ExpectTimingOrEvent:
+                if (IsKeyword(token, "BEFORE") || IsKeyword(token, "AFTER"))
+                    return TriggerHeader.ExpectEvent;
+                if (IsKeyword(token, "INSTEAD"))
+                    return TriggerHeader.ExpectOf;
+                return IsTriggerEvent(token) ? TriggerHeader.ExpectOn : TriggerHeader.NotTrigger;
+            case TriggerHeader.ExpectOf:
+                return IsKeyword(token, "OF") ? TriggerHeader.ExpectEvent : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectEvent:
-                return IsKeyword(token, "INSERT") || IsKeyword(token, "UPDATE") || IsKeyword(token, "DELETE")
-                    ? TriggerHeader.ExpectOn
-                    : TriggerHeader.NotTrigger;
+                return IsTriggerEvent(token) ? TriggerHeader.ExpectOn : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectOn:
-                return IsKeyword(token, "ON") ? TriggerHeader.ExpectTable : TriggerHeader.NotTrigger;
+                return IsKeyword(token, "ON") && !IsQuotedIdentifier(sql, token)
+                    ? TriggerHeader.ExpectTable
+                    : TriggerHeader.ExpectOn;
             case TriggerHeader.ExpectTable:
                 return IsIdentifier(token) ? TriggerHeader.ExpectBegin : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectBegin:
                 if (!IsKeyword(token, "BEGIN"))
-                    return TriggerHeader.NotTrigger;
+                    return TriggerHeader.ExpectBegin;
 
                 inTriggerBody = true;
                 triggerBodyAtStatementStart = true;
@@ -110,6 +124,12 @@ internal static class SqlScript
 
     private static bool IsIdentifier(SqlToken token) => token.Kind == TokenKind.Identifier;
 
+    private static bool IsQuotedIdentifier(string sql, SqlToken token)
+        => token.Offset < sql.Length && sql[token.Offset] is '"' or '[' or '`';
+
+    private static bool IsTriggerEvent(SqlToken token)
+        => IsKeyword(token, "INSERT") || IsKeyword(token, "UPDATE") || IsKeyword(token, "DELETE");
+
     private enum TriggerHeader
     {
         None,
@@ -119,7 +139,8 @@ internal static class SqlScript
         ExpectNot,
         ExpectExists,
         ExpectName,
-        ExpectAfter,
+        ExpectTimingOrEvent,
+        ExpectOf,
         ExpectEvent,
         ExpectOn,
         ExpectTable,
