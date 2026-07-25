@@ -43,6 +43,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly Dictionary<SqlValue[], int>?[] _groupIndexes;
     private readonly int[] _rowSetPositions;
     private readonly WorkTableRuntime?[] _workTables;
+    private readonly WindowBufferRuntime?[] _windowBuffers;
     private readonly IReadOnlyList<VdbeCursorSource?>? _cursorSources;
     private readonly IReadOnlyList<VdbeWriteTarget?>? _writeTargets;
     private readonly VdbeTransactionContext _transaction = new();
@@ -89,6 +90,7 @@ public sealed class ResumableStatement : IDisposable
         _groupIndexes = new Dictionary<SqlValue[], int>?[program.DistinctSetCount];
         _rowSetPositions = new int[program.DistinctSetCount];
         _workTables = new WorkTableRuntime?[program.WorkTableCount];
+        _windowBuffers = new WindowBufferRuntime?[program.WindowBufferCount];
         _cursorSources = cursorSources;
         _writeTargets = writeTargets;
         _binding = parameterBinding;
@@ -863,9 +865,57 @@ public sealed class ResumableStatement : IDisposable
                     CloseWorkTable(closeWorkTable.WorkTable);
                     AdvanceInstructionPointer();
                     break;
+                case OpenWindowBufferInstruction openWindowBuffer:
+                    OpenWindowBuffer(openWindowBuffer);
+                    AdvanceInstructionPointer();
+                    break;
+                case WindowBufferInsertInstruction windowInsert:
+                    {
+                        var runtime = RequireOpenWindowBuffer(windowInsert.Buffer);
+                        runtime.Insert(ReadRegisters(windowInsert.Record));
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case WindowBufferComputeInstruction windowCompute:
+                    {
+                        // Ends the buffered phase: the whole buffer is handed to the window evaluator once,
+                        // which is what makes forward-looking and peer-relative frames representable, then
+                        // the buffer positions on its first row so the drain loop can emit.
+                        var runtime = RequireOpenWindowBuffer(windowCompute.Buffer);
+                        if (runtime.Compute())
+                            AdvanceInstructionPointer();
+                        else
+                            _instructionPointer = windowCompute.EmptyTarget;
+
+                        break;
+                    }
+                case WindowBufferDataInstruction windowData:
+                    {
+                        var runtime = RequireOpenWindowBuffer(windowData.Buffer);
+                        var record = runtime.Current();
+                        Array.Copy(record, 0, _registers, windowData.Destination.Start.Index, record.Length);
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case WindowBufferNextInstruction windowNext:
+                    {
+                        var runtime = RequireOpenWindowBuffer(windowNext.Buffer);
+                        if (runtime.MoveNext())
+                            _instructionPointer = windowNext.LoopTarget;
+                        else
+                            AdvanceInstructionPointer();
+
+                        break;
+                    }
+                case CloseWindowBufferInstruction closeWindowBuffer:
+                    CloseWindowBuffer(closeWindowBuffer.Buffer);
+                    AdvanceInstructionPointer();
+                    break;
                 case HaltInstruction:
                     Array.Clear(_openCursors);
                     Array.Clear(_joinCursorRows);
+                    Array.Clear(_sorters);
+                    Array.Clear(_windowBuffers);
                     AdvanceInstructionPointer();
                     State = ResumableStatementState.Done;
                     return ResumableStatementStepResult.Done;
@@ -904,6 +954,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_groupIndexes);
         Array.Clear(_rowSetPositions);
         Array.Clear(_workTables);
+        Array.Clear(_windowBuffers);
         _transaction.Reset();
         _currentRow = null;
         _instructionPointer = default;
@@ -969,6 +1020,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_groupIndexes);
         Array.Clear(_rowSetPositions);
         Array.Clear(_workTables);
+        Array.Clear(_windowBuffers);
         _transaction.Reset();
         _binding = null;
         _currentRow = null;
@@ -1011,6 +1063,29 @@ public sealed class ResumableStatement : IDisposable
     private SorterRuntime RequireOpenSorter(Sorter sorter)
         => _sorters[sorter.Index]
             ?? throw new InvalidOperationException($"Sorter {sorter.Index} is not open.");
+
+    private void OpenWindowBuffer(OpenWindowBufferInstruction instruction)
+    {
+        if (_windowBuffers[instruction.Buffer.Index] is not null)
+            throw new InvalidOperationException($"Window buffer {instruction.Buffer.Index} is already open.");
+
+        _windowBuffers[instruction.Buffer.Index] = new WindowBufferRuntime(
+            instruction.ColumnCount,
+            instruction.WindowCount,
+            instruction.Evaluator);
+    }
+
+    private void CloseWindowBuffer(WindowBuffer buffer)
+    {
+        if (_windowBuffers[buffer.Index] is null)
+            throw new InvalidOperationException($"Window buffer {buffer.Index} is not open.");
+
+        _windowBuffers[buffer.Index] = null;
+    }
+
+    private WindowBufferRuntime RequireOpenWindowBuffer(WindowBuffer buffer)
+        => _windowBuffers[buffer.Index]
+            ?? throw new InvalidOperationException($"Window buffer {buffer.Index} is not open.");
 
     private void OpenWorkTable(OpenWorkTableInstruction instruction)
     {
@@ -1319,6 +1394,109 @@ public sealed class ResumableStatement : IDisposable
         {
             if (!_sorted)
                 throw new InvalidOperationException("Sorter must be sorted before advancing.");
+
+            _position++;
+            return _position < _rows.Count;
+        }
+    }
+
+    // Holds one window buffer's scanned rows, the window values computed over them, and the drain cursor.
+    // Rows are copied on insert so overwriting the staging registers between iterations cannot mutate a
+    // buffered row. Compute runs the caller-supplied evaluator exactly once over the whole buffer — the
+    // step that makes a full-partition frame (forward-looking ROWS, peer-relative RANGE/GROUPS, ranking and
+    // navigation functions) representable — and pins its result shape so a misbehaving evaluator fails
+    // loudly instead of producing short or ragged rows. Draining then walks the buffer in insertion order,
+    // handing out each row concatenated with its window values.
+    private sealed class WindowBufferRuntime
+    {
+        private readonly int _columnCount;
+        private readonly int _windowCount;
+        private readonly VdbeWindowEvaluator _evaluator;
+        private readonly List<SqlValue[]> _rows = [];
+        private SqlValue[][]? _windowValues;
+        private int _position = -1;
+
+        public WindowBufferRuntime(int columnCount, int windowCount, VdbeWindowEvaluator evaluator)
+        {
+            _columnCount = columnCount;
+            _windowCount = windowCount;
+            _evaluator = evaluator;
+        }
+
+        public void Insert(SqlValue[] row)
+        {
+            if (_windowValues is not null)
+            {
+                throw new InvalidOperationException(
+                    "Cannot insert into a window buffer after its window values have been computed.");
+            }
+
+            if (row.Length != _columnCount)
+            {
+                throw new InvalidOperationException(
+                    $"Window buffer stores {_columnCount}-column rows but received {row.Length} values.");
+            }
+
+            _rows.Add(row);
+        }
+
+        // Computes every buffered row's window values and positions on the first row. Returns false (and
+        // leaves the buffer unpositioned) when there is nothing to drain.
+        public bool Compute()
+        {
+            var computed = _evaluator(_rows)
+                ?? throw new InvalidOperationException("A window evaluator returned null.");
+            if (computed.Count != _rows.Count)
+            {
+                throw new InvalidOperationException(
+                    $"A window evaluator returned {computed.Count} window tuples for {_rows.Count} buffered rows.");
+            }
+
+            var values = new SqlValue[computed.Count][];
+            for (var index = 0; index < computed.Count; index++)
+            {
+                var tuple = computed[index]
+                    ?? throw new InvalidOperationException("A window evaluator returned a null window tuple.");
+                if (tuple.Length != _windowCount)
+                {
+                    throw new InvalidOperationException(
+                        $"A window evaluator returned a {tuple.Length}-wide window tuple for a buffer declaring {_windowCount} window functions.");
+                }
+
+                values[index] = tuple;
+            }
+
+            _windowValues = values;
+            _position = _rows.Count == 0 ? -1 : 0;
+            return _position >= 0;
+        }
+
+        // The current row followed by that row's computed window values, as one contiguous record.
+        public SqlValue[] Current()
+        {
+            if (_windowValues is null)
+            {
+                throw new InvalidOperationException(
+                    "Window buffer must compute its window values before reading a record.");
+            }
+
+            if (_position < 0 || _position >= _rows.Count)
+                throw new InvalidOperationException("Window buffer is not positioned on a row.");
+
+            var record = new SqlValue[_columnCount + _windowCount];
+            Array.Copy(_rows[_position], record, _columnCount);
+            Array.Copy(_windowValues[_position], 0, record, _columnCount, _windowCount);
+            return record;
+        }
+
+        // Advances to the next buffered row, returning whether one remains.
+        public bool MoveNext()
+        {
+            if (_windowValues is null)
+            {
+                throw new InvalidOperationException(
+                    "Window buffer must compute its window values before advancing.");
+            }
 
             _position++;
             return _position < _rows.Count;

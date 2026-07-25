@@ -361,6 +361,42 @@ public static class VdbeExplain
                 0,
                 null,
                 $"close work table {closeWorkTable.WorkTable.Index}"),
+            OpenWindowBufferInstruction openWindowBuffer => (
+                openWindowBuffer.Buffer.Index,
+                openWindowBuffer.ColumnCount,
+                openWindowBuffer.WindowCount,
+                null,
+                $"open window buffer {openWindowBuffer.Buffer.Index} ({openWindowBuffer.ColumnCount} cols, {openWindowBuffer.WindowCount} windows)"),
+            WindowBufferInsertInstruction windowInsert => (
+                windowInsert.Buffer.Index,
+                windowInsert.Record.Start.Index,
+                windowInsert.Record.Count,
+                null,
+                $"window buffer {windowInsert.Buffer.Index} insert {FormatRange(windowInsert.Record)}"),
+            WindowBufferComputeInstruction windowCompute => (
+                windowCompute.Buffer.Index,
+                windowCompute.EmptyTarget.Offset,
+                0,
+                null,
+                $"compute window buffer {windowCompute.Buffer.Index}, goto {windowCompute.EmptyTarget.Offset} if empty"),
+            WindowBufferDataInstruction windowData => (
+                windowData.Buffer.Index,
+                windowData.Destination.Start.Index,
+                windowData.Destination.Count,
+                null,
+                $"{FormatRange(windowData.Destination)}=window buffer {windowData.Buffer.Index} data"),
+            WindowBufferNextInstruction windowNext => (
+                windowNext.Buffer.Index,
+                windowNext.LoopTarget.Offset,
+                0,
+                null,
+                $"next window buffer {windowNext.Buffer.Index}, goto {windowNext.LoopTarget.Offset} if more rows"),
+            CloseWindowBufferInstruction closeWindowBuffer => (
+                closeWindowBuffer.Buffer.Index,
+                0,
+                0,
+                null,
+                $"close window buffer {closeWindowBuffer.Buffer.Index}"),
             YieldInstruction => (0, 0, 0, null, "yield"),
             HaltInstruction => (0, 0, 0, null, "halt"),
             _ => throw new VdbeProgramValidationException(

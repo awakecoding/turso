@@ -167,7 +167,8 @@ public static class LimitOffsetProgramBuilder
             program.SorterCount,
             program.AccumulatorCount,
             program.DistinctSetCount,
-            program.ParameterSlotCount);
+            program.ParameterSlotCount,
+            windowBufferCount: program.WindowBufferCount);
     }
 
     /// <summary>
@@ -205,6 +206,8 @@ public static class LimitOffsetProgramBuilder
             NextInstruction x => new NextInstruction(x.Cursor, Pc(x.LoopTarget)),
             SorterSortInstruction x => new SorterSortInstruction(x.Sorter, Pc(x.EmptyTarget)),
             SorterNextInstruction x => new SorterNextInstruction(x.Sorter, Pc(x.LoopTarget)),
+            WindowBufferComputeInstruction x => new WindowBufferComputeInstruction(x.Buffer, Pc(x.EmptyTarget)),
+            WindowBufferNextInstruction x => new WindowBufferNextInstruction(x.Buffer, Pc(x.LoopTarget)),
             GotoInstruction x => new GotoInstruction(Pc(x.Target)),
             JumpIfInstruction x => new JumpIfInstruction(x.Register, Pc(x.Target)),
             SameGroupInstruction x => new SameGroupInstruction(x.CurrentKey, x.SavedKey, x.Comparer, Pc(x.SameGroupTarget)),
@@ -224,6 +227,10 @@ public static class LimitOffsetProgramBuilder
                 or SorterInsertInstruction
                 or SorterDataInstruction
                 or CloseSorterInstruction
+                or OpenWindowBufferInstruction
+                or WindowBufferInsertInstruction
+                or WindowBufferDataInstruction
+                or CloseWindowBufferInstruction
                 or AggResetInstruction
                 or AggStepInstruction
                 or AggFinalizeInstruction

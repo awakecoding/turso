@@ -74,6 +74,35 @@ public readonly record struct WorkTable
     public int Index { get; }
 }
 
+/// <summary>
+/// A buffered-window resource: the ordered row buffer plus the per-row window-value block a windowed
+/// SELECT computes over. It is the windowing analogue of <see cref="Sorter"/> — an index into a
+/// fixed-width table of runtime state the interpreter owns — except its buffer is filled row by row,
+/// then transformed once into a parallel block of window-function values, and finally drained in
+/// insertion order. A program declaring <see cref="VdbeProgram.WindowBufferCount"/> = N has window
+/// buffers <c>0..N-1</c>.
+/// </summary>
+/// <remarks>
+/// The buffer exists because a window frame is not expressible as a streaming fold: a frame may look
+/// forward (<c>FOLLOWING</c>), may be peer-relative (<c>RANGE</c>/<c>GROUPS</c>), and ranking and
+/// navigation functions need the whole partition before the first row's value is known. Buffering the
+/// scanned rows and computing every window value in one pass is what lets the emitted program preserve
+/// full-partition frame semantics exactly, while emission (ordering, projection, LIMIT/OFFSET gating,
+/// and <c>ResultRow</c>) stays ordinary opcode-driven work.
+/// </remarks>
+public readonly record struct WindowBuffer
+{
+    public WindowBuffer(int index)
+    {
+        if (index < 0)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        Index = index;
+    }
+
+    public int Index { get; }
+}
+
 public readonly record struct ProgramCounter
 {
     public ProgramCounter(int offset)
@@ -187,6 +216,12 @@ public enum VdbeOpcode
     RowSetNext = 57,
     GuardedRow = 58,
     WorkTableExpandGeneration = 59,
+    OpenWindowBuffer = 60,
+    WindowBufferInsert = 61,
+    WindowBufferCompute = 62,
+    WindowBufferData = 63,
+    WindowBufferNext = 64,
+    CloseWindowBuffer = 65,
 }
 
 /// <summary>
@@ -317,6 +352,23 @@ public delegate IReadOnlyList<SqlValue[]> VdbeRecursiveTransform(SqlValue[] fron
 /// </summary>
 public delegate IReadOnlyList<SqlValue[]> VdbeRecursiveGenerationTransform(
     IReadOnlyList<SqlValue[]> frontierRows);
+
+/// <summary>
+/// Computes every window function's value for every buffered row of a windowed SELECT. The compiler
+/// supplies the delegate so a <see cref="WindowBufferComputeInstruction"/> reuses the evaluator's exact
+/// window semantics — partitioning, per-partition window ordering with stable ties, peer groups, ROWS /
+/// RANGE / GROUPS frame resolution, frame exclusion, <c>FILTER</c>, and the ranking, navigation and
+/// aggregate function families — rather than the executor re-deriving them.
+/// </summary>
+/// <remarks>
+/// The delegate is a leaf in exactly the sense <see cref="VdbeRowPredicate"/> and
+/// <see cref="VdbeAggregate"/> are: it maps the buffer's rows (in the insertion order the ingest loop
+/// produced, which is scan order) to one window-value tuple per row, and knows nothing of the buffer,
+/// the drain cursor, the output ordering, the projection, or the row gates — all of which are the
+/// program's own opcodes. It must return exactly one tuple per input row, in the same order, each of the
+/// buffer's declared window-value width. Returning a different shape is a hard error.
+/// </remarks>
+public delegate IReadOnlyList<SqlValue[]> VdbeWindowEvaluator(IReadOnlyList<SqlValue[]> bufferedRows);
 
 /// <summary>
 /// A single aggregate function expressed as the three lifecycle operations the
@@ -1488,6 +1540,76 @@ public sealed record CloseWorkTableInstruction(WorkTable WorkTable) : VdbeInstru
 }
 
 /// <summary>
+/// Opens window buffer <paramref name="Buffer"/>: an insertion-ordered buffer of
+/// <paramref name="ColumnCount"/>-wide scanned rows that a <see cref="WindowBufferInsertInstruction"/>
+/// loop fills, a <see cref="WindowBufferComputeInstruction"/> transforms into a parallel block of
+/// <paramref name="WindowCount"/> window values per row through <paramref name="Evaluator"/>, and a
+/// <see cref="WindowBufferDataInstruction"/>/<see cref="WindowBufferNextInstruction"/> loop drains. It is
+/// the windowing analogue of <see cref="OpenSorterInstruction"/>: it allocates the runtime buffer and
+/// fixes its shape up front.
+/// </summary>
+/// <remarks>
+/// <paramref name="WindowCount"/> may be zero only in the degenerate sense that a program declaring no
+/// window functions has nothing to compute; the validator requires it to be positive because a window
+/// buffer exists precisely to hold window values. The evaluator delegate is invoked exactly once, by
+/// <c>WindowBufferCompute</c>, over the whole buffer, which is what makes forward-looking and
+/// peer-relative frames representable.
+/// </remarks>
+public sealed record OpenWindowBufferInstruction(
+    WindowBuffer Buffer,
+    int ColumnCount,
+    int WindowCount,
+    VdbeWindowEvaluator Evaluator) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenWindowBuffer;
+}
+
+/// <summary>Appends a snapshot of the registers in <paramref name="Record"/> to window buffer
+/// <paramref name="Buffer"/>. The values are copied, so later writes to those registers cannot disturb a
+/// buffered row. The range width must equal the buffer's scanned-column count.</summary>
+public sealed record WindowBufferInsertInstruction(WindowBuffer Buffer, RegisterRange Record)
+    : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.WindowBufferInsert;
+}
+
+/// <summary>
+/// Runs the buffer's <see cref="VdbeWindowEvaluator"/> over every buffered row, storing the resulting
+/// per-row window values alongside them, then positions the buffer on its first row. Jumps to
+/// <paramref name="EmptyTarget"/> when the buffer holds no rows. It is the windowing analogue of
+/// <c>SorterSort</c>: the single point at which the buffered phase ends and the drain phase begins.
+/// </summary>
+public sealed record WindowBufferComputeInstruction(WindowBuffer Buffer, ProgramCounter EmptyTarget)
+    : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.WindowBufferCompute;
+}
+
+/// <summary>Copies the buffer's current row followed by that row's computed window values into the
+/// contiguous register block <paramref name="Destination"/> spans. The range width must equal the
+/// buffer's column count plus its window count.</summary>
+public sealed record WindowBufferDataInstruction(WindowBuffer Buffer, RegisterRange Destination)
+    : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.WindowBufferData;
+}
+
+/// <summary>Advances the window buffer to the next buffered row, jumping to
+/// <paramref name="LoopTarget"/> while more rows remain and falling through once the buffer is
+/// drained.</summary>
+public sealed record WindowBufferNextInstruction(WindowBuffer Buffer, ProgramCounter LoopTarget)
+    : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.WindowBufferNext;
+}
+
+/// <summary>Releases window buffer <paramref name="Buffer"/>'s rows and computed window values.</summary>
+public sealed record CloseWindowBufferInstruction(WindowBuffer Buffer) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.CloseWindowBuffer;
+}
+
+/// <summary>
 /// Thrown when a recursive worktable would admit more rows than its <see cref="OpenWorkTableInstruction.MaxRows"/>
 /// guard allows. It is the loud, bounded failure that keeps a runaway (or genuinely non-terminating)
 /// <c>UNION ALL</c> recursion from exhausting memory, mirroring the tree-walking evaluator's recursive-row cap.
@@ -1523,7 +1645,8 @@ public sealed class VdbeProgram
         int accumulatorCount = 0,
         int distinctSetCount = 0,
         int parameterSlotCount = 0,
-        int workTableCount = 0)
+        int workTableCount = 0,
+        int windowBufferCount = 0)
     {
         if (registerCount < 0)
             throw new ArgumentOutOfRangeException(nameof(registerCount));
@@ -1539,6 +1662,8 @@ public sealed class VdbeProgram
             throw new ArgumentOutOfRangeException(nameof(parameterSlotCount));
         if (workTableCount < 0)
             throw new ArgumentOutOfRangeException(nameof(workTableCount));
+        if (windowBufferCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(windowBufferCount));
         ArgumentNullException.ThrowIfNull(instructions);
 
         RegisterCount = registerCount;
@@ -1548,6 +1673,7 @@ public sealed class VdbeProgram
         DistinctSetCount = distinctSetCount;
         ParameterSlotCount = parameterSlotCount;
         WorkTableCount = workTableCount;
+        WindowBufferCount = windowBufferCount;
         _instructions = Array.AsReadOnly(instructions.ToArray());
         Validate();
     }
@@ -1572,6 +1698,11 @@ public sealed class VdbeProgram
     /// recursive-CTE evaluation.</summary>
     public int WorkTableCount { get; }
 
+    /// <summary>The number of buffered-window resources the program opens, i.e. the width of the window
+    /// buffer pool a <see cref="ResumableStatement"/> allocates. Zero for a program that evaluates no
+    /// window functions.</summary>
+    public int WindowBufferCount { get; }
+
     public IReadOnlyList<VdbeInstruction> Instructions => _instructions;
 
     public void Validate()
@@ -1587,6 +1718,9 @@ public sealed class VdbeProgram
         var sorterColumnCounts = new int[SorterCount];
         var openWorkTables = new bool[WorkTableCount];
         var workTableColumnCounts = new int[WorkTableCount];
+        var openWindowBuffers = new bool[WindowBufferCount];
+        var windowBufferColumnCounts = new int[WindowBufferCount];
+        var windowBufferRecordWidths = new int[WindowBufferCount];
         for (var instructionIndex = 0; instructionIndex < _instructions.Count; instructionIndex++)
         {
             var instruction = _instructions[instructionIndex]
@@ -2212,6 +2346,69 @@ public sealed class VdbeProgram
                     ValidateOpenWorkTable(closeWorkTable.WorkTable, openWorkTables, instructionIndex);
                     openWorkTables[closeWorkTable.WorkTable.Index] = false;
                     break;
+                case OpenWindowBufferInstruction openWindowBuffer:
+                    ValidateWindowBuffer(openWindowBuffer.Buffer, instructionIndex);
+                    if (openWindowBuffers[openWindowBuffer.Buffer.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens window buffer {openWindowBuffer.Buffer.Index} twice.");
+                    }
+
+                    if (openWindowBuffer.ColumnCount <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens window buffer {openWindowBuffer.Buffer.Index} with a non-positive column count.");
+                    }
+
+                    if (openWindowBuffer.WindowCount <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens window buffer {openWindowBuffer.Buffer.Index} with a non-positive window count.");
+                    }
+
+                    if (openWindowBuffer.Evaluator is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens window buffer {openWindowBuffer.Buffer.Index} with a null window evaluator.");
+                    }
+
+                    openWindowBuffers[openWindowBuffer.Buffer.Index] = true;
+                    windowBufferColumnCounts[openWindowBuffer.Buffer.Index] = openWindowBuffer.ColumnCount;
+                    windowBufferRecordWidths[openWindowBuffer.Buffer.Index] =
+                        openWindowBuffer.ColumnCount + openWindowBuffer.WindowCount;
+                    break;
+                case WindowBufferInsertInstruction windowInsert:
+                    ValidateOpenWindowBuffer(windowInsert.Buffer, openWindowBuffers, instructionIndex);
+                    ValidateRegisterRange(windowInsert.Record, instructionIndex);
+                    ValidateWindowBufferWidth(
+                        windowInsert.Buffer,
+                        windowInsert.Record,
+                        windowBufferColumnCounts[windowInsert.Buffer.Index],
+                        "scanned row",
+                        instructionIndex);
+                    break;
+                case WindowBufferComputeInstruction windowCompute:
+                    ValidateOpenWindowBuffer(windowCompute.Buffer, openWindowBuffers, instructionIndex);
+                    ValidateJumpTarget(windowCompute.EmptyTarget, instructionIndex);
+                    break;
+                case WindowBufferDataInstruction windowData:
+                    ValidateOpenWindowBuffer(windowData.Buffer, openWindowBuffers, instructionIndex);
+                    ValidateRegisterRange(windowData.Destination, instructionIndex);
+                    ValidateWindowBufferWidth(
+                        windowData.Buffer,
+                        windowData.Destination,
+                        windowBufferRecordWidths[windowData.Buffer.Index],
+                        "row-and-window record",
+                        instructionIndex);
+                    break;
+                case WindowBufferNextInstruction windowNext:
+                    ValidateOpenWindowBuffer(windowNext.Buffer, openWindowBuffers, instructionIndex);
+                    ValidateJumpTarget(windowNext.LoopTarget, instructionIndex);
+                    break;
+                case CloseWindowBufferInstruction closeWindowBuffer:
+                    ValidateOpenWindowBuffer(closeWindowBuffer.Buffer, openWindowBuffers, instructionIndex);
+                    openWindowBuffers[closeWindowBuffer.Buffer.Index] = false;
+                    break;
                 case HaltInstruction when instructionIndex == _instructions.Count - 1:
                     break;
                 case HaltInstruction:
@@ -2346,6 +2543,39 @@ public sealed class VdbeProgram
         {
             throw new VdbeProgramValidationException(
                 $"VDBE instruction {instructionIndex} moves {range.Count} registers for work table {workTable.Index}, which stores {workTableColumnCount}-column records.");
+        }
+    }
+
+    private void ValidateWindowBuffer(WindowBuffer buffer, int instructionIndex)
+    {
+        if (buffer.Index >= WindowBufferCount)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} references window buffer {buffer.Index}, but the program has {WindowBufferCount} window buffers.");
+        }
+    }
+
+    private void ValidateOpenWindowBuffer(WindowBuffer buffer, bool[] openWindowBuffers, int instructionIndex)
+    {
+        ValidateWindowBuffer(buffer, instructionIndex);
+        if (!openWindowBuffers[buffer.Index])
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} uses window buffer {buffer.Index} before opening it.");
+        }
+    }
+
+    private static void ValidateWindowBufferWidth(
+        WindowBuffer buffer,
+        RegisterRange range,
+        int expectedWidth,
+        string shape,
+        int instructionIndex)
+    {
+        if (range.Count != expectedWidth)
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} moves {range.Count} registers for window buffer {buffer.Index}, whose {shape} is {expectedWidth} columns wide.");
         }
     }
 

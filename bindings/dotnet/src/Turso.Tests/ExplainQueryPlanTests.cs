@@ -207,6 +207,14 @@ public sealed class ExplainQueryPlanTests
         ReadPlan(
                 connection,
                 "EXPLAIN QUERY PLAN SELECT row_number() OVER (ORDER BY id) FROM left_items;")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED COMPILED VDBE"));
+        ReadPlan(
+                connection,
+                """
+                EXPLAIN QUERY PLAN
+                SELECT row_number() OVER (ORDER BY l.id)
+                FROM left_items l JOIN right_items r ON r.id=l.id
+                """)
             .Rows[0][3].Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
         ReadPlan(
                 connection,
