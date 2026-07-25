@@ -278,23 +278,22 @@ public sealed class ManagedBoundedUpsertRuntimeSliceTests
     }
 
     [Test]
-    public void UpsertRejectsUnboundedAndAmbiguousForms()
+    public void TargetlessDoNothingAndDuplicateExactTargetsUseSQLiteInference()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE items(id INTEGER PRIMARY KEY, code TEXT UNIQUE, value INTEGER);");
         Execute(connection, "INSERT INTO items VALUES (1, 'one', 1);");
 
-        Action targetless = () => Execute(connection, "INSERT INTO items VALUES (1, 'x', 2) ON CONFLICT DO NOTHING;");
-        targetless.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*requires a parenthesized PRIMARY KEY or UNIQUE conflict target*");
-
+        Execute(connection, "INSERT INTO items VALUES (1, 'x', 2) ON CONFLICT DO NOTHING;");
         Execute(connection, "CREATE UNIQUE INDEX duplicate_code ON items(code);");
-        Action ambiguous = () => Execute(
+        Execute(
             connection,
-            "INSERT INTO items VALUES (2, 'one', 2) ON CONFLICT(code) DO NOTHING;");
-        ambiguous.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*matches multiple PRIMARY KEY or UNIQUE constraints*");
+            "INSERT INTO items VALUES (2, 'one', 2) ON CONFLICT(code) DO UPDATE SET value = excluded.value;");
+
+        AssertRows(
+            ReadRows(connection, "SELECT id, code, value FROM items;"),
+            [SqlValue.Integer(1), SqlValue.Text("one"), SqlValue.Integer(2)]);
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

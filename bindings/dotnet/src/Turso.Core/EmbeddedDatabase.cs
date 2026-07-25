@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
 using Turso.Core.Compilation;
@@ -89,7 +90,7 @@ internal sealed class EmbeddedConflictRollbackException : EmbeddedSqlException
     public long? LastInsertRowId { get; }
 }
 
-internal sealed class EmbeddedConflictFailException : EmbeddedSqlException
+internal class EmbeddedConflictFailException : EmbeddedSqlException
 {
     public EmbeddedConflictFailException(EmbeddedSqlException conflict, long lastInsertRowId)
         : base(conflict.Message, conflict)
@@ -100,6 +101,14 @@ internal sealed class EmbeddedConflictFailException : EmbeddedSqlException
     public long LastInsertRowId { get; }
 }
 
+internal sealed class EmbeddedUpsertConflictFailException : EmbeddedConflictFailException
+{
+    public EmbeddedUpsertConflictFailException(EmbeddedSqlException conflict, long lastInsertRowId)
+        : base(conflict, lastInsertRowId)
+    {
+    }
+}
+
 internal sealed class EmbeddedStatementAbortException : EmbeddedSqlException
 {
     public EmbeddedStatementAbortException(EmbeddedSqlException conflict, long lastInsertRowId)
@@ -107,6 +116,20 @@ internal sealed class EmbeddedStatementAbortException : EmbeddedSqlException
     {
         LastInsertRowId = lastInsertRowId;
     }
+
+    public long LastInsertRowId { get; }
+}
+
+internal sealed class EmbeddedStatementFailureException : Exception
+{
+    public EmbeddedStatementFailureException(Exception failure, long lastInsertRowId)
+        : base(failure.Message, failure)
+    {
+        Failure = failure;
+        LastInsertRowId = lastInsertRowId;
+    }
+
+    public Exception Failure { get; }
 
     public long LastInsertRowId { get; }
 }
@@ -323,7 +346,8 @@ public sealed class EmbeddedDatabase : IDisposable
         ForeignKeyStatementState? ForeignKeyStatement = null,
         bool IndexExpression = false,
         CancellationToken CancellationToken = default,
-        bool SchemaValidation = false);
+        bool SchemaValidation = false,
+        InsertConflictAlgorithm? TriggerConflictAlgorithm = null);
 
     internal sealed class ForeignKeyStatementState
     {
@@ -2997,6 +3021,15 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private ExecutionResult ExecuteInsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
+        if (context.InsideTrigger && context.TriggerConflictAlgorithm is { } triggerConflictAlgorithm)
+            statement = statement with { ConflictAlgorithm = triggerConflictAlgorithm };
+
+        if (statement.Upsert is not null)
+        {
+            return context.ForeignKeysEnabled
+                ? ExecuteWithForeignKeyStatement(context, () => ExecuteUpsert(statement, parameters, context))
+                : ExecuteUpsert(statement, parameters, context);
+        }
         if (statement.ConflictAlgorithm is { } algorithm)
         {
             return context.ForeignKeysEnabled
@@ -3004,12 +3037,6 @@ public sealed class EmbeddedDatabase : IDisposable
                     context,
                     () => ExecuteConflictResolvedInsert(statement, algorithm, parameters, context))
                 : ExecuteConflictResolvedInsert(statement, algorithm, parameters, context);
-        }
-        if (statement.Upsert is not null)
-        {
-            return context.ForeignKeysEnabled
-                ? ExecuteWithForeignKeyStatement(context, () => ExecuteUpsert(statement, parameters, context))
-                : ExecuteUpsert(statement, parameters, context);
         }
         if (context.Tables.TryGetValue(statement.TableName, out var table)
             && table.HasNonDefaultConflictAlgorithms)
@@ -3152,6 +3179,8 @@ public sealed class EmbeddedDatabase : IDisposable
                                 exception,
                                 table.HasRowid ? insertedRowIds[^1] : context.LastInsertRowId);
                         }
+                        if (context.InsideTrigger)
+                            throw new EmbeddedConflictFailException(exception, context.LastInsertRowId);
                         throw;
                     case InsertConflictAlgorithm.Rollback:
                         throw new EmbeddedConflictRollbackException(exception);
@@ -3187,13 +3216,9 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException(
                 "Managed INSERT OR conflict resolution cannot be combined with an ON CONFLICT UPSERT clause.");
         }
-        if (context.InsideTrigger)
-        {
-            throw new EmbeddedSqlException(
-                "Managed INSERT OR conflict resolution is not supported inside trigger bodies.");
-        }
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+        context = context with { TriggerConflictAlgorithm = algorithm };
         if (algorithm != InsertConflictAlgorithm.Replace
             && GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert).Count > 0)
         {
@@ -3322,6 +3347,8 @@ public sealed class EmbeddedDatabase : IDisposable
                     exception,
                     table.HasRowid ? insertedRowIds[^1] : context.LastInsertRowId);
             }
+            if (context.InsideTrigger)
+                throw new EmbeddedConflictFailException(exception, context.LastInsertRowId);
 
             throw;
         }
@@ -3499,11 +3526,17 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] candidate,
         long candidateRowId,
         IReadOnlyList<TriggerDefinition> deleteTriggers,
-        IReadOnlyList<TriggerDefinition> insertTriggers)
+        IReadOnlyList<TriggerDefinition> insertTriggers,
+        IReadOnlyList<int>? conflictPositions = null,
+        Action<IReadOnlyList<TriggerDefinition>, bool>? triggerDispatcher = null)
     {
-        var conflicts = FindReplacementConflicts(table, candidate, candidateRowId);
-        var conflictedRowIds = conflicts
-            .OrderBy(index => index)
+        var orderedConflicts = conflictPositions
+            ?? FindInsertUniqueConflicts(tableName, table, candidate, candidateRowId)
+                .Select(conflict => conflict.RowPosition)
+                .Distinct()
+                .ToArray();
+        var conflicts = orderedConflicts.ToHashSet();
+        var conflictedRowIds = orderedConflicts
             .Select(index => table.RowIds[index])
             .ToArray();
         var rows = new List<SqlValue[]>(table.Rows.Count - conflicts.Count + 1);
@@ -3540,51 +3573,116 @@ public sealed class EmbeddedDatabase : IDisposable
                 RecordBlobMutation(tableName, conflictedRowId);
             ValidateForeignKeysAfterDelete(context, tableName, table, originalRows, rows, [deletedRow]);
             if (deleteTriggers.Count > 0)
-                FireTriggers(deleteTriggers, context);
+                DispatchTriggers(deleteTriggers, candidateInserted: false);
         }
 
         CommitInserts(context, tableName, table, [candidate], [candidateRowId]);
         if (insertTriggers.Count > 0)
-            FireTriggers(insertTriggers, context);
+            DispatchTriggers(insertTriggers, candidateInserted: true);
+
+        void DispatchTriggers(
+            IReadOnlyList<TriggerDefinition> triggers,
+            bool candidateInserted)
+        {
+            if (triggerDispatcher is null)
+                FireTriggers(triggers, context);
+            else
+                triggerDispatcher(triggers, candidateInserted);
+        }
     }
 
-    private HashSet<int> FindReplacementConflicts(
+    private IReadOnlyList<InsertUniqueConflict> FindInsertUniqueConflicts(
+        string tableName,
         EmbeddedTable table,
         SqlValue[] candidate,
-        long candidateRowId)
+        long candidateRowId,
+        Func<IReadOnlyList<InsertUniqueConflict>, bool>? shouldStop = null)
     {
-        var constraints = new List<IReadOnlyList<UpsertConflictColumn>>();
-        for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
+        var conflicts = new List<InsertUniqueConflict>();
+        if (table.HasRowid)
         {
-            var column = table.ColumnDefinitions[columnIndex];
-            if (column.PrimaryKey)
-                constraints.Add([new UpsertConflictColumn(column.Name, columnIndex, column.Collation)]);
-        }
-
-        if (table.TableLevelPrimaryKey is not null)
-        {
-            constraints.Add(table.PrimaryKeyColumns
-                .Select((entry, position) => new UpsertConflictColumn(
-                    table.Columns[entry.Index],
-                    entry.Index,
-                    table.TableLevelPrimaryKey[position].Collation
-                        ?? table.ColumnDefinitions[entry.Index].Collation))
-                .ToArray());
-        }
-
-        var conflicts = new HashSet<int>();
-        for (var position = 0; position < table.Rows.Count; position++)
-        {
-            if (table.RowIds[position] == candidateRowId
-                || constraints.Any(constraint => RowsConflictOnConstraint(table.Rows[position], candidate, constraint))
-                || table.Indexes.Any(index =>
-                    index.Unique && RowsConflictOnIndex(table, index, table.Rows[position], candidate)))
+            var rowPosition = table.RowIds.IndexOf(candidateRowId);
+            if (rowPosition >= 0)
             {
-                conflicts.Add(position);
+                var aliasIndex = table.RowidAliasColumnIndex;
+                var column = aliasIndex >= 0 ? table.Columns[aliasIndex] : "rowid";
+                if (Add(
+                        rowPosition,
+                        $"UNIQUE constraint failed: {tableName}.{column}",
+                        aliasIndex >= 0 ? table.RowidAliasConflictAlgorithm : null))
+                {
+                    return conflicts;
+                }
             }
         }
 
+        var primaryKeyAdded = false;
+        for (var indexPosition = table.Indexes.Count - 1; indexPosition >= 0; indexPosition--)
+        {
+            var index = table.Indexes[indexPosition];
+            if (!primaryKeyAdded
+                && table.WithoutRowid
+                && table.PrimaryKeyConstraintOrdinal is { } primaryKeyOrdinal
+                && index.Origin != EmbeddedIndexOrigin.Explicit
+                && primaryKeyOrdinal > (index.ConstraintOrdinal ?? indexPosition))
+            {
+                if (AddWithoutRowidPrimaryKeyConflict())
+                    return conflicts;
+                primaryKeyAdded = true;
+            }
+
+            if (!index.Unique)
+                continue;
+            var rowPosition = table.Rows.FindIndex(row =>
+                RowsConflictOnIndex(table, index, row, candidate));
+            if (rowPosition < 0)
+                continue;
+
+            var message = index.Columns.Any(column => column.IsExpression)
+                ? $"UNIQUE constraint failed: index '{index.Name}'"
+                : "UNIQUE constraint failed: "
+                    + string.Join(", ", index.Columns.Select(column => $"{tableName}.{column.Name}"));
+            if (Add(rowPosition, message, index.ConflictAlgorithm))
+                return conflicts;
+        }
+        if (!primaryKeyAdded && table.WithoutRowid && AddWithoutRowidPrimaryKeyConflict())
+            return conflicts;
+
         return conflicts;
+
+        bool AddWithoutRowidPrimaryKeyConflict()
+        {
+            if (table.PrimaryKeyColumns.Count == 0)
+                return false;
+            var primaryKey = table.PrimaryKeyColumns
+                .Select((entry, position) => new UpsertConflictColumn(
+                    table.Columns[entry.Index],
+                    entry.Index,
+                    table.TableLevelPrimaryKey?[position].Collation
+                        ?? table.ColumnDefinitions[entry.Index].Collation))
+                .ToArray();
+            var rowPosition = table.Rows.FindIndex(row =>
+                RowsConflictOnConstraint(row, candidate, primaryKey));
+            if (rowPosition < 0)
+                return false;
+
+            return Add(
+                rowPosition,
+                "UNIQUE constraint failed: "
+                    + string.Join(", ", primaryKey.Select(column => $"{tableName}.{column.Name}")),
+                table.PrimaryKeyConflictAlgorithm);
+        }
+
+        bool Add(
+            int rowPosition,
+            string message,
+            InsertConflictAlgorithm? algorithm)
+        {
+            conflicts.Add(new InsertUniqueConflict(
+                rowPosition,
+                new EmbeddedSqlException(message, algorithm, constraintViolation: true)));
+            return shouldStop?.Invoke(conflicts) ?? false;
+        }
     }
 
     private bool RowsConflictOnConstraint(
@@ -3610,30 +3708,30 @@ public sealed class EmbeddedDatabase : IDisposable
             || exception.Message.StartsWith("NOT NULL constraint failed:", StringComparison.Ordinal)
             || exception.Message.StartsWith("CHECK constraint failed:", StringComparison.Ordinal);
 
-    // Trigger bodies can fail after their row mutations are published. Keep the complete
-    // statement under one backup so every VALUES row and statement-level trigger is atomic.
+    // Trigger bodies can fail after row mutations are published. Keep one statement backup;
+    // only a top-level FAIL policy may retain the successfully processed prefix.
     private ExecutionResult ExecuteUpsert(InsertStatement statement, SqlValue[] parameters, QueryContext context)
     {
         var backup = CloneTables(context.Tables);
         try
         {
-            var (result, mutationEvents) = PerformUpsertEvaluated(statement, parameters, context);
-            foreach (var triggerEvent in mutationEvents)
-            {
-                var triggers = GetMatchingTriggers(context, statement.TableName, triggerEvent);
-                if (triggers.Count == 0)
-                    continue;
-
-                if (context.InsideTrigger)
-                {
-                    throw new EmbeddedSqlException(
-                        $"cannot modify {statement.TableName} within a trigger body: recursive triggers are not supported");
-                }
-
-                FireTriggers(triggers, context);
-            }
-
-            return result;
+            return PerformUpsertEvaluated(statement, parameters, context);
+        }
+        catch (EmbeddedUpsertConflictFailException)
+        {
+            throw;
+        }
+        catch (EmbeddedConflictFailException exception)
+        {
+            RestoreTables(context.Tables, backup);
+            throw new EmbeddedSqlException(
+                exception.Message,
+                exception.InnerException ?? exception);
+        }
+        catch (EmbeddedConflictRollbackException)
+        {
+            RestoreTables(context.Tables, backup);
+            throw;
         }
         catch
         {
@@ -3642,7 +3740,7 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    private (ExecutionResult Result, IReadOnlyList<TriggerEvent> MutationEvents) PerformUpsertEvaluated(
+    private ExecutionResult PerformUpsertEvaluated(
         InsertStatement statement,
         SqlValue[] parameters,
         QueryContext context)
@@ -3657,6 +3755,8 @@ public sealed class EmbeddedDatabase : IDisposable
         if (!context.Tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
+        var triggerConflictAlgorithm = statement.ConflictAlgorithm;
+        context = context with { TriggerConflictAlgorithm = triggerConflictAlgorithm };
         var conflictTarget = ResolveUpsertConflictTarget(statement.TableName, table, statement.Upsert);
         var insertPlan = PrepareInsert(statement, table, context);
         var updateAction = statement.Upsert.Action as DoUpdateUpsertAction;
@@ -3680,100 +3780,224 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var affectedRows = new List<SqlValue[]>();
         var affectedRowIds = new List<long>();
-        var mutationEvents = new List<TriggerEvent>();
+        var affectedLastInsertRowIds = new List<long?>();
+        var insertTriggers = GetMatchingTriggers(context, statement.TableName, TriggerEvent.Insert);
+        var updateTriggers = GetMatchingTriggers(context, statement.TableName, TriggerEvent.Update);
+        var deleteTriggers = context.RecursiveTriggersEnabled
+            ? GetMatchingTriggers(context, statement.TableName, TriggerEvent.Delete)
+            : Array.Empty<TriggerDefinition>();
         long? lastInsertRowId = null;
         foreach (var values in statement.Rows)
         {
-            var (candidate, candidateRowId) = BuildInsertRow(
-                statement,
-                table,
-                insertPlan,
-                values,
-                parameters,
-                context,
-                allowExistingRowid: true);
-            var conflictPosition = FindUpsertConflictPosition(table, conflictTarget, candidate, table.Rows);
+            SynchronizeInsertAllocation(insertPlan, table);
+            var allocationSnapshot = CaptureInsertAllocation(insertPlan);
+            SqlValue[]? candidate = null;
+            var candidateRowId = 0L;
+            try
+            {
+                (candidate, candidateRowId) = BuildInsertRow(
+                    statement,
+                    table,
+                    insertPlan,
+                    values,
+                    parameters,
+                    context,
+                    allowExistingRowid: true);
+                table.ValidateRows(statement.TableName, [candidate]);
+                ValidatePrimaryKey(statement.TableName, table, [candidate]);
+            }
+            catch (EmbeddedSqlException exception) when (IsConflictAlgorithmConstraint(exception))
+            {
+                if (HandleInsertConflict(
+                        exception,
+                        candidate,
+                        candidateRowId,
+                        allocationSnapshot,
+                        uniqueConflicts: null))
+                    continue;
+                throw;
+            }
+            catch (Exception exception) when (
+                lastInsertRowId.HasValue
+                && exception is not OperationCanceledException
+                && exception is not EmbeddedConflictFailException
+                && exception is not EmbeddedConflictRollbackException
+                && exception is not EmbeddedStatementAbortException
+                && exception is not EmbeddedStatementFailureException)
+            {
+                throw new EmbeddedStatementFailureException(exception, lastInsertRowId.Value);
+            }
+
+            var conflictPosition = PreserveLastInsertRowIdOnFailure(() =>
+                FindUpsertConflictPosition(
+                    table,
+                    conflictTarget,
+                    candidate,
+                    candidateRowId,
+                    table.Rows,
+                    table.RowIds));
 
             if (conflictPosition < 0)
             {
-                var rows = new List<SqlValue[]>(table.Rows.Count + 1);
-                rows.AddRange(table.Rows);
-                rows.Add(candidate);
-                var rowIds = new List<long>(table.RowIds.Count + 1);
-                rowIds.AddRange(table.RowIds);
-                rowIds.Add(candidateRowId);
+                var uniqueConflicts = PreserveLastInsertRowIdOnFailure(() =>
+                    FindInsertUniqueConflicts(
+                        statement.TableName,
+                        table,
+                        candidate,
+                        candidateRowId,
+                        conflicts =>
+                        {
+                            if (statement.ConflictAlgorithm == InsertConflictAlgorithm.Replace)
+                                return false;
+                            if (statement.ConflictAlgorithm is not null)
+                                return true;
+                            return conflicts.Any(conflict =>
+                                (conflict.Exception.ConflictAlgorithm ?? InsertConflictAlgorithm.Abort)
+                                != InsertConflictAlgorithm.Replace);
+                        }));
+                if (uniqueConflicts.Count > 0
+                    && HandleInsertConflict(
+                        uniqueConflicts[0].Exception,
+                        candidate,
+                        candidateRowId,
+                        allocationSnapshot,
+                        uniqueConflicts))
+                {
+                    continue;
+                }
 
-                ValidateRowIdsUnique(statement.TableName, table, rowIds, table.RowidAliasColumnIndex);
-                table.ValidateRows(statement.TableName, rows);
-                ValidateColumnUniqueConstraints(table, rows);
-                ValidatePrimaryKey(statement.TableName, table, rows);
-                ValidateUniqueIndexes(statement.TableName, table, rows);
-                ValidateForeignKeysAfterInsert(context, statement.TableName, table, [candidate], rows);
-                ApplyUpsertRows(table, rows, rowIds);
+                try
+                {
+                    CommitInserts(
+                        context,
+                        statement.TableName,
+                        table,
+                        [candidate],
+                        [candidateRowId]);
+                }
+                catch (EmbeddedSqlException exception) when (IsConflictAlgorithmConstraint(exception))
+                {
+                    if (HandleInsertConflict(exception, candidate, candidateRowId, allocationSnapshot))
+                        continue;
+                    throw;
+                }
+                catch (Exception exception) when (
+                    lastInsertRowId.HasValue
+                    && exception is not OperationCanceledException
+                    && exception is not EmbeddedConflictFailException
+                    && exception is not EmbeddedConflictRollbackException
+                    && exception is not EmbeddedStatementAbortException
+                    && exception is not EmbeddedStatementFailureException)
+                {
+                    throw new EmbeddedStatementFailureException(exception, lastInsertRowId.Value);
+                }
 
                 affectedRows.Add(candidate);
                 affectedRowIds.Add(candidateRowId);
                 if (table.HasRowid)
+                {
                     lastInsertRowId = candidateRowId;
-                if (!mutationEvents.Contains(TriggerEvent.Insert))
-                    mutationEvents.Add(TriggerEvent.Insert);
+                    context = context with { LastInsertRowId = candidateRowId };
+                }
+                affectedLastInsertRowIds.Add(context.LastInsertRowId);
+                FireMutationTriggers(insertTriggers, triggerConflictAlgorithm);
                 continue;
             }
 
+            RestoreInsertAllocation(insertPlan, allocationSnapshot);
             if (updateAction is null)
                 continue;
 
-            var original = table.Rows[conflictPosition];
-            var originalRowId = table.RowIds[conflictPosition];
-            var source = CreateUpsertSourceRow(
-                statement.TableName,
-                table,
-                original,
-                originalRowId,
-                candidate);
-            if (updateAction.Where is not null
-                && !IsTrue(Evaluate(updateAction.Where, parameters, source, context)))
+            try
             {
-                continue;
+                var updateContext = context with
+                {
+                    TriggerConflictAlgorithm = InsertConflictAlgorithm.Abort,
+                };
+                var original = table.Rows[conflictPosition];
+                var originalRowId = table.RowIds[conflictPosition];
+                var source = CreateUpsertSourceRow(
+                    statement.TableName,
+                    table,
+                    original,
+                    originalRowId,
+                    candidate);
+                if (updateAction.Where is not null
+                    && !IsTrue(Evaluate(updateAction.Where, parameters, source, updateContext)))
+                {
+                    continue;
+                }
+
+                var updated = BuildUpsertUpdatedRow(
+                    statement.TableName,
+                    table,
+                    updatePlan!,
+                    original,
+                    originalRowId,
+                    source,
+                    parameters,
+                    updateContext);
+                var updatedRows = new List<SqlValue[]>(table.Rows);
+                updatedRows[conflictPosition] = updated;
+                var updatedRowIds = new List<long>(table.RowIds);
+
+                ValidateRowIdsUnique(statement.TableName, table, updatedRowIds, updatePlan!.AliasIndex);
+                table.ValidateRows(statement.TableName, updatedRows);
+                ValidateColumnUniqueConstraints(table, updatedRows);
+                ValidatePrimaryKey(statement.TableName, table, updatedRows);
+                ValidateUniqueIndexes(statement.TableName, table, updatedRows);
+                var originalRows = table.Rows.Select(row => row.ToArray()).ToArray();
+                ApplyUpsertRows(table, updatedRows, updatedRowIds);
+                ValidateForeignKeysAfterUpdate(
+                    updateContext,
+                    statement.TableName,
+                    table,
+                    originalRows,
+                    updatedRows,
+                    updatePlan!,
+                    [conflictPosition]);
+
+                affectedRows.Add(updated);
+                affectedRowIds.Add(originalRowId);
+                affectedLastInsertRowIds.Add(context.LastInsertRowId);
+                FireMutationTriggers(updateTriggers, InsertConflictAlgorithm.Abort);
             }
-
-            var updated = BuildUpsertUpdatedRow(
-                statement.TableName,
-                table,
-                updatePlan!,
-                original,
-                originalRowId,
-                source,
-                parameters,
-                context);
-            var updatedRows = new List<SqlValue[]>(table.Rows);
-            updatedRows[conflictPosition] = updated;
-            var updatedRowIds = new List<long>(table.RowIds);
-
-            ValidateRowIdsUnique(statement.TableName, table, updatedRowIds, updatePlan!.AliasIndex);
-            table.ValidateRows(statement.TableName, updatedRows);
-            ValidateColumnUniqueConstraints(table, updatedRows);
-            ValidatePrimaryKey(statement.TableName, table, updatedRows);
-            ValidateUniqueIndexes(statement.TableName, table, updatedRows);
-            var originalRows = table.Rows.Select(row => row.ToArray()).ToArray();
-            ApplyUpsertRows(table, updatedRows, updatedRowIds);
-            ValidateForeignKeysAfterUpdate(
-                context,
-                statement.TableName,
-                table,
-                originalRows,
-                updatedRows,
-                updatePlan!,
-                [conflictPosition]);
-
-            affectedRows.Add(updated);
-            affectedRowIds.Add(originalRowId);
-            if (!mutationEvents.Contains(TriggerEvent.Update))
-                mutationEvents.Add(TriggerEvent.Update);
+            catch (EmbeddedUpsertConflictFailException)
+            {
+                throw;
+            }
+            catch (EmbeddedConflictFailException exception)
+            {
+                var failure = new EmbeddedSqlException(
+                    exception.Message,
+                    exception.InnerException ?? exception);
+                if (lastInsertRowId is { } insertedRowId)
+                    throw new EmbeddedStatementAbortException(failure, insertedRowId);
+                throw failure;
+            }
+            catch (EmbeddedSqlException exception) when (
+                lastInsertRowId.HasValue
+                && exception is not EmbeddedConflictFailException
+                && exception is not EmbeddedConflictRollbackException
+                && exception is not EmbeddedStatementAbortException)
+            {
+                throw new EmbeddedStatementAbortException(exception, lastInsertRowId.Value);
+            }
+            catch (Exception exception) when (
+                lastInsertRowId.HasValue
+                && exception is not OperationCanceledException
+                && exception is not EmbeddedConflictFailException
+                && exception is not EmbeddedConflictRollbackException
+                && exception is not EmbeddedStatementAbortException
+                && exception is not EmbeddedStatementFailureException)
+            {
+                throw new EmbeddedStatementFailureException(exception, lastInsertRowId.Value);
+            }
         }
 
-        return (
-            BuildUpsertReturningResult(
+        try
+        {
+            return BuildUpsertReturningResult(
                 statement,
                 table,
                 affectedRows,
@@ -3782,8 +4006,231 @@ public sealed class EmbeddedDatabase : IDisposable
                 context,
                 rowsAffected: affectedRows.Count,
                 changed: affectedRows.Count > 0,
-                lastInsertRowId: lastInsertRowId),
-            mutationEvents);
+                lastInsertRowId: lastInsertRowId,
+                affectedLastInsertRowIds: affectedLastInsertRowIds);
+        }
+        catch (EmbeddedSqlException exception) when (
+            lastInsertRowId.HasValue
+            && exception is not EmbeddedConflictFailException
+            && exception is not EmbeddedConflictRollbackException
+            && exception is not EmbeddedStatementAbortException)
+        {
+            throw new EmbeddedStatementAbortException(exception, lastInsertRowId.Value);
+        }
+        catch (Exception exception) when (
+            lastInsertRowId.HasValue
+            && exception is not OperationCanceledException
+            && exception is not EmbeddedConflictFailException
+            && exception is not EmbeddedConflictRollbackException
+            && exception is not EmbeddedStatementAbortException
+            && exception is not EmbeddedStatementFailureException)
+        {
+            throw new EmbeddedStatementFailureException(exception, lastInsertRowId.Value);
+        }
+
+        bool HandleInsertConflict(
+            EmbeddedSqlException exception,
+            SqlValue[]? conflictingCandidate,
+            long conflictingRowId,
+            InsertAllocationSnapshot? allocationSnapshot,
+            IReadOnlyList<InsertUniqueConflict>? uniqueConflicts = null)
+        {
+            var algorithm = statement.ConflictAlgorithm
+                ?? exception.ConflictAlgorithm
+                ?? InsertConflictAlgorithm.Abort;
+            switch (algorithm)
+            {
+                case InsertConflictAlgorithm.Ignore:
+                    RestoreInsertAllocation(insertPlan, allocationSnapshot);
+                    return true;
+                case InsertConflictAlgorithm.Replace
+                    when conflictingCandidate is not null
+                        && exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal):
+                    IReadOnlyList<int>? replacementConflicts = null;
+                    if (statement.ConflictAlgorithm is null && uniqueConflicts is not null)
+                    {
+                        var nonReplace = uniqueConflicts.FirstOrDefault(conflict =>
+                            (conflict.Exception.ConflictAlgorithm ?? InsertConflictAlgorithm.Abort)
+                            != InsertConflictAlgorithm.Replace);
+                        if (nonReplace is not null)
+                        {
+                            return HandleInsertConflict(
+                                nonReplace.Exception,
+                                conflictingCandidate,
+                                conflictingRowId,
+                                allocationSnapshot);
+                        }
+
+                        replacementConflicts = uniqueConflicts
+                            .Select(conflict => conflict.RowPosition)
+                            .Distinct()
+                            .ToArray();
+                    }
+
+                    EnsureTriggersMayFire(deleteTriggers);
+                    EnsureTriggersMayFire(insertTriggers);
+                    PreserveLastInsertRowIdOnFailure(() =>
+                    {
+                        ExecuteReplacement();
+                        return true;
+                    });
+                    affectedRows.Add(conflictingCandidate);
+                    affectedRowIds.Add(conflictingRowId);
+                    if (table.HasRowid)
+                    {
+                        lastInsertRowId = conflictingRowId;
+                        context = context with { LastInsertRowId = conflictingRowId };
+                    }
+                    affectedLastInsertRowIds.Add(context.LastInsertRowId);
+                    return true;
+
+                    void ExecuteReplacement()
+                    {
+                        CommitReplacement(
+                            context,
+                            statement.TableName,
+                            table,
+                            conflictingCandidate,
+                            conflictingRowId,
+                            deleteTriggers,
+                            insertTriggers,
+                            replacementConflicts,
+                            (triggers, candidateInserted) => FireUpsertTriggers(
+                                triggers,
+                                candidateInserted && table.HasRowid
+                                    ? conflictingRowId
+                                    : lastInsertRowId,
+                                triggerConflictAlgorithm));
+                    }
+                case InsertConflictAlgorithm.Fail:
+                    if (affectedRows.Count == 0)
+                        throw exception;
+                    throw new EmbeddedUpsertConflictFailException(
+                        exception,
+                        lastInsertRowId ?? context.LastInsertRowId);
+                case InsertConflictAlgorithm.Rollback:
+                    throw new EmbeddedConflictRollbackException(exception, lastInsertRowId);
+                case InsertConflictAlgorithm.Abort:
+                case InsertConflictAlgorithm.Replace:
+                    if (lastInsertRowId is { } insertedRowId)
+                        throw new EmbeddedStatementAbortException(exception, insertedRowId);
+                    throw exception;
+                default:
+                    throw new InvalidOperationException("Unknown INSERT conflict algorithm.");
+            }
+        }
+
+        void FireMutationTriggers(
+            IReadOnlyList<TriggerDefinition> triggers,
+            InsertConflictAlgorithm? inheritedConflictAlgorithm)
+            => FireUpsertTriggers(triggers, lastInsertRowId, inheritedConflictAlgorithm);
+
+        void FireUpsertTriggers(
+            IReadOnlyList<TriggerDefinition> triggers,
+            long? failureLastInsertRowId,
+            InsertConflictAlgorithm? inheritedConflictAlgorithm)
+        {
+            EnsureTriggersMayFire(triggers);
+            if (triggers.Count == 0)
+                return;
+
+            try
+            {
+                var mutationContext = failureLastInsertRowId is { } insertedRowId
+                    ? context with { LastInsertRowId = insertedRowId }
+                    : context;
+                FireTriggers(triggers, mutationContext, inheritedConflictAlgorithm);
+            }
+            catch (EmbeddedConflictRollbackException exception)
+            {
+                if (failureLastInsertRowId is not { } insertedRowId)
+                    throw;
+                throw new EmbeddedConflictRollbackException(
+                    new EmbeddedSqlException(
+                        exception.Message,
+                        exception.InnerException ?? exception),
+                    insertedRowId);
+            }
+            catch (EmbeddedConflictFailException exception)
+            {
+                var failure = new EmbeddedSqlException(
+                    exception.Message,
+                    exception.InnerException ?? exception);
+                if (inheritedConflictAlgorithm != InsertConflictAlgorithm.Abort)
+                {
+                    throw new EmbeddedUpsertConflictFailException(
+                        failure,
+                        failureLastInsertRowId ?? context.LastInsertRowId);
+                }
+                if (failureLastInsertRowId is { } insertedRowId)
+                    throw new EmbeddedStatementAbortException(failure, insertedRowId);
+                throw failure;
+            }
+            catch (EmbeddedStatementAbortException exception)
+            {
+                if (failureLastInsertRowId is not { } insertedRowId)
+                    throw;
+                throw new EmbeddedStatementAbortException(
+                    new EmbeddedSqlException(
+                        exception.Message,
+                        exception.InnerException ?? exception),
+                    insertedRowId);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                if (inheritedConflictAlgorithm == InsertConflictAlgorithm.Fail
+                    && IsConflictAlgorithmConstraint(exception))
+                {
+                    throw new EmbeddedUpsertConflictFailException(
+                        exception,
+                        failureLastInsertRowId ?? context.LastInsertRowId);
+                }
+                if (failureLastInsertRowId is { } insertedRowId)
+                    throw new EmbeddedStatementAbortException(exception, insertedRowId);
+                throw;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                if (failureLastInsertRowId is { } insertedRowId)
+                    throw new EmbeddedStatementFailureException(exception, insertedRowId);
+                throw;
+            }
+        }
+
+        void EnsureTriggersMayFire(IReadOnlyList<TriggerDefinition> triggers)
+        {
+            if (triggers.Count > 0 && context.InsideTrigger)
+            {
+                throw new EmbeddedSqlException(
+                    $"cannot modify {statement.TableName} within a trigger body: recursive triggers are not supported");
+            }
+        }
+
+        T PreserveLastInsertRowIdOnFailure<T>(Func<T> operation)
+        {
+            try
+            {
+                return operation();
+            }
+            catch (Exception exception) when (
+                exception is EmbeddedConflictFailException
+                    or EmbeddedConflictRollbackException
+                    or EmbeddedStatementAbortException
+                    or EmbeddedStatementFailureException)
+            {
+                throw;
+            }
+            catch (EmbeddedSqlException exception) when (lastInsertRowId.HasValue)
+            {
+                throw new EmbeddedStatementAbortException(exception, lastInsertRowId.Value);
+            }
+            catch (Exception exception) when (
+                lastInsertRowId.HasValue
+                && exception is not OperationCanceledException)
+            {
+                throw new EmbeddedStatementFailureException(exception, lastInsertRowId.Value);
+            }
+        }
     }
 
     private void ApplyUpsertRows(EmbeddedTable table, List<SqlValue[]> rows, List<long> rowIds)
@@ -3804,7 +4251,8 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         int rowsAffected,
         bool changed,
-        long? lastInsertRowId)
+        long? lastInsertRowId,
+        IReadOnlyList<long?> affectedLastInsertRowIds)
     {
         if (statement.Returning is null)
         {
@@ -3824,7 +4272,8 @@ public sealed class EmbeddedDatabase : IDisposable
             changed,
             parameters,
             context,
-            lastInsertRowId);
+            lastInsertRowId,
+            affectedLastInsertRowIds);
     }
 
     private UpsertConflictTarget ResolveUpsertConflictTarget(
@@ -3834,11 +4283,18 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         var target = upsert.Target;
         if (target.Count == 0)
-            throw new InvalidOperationException("UPSERT conflict target cannot be empty.");
-
-        var matches = new List<UpsertConflictTarget>();
-        foreach (var index in table.Indexes)
         {
+            if (upsert.Action is not DoNothingUpsertAction || upsert.TargetWhere is not null)
+                throw new InvalidOperationException("Only target-less UPSERT DO NOTHING is supported.");
+
+            return new UpsertConflictTarget(Index: null, Columns: null, CatchesAllUniqueConstraints: true);
+        }
+
+        UpsertConflictTarget? constraintMatch = null;
+        var constraintOrdinal = int.MinValue;
+        for (var position = table.Indexes.Count - 1; position >= 0; position--)
+        {
+            var index = table.Indexes[position];
             if (!index.Unique
                 || !IndexExpressionSemantics.ExpressionsEqual(upsert.TargetWhere, index.Where)
                 || !UpsertTargetMatches(table, target, index.Columns))
@@ -3846,10 +4302,24 @@ public sealed class EmbeddedDatabase : IDisposable
                 continue;
             }
 
-            matches.Add(new UpsertConflictTarget(index, Columns: null));
+            if (index.Origin == EmbeddedIndexOrigin.Explicit)
+                return new UpsertConflictTarget(index, Columns: null, CatchesAllUniqueConstraints: false);
+
+            var ordinal = index.ConstraintOrdinal ?? position;
+            if (constraintMatch is null || ordinal > constraintOrdinal)
+            {
+                constraintMatch = new UpsertConflictTarget(
+                    index,
+                    Columns: null,
+                    CatchesAllUniqueConstraints: false);
+                constraintOrdinal = ordinal;
+            }
         }
 
-        if (upsert.TargetWhere is null && table.PrimaryKeyColumns.Count > 0)
+        UpsertConflictTarget? primaryKeyMatch = null;
+        if (upsert.TargetWhere is null
+            && table.PrimaryKeyColumns.Count > 0
+            && (!table.HasRowidAlias || target.All(term => term.Collation is null)))
         {
             var columns = table.PrimaryKeyColumns
                 .Select((entry, position) => new UpsertConflictColumn(
@@ -3859,17 +4329,26 @@ public sealed class EmbeddedDatabase : IDisposable
                         ?? table.ColumnDefinitions[entry.Index].Collation))
                 .ToArray();
             if (UpsertTargetMatches(target, columns))
-                matches.Add(new UpsertConflictTarget(Index: null, columns));
+                primaryKeyMatch = new UpsertConflictTarget(
+                    Index: null,
+                    Columns: columns,
+                    CatchesAllUniqueConstraints: false);
         }
 
-        return matches.Count switch
+        if (primaryKeyMatch is not null
+            && table.WithoutRowid
+            && table.PrimaryKeyConstraintOrdinal is { } primaryKeyOrdinal
+            && primaryKeyOrdinal > constraintOrdinal)
         {
-            1 => matches[0],
-            0 => throw new EmbeddedSqlException(
-                $"ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint on table {tableName}."),
-            _ => throw new EmbeddedSqlException(
-                "Managed UPSERT does not support a conflict target that matches multiple PRIMARY KEY or UNIQUE constraints."),
-        };
+            return primaryKeyMatch;
+        }
+        if (constraintMatch is not null)
+            return constraintMatch;
+        if (primaryKeyMatch is not null)
+            return primaryKeyMatch;
+
+        throw new EmbeddedSqlException(
+            $"ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint on table {tableName}.");
     }
 
     private static bool UpsertTargetMatches(
@@ -3877,13 +4356,8 @@ public sealed class EmbeddedDatabase : IDisposable
         IReadOnlyList<UpsertTargetColumn> target,
         IReadOnlyList<EmbeddedIndexColumn> constraint)
     {
-        if (target.Count != constraint.Count)
-            return false;
-
-        for (var index = 0; index < target.Count; index++)
+        return UpsertTargetTermsMatch(target, constraint, (targetTerm, indexTerm) =>
         {
-            var targetTerm = target[index];
-            var indexTerm = constraint[index];
             if (targetTerm.IsExpression != indexTerm.IsExpression)
                 return false;
             if (targetTerm.IsExpression)
@@ -3896,49 +4370,89 @@ public sealed class EmbeddedDatabase : IDisposable
                 return false;
             }
 
-            if (targetTerm.Collation is not null
-                && !string.Equals(
+            return targetTerm.Collation is null
+                || string.Equals(
                     targetTerm.Collation,
                     IndexExpressionSemantics.GetCollationName(table, indexTerm),
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-        }
-
-        return true;
+                    StringComparison.OrdinalIgnoreCase);
+        });
     }
 
     private static bool UpsertTargetMatches(
         IReadOnlyList<UpsertTargetColumn> target,
         IReadOnlyList<UpsertConflictColumn> constraint)
     {
+        return UpsertTargetTermsMatch(target, constraint, static (targetTerm, constraintTerm) =>
+        {
+            return !targetTerm.IsExpression
+                && string.Equals(targetTerm.Name, constraintTerm.Name, StringComparison.OrdinalIgnoreCase)
+                && (targetTerm.Collation is null
+                    || string.Equals(
+                        targetTerm.Collation,
+                        constraintTerm.Collation ?? "BINARY",
+                        StringComparison.OrdinalIgnoreCase));
+        });
+    }
+
+    private static bool UpsertTargetTermsMatch<TConstraint>(
+        IReadOnlyList<UpsertTargetColumn> target,
+        IReadOnlyList<TConstraint> constraint,
+        Func<UpsertTargetColumn, TConstraint, bool> termsMatch)
+    {
         if (target.Count != constraint.Count)
             return false;
 
-        for (var index = 0; index < target.Count; index++)
+        var assignedTargets = Enumerable.Repeat(-1, constraint.Count).ToArray();
+        for (var targetPosition = 0; targetPosition < target.Count; targetPosition++)
         {
-            if (target[index].IsExpression
-                || !string.Equals(target[index].Name, constraint[index].Name, StringComparison.OrdinalIgnoreCase)
-                || (target[index].Collation is not null
-                    && !string.Equals(
-                        target[index].Collation,
-                        constraint[index].Collation ?? "BINARY",
-                        StringComparison.OrdinalIgnoreCase)))
-            {
+            if (!TryAssign(targetPosition, new bool[constraint.Count]))
                 return false;
-            }
         }
 
         return true;
+
+        bool TryAssign(int targetPosition, bool[] visited)
+        {
+            for (var constraintPosition = 0; constraintPosition < constraint.Count; constraintPosition++)
+            {
+                if (visited[constraintPosition]
+                    || !termsMatch(target[targetPosition], constraint[constraintPosition]))
+                {
+                    continue;
+                }
+
+                visited[constraintPosition] = true;
+                if (assignedTargets[constraintPosition] < 0
+                    || TryAssign(assignedTargets[constraintPosition], visited))
+                {
+                    assignedTargets[constraintPosition] = targetPosition;
+                    return true;
+                }
+            }
+
+            return false;
+        }
     }
 
     private int FindUpsertConflictPosition(
         EmbeddedTable table,
         UpsertConflictTarget target,
         SqlValue[] candidate,
-        IReadOnlyList<SqlValue[]> rows)
+        long candidateRowId,
+        IReadOnlyList<SqlValue[]> rows,
+        IReadOnlyList<long> rowIds)
     {
+        if (target.CatchesAllUniqueConstraints)
+        {
+            var conflicts = FindInsertUniqueConflicts(
+                table.Name,
+                table,
+                candidate,
+                candidateRowId,
+                _ => true);
+            return conflicts.Count == 0 ? -1 : conflicts[0].RowPosition;
+        }
+
         if (target.Index is { } index)
         {
             if (!IndexExpressionSemantics.Qualifies(
@@ -4160,9 +4674,56 @@ public sealed class EmbeddedDatabase : IDisposable
 
     private sealed record UpsertConflictColumn(string Name, int Index, string? Collation);
 
+    private sealed record InsertUniqueConflict(
+        int RowPosition,
+        EmbeddedSqlException Exception);
+
     private sealed record UpsertConflictTarget(
         EmbeddedIndex? Index,
-        IReadOnlyList<UpsertConflictColumn>? Columns);
+        IReadOnlyList<UpsertConflictColumn>? Columns,
+        bool CatchesAllUniqueConstraints);
+
+    private static InsertAllocationSnapshot? CaptureInsertAllocation(InsertPlan plan)
+    {
+        plan.LastAddedRowId = null;
+        return plan.AutoIncrement is null
+            ? new InsertAllocationSnapshot(plan.AnyRow, plan.LargestRowId)
+            : null;
+    }
+
+    private static void RestoreInsertAllocation(InsertPlan plan, InsertAllocationSnapshot? snapshot)
+    {
+        if (snapshot is not { } value)
+            return;
+
+        plan.AnyRow = value.AnyRow;
+        plan.LargestRowId = value.LargestRowId;
+        if (plan.LastAddedRowId is { } rowId && !plan.Used.Remove(rowId))
+            throw new InvalidOperationException("The skipped UPSERT rowid allocation was lost.");
+        plan.LastAddedRowId = null;
+    }
+
+    private static void SynchronizeInsertAllocation(InsertPlan plan, EmbeddedTable table)
+    {
+        if (plan.AutoIncrement is null)
+        {
+            plan.Used.Clear();
+            plan.Used.UnionWith(table.RowIds);
+            plan.AnyRow = table.RowIds.Count > 0;
+            plan.LargestRowId = plan.AnyRow ? table.RowIds.Max() : long.MinValue;
+            return;
+        }
+
+        plan.Used.UnionWith(table.RowIds);
+        if (table.RowIds.Count == 0)
+            return;
+        plan.AnyRow = true;
+        plan.LargestRowId = Math.Max(plan.LargestRowId, table.RowIds.Max());
+    }
+
+    private sealed record InsertAllocationSnapshot(
+        bool AnyRow,
+        long LargestRowId);
 
     // Materializes every generated column into the row in dependency order, applying the
     // declared-type affinity and enforcing NOT NULL with a table-qualified message. The
@@ -4699,13 +5260,19 @@ public sealed class EmbeddedDatabase : IDisposable
             rowid = plan.AutoIncrement is null
                 ? plan.AnyRow ? NextAutoRowId(plan.LargestRowId, plan.Used) : 1
                 : plan.AutoIncrement.NextRowId(plan.AnyRow, plan.LargestRowId);
-            plan.Used.Add(rowid);
+            if (!plan.Used.Add(rowid))
+                throw new InvalidOperationException("Generated INSERT rowid is already in use.");
+            plan.LastAddedRowId = rowid;
         }
         else if (EmbeddedTable.TryCoerceRowid(rowidSource, out var explicitRowid))
         {
             rowid = explicitRowid;
             plan.AutoIncrement?.Observe(rowid);
-            if (!plan.Used.Add(rowid))
+            if (plan.Used.Add(rowid))
+            {
+                plan.LastAddedRowId = rowid;
+            }
+            else
             {
                 if (!allowExistingRowid)
                 {
@@ -4818,6 +5385,8 @@ public sealed class EmbeddedDatabase : IDisposable
         public long LargestRowId { get; set; }
 
         public AutoIncrementTracker? AutoIncrement { get; init; }
+
+        public long? LastAddedRowId { get; set; }
     }
 
     private static long CoerceSqliteSequenceInteger(SqlValue value)
@@ -5003,15 +5572,43 @@ public sealed class EmbeddedDatabase : IDisposable
             {
                 rows[position] = row;
                 rowIds[position] = rowid;
-                if (exception.ConflictAlgorithm == InsertConflictAlgorithm.Ignore)
+                var inheritedAlgorithm = context.InsideTrigger
+                    ? context.TriggerConflictAlgorithm
+                    : null;
+                if (inheritedAlgorithm is not null && !IsConflictAlgorithmConstraint(exception))
+                    throw;
+                var algorithm = inheritedAlgorithm ?? exception.ConflictAlgorithm;
+                if (algorithm == InsertConflictAlgorithm.Ignore)
                     continue;
-                if (exception.ConflictAlgorithm is InsertConflictAlgorithm.Fail
+                if (inheritedAlgorithm == InsertConflictAlgorithm.Fail)
+                {
+                    if (rowsAffected > 0)
+                    {
+                        CommitUpdates(
+                            context,
+                            statement.TableName,
+                            table,
+                            table.Rows,
+                            rows,
+                            rowIds,
+                            plan,
+                            updatedPositions,
+                            beforeMutation: null);
+                    }
+
+                    throw new EmbeddedUpsertConflictFailException(
+                        exception,
+                        context.LastInsertRowId);
+                }
+                if (inheritedAlgorithm == InsertConflictAlgorithm.Rollback)
+                    throw new EmbeddedConflictRollbackException(exception);
+                if (algorithm is InsertConflictAlgorithm.Fail
                     or InsertConflictAlgorithm.Rollback
                     or InsertConflictAlgorithm.Replace)
                 {
                     throw new EmbeddedSqlException(
                         "Managed UPDATE cannot apply schema-level ON CONFLICT "
-                        + $"{exception.ConflictAlgorithm.Value.ToString().ToUpperInvariant()} until the pending "
+                        + $"{algorithm.Value.ToString().ToUpperInvariant()} until the pending "
                         + "row-update engine supports partial publication, transaction rollback, and replacement.");
                 }
                 throw;
@@ -6180,6 +6777,13 @@ public sealed class EmbeddedDatabase : IDisposable
             var column = table.ColumnDefinitions[columnIndex];
             if (!column.PrimaryKey)
                 continue;
+            if (table.Indexes.Any(index =>
+                    index.Origin == EmbeddedIndexOrigin.PrimaryKey
+                    && index.Columns.Count == 1
+                    && index.Columns[0].ColumnIndex == columnIndex))
+            {
+                continue;
+            }
 
             var values = new List<SqlValue>();
             foreach (var row in rows)
@@ -6463,7 +7067,8 @@ public sealed class EmbeddedDatabase : IDisposable
         bool changed,
         SqlValue[] parameters,
         QueryContext context,
-        long? lastInsertRowId = null)
+        long? lastInsertRowId = null,
+        IReadOnlyList<long?>? rowFailureLastInsertRowIds = null)
     {
         var outputColumns = BuildOutputColumns(tableName, table.Columns);
 
@@ -6486,25 +7091,48 @@ public sealed class EmbeddedDatabase : IDisposable
                 RowId: table.HasRowid && rowIndex < affectedRowIds.Count ? affectedRowIds[rowIndex] : null,
                 RowIdQualifier: tableName,
                 ColumnDefinitions: table.ColumnDefinitions);
+            var evaluationContext = rowFailureLastInsertRowIds is not null
+                && rowIndex < rowFailureLastInsertRowIds.Count
+                && rowFailureLastInsertRowIds[rowIndex] is { } rowLastInsertRowId
+                    ? context with { LastInsertRowId = rowLastInsertRowId }
+                    : context;
             var output = new List<SqlValue>();
-            foreach (var projection in returning)
+            try
             {
-                switch (projection.Expression)
+                foreach (var projection in returning)
                 {
-                    case StarExpression:
-                        for (var index = 0; index < table.Columns.Length; index++)
-                            output.Add(rowValues[index]);
-                        break;
-                    case QualifiedStarExpression qualifiedStar:
-                        if (!string.Equals(qualifiedStar.Qualifier, tableName, StringComparison.OrdinalIgnoreCase))
-                            throw new EmbeddedSqlException($"no such table: {qualifiedStar.Qualifier}");
-                        for (var index = 0; index < table.Columns.Length; index++)
-                            output.Add(rowValues[index]);
-                        break;
-                    default:
-                        output.Add(Evaluate(projection.Expression, parameters, source, context));
-                        break;
+                    switch (projection.Expression)
+                    {
+                        case StarExpression:
+                            for (var index = 0; index < table.Columns.Length; index++)
+                                output.Add(rowValues[index]);
+                            break;
+                        case QualifiedStarExpression qualifiedStar:
+                            if (!string.Equals(qualifiedStar.Qualifier, tableName, StringComparison.OrdinalIgnoreCase))
+                                throw new EmbeddedSqlException($"no such table: {qualifiedStar.Qualifier}");
+                            for (var index = 0; index < table.Columns.Length; index++)
+                                output.Add(rowValues[index]);
+                            break;
+                        default:
+                            output.Add(Evaluate(projection.Expression, parameters, source, evaluationContext));
+                            break;
+                    }
                 }
+            }
+            catch (Exception exception) when (
+                rowFailureLastInsertRowIds is not null
+                && rowIndex < rowFailureLastInsertRowIds.Count
+                && rowFailureLastInsertRowIds[rowIndex].HasValue
+                && exception is not OperationCanceledException
+                && exception is not EmbeddedConflictFailException
+                && exception is not EmbeddedConflictRollbackException
+                && exception is not EmbeddedStatementAbortException
+                && exception is not EmbeddedStatementFailureException)
+            {
+                var failureLastInsertRowId = rowFailureLastInsertRowIds[rowIndex]!.Value;
+                if (exception is EmbeddedSqlException sqlException)
+                    throw new EmbeddedStatementAbortException(sqlException, failureLastInsertRowId);
+                throw new EmbeddedStatementFailureException(exception, failureLastInsertRowId);
             }
 
             resultRows.Add(output.ToArray());
@@ -6560,6 +7188,10 @@ public sealed class EmbeddedDatabase : IDisposable
         try
         {
             return PerformAndFire();
+        }
+        catch (EmbeddedUpsertConflictFailException)
+        {
+            throw;
         }
         catch
         {
@@ -6621,7 +7253,10 @@ public sealed class EmbeddedDatabase : IDisposable
         }
     }
 
-    private void FireTriggers(IReadOnlyList<TriggerDefinition> triggers, QueryContext context)
+    private void FireTriggers(
+        IReadOnlyList<TriggerDefinition> triggers,
+        QueryContext context,
+        InsertConflictAlgorithm? triggerConflictAlgorithm = null)
     {
         // Trigger bodies are independently parsed statements, so the outer statement's CTE
         // scope is not visible to them.
@@ -6637,24 +7272,20 @@ public sealed class EmbeddedDatabase : IDisposable
                 InsideTrigger = true,
                 ActiveTriggers = activeTriggers,
                 TriggerDepth = context.TriggerDepth + 1,
+                TriggerConflictAlgorithm = triggerConflictAlgorithm ?? context.TriggerConflictAlgorithm,
             };
             foreach (var bodyStatement in trigger.Body)
             {
-                switch (bodyStatement)
+                var result = bodyStatement switch
                 {
-                    case InsertStatement insert:
-                        ExecuteInsert(insert, EmptyParameters, triggerContext);
-                        break;
-                    case UpdateStatement update:
-                        ExecuteUpdate(update, EmptyParameters, triggerContext);
-                        break;
-                    case DeleteStatement delete:
-                        ExecuteDelete(delete, EmptyParameters, triggerContext);
-                        break;
-                    default:
-                        throw new EmbeddedSqlException(
-                            $"unsupported trigger body statement {bodyStatement.GetType().Name}");
-                }
+                    InsertStatement insert => ExecuteInsert(insert, EmptyParameters, triggerContext),
+                    UpdateStatement update => ExecuteUpdate(update, EmptyParameters, triggerContext),
+                    DeleteStatement delete => ExecuteDelete(delete, EmptyParameters, triggerContext),
+                    _ => throw new EmbeddedSqlException(
+                        $"unsupported trigger body statement {bodyStatement.GetType().Name}"),
+                };
+                if (result.LastInsertRowId is { } insertedRowId)
+                    triggerContext = triggerContext with { LastInsertRowId = insertedRowId };
             }
         }
     }
@@ -14338,13 +14969,30 @@ public sealed class EmbeddedDatabase : IDisposable
                 return definition;
             }
 
+            var keyConstraints = new List<(int DeclarationOrder, int FallbackOrder, string Sql)>();
             if (column.PrimaryKey)
             {
-                definition += FormatConstraintName(column.PrimaryKeyConstraintName)
+                keyConstraints.Add((
+                    column.PrimaryKeyDeclarationOrder ?? 0,
+                    0,
+                    FormatConstraintName(column.PrimaryKeyConstraintName)
                     + (column.PrimaryKeyDescending ? " PRIMARY KEY DESC" : " PRIMARY KEY")
                     + FormatConflictClause(column.PrimaryKeyConflictAlgorithm)
-                    + (column.AutoIncrement ? " AUTOINCREMENT" : string.Empty);
+                    + (column.AutoIncrement ? " AUTOINCREMENT" : string.Empty)));
             }
+            if (column.Unique)
+            {
+                keyConstraints.Add((
+                    column.UniqueDeclarationOrder ?? 1,
+                    1,
+                    FormatConstraintName(column.UniqueConstraintName)
+                    + " UNIQUE"
+                    + FormatConflictClause(column.UniqueConflictAlgorithm)));
+            }
+            foreach (var constraint in keyConstraints
+                         .OrderBy(constraint => constraint.DeclarationOrder)
+                         .ThenBy(constraint => constraint.FallbackOrder))
+                definition += constraint.Sql;
             if (column.NotNull)
             {
                 definition += FormatConstraintName(column.NotNullConstraintName)
@@ -14354,12 +15002,6 @@ public sealed class EmbeddedDatabase : IDisposable
             if (column.ExplicitNull)
             {
                 definition += FormatConstraintName(column.NullConstraintName) + " NULL";
-            }
-            if (column.Unique)
-            {
-                definition += FormatConstraintName(column.UniqueConstraintName)
-                    + " UNIQUE"
-                    + FormatConflictClause(column.UniqueConflictAlgorithm);
             }
             if (column.HasDefault)
             {
@@ -23467,6 +24109,12 @@ public sealed class EmbeddedConnection : IDisposable
                     _lastInsertRowId = exception.LastInsertRowId;
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
+                catch (EmbeddedStatementFailureException exception)
+                {
+                    _lastInsertRowId = exception.LastInsertRowId;
+                    ExceptionDispatchInfo.Capture(exception.Failure).Throw();
+                    throw new InvalidOperationException("ExceptionDispatchInfo.Throw unexpectedly returned.");
+                }
                 catch (EmbeddedConflictFailException exception)
                 {
                     _lastInsertRowId = exception.LastInsertRowId;
@@ -25830,6 +26478,8 @@ public sealed class EmbeddedStatement : IDisposable
 internal sealed class EmbeddedTable
 {
     private readonly Dictionary<string, int> _columnIndices;
+    private bool _hasEffectivePrimaryKeyConflictAlgorithm;
+    private InsertConflictAlgorithm? _effectivePrimaryKeyConflictAlgorithm;
 
     public EmbeddedTable(
         string name,
@@ -25927,16 +26577,44 @@ internal sealed class EmbeddedTable
         for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
         {
             var column = ColumnDefinitions[columnIndex];
-            if (!column.Unique)
-                continue;
+            var constraints = new List<(
+                int DeclarationOrder,
+                int FallbackOrder,
+                EmbeddedIndexOrigin Origin,
+                InsertConflictAlgorithm? ConflictAlgorithm,
+                bool Descending)>();
+            if (column.PrimaryKey && !HasRowidAlias)
+            {
+                constraints.Add((
+                    column.PrimaryKeyDeclarationOrder ?? 0,
+                    0,
+                    EmbeddedIndexOrigin.PrimaryKey,
+                    column.PrimaryKeyConflictAlgorithm,
+                    column.PrimaryKeyDescending));
+            }
+            if (column.Unique)
+            {
+                constraints.Add((
+                    column.UniqueDeclarationOrder ?? 1,
+                    1,
+                    EmbeddedIndexOrigin.UniqueConstraint,
+                    column.UniqueConflictAlgorithm,
+                    Descending: false));
+            }
 
-            autoIndex++;
-            Indexes.Add(new EmbeddedIndex(
-                $"sqlite_autoindex_{Name}_{autoIndex}",
-                Unique: true,
-                [new EmbeddedIndexColumn(column.Name, columnIndex, column.Collation, Descending: false)],
-                EmbeddedIndexOrigin.UniqueConstraint,
-                column.UniqueConflictAlgorithm));
+            foreach (var constraint in constraints
+                         .OrderBy(constraint => constraint.DeclarationOrder)
+                         .ThenBy(constraint => constraint.FallbackOrder))
+            {
+                AddConstraint(
+                    [new EmbeddedIndexColumn(
+                        column.Name,
+                        columnIndex,
+                        column.Collation,
+                        constraint.Descending)],
+                    constraint.Origin,
+                    constraint.ConflictAlgorithm);
+            }
         }
 
         foreach (var constraint in GetTableKeyConstraintsInDeclarationOrder())
@@ -25944,15 +26622,81 @@ internal sealed class EmbeddedTable
             if (constraint.IsPrimaryKey && HasRowidAlias)
                 continue;
 
-            autoIndex++;
-            Indexes.Add(new EmbeddedIndex(
-                $"sqlite_autoindex_{Name}_{autoIndex}",
-                Unique: true,
+            AddConstraint(
                 constraint.Columns,
                 constraint.IsPrimaryKey
                     ? EmbeddedIndexOrigin.PrimaryKey
                     : EmbeddedIndexOrigin.UniqueConstraint,
-                constraint.ConflictAlgorithm));
+                constraint.ConflictAlgorithm);
+        }
+
+        void AddConstraint(
+            EmbeddedIndexColumn[] columns,
+            EmbeddedIndexOrigin origin,
+            InsertConflictAlgorithm? conflictAlgorithm)
+        {
+            var existingPosition = Indexes.FindIndex(index =>
+                index.Origin != EmbeddedIndexOrigin.Explicit
+                && SameConstraintKey(index.Columns, columns));
+            if (existingPosition >= 0)
+            {
+                var existing = Indexes[existingPosition];
+                if (existing.ConflictAlgorithm is { } existingAlgorithm
+                    && conflictAlgorithm is { } newAlgorithm
+                    && existingAlgorithm != newAlgorithm)
+                {
+                    throw new EmbeddedSqlException("conflicting ON CONFLICT clauses specified");
+                }
+
+                var mergedOrigin = existing.Origin == EmbeddedIndexOrigin.PrimaryKey
+                    || origin == EmbeddedIndexOrigin.PrimaryKey
+                        ? EmbeddedIndexOrigin.PrimaryKey
+                        : EmbeddedIndexOrigin.UniqueConstraint;
+                var mergedConflictAlgorithm = existing.ConflictAlgorithm ?? conflictAlgorithm;
+                Indexes[existingPosition] = existing with
+                {
+                    Origin = mergedOrigin,
+                    ConflictAlgorithm = mergedConflictAlgorithm,
+                };
+                if (mergedOrigin == EmbeddedIndexOrigin.PrimaryKey)
+                    SetEffectivePrimaryKeyConflictAlgorithm(mergedConflictAlgorithm);
+                return;
+            }
+
+            autoIndex++;
+            if (origin == EmbeddedIndexOrigin.PrimaryKey)
+                SetEffectivePrimaryKeyConflictAlgorithm(conflictAlgorithm);
+            Indexes.Add(new EmbeddedIndex(
+                $"sqlite_autoindex_{Name}_{autoIndex}",
+                Unique: true,
+                columns,
+                origin,
+                conflictAlgorithm,
+                ConstraintOrdinal: autoIndex));
+        }
+
+        bool SameConstraintKey(
+            IReadOnlyList<EmbeddedIndexColumn> left,
+            IReadOnlyList<EmbeddedIndexColumn> right)
+        {
+            if (left.Count != right.Count)
+                return false;
+
+            for (var position = 0; position < left.Count; position++)
+            {
+                if (left[position].ColumnIndex != right[position].ColumnIndex)
+                    return false;
+                var leftCollation = left[position].Collation
+                    ?? ColumnDefinitions[left[position].ColumnIndex].Collation
+                    ?? "BINARY";
+                var rightCollation = right[position].Collation
+                    ?? ColumnDefinitions[right[position].ColumnIndex].Collation
+                    ?? "BINARY";
+                if (!string.Equals(leftCollation, rightCollation, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            return true;
         }
     }
 
@@ -25962,32 +26706,50 @@ internal sealed class EmbeddedTable
         var groups = new List<(
             EmbeddedIndexColumn[] Columns,
             bool IsPrimaryKey,
-            EmbeddedIndex? Index)>();
+            EmbeddedIndex? Index,
+            int ConstraintOrdinal,
+            InsertConflictAlgorithm? ConflictAlgorithm)>();
 
         for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
         {
             var column = ColumnDefinitions[columnIndex];
-            var key = new[]
-            {
-                new EmbeddedIndexColumn(
-                    column.Name,
-                    columnIndex,
-                    column.Collation,
-                    column.PrimaryKeyDescending),
-            };
+            var constraints = new List<(
+                int DeclarationOrder,
+                int FallbackOrder,
+                bool IsPrimaryKey,
+                InsertConflictAlgorithm? ConflictAlgorithm,
+                bool Descending)>();
             if (column.PrimaryKey)
             {
-                AddConstraint(
-                    key,
-                    isPrimaryKey: true,
-                    column.PrimaryKeyConflictAlgorithm);
+                constraints.Add((
+                    column.PrimaryKeyDeclarationOrder ?? 0,
+                    0,
+                    IsPrimaryKey: true,
+                    column.PrimaryKeyConflictAlgorithm,
+                    column.PrimaryKeyDescending));
             }
             if (column.Unique)
             {
+                constraints.Add((
+                    column.UniqueDeclarationOrder ?? 1,
+                    1,
+                    IsPrimaryKey: false,
+                    column.UniqueConflictAlgorithm,
+                    Descending: false));
+            }
+
+            foreach (var constraint in constraints
+                         .OrderBy(constraint => constraint.DeclarationOrder)
+                         .ThenBy(constraint => constraint.FallbackOrder))
+            {
                 AddConstraint(
-                    key,
-                    isPrimaryKey: false,
-                    column.UniqueConflictAlgorithm);
+                    [new EmbeddedIndexColumn(
+                        column.Name,
+                        columnIndex,
+                        column.Collation,
+                        constraint.Descending)],
+                    constraint.IsPrimaryKey,
+                    constraint.ConflictAlgorithm);
             }
         }
 
@@ -26008,16 +26770,55 @@ internal sealed class EmbeddedTable
             if (existingPosition >= 0)
             {
                 var existing = groups[existingPosition];
-                if (isPrimaryKey && !existing.IsPrimaryKey)
+                if (existing.ConflictAlgorithm is { } existingAlgorithm
+                    && conflictAlgorithm is { } newAlgorithm
+                    && existingAlgorithm != newAlgorithm)
                 {
-                    if (existing.Index is not null)
-                        Indexes.Remove(existing.Index);
-                    groups[existingPosition] = (existing.Columns, IsPrimaryKey: true, Index: null);
+                    throw new EmbeddedSqlException("conflicting ON CONFLICT clauses specified");
                 }
+
+                var mergedConflictAlgorithm = existing.ConflictAlgorithm ?? conflictAlgorithm;
+                var mergedIsPrimaryKey = existing.IsPrimaryKey || isPrimaryKey;
+                var mergedIndex = existing.Index;
+                if (mergedIsPrimaryKey)
+                {
+                    if (mergedIndex is not null)
+                        Indexes.Remove(mergedIndex);
+                    mergedIndex = null;
+                    PrimaryKeyConstraintOrdinal = existing.ConstraintOrdinal;
+                    SetEffectivePrimaryKeyConflictAlgorithm(mergedConflictAlgorithm);
+                    PrimaryKeyColumns = Array.AsReadOnly(existing.Columns
+                        .Select(column => (column.ColumnIndex, column.Descending))
+                        .ToArray());
+                    PrimaryKeySchema = CreatePrimaryKeySchema(ColumnDefinitions, existing.Columns);
+                }
+                else if (mergedIndex is not null
+                    && mergedIndex.ConflictAlgorithm != mergedConflictAlgorithm)
+                {
+                    var indexPosition = Indexes.IndexOf(mergedIndex);
+                    mergedIndex = mergedIndex with
+                    {
+                        ConflictAlgorithm = mergedConflictAlgorithm,
+                    };
+                    Indexes[indexPosition] = mergedIndex;
+                }
+
+                groups[existingPosition] = (
+                    existing.Columns,
+                    mergedIsPrimaryKey,
+                    mergedIndex,
+                    existing.ConstraintOrdinal,
+                    mergedConflictAlgorithm);
                 return;
             }
 
             autoIndex++;
+            if (isPrimaryKey)
+            {
+                PrimaryKeyConstraintOrdinal = autoIndex;
+                SetEffectivePrimaryKeyConflictAlgorithm(conflictAlgorithm);
+                PrimaryKeySchema = CreatePrimaryKeySchema(ColumnDefinitions, columns);
+            }
             EmbeddedIndex? index = null;
             if (!isPrimaryKey)
             {
@@ -26026,11 +26827,12 @@ internal sealed class EmbeddedTable
                     Unique: true,
                     columns,
                     EmbeddedIndexOrigin.UniqueConstraint,
-                    conflictAlgorithm);
+                    conflictAlgorithm,
+                    ConstraintOrdinal: autoIndex);
                 Indexes.Add(index);
             }
 
-            groups.Add((columns, isPrimaryKey, index));
+            groups.Add((columns, isPrimaryKey, index, autoIndex, conflictAlgorithm));
         }
 
         bool SameConstraintKey(
@@ -26056,6 +26858,65 @@ internal sealed class EmbeddedTable
 
             return true;
         }
+    }
+
+    private void SetEffectivePrimaryKeyConflictAlgorithm(InsertConflictAlgorithm? conflictAlgorithm)
+    {
+        _hasEffectivePrimaryKeyConflictAlgorithm = true;
+        _effectivePrimaryKeyConflictAlgorithm = conflictAlgorithm;
+    }
+
+    internal bool TryGetLegacyImplicitIndex(string indexName, out EmbeddedIndex? index)
+    {
+        index = null;
+        if (WithoutRowid)
+            return false;
+
+        var autoIndex = 0;
+        for (var columnIndex = 0; columnIndex < ColumnDefinitions.Length; columnIndex++)
+        {
+            var column = ColumnDefinitions[columnIndex];
+            if (!column.Unique)
+                continue;
+
+            autoIndex++;
+            var candidate = new EmbeddedIndex(
+                $"sqlite_autoindex_{Name}_{autoIndex}",
+                Unique: true,
+                [new EmbeddedIndexColumn(column.Name, columnIndex, column.Collation, Descending: false)],
+                EmbeddedIndexOrigin.UniqueConstraint,
+                column.UniqueConflictAlgorithm,
+                ConstraintOrdinal: autoIndex);
+            if (string.Equals(candidate.Name, indexName, StringComparison.OrdinalIgnoreCase))
+            {
+                index = candidate;
+                return true;
+            }
+        }
+
+        foreach (var constraint in GetTableKeyConstraintsInDeclarationOrder())
+        {
+            if (constraint.IsPrimaryKey && HasRowidAlias)
+                continue;
+
+            autoIndex++;
+            var candidate = new EmbeddedIndex(
+                $"sqlite_autoindex_{Name}_{autoIndex}",
+                Unique: true,
+                constraint.Columns,
+                constraint.IsPrimaryKey
+                    ? EmbeddedIndexOrigin.PrimaryKey
+                    : EmbeddedIndexOrigin.UniqueConstraint,
+                constraint.ConflictAlgorithm,
+                ConstraintOrdinal: autoIndex);
+            if (string.Equals(candidate.Name, indexName, StringComparison.OrdinalIgnoreCase))
+            {
+                index = candidate;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private IReadOnlyList<(
@@ -26313,25 +27174,29 @@ internal sealed class EmbeddedTable
     public InsertConflictAlgorithm? TablePrimaryKeyConflictAlgorithm { get; }
 
     public InsertConflictAlgorithm? PrimaryKeyConflictAlgorithm
-        => TableLevelPrimaryKey is not null
-            ? TablePrimaryKeyConflictAlgorithm
-            : PrimaryKeyColumns.Count == 1
-                ? ColumnDefinitions[PrimaryKeyColumns[0].Index].PrimaryKeyConflictAlgorithm
-                : null;
+        => _hasEffectivePrimaryKeyConflictAlgorithm
+            ? _effectivePrimaryKeyConflictAlgorithm
+            : TableLevelPrimaryKey is not null
+                ? TablePrimaryKeyConflictAlgorithm
+                : PrimaryKeyColumns.Count == 1
+                    ? ColumnDefinitions[PrimaryKeyColumns[0].Index].PrimaryKeyConflictAlgorithm
+                    : null;
 
     public string? TablePrimaryKeyConstraintName { get; }
 
     public int? TablePrimaryKeyDeclarationOrder { get; }
 
+    public int? PrimaryKeyConstraintOrdinal { get; private set; }
+
     // The resolved primary-key columns (index + direction) in key order. Empty when the
     // table has no primary key. Used for WITHOUT ROWID ordering/uniqueness and table_info.
-    public IReadOnlyList<(int Index, bool Descending)> PrimaryKeyColumns { get; }
+    public IReadOnlyList<(int Index, bool Descending)> PrimaryKeyColumns { get; private set; }
 
     // The immutable physical-key descriptor in declaration order. A table-level COLLATE
     // overrides the declared column collation; absent declarations use SQLite's BINARY
     // default. File-backed index-table support must consume this instead of reconstructing
     // key metadata from lossy column flags.
-    public SqlitePrimaryKeySchema? PrimaryKeySchema { get; }
+    public SqlitePrimaryKeySchema? PrimaryKeySchema { get; private set; }
 
     // Column indices of generated columns in dependency (topological) order, so evaluating
     // them in sequence always sees the values a later generated column depends on.
@@ -26516,6 +27381,22 @@ internal sealed class EmbeddedTable
                 collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation));
         }
 
+        return new SqlitePrimaryKeySchema(terms);
+    }
+
+    private static SqlitePrimaryKeySchema CreatePrimaryKeySchema(
+        IReadOnlyList<EmbeddedColumn> columns,
+        IReadOnlyList<EmbeddedIndexColumn> primaryKeyColumns)
+    {
+        var terms = primaryKeyColumns.Select(column =>
+        {
+            var collation = column.Collation ?? columns[column.ColumnIndex].Collation;
+            return new SqlitePrimaryKeyTerm(
+                column.ColumnIndex,
+                columns[column.ColumnIndex].Name,
+                column.Descending ? SqliteKeySortOrder.Descending : SqliteKeySortOrder.Ascending,
+                collation is null ? SqliteKeyCollation.Binary : SqliteKeyCollation.FromName(collation));
+        });
         return new SqlitePrimaryKeySchema(terms);
     }
 
@@ -27091,6 +27972,13 @@ internal sealed class EmbeddedTable
 
             if (!column.PrimaryKey)
                 continue;
+            if (Indexes.Any(index =>
+                    index.Origin == EmbeddedIndexOrigin.PrimaryKey
+                    && index.Columns.Count == 1
+                    && index.Columns[0].ColumnIndex == columnIndex))
+            {
+                continue;
+            }
 
             var values = new HashSet<SqlValue>();
             foreach (var row in rows)
