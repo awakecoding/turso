@@ -91,6 +91,30 @@ public class SqliteTableLeafMutationTests
     }
 
     [Test]
+    public void MutationWriterStoresPartialOverflowChunkOnlyOnTheFinalPage()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        var header = SqliteDatabaseHeader.CreateDefault() with { PageSize = SqlitePageSize.Minimum };
+        using var store = SqlitePageStore.Create(fileSystem, "ordered-overflow.db", header);
+        var payload = Enumerable.Range(0, 997).Select(value => unchecked((byte)value)).ToArray();
+        var writer = new SqliteTableLeafMutationWriter(store, new SqliteAppendOnlyPageAllocator(store));
+
+        var mutation = writer.CreatePage([new SqliteTableLeafCellInput(1, payload)]);
+
+        mutation.OverflowPages.Should().HaveCountGreaterThan(1);
+        var firstOverflowPage = SqliteOverflowPageView.Parse(
+            mutation.OverflowPages[0].Page.Span,
+            store.Header.UsableSpace);
+        firstOverflowPage.NextPageNumber.Should().Be(mutation.OverflowPages[1].PageNumber);
+        mutation.ApplyTo(store);
+
+        var cell = SqliteTableLeafPageView.Parse(
+            store.ReadPage(mutation.TableLeafPageNumber),
+            store.Header.UsableSpace).Cells.Single().Cell;
+        new SqliteOverflowChainReader(store).ReadPayload(cell).Should().Equal(payload);
+    }
+
+    [Test]
     public void MutationWriterRewritesRootLeafWithoutChangingItsDatabaseHeader()
     {
         var fileSystem = new InMemoryFileSystem();

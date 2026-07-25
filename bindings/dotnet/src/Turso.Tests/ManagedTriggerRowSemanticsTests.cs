@@ -1674,7 +1674,7 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
-    public void UnsafeBeforeUpdateSelfMutationIsRejectedBeforeCallbacks()
+    public void BeforeUpdateCanMutateAnotherRowInTheTargetTable()
     {
         var callbacks = 0;
         using var database = new EmbeddedDatabase();
@@ -1688,22 +1688,22 @@ public sealed class ManagedTriggerRowSemanticsTests
             });
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE data(id INTEGER PRIMARY KEY, value INTEGER)");
-        Execute(connection, "INSERT INTO data VALUES (1, 10)");
+        Execute(connection, "INSERT INTO data VALUES (1, 10), (2, 20)");
         Execute(
             connection,
             "CREATE TRIGGER data_before BEFORE UPDATE ON data BEGIN "
-                + "SELECT mark(OLD.id); DELETE FROM data WHERE id = OLD.id; END");
+                + "SELECT mark(OLD.id); UPDATE data SET value = value + 100 WHERE id = 2; END");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => Execute(connection, "UPDATE data SET value = 11 WHERE id = 1"))!
-            .Message.Should().Contain("unsafe BEFORE trigger");
-        callbacks.Should().Be(0);
-        ReadRows(connection, "SELECT id, value FROM data").Should().ContainSingle()
-            .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(10));
+        Execute(connection, "UPDATE data SET value = 11 WHERE id = 1");
+
+        callbacks.Should().Be(1);
+        ReadRows(connection, "SELECT id, value FROM data ORDER BY id")
+            .Select(row => (row[0].AsInteger(), row[1].AsInteger()))
+            .Should().Equal((1L, 11L), (2L, 120L));
     }
 
     [Test]
-    public void UnsafeForeignKeyActionTriggerIsRejectedBeforeParentMutation()
+    public void BeforeForeignKeyActionTriggerCanMutateAnotherTargetRow()
     {
         var callbacks = 0;
         using var database = new EmbeddedDatabase();
@@ -1727,16 +1727,14 @@ public sealed class ManagedTriggerRowSemanticsTests
         Execute(
             connection,
             "CREATE TRIGGER child_before BEFORE UPDATE ON child BEGIN "
-                + "SELECT mark(OLD.id); UPDATE child SET note = 'trigger' WHERE id = OLD.id; END");
+                + "SELECT mark(OLD.id); UPDATE child SET note = 'trigger' WHERE id = 999; END");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => Execute(connection, "UPDATE parent SET id = 2 WHERE id = 1"))!
-            .Message.Should().Contain("unsafe BEFORE trigger");
-        callbacks.Should().Be(0);
+        Execute(connection, "UPDATE parent SET id = 2 WHERE id = 1");
+        callbacks.Should().Be(1);
         ReadRows(connection, "SELECT id FROM parent").Should().ContainSingle()
-            .Which[0].Should().Be(SqlValue.Integer(1));
+            .Which[0].Should().Be(SqlValue.Integer(2));
         ReadRows(connection, "SELECT parent_id, note FROM child").Should().ContainSingle()
-            .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Text("old"));
+            .Which.Should().Equal(SqlValue.Integer(2), SqlValue.Text("old"));
     }
 
     [Test]
@@ -2095,7 +2093,7 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
-    public void ForeignKeyActionEdgesParticipateInUnsafeMutationPreflight()
+    public void ForeignKeyActionTriggerFailureUsesForeignKeyValidation()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -2114,7 +2112,7 @@ public sealed class ManagedTriggerRowSemanticsTests
 
         Assert.Throws<EmbeddedSqlException>(
             () => Execute(connection, "UPDATE parent SET id = 2 WHERE id = 1"))!
-            .Message.Should().Contain("unsafe BEFORE trigger");
+            .Message.Should().Contain("FOREIGN KEY constraint failed");
         ReadRows(connection, "SELECT id FROM parent").Should().ContainSingle()
             .Which[0].Should().Be(SqlValue.Integer(1));
         ReadRows(connection, "SELECT id, parent_id FROM child").Should().ContainSingle()

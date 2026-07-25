@@ -416,6 +416,10 @@ public class SqliteCommand : DbCommand
         SqliteStatementAdapter? nativeStatement = null;
         try
         {
+            connection.NativeDatabase.SetBusyTimeout(
+                CommandTimeout == 0
+                    ? TimeSpan.MaxValue
+                    : TimeSpan.FromSeconds(CommandTimeout));
             nativeStatement = SqliteStatementAdapter.FromNative(connection.NativeDatabase.PrepareStatement(sql));
             BindNativeParameters(nativeStatement);
             var statement = nativeStatement;

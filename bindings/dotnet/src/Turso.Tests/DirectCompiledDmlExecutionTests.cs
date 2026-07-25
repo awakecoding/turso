@@ -427,6 +427,36 @@ public class DirectCompiledDmlExecutionTests
     }
 
     [Test]
+    public void FailedCommitFaultsTheStatementUntilReset()
+    {
+        var commitAttempts = 0;
+        var target = new VdbeWriteTarget
+        {
+            TableName = "t",
+            RowCount = 0,
+            MutateRow = _ => throw new AssertionException("No rows should be mutated."),
+            Commit = () =>
+            {
+                commitAttempts++;
+                throw new InvalidOperationException("commit failed after applying its side effect");
+            },
+        };
+        var compiled = DmlStatementCompiler.Compile(
+            DmlKind.Insert, "t", columnCount: 1, predicate: null, returningOps: [], writeTarget: target);
+        using var statement = new ResumableStatement(compiled.Program, writeTargets: compiled.WriteTargets);
+
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable());
+        statement.State.Should().Be(ResumableStatementState.Faulted);
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable())!
+            .Message.Should().Contain("Call Reset");
+        commitAttempts.Should().Be(1);
+
+        statement.Reset();
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable());
+        commitAttempts.Should().Be(2);
+    }
+
+    [Test]
     public void MutationOpcodeWithoutABoundActionThrows()
     {
         // A write target missing its MutateRow delegate is a hard executor error, not a silent no-op.

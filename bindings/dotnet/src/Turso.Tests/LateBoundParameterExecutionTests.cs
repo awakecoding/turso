@@ -114,6 +114,46 @@ public class LateBoundParameterExecutionTests
     }
 
     [Test]
+    public void RebindAfterCancellationRequiresResetEvenWhenTheStatementIsReady()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var cancel = new VdbeScalarFunction
+        {
+            Name = "cancel",
+            Arity = 0,
+            Invoke = _ =>
+            {
+                cancellation.Cancel();
+                return SqlValue.Null;
+            },
+        };
+        var program = new VdbeProgram(
+            registerCount: 3,
+            cursorCount: 0,
+            instructions:
+            [
+                new LoadParameterInstruction(new Register(0), new ParameterSlot(0)),
+                new FunctionInstruction(new Register(2), cancel, new RegisterRange(new Register(0), 0)),
+                new LoadParameterInstruction(new Register(1), new ParameterSlot(1)),
+                new ResultRowInstruction(new RegisterRange(new Register(0), 2)),
+                new HaltInstruction(),
+            ],
+            parameterSlotCount: 2);
+        using var statement = new ResumableStatement(
+            program,
+            parameterBinding: Binding(SqlValue.Integer(1), SqlValue.Integer(2)));
+
+        Assert.Throws<OperationCanceledException>(() => statement.StepResumable(cancellation.Token));
+        statement.State.Should().Be(ResumableStatementState.Ready);
+        Assert.Throws<InvalidOperationException>(() =>
+            statement.Rebind(Binding(SqlValue.Integer(10), SqlValue.Integer(20))));
+
+        statement.Reset();
+        statement.Rebind(Binding(SqlValue.Integer(10), SqlValue.Integer(20)));
+        DrainRows(statement).Single().Should().Equal(SqlValue.Integer(10), SqlValue.Integer(20));
+    }
+
+    [Test]
     public void RebindRejectsNull()
     {
         var program = ParamRowProgram(1);

@@ -180,6 +180,33 @@ public sealed class ManagedVacuumStorageTests
     }
 
     [Test]
+    public void VacuumIntoPreservesTheSourcePendingPageSizeForLaterVacuum()
+    {
+        var sourcePath = CreateDatabasePath("into-pending-source");
+        var outputPath = CreateDatabasePath("into-pending-output", createDirectoryOnly: true);
+        try
+        {
+            using var database = EmbeddedDatabase.OpenFile(sourcePath);
+            using var connection = database.Connect();
+            Execute(connection, "CREATE TABLE entries(value TEXT); INSERT INTO entries VALUES ('source');");
+            ReadValue(connection, "PRAGMA journal_mode=delete;").Should().Be(SqlValue.Text("delete"));
+            Execute(connection, "PRAGMA page_size=1024;");
+
+            ExecuteVacuumInto(connection, "VACUUM INTO ?1;", outputPath);
+            ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(4096));
+
+            Execute(connection, "VACUUM;");
+            ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(1024));
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(sourcePath);
+            DeleteDatabase(outputPath);
+        }
+    }
+
+    [Test]
     public void VacuumAttachedSchemaAndIntoPreserveAttachmentEncryptionKey()
     {
         var inner = new InMemoryFileSystem();

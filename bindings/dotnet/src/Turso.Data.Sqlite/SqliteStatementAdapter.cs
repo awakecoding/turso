@@ -88,7 +88,20 @@ internal sealed class SqliteStatementAdapter : IDisposable
     private bool ReadNative(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var result = GetNativeStatement().Read();
+        var statement = GetNativeStatement();
+        using var registration = cancellationToken.UnsafeRegister(
+            static state => ((TursoNativeStatement)state!).Interrupt(),
+            statement);
+        bool result;
+        try
+        {
+            result = statement.Read();
+        }
+        catch (TursoException) when (cancellationToken.IsCancellationRequested)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw;
+        }
         cancellationToken.ThrowIfCancellationRequested();
         return result;
     }

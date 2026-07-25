@@ -1067,16 +1067,17 @@ internal sealed class SqlParser
         QueryStatement? source = null;
         if (ConsumeKeyword("VALUES"))
         {
-            do
+            var values = ParseValuesClause();
+            if (CurrentIsKeyword("UNION")
+                || CurrentIsKeyword("INTERSECT")
+                || CurrentIsKeyword("EXCEPT"))
             {
-                Expect(TokenKind.LeftParen);
-                var values = new List<Expression> { ParseExpression() };
-                while (Consume(TokenKind.Comma))
-                    values.Add(ParseExpression());
-                Expect(TokenKind.RightParen);
-                rows.Add(values.ToArray());
+                source = ParseQuery(values);
             }
-            while (Consume(TokenKind.Comma));
+            else
+            {
+                rows.AddRange(values.Rows.Select(static row => row.ToArray()));
+            }
         }
         else if (ConsumeKeyword("DEFAULT"))
         {
@@ -1307,7 +1308,12 @@ internal sealed class SqlParser
         if (ConsumeKeyword("WITH"))
             return ParseWithSelect();
 
-        var terms = new List<QueryStatement> { ParseQueryTerm() };
+        return ParseQuery(ParseQueryTerm());
+    }
+
+    private QueryStatement ParseQuery(QueryStatement firstTerm)
+    {
+        var terms = new List<QueryStatement> { firstTerm };
         var operators = new List<CompoundOperator>();
         while (true)
         {
@@ -1415,7 +1421,7 @@ internal sealed class SqlParser
         var commonTableExpressions = new List<CommonTableExpression>();
         do
         {
-            var name = ParseSchemaQualifiedName();
+            var name = ExpectIdentifier();
             IReadOnlyList<string>? columns = null;
             if (Consume(TokenKind.LeftParen))
             {
@@ -2266,6 +2272,15 @@ internal sealed class SqlParser
         {
             case TokenKind.Integer:
                 _lexer.Next();
+                if (token.Text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                    && ulong.TryParse(
+                        token.Text.AsSpan(2),
+                        NumberStyles.AllowHexSpecifier,
+                        CultureInfo.InvariantCulture,
+                        out var hexadecimal))
+                {
+                    return new LiteralExpression(SqlValue.Integer(unchecked((long)hexadecimal)));
+                }
                 if (long.TryParse(token.Text, CultureInfo.InvariantCulture, out var integer))
                     return new LiteralExpression(SqlValue.Integer(integer));
 
@@ -2352,9 +2367,6 @@ internal sealed class SqlParser
 
                     if (Consume(TokenKind.RightParen))
                     {
-                        if (distinct)
-                            throw Error("DISTINCT aggregates must have exactly one argument.");
-
                         var (emptyFilter, emptyWindow) = ParseFunctionSuffix();
                         return new FunctionExpression(functionName, [], false, false, emptyFilter, emptyWindow);
                     }
@@ -2362,11 +2374,14 @@ internal sealed class SqlParser
                     var arguments = new List<Expression> { ParseExpression() };
                     while (Consume(TokenKind.Comma))
                         arguments.Add(ParseExpression());
+                    if (CurrentIsKeyword("ORDER"))
+                    {
+                        throw Error(
+                            "ORDER BY within aggregate functions is not supported by the managed engine.");
+                    }
                     Expect(TokenKind.RightParen);
                     if (string.Equals(token.Text, "COUNT", StringComparison.OrdinalIgnoreCase) && arguments.Count != 1)
                         throw Error("wrong number of arguments to function COUNT()");
-                    if (distinct && arguments.Count != 1)
-                        throw Error("DISTINCT aggregates must have exactly one argument.");
 
                     var (filter, window) = ParseFunctionSuffix();
                     return new FunctionExpression(functionName, arguments, false, distinct, filter, window);

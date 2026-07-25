@@ -413,9 +413,10 @@ public class CorePrimitiveTests
     [Test]
     public void ParameterMapSupportsDollarInNamesAndBoundsParameterIndices()
     {
-        var parameters = SqlParameterMap.Parse("SELECT :a$b, :a$b;");
-        parameters.Count.Should().Be(1);
+        var parameters = SqlParameterMap.Parse("SELECT :a$b, :a$b, $a::b(c), $a::b(c);");
+        parameters.Count.Should().Be(2);
         parameters.GetName(1).Should().Be(":a$b");
+        parameters.GetName(2).Should().Be("$a::b(c)");
 
         Assert.Throws<FormatException>(() => SqlParameterMap.Parse("?250001"));
     }

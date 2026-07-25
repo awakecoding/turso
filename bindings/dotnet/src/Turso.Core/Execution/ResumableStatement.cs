@@ -50,6 +50,7 @@ public sealed class ResumableStatement : IDisposable
     private VdbeParameterBinding? _binding;
     private ProgramCounter _instructionPointer;
     private ReadOnlyCollection<SqlValue>? _currentRow;
+    private bool _hasExecutedInstruction;
     private bool _disposed;
 
     public ResumableStatement(
@@ -170,6 +171,7 @@ public sealed class ResumableStatement : IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             var instruction = Program.Instructions[_instructionPointer.Offset];
+            _hasExecutedInstruction = true;
             switch (instruction)
             {
                 case LoadConstantInstruction loadConstant:
@@ -414,9 +416,18 @@ public sealed class ResumableStatement : IDisposable
                     }
                 case CommitInstruction commit:
                     {
-                        var target = RequireWriteTarget(commit.Cursor);
-                        LastInsertRowId = target.Commit();
-                        AdvanceInstructionPointer();
+                        try
+                        {
+                            var target = RequireWriteTarget(commit.Cursor);
+                            LastInsertRowId = target.Commit();
+                            AdvanceInstructionPointer();
+                        }
+                        catch
+                        {
+                            State = ResumableStatementState.Faulted;
+                            throw;
+                        }
+
                         break;
                     }
                 case OpenSorterInstruction openSorter:
@@ -958,6 +969,7 @@ public sealed class ResumableStatement : IDisposable
         _transaction.Reset();
         _currentRow = null;
         _instructionPointer = default;
+        _hasExecutedInstruction = false;
         RowsAffected = 0;
         LastInsertRowId = null;
         // The parameter binding is intentionally preserved across Reset, mirroring SQLite's
@@ -980,7 +992,7 @@ public sealed class ResumableStatement : IDisposable
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(parameterBinding);
-        if (State != ResumableStatementState.Ready)
+        if (State != ResumableStatementState.Ready || _hasExecutedInstruction)
         {
             throw new InvalidOperationException(
                 "Parameters can only be rebound from the Ready state; call Reset before rebinding a statement that has started, yielded, or finished.");

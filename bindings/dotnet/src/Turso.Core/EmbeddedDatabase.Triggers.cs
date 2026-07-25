@@ -1691,17 +1691,6 @@ public sealed partial class EmbeddedDatabase
             RejectUnboundedRecursiveTriggerCycles(context, programs);
         foreach (var trigger in programs)
         {
-            if (trigger.Timing == TriggerTiming.Before
-                && trigger.Event is TriggerEvent.Update or TriggerEvent.Delete
-                && TriggerCanMutateTarget(context, trigger, trigger.TableName, []))
-            {
-                throw new EmbeddedSqlException(
-                    $"unsafe BEFORE trigger {trigger.Name} can modify its own target table");
-            }
-        }
-
-        foreach (var trigger in programs)
-        {
             ValidateTriggerSchema(trigger, context, context.CancellationToken);
         }
     }
@@ -2143,54 +2132,6 @@ public sealed partial class EmbeddedDatabase
 
         foreach (var column in EnumerateTriggerColumnExpressions(expression))
             yield return column;
-    }
-
-    private bool TriggerCanMutateTarget(
-        QueryContext context,
-        TriggerDefinition trigger,
-        string targetName,
-        HashSet<string> visited)
-    {
-        if (!visited.Add(trigger.Name))
-            return false;
-        foreach (var statement in trigger.Body)
-        {
-            var mutation = GetDirectMutationEdge(statement);
-            if (mutation is null)
-                continue;
-            if (MutationCanReachTarget(context, mutation, targetName, []))
-                return true;
-            foreach (var nested in GetBodyStatementTriggers(context, statement))
-            {
-                if (TriggerCanMutateTarget(context, nested, targetName, visited))
-                    return true;
-            }
-        }
-
-        return false;
-    }
-
-    private bool MutationCanReachTarget(
-        QueryContext context,
-        TriggerMutationEdge mutation,
-        string targetName,
-        HashSet<(string TableName, TriggerEvent Event, string Columns)> visited)
-    {
-        if (string.Equals(mutation.TableName, targetName, StringComparison.OrdinalIgnoreCase))
-            return true;
-        var key = (
-            mutation.TableName.ToUpperInvariant(),
-            mutation.Event,
-            GetMutationColumnKey(mutation.UpdatedColumns));
-        if (!visited.Add(key))
-            return false;
-        foreach (var action in GetForeignKeyActionMutationEdges(context, mutation))
-        {
-            if (MutationCanReachTarget(context, action, targetName, visited))
-                return true;
-        }
-
-        return false;
     }
 
     private static bool TriggerContainsAbortCapableExpression(TriggerDefinition trigger)

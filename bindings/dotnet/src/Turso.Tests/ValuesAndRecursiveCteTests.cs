@@ -150,6 +150,42 @@ public class ValuesAndRecursiveCteTests
     }
 
     [Test]
+    public void RecursiveUnionTreatsIntegerAndRealValuesAsEqual()
+    {
+        AssertMatchesSqlite(
+            [],
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT CAST(x AS REAL) FROM c) "
+            + "SELECT count(*) AS total FROM c");
+    }
+
+    [Test]
+    public void RecursiveUnionUsesNoCaseCollationForDeduplication()
+    {
+        AssertMatchesSqlite(
+            [],
+            "WITH RECURSIVE c(x) AS (SELECT 'A' COLLATE NOCASE UNION SELECT lower(x) FROM c) "
+            + "SELECT count(*) AS total FROM c");
+    }
+
+    [Test]
+    public void RecursiveUnionUsesRTrimCollationForDeduplication()
+    {
+        AssertMatchesSqlite(
+            [],
+            "WITH RECURSIVE c(x) AS (SELECT 'a ' COLLATE RTRIM UNION SELECT 'a' FROM c) "
+            + "SELECT count(*) AS total FROM c");
+    }
+
+    [Test]
+    public void RecursiveUnionTreatsNullValuesAsEqual()
+    {
+        AssertMatchesSqlite(
+            [],
+            "WITH RECURSIVE c(x) AS (SELECT NULL UNION SELECT NULL FROM c) "
+            + "SELECT count(*) AS total FROM c");
+    }
+
+    [Test]
     public void RecursiveTreeTraversalMatchesSqlite()
     {
         AssertMatchesSqlite(

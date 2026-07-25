@@ -189,6 +189,7 @@ internal sealed class SqlLexer
             '(' => new SqlToken(TokenKind.LeftParen, "(", start),
             ')' => new SqlToken(TokenKind.RightParen, ")", start),
             ',' => new SqlToken(TokenKind.Comma, ",", start),
+            '.' when _offset < _sql.Length && char.IsAsciiDigit(_sql[_offset]) => ReadNumber(start, startsWithDecimalPoint: true),
             '.' => new SqlToken(TokenKind.Dot, ".", start),
             ';' => new SqlToken(TokenKind.Semicolon, ";", start),
             '+' => new SqlToken(TokenKind.Plus, "+", start),
@@ -198,6 +199,7 @@ internal sealed class SqlLexer
             '%' => new SqlToken(TokenKind.Percent, "%", start),
             '~' => new SqlToken(TokenKind.BitwiseNot, "~", start),
             '&' => new SqlToken(TokenKind.BitwiseAnd, "&", start),
+            '=' when ConsumeCharacter('=') => new SqlToken(TokenKind.Equal, "==", start),
             '=' => new SqlToken(TokenKind.Equal, "=", start),
             '!' when ConsumeCharacter('=') => new SqlToken(TokenKind.NotEqual, "!=", start),
             '<' when ConsumeCharacter('=') => new SqlToken(TokenKind.LessThanOrEqual, "<=", start),
@@ -301,27 +303,80 @@ internal sealed class SqlLexer
 
     private SqlToken ReadParameter(int start)
     {
-        while (_offset < _sql.Length && (char.IsAsciiLetterOrDigit(_sql[_offset]) || _sql[_offset] is '_' or '$'))
-            _offset++;
+        ConsumeParameterIdentifier();
+        if (_sql[start] == '$')
+        {
+            while (_offset + 1 < _sql.Length && _sql[_offset] == ':' && _sql[_offset + 1] == ':')
+            {
+                _offset += 2;
+                ConsumeParameterIdentifier();
+            }
+
+            if (_offset < _sql.Length && _sql[_offset] == '(')
+            {
+                _offset++;
+                ConsumeParameterIdentifier();
+                if (_offset < _sql.Length && _sql[_offset] == ')')
+                    _offset++;
+            }
+        }
 
         return new SqlToken(TokenKind.Parameter, _sql[start.._offset], start);
     }
 
-    private SqlToken ReadNumber(int start)
+    private void ConsumeParameterIdentifier()
     {
+        while (_offset < _sql.Length
+               && (char.IsAsciiLetterOrDigit(_sql[_offset]) || _sql[_offset] is '_' or '$'))
+        {
+            _offset++;
+        }
+    }
+
+    private SqlToken ReadNumber(int start, bool startsWithDecimalPoint = false)
+    {
+        if (!startsWithDecimalPoint
+            && _sql[start] == '0'
+            && _offset + 1 < _sql.Length
+            && _sql[_offset] is 'x' or 'X'
+            && char.IsAsciiHexDigit(_sql[_offset + 1]))
+        {
+            _offset++;
+            while (_offset < _sql.Length && char.IsAsciiHexDigit(_sql[_offset]))
+                _offset++;
+            return new SqlToken(TokenKind.Integer, _sql[start.._offset], start);
+        }
+
         while (_offset < _sql.Length && char.IsAsciiDigit(_sql[_offset]))
             _offset++;
 
-        if (_offset < _sql.Length && _sql[_offset] == '.')
+        var isReal = startsWithDecimalPoint;
+        if (!startsWithDecimalPoint && _offset < _sql.Length && _sql[_offset] == '.')
         {
+            isReal = true;
             _offset++;
             while (_offset < _sql.Length && char.IsAsciiDigit(_sql[_offset]))
                 _offset++;
-
-            return new SqlToken(TokenKind.Real, _sql[start.._offset], start);
         }
 
-        return new SqlToken(TokenKind.Integer, _sql[start.._offset], start);
+        if (_offset < _sql.Length && _sql[_offset] is 'e' or 'E')
+        {
+            var exponentStart = _offset + 1;
+            if (exponentStart < _sql.Length && _sql[exponentStart] is '+' or '-')
+                exponentStart++;
+            if (exponentStart < _sql.Length && char.IsAsciiDigit(_sql[exponentStart]))
+            {
+                isReal = true;
+                _offset = exponentStart + 1;
+                while (_offset < _sql.Length && char.IsAsciiDigit(_sql[_offset]))
+                    _offset++;
+            }
+        }
+
+        return new SqlToken(
+            isReal ? TokenKind.Real : TokenKind.Integer,
+            _sql[start.._offset],
+            start);
     }
 
     private SqlToken ReadIdentifier(int start)

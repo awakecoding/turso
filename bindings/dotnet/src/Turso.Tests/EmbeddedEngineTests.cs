@@ -46,6 +46,258 @@ public class EmbeddedEngineTests
     }
 
     [Test]
+    public void LexerAcceptsSQLiteEqualityNumericAndDollarParameterForms()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        using var statement = connection.Prepare("SELECT 1 == 1, 1e2, 0x10, .5, $a::b(c);");
+        statement.Bind("$a::b(c)", SqlValue.Integer(7)).Should().BeTrue();
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(1));
+        statement.GetValue(1).Should().Be(SqlValue.Real(100));
+        statement.GetValue(2).Should().Be(SqlValue.Integer(16));
+        statement.GetValue(3).Should().Be(SqlValue.Real(0.5));
+        statement.GetValue(4).Should().Be(SqlValue.Integer(7));
+        statement.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    [Test]
+    public void QualifiedCteNamesAndNonAggregateHavingAreRejected()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Assert.Throws<EmbeddedSqlException>(() => connection.Prepare("WITH a.b AS (SELECT 1) SELECT 1;"));
+        using var having = connection.Prepare("SELECT 1 HAVING 0;");
+        Assert.Throws<EmbeddedSqlException>(() => having.Step())!
+            .Message.Should().Be("HAVING clause on a non-aggregate query");
+    }
+
+    [Test]
+    public void InsertValuesCanStartACompoundQuerySource()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE values_table(value INTEGER);");
+        Execute(connection, "INSERT INTO values_table VALUES (1) UNION ALL SELECT 2 UNION ALL SELECT 3;");
+
+        using var statement = connection.Prepare("SELECT value FROM values_table ORDER BY value;");
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(1));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(2));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(3));
+        statement.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    [Test]
+    public void DistinctOnScalarFunctionsDoesNotRequireAggregateArity()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        using var statement = connection.Prepare("SELECT coalesce(DISTINCT NULL, 7);");
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(7));
+        statement.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    [Test]
+    public void OrderedAggregateArgumentsAreExplicitlyRejected()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Assert.Throws<EmbeddedSqlException>(
+                () => connection.Prepare("SELECT group_concat(value ORDER BY value);"))!
+            .Message.Should().Contain("ORDER BY within aggregate functions is not supported");
+    }
+
+    [Test]
+    public void StatementStreamsProjectionCallbacksOneRowAtATime()
+    {
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "fail_on_two",
+            1,
+            values => values[0] == SqlValue.Integer(2)
+                ? throw new InvalidOperationException("later row")
+                : values[0]);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE values_table(value INTEGER);");
+        Execute(connection, "INSERT INTO values_table VALUES (1), (2);");
+        using var statement = connection.Prepare("SELECT fail_on_two(value) FROM values_table;");
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(1));
+        Assert.Throws<InvalidOperationException>(() => statement.Step())!
+            .Message.Should().Be("later row");
+    }
+
+    [Test]
+    public void OrderByEvaluatesScalarCallbackKeysOnceInSourceOrder()
+    {
+        var observed = new List<long>();
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "observe_sort_key",
+            1,
+            values =>
+            {
+                observed.Add(values[0].AsInteger());
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE values_table(value INTEGER);");
+        Execute(connection, "INSERT INTO values_table VALUES (3), (1), (2);");
+        using var statement = connection.Prepare(
+            "SELECT value FROM values_table ORDER BY observe_sort_key(value);");
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(1));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(2));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(3));
+        statement.Step().Should().Be(StatementStepResult.Done);
+        observed.Should().Equal(3, 1, 2);
+    }
+
+    [Test]
+    public void GroupedOrderByEvaluatesCallbackKeysOnceInGroupSourceOrder()
+    {
+        var observed = new List<long>();
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "observe_group_key",
+            1,
+            values =>
+            {
+                observed.Add(values[0].AsInteger());
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE grouped_values(group_name TEXT, value INTEGER);");
+        Execute(connection, "INSERT INTO grouped_values VALUES ('later', 30), ('first', 1), ('first', 2);");
+        using var statement = connection.Prepare(
+            "SELECT group_name, sum(value) FROM grouped_values "
+            + "GROUP BY group_name ORDER BY observe_group_key(sum(value));");
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Text("first"));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Text("later"));
+        statement.Step().Should().Be(StatementStepResult.Done);
+        observed.Should().Equal(30, 3);
+    }
+
+    [Test]
+    public void OrderByStopsAtTheFirstCallbackFailureInSourceOrder()
+    {
+        var observed = new List<long>();
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "fail_on_second_sort_key",
+            1,
+            values =>
+            {
+                var value = values[0].AsInteger();
+                observed.Add(value);
+                if (value == 1)
+                    throw new InvalidOperationException("sort key failure");
+
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE values_table(value INTEGER);");
+        Execute(connection, "INSERT INTO values_table VALUES (3), (1), (2);");
+
+        using var statement = connection.Prepare(
+            "SELECT value FROM values_table ORDER BY fail_on_second_sort_key(value);");
+        Assert.Throws<InvalidOperationException>(() => statement.Step());
+        observed.Should().Equal(3, 1);
+    }
+
+    [Test]
+    public void UnqualifiedColumnsFromSeparateJoinSourcesAreRejectedAsAmbiguous()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE left_values(id INTEGER, value INTEGER);");
+        Execute(connection, "CREATE TABLE right_values(id INTEGER, value INTEGER);");
+        Execute(connection, "INSERT INTO left_values VALUES (1, 10);");
+        Execute(connection, "INSERT INTO right_values VALUES (1, 20);");
+
+        var queries = new[]
+        {
+            "SELECT id FROM left_values JOIN right_values ON left_values.id = right_values.id;",
+            "SELECT left_values.id FROM left_values JOIN right_values ON left_values.id = right_values.id WHERE value = 10;",
+            "SELECT left_values.id FROM left_values JOIN right_values ON left_values.id = right_values.id ORDER BY value;",
+            "SELECT count(*) FROM left_values JOIN right_values ON left_values.id = right_values.id GROUP BY value;",
+        };
+        foreach (var query in queries)
+        {
+            using var statement = connection.Prepare(query);
+            Assert.That(
+                Assert.Throws<EmbeddedSqlException>(() => statement.Step())!.Message,
+                Is.EqualTo("ambiguous column name: value").Or.EqualTo("ambiguous column name: id"));
+        }
+    }
+
+    [Test]
+    public void UsingAndNaturalJoinColumnsRemainUnambiguous()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE left_values(id INTEGER, left_value INTEGER);");
+        Execute(connection, "CREATE TABLE right_values(id INTEGER, right_value INTEGER);");
+        Execute(connection, "INSERT INTO left_values VALUES (1, 10);");
+        Execute(connection, "INSERT INTO right_values VALUES (1, 20);");
+
+        using var usingStatement = connection.Prepare(
+            "SELECT id FROM left_values JOIN right_values USING(id);");
+        usingStatement.Step().Should().Be(StatementStepResult.Row);
+        usingStatement.GetValue(0).Should().Be(SqlValue.Integer(1));
+
+        using var naturalStatement = connection.Prepare(
+            "SELECT id FROM left_values NATURAL JOIN right_values;");
+        naturalStatement.Step().Should().Be(StatementStepResult.Row);
+        naturalStatement.GetValue(0).Should().Be(SqlValue.Integer(1));
+    }
+
+    [Test]
+    public void RegisteredBuiltinBinaryCollationOverridesBuiltinComparisonSemantics()
+    {
+        var database = new EmbeddedDatabase();
+        database.RegisterCollation("BINARY", (_, _) => 0);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE values_table(value TEXT);");
+        Execute(connection, "CREATE INDEX values_by_value ON values_table(value);");
+        Execute(connection, "INSERT INTO values_table VALUES ('b'), ('a');");
+
+        using var equality = connection.Prepare(
+            "SELECT value FROM values_table WHERE value = 'a' ORDER BY value;");
+        equality.Step().Should().Be(StatementStepResult.Row);
+        equality.GetValue(0).Should().Be(SqlValue.Text("b"));
+        equality.Step().Should().Be(StatementStepResult.Row);
+        equality.GetValue(0).Should().Be(SqlValue.Text("a"));
+        equality.Step().Should().Be(StatementStepResult.Done);
+
+        using var distinct = connection.Prepare("SELECT DISTINCT value FROM values_table;");
+        distinct.Step().Should().Be(StatementStepResult.Row);
+        distinct.GetValue(0).Should().Be(SqlValue.Text("b"));
+        distinct.Step().Should().Be(StatementStepResult.Done);
+
+        using var grouped = connection.Prepare(
+            "SELECT count(*) FROM values_table GROUP BY value;");
+        grouped.Step().Should().Be(StatementStepResult.Row);
+        grouped.GetValue(0).Should().Be(SqlValue.Integer(2));
+        grouped.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    [Test]
     public void TransactionsRollbackChangesAndCountRows()
     {
         var database = new EmbeddedDatabase();
@@ -1610,8 +1862,8 @@ public class EmbeddedEngineTests
         Execute(connection, "CREATE TABLE t(x, y);");
         Execute(connection, "INSERT INTO t VALUES (1, 2);");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => connection.Prepare("SELECT group_concat(DISTINCT x, y) FROM t;"))!
+        using var statement = connection.Prepare("SELECT group_concat(DISTINCT x, y) FROM t;");
+        Assert.Throws<EmbeddedSqlException>(() => statement.Step())!
             .Message.Should().StartWith("DISTINCT aggregates must have exactly one argument.");
     }
 

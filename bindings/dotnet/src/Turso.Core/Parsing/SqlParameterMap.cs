@@ -100,9 +100,7 @@ public sealed class SqlParameterMap
 
     private static int AddNamedParameter(string sql, int cursor, List<string?> names, Dictionary<string, int> indices)
     {
-        var end = cursor + 1;
-        while (end < sql.Length && IsParameterIdentifierCharacter(sql[end]))
-            end++;
+        var end = ScanNamedParameterEnd(sql, cursor);
 
         if (end == cursor + 1)
             return end;
@@ -114,6 +112,34 @@ public sealed class SqlParameterMap
             var index = names.Count;
             names.Add(name);
             indices.Add(name, index);
+        }
+
+        return end;
+    }
+
+    private static int ScanNamedParameterEnd(string sql, int cursor)
+    {
+        var end = cursor + 1;
+        while (end < sql.Length && IsParameterIdentifierCharacter(sql[end]))
+            end++;
+
+        if (sql[cursor] != '$')
+            return end;
+
+        while (end + 1 < sql.Length && sql[end] == ':' && sql[end + 1] == ':')
+        {
+            end += 2;
+            while (end < sql.Length && IsParameterIdentifierCharacter(sql[end]))
+                end++;
+        }
+
+        if (end < sql.Length && sql[end] == '(')
+        {
+            end++;
+            while (end < sql.Length && IsParameterIdentifierCharacter(sql[end]))
+                end++;
+            if (end < sql.Length && sql[end] == ')')
+                end++;
         }
 
         return end;

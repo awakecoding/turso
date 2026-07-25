@@ -364,31 +364,39 @@ public sealed class SqliteTableLeafMutationWriter
             }
 
             var remainingOverflowBytes = payload.Length - layout.LocalPayloadLength;
-            uint nextPageNumber = 0;
+            var allocations = new List<SqlitePageAllocation>();
             while (remainingOverflowBytes > 0)
             {
-                var bytesOnPage = Math.Min(overflowCapacity, remainingOverflowBytes);
-                var payloadOffset = layout.LocalPayloadLength + remainingOverflowBytes - bytesOnPage;
                 var allocation = _allocator.Allocate();
                 ValidateDataPageAllocation(allocation);
                 if (allocation.DatabaseSizeInPages > allocationDatabaseSizeInPages)
                     allocationDatabaseSizeInPages = allocation.DatabaseSizeInPages;
+                allocations.Add(allocation);
+                remainingOverflowBytes -= Math.Min(overflowCapacity, remainingOverflowBytes);
+            }
+
+            var overflowOffset = layout.LocalPayloadLength;
+            for (var index = 0; index < allocations.Count; index++)
+            {
+                var bytesOnPage = Math.Min(overflowCapacity, payload.Length - overflowOffset);
+                var nextPageNumber = index + 1 < allocations.Count
+                    ? allocations[index + 1].PageNumber
+                    : 0U;
                 overflowPages.Add(new SqlitePageImage(
-                    allocation.PageNumber,
+                    allocations[index].PageNumber,
                     SqliteOverflowPageView.Create(
                         _pageStore.PageSize,
                         usableSpace,
                         nextPageNumber,
-                        payload.Slice(payloadOffset, bytesOnPage)).ToArray()));
-                nextPageNumber = allocation.PageNumber;
-                remainingOverflowBytes -= bytesOnPage;
+                        payload.Slice(overflowOffset, bytesOnPage)).ToArray()));
+                overflowOffset += bytesOnPage;
             }
 
             cells.Add(SqliteTableLeafCell.Create(
                 input.RowId,
                 checked((ulong)payload.Length),
                 payload[..layout.LocalPayloadLength],
-                nextPageNumber,
+                allocations[0].PageNumber,
                 usableSpace));
         }
 
