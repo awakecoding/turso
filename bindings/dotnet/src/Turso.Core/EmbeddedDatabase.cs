@@ -347,7 +347,8 @@ public sealed class EmbeddedDatabase : IDisposable
         bool IndexExpression = false,
         CancellationToken CancellationToken = default,
         bool SchemaValidation = false,
-        InsertConflictAlgorithm? TriggerConflictAlgorithm = null);
+        InsertConflictAlgorithm? TriggerConflictAlgorithm = null,
+        bool PreserveUpsertFail = false);
 
     internal sealed class ForeignKeyStatementState
     {
@@ -3756,7 +3757,11 @@ public sealed class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         var triggerConflictAlgorithm = statement.ConflictAlgorithm;
-        context = context with { TriggerConflictAlgorithm = triggerConflictAlgorithm };
+        context = context with
+        {
+            TriggerConflictAlgorithm = triggerConflictAlgorithm,
+            PreserveUpsertFail = true,
+        };
         var conflictTarget = ResolveUpsertConflictTarget(statement.TableName, table, statement.Upsert);
         var insertPlan = PrepareInsert(statement, table, context);
         var updateAction = statement.Upsert.Action as DoUpdateUpsertAction;
@@ -3913,6 +3918,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 var updateContext = context with
                 {
                     TriggerConflictAlgorithm = InsertConflictAlgorithm.Abort,
+                    PreserveUpsertFail = false,
                 };
                 var original = table.Rows[conflictPosition];
                 var originalRowId = table.RowIds[conflictPosition];
@@ -4103,8 +4109,11 @@ public sealed class EmbeddedDatabase : IDisposable
                                 triggerConflictAlgorithm));
                     }
                 case InsertConflictAlgorithm.Fail:
-                    if (affectedRows.Count == 0)
+                    if (affectedRows.Count == 0
+                        && !(context.InsideTrigger && context.PreserveUpsertFail))
+                    {
                         throw exception;
+                    }
                     throw new EmbeddedUpsertConflictFailException(
                         exception,
                         lastInsertRowId ?? context.LastInsertRowId);
@@ -6285,17 +6294,26 @@ public sealed class EmbeddedDatabase : IDisposable
         IReadOnlyList<SqlValue> oldParentValues)
     {
         var actionContext = EnterForeignKeyAction(context);
-        _ = ExecuteWithTriggers(
-            childTableName,
-            TriggerEvent.Delete,
-            actionContext,
-            () => PerformForeignKeyDelete(
-                actionContext,
+        if (context.PreserveUpsertFail)
+            actionContext = actionContext with { TriggerConflictAlgorithm = null };
+        try
+        {
+            _ = ExecuteWithTriggers(
                 childTableName,
-                childTable,
-                foreignKey,
-                parent,
-                oldParentValues));
+                TriggerEvent.Delete,
+                actionContext,
+                () => PerformForeignKeyDelete(
+                    actionContext,
+                    childTableName,
+                    childTable,
+                    foreignKey,
+                    parent,
+                    oldParentValues));
+        }
+        catch (EmbeddedConflictFailException exception) when (actionContext.PreserveUpsertFail)
+        {
+            throw PromoteUpsertFail(exception, actionContext);
+        }
     }
 
     private ExecutionResult PerformForeignKeyDelete(
@@ -6365,20 +6383,55 @@ public sealed class EmbeddedDatabase : IDisposable
         ForeignKeyAction action,
         IReadOnlyList<SqlValue>? newParentValues)
     {
-        var actionContext = EnterForeignKeyAction(context);
-        _ = ExecuteWithTriggers(
-            childTableName,
-            TriggerEvent.Update,
-            actionContext,
-            () => PerformForeignKeyUpdate(
-                actionContext,
+        var actionContext = EnterForeignKeyAction(context) with
+        {
+            TriggerConflictAlgorithm = context.PreserveUpsertFail
+                ? null
+                : context.TriggerConflictAlgorithm,
+            PreserveUpsertFail = false,
+        };
+        try
+        {
+            _ = ExecuteWithTriggers(
                 childTableName,
-                childTable,
-                foreignKey,
-                parent,
-                oldParentValues,
-                action,
-                newParentValues));
+                TriggerEvent.Update,
+                actionContext,
+                () => PerformForeignKeyUpdate(
+                    actionContext,
+                    childTableName,
+                    childTable,
+                    foreignKey,
+                    parent,
+                    oldParentValues,
+                    action,
+                    newParentValues));
+        }
+        catch (EmbeddedConflictFailException exception)
+        {
+            throw DemoteUpsertFail(exception, actionContext);
+        }
+    }
+
+    private static EmbeddedUpsertConflictFailException PromoteUpsertFail(
+        EmbeddedConflictFailException exception,
+        QueryContext context)
+    {
+        var conflict = exception.InnerException as EmbeddedSqlException
+            ?? new EmbeddedSqlException(
+                exception.Message,
+                exception.InnerException ?? exception);
+        return new EmbeddedUpsertConflictFailException(conflict, context.LastInsertRowId);
+    }
+
+    private static EmbeddedStatementAbortException DemoteUpsertFail(
+        EmbeddedConflictFailException exception,
+        QueryContext context)
+    {
+        var conflict = exception.InnerException as EmbeddedSqlException
+            ?? new EmbeddedSqlException(
+                exception.Message,
+                exception.InnerException ?? exception);
+        return new EmbeddedStatementAbortException(conflict, context.LastInsertRowId);
     }
 
     private ExecutionResult PerformForeignKeyUpdate(
@@ -7177,7 +7230,12 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             var result = performBase();
             if (result.RowsAffected > 0 && triggers.Count > 0)
-                FireTriggers(triggers, context);
+            {
+                var triggerContext = result.LastInsertRowId is { } insertedRowId
+                    ? context with { LastInsertRowId = insertedRowId }
+                    : context;
+                FireTriggers(triggers, triggerContext);
+            }
             return result;
         }
 
@@ -7190,6 +7248,10 @@ public sealed class EmbeddedDatabase : IDisposable
             return PerformAndFire();
         }
         catch (EmbeddedUpsertConflictFailException)
+        {
+            throw;
+        }
+        catch (EmbeddedConflictFailException) when (context.PreserveUpsertFail)
         {
             throw;
         }

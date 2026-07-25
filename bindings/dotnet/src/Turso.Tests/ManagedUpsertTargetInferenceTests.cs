@@ -1932,6 +1932,426 @@ public sealed class ManagedUpsertTargetInferenceTests
             .Rows.Should().Equal("I:7");
     }
 
+    [Test]
+    public void ForeignKeyCascadeTriggerFailRetainsReplacementPrefix()
+    {
+        string[] setup =
+        [
+            "PRAGMA foreign_keys = ON",
+            """
+            CREATE TABLE parent(
+                id INTEGER PRIMARY KEY,
+                code TEXT UNIQUE ON CONFLICT REPLACE
+            )
+            """,
+            """
+            CREATE TABLE child(
+                parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE TABLE audit(value INTEGER UNIQUE)",
+            "INSERT INTO parent VALUES (1, 'one')",
+            "INSERT INTO child VALUES (1)",
+            "INSERT INTO audit VALUES (100)",
+            """
+            CREATE TRIGGER child_delete AFTER DELETE ON child BEGIN
+                INSERT OR FAIL INTO audit VALUES (200), (100);
+            END
+            """,
+        ];
+        const string insert = """
+            INSERT INTO parent VALUES (2, 'one')
+            ON CONFLICT(id) DO NOTHING
+            """;
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM parent"),
+            QuerySqlite(sqlite, "SELECT * FROM parent"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM child"),
+            QuerySqlite(sqlite, "SELECT * FROM child"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM audit ORDER BY value"),
+            QuerySqlite(sqlite, "SELECT * FROM audit ORDER BY value"));
+    }
+
+    [Test]
+    public void ForeignKeySetNullTriggerFailAbortsReplacement()
+    {
+        string[] setup =
+        [
+            "PRAGMA foreign_keys = ON",
+            """
+            CREATE TABLE parent(
+                id INTEGER PRIMARY KEY,
+                code TEXT UNIQUE ON CONFLICT REPLACE
+            )
+            """,
+            """
+            CREATE TABLE child(
+                parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL
+            )
+            """,
+            "CREATE TABLE audit(value INTEGER UNIQUE)",
+            "INSERT INTO parent VALUES (1, 'one')",
+            "INSERT INTO child VALUES (1)",
+            "INSERT INTO audit VALUES (100)",
+            """
+            CREATE TRIGGER child_update AFTER UPDATE ON child BEGIN
+                INSERT OR FAIL INTO audit VALUES (200), (100);
+            END
+            """,
+        ];
+        const string insert = """
+            INSERT INTO parent VALUES (2, 'one')
+            ON CONFLICT(id) DO NOTHING
+            """;
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM parent"),
+            QuerySqlite(sqlite, "SELECT * FROM parent"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM child"),
+            QuerySqlite(sqlite, "SELECT * FROM child"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM audit ORDER BY value"),
+            QuerySqlite(sqlite, "SELECT * FROM audit ORDER BY value"));
+    }
+
+    [Test]
+    public void ForeignKeySetNullNestedUpsertFailAbortsReplacement()
+    {
+        string[] setup =
+        [
+            "PRAGMA foreign_keys = ON",
+            """
+            CREATE TABLE parent(
+                id INTEGER PRIMARY KEY,
+                code TEXT UNIQUE ON CONFLICT REPLACE
+            )
+            """,
+            """
+            CREATE TABLE child(
+                parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL
+            )
+            """,
+            "CREATE TABLE audit(id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "INSERT INTO parent VALUES (1, 'one')",
+            "INSERT INTO child VALUES (1)",
+            "INSERT INTO audit VALUES (1, 'duplicate')",
+            """
+            CREATE TRIGGER child_update AFTER UPDATE ON child BEGIN
+                INSERT OR FAIL INTO audit VALUES (2, 'prefix'), (3, 'duplicate')
+                ON CONFLICT(id) DO NOTHING;
+            END
+            """,
+        ];
+        const string insert = """
+            INSERT INTO parent VALUES (2, 'one')
+            ON CONFLICT(id) DO NOTHING
+            """;
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM parent"),
+            QuerySqlite(sqlite, "SELECT * FROM parent"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM child"),
+            QuerySqlite(sqlite, "SELECT * FROM child"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM audit ORDER BY id"),
+            QuerySqlite(sqlite, "SELECT * FROM audit ORDER BY id"));
+    }
+
+    [Test]
+    public void OrdinaryTriggerNestedUpsertFailRetainsPrefixes()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE target(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE audit(id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "INSERT INTO audit VALUES (1, 'duplicate')",
+            """
+            CREATE TRIGGER target_insert AFTER INSERT ON target BEGIN
+                INSERT OR FAIL INTO audit VALUES (2, 'prefix'), (3, 'duplicate')
+                ON CONFLICT(id) DO NOTHING;
+            END
+            """,
+        ];
+        const string insert = "INSERT INTO target VALUES (10) ON CONFLICT(id) DO NOTHING";
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM target"),
+            QuerySqlite(sqlite, "SELECT * FROM target"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM audit ORDER BY id"),
+            QuerySqlite(sqlite, "SELECT * FROM audit ORDER BY id"));
+    }
+
+    [Test]
+    public void ForeignKeyCascadeImmediateNestedUpsertFailRetainsDeletionPrefix()
+    {
+        string[] setup =
+        [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE ON CONFLICT REPLACE)",
+            "CREATE TABLE child(parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+            "CREATE TABLE audit(id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "CREATE TABLE marker(id INTEGER PRIMARY KEY)",
+            "INSERT INTO parent VALUES (1, 'one')",
+            "INSERT INTO child VALUES (1)",
+            "INSERT INTO audit VALUES (1, 'duplicate')",
+            "INSERT INTO marker VALUES (99)",
+            """
+            CREATE TRIGGER child_delete AFTER DELETE ON child BEGIN
+                INSERT INTO audit VALUES (41, 'inner');
+                INSERT OR FAIL INTO audit VALUES (2, 'duplicate')
+                ON CONFLICT(id) DO NOTHING;
+            END
+            """,
+        ];
+        const string insert = "INSERT INTO parent VALUES (2, 'one') ON CONFLICT(id) DO NOTHING";
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM parent"),
+            QuerySqlite(sqlite, "SELECT * FROM parent"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM child"),
+            QuerySqlite(sqlite, "SELECT * FROM child"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM audit"),
+            QuerySqlite(sqlite, "SELECT * FROM audit"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT last_insert_rowid() AS lir"),
+            QuerySqlite(sqlite, "SELECT last_insert_rowid() AS lir"));
+    }
+
+    [Test]
+    public void OuterReplaceDoesNotOverrideForeignKeyUpdateTriggerFail()
+    {
+        string[] setup =
+        [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "CREATE TABLE child(parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL)",
+            "CREATE TABLE audit(value INTEGER UNIQUE)",
+            "INSERT INTO parent VALUES (1, 'one')",
+            "INSERT INTO child VALUES (1)",
+            "INSERT INTO audit VALUES (100)",
+            """
+            CREATE TRIGGER child_update AFTER UPDATE ON child BEGIN
+                INSERT OR FAIL INTO audit VALUES (200), (100);
+            END
+            """,
+        ];
+        const string insert = """
+            INSERT OR REPLACE INTO parent VALUES (2, 'one')
+            ON CONFLICT(id) DO NOTHING
+            """;
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM parent"),
+            QuerySqlite(sqlite, "SELECT * FROM parent"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM child"),
+            QuerySqlite(sqlite, "SELECT * FROM child"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM audit ORDER BY value"),
+            QuerySqlite(sqlite, "SELECT * FROM audit ORDER BY value"));
+    }
+
+    [Test]
+    public void OuterFailCannotReclassifyAtomicForeignKeyUpdateFailure()
+    {
+        string[] setup =
+        [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE driver(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY, parent_key TEXT UNIQUE)",
+            "CREATE TABLE child(parent_key TEXT REFERENCES parent(parent_key) ON UPDATE CASCADE)",
+            "CREATE TABLE audit(id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "INSERT INTO parent VALUES (1, 'old')",
+            "INSERT INTO child VALUES ('old')",
+            "INSERT INTO audit VALUES (1, 'duplicate')",
+            """
+            CREATE TRIGGER child_update AFTER UPDATE ON child BEGIN
+                INSERT OR FAIL INTO audit VALUES (2, 'prefix'), (3, 'duplicate')
+                ON CONFLICT(id) DO NOTHING;
+            END
+            """,
+            """
+            CREATE TRIGGER driver_insert AFTER INSERT ON driver BEGIN
+                UPDATE parent SET parent_key = 'new' WHERE id = 1;
+            END
+            """,
+        ];
+        const string insert = """
+            INSERT OR FAIL INTO driver VALUES (1)
+            ON CONFLICT(id) DO NOTHING
+            """;
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM driver"),
+            QuerySqlite(sqlite, "SELECT * FROM driver"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM parent"),
+            QuerySqlite(sqlite, "SELECT * FROM parent"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM child"),
+            QuerySqlite(sqlite, "SELECT * FROM child"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM audit ORDER BY id"),
+            QuerySqlite(sqlite, "SELECT * FROM audit ORDER BY id"));
+    }
+
+    [Test]
+    public void StandardInsertTriggerFailureRecordsTheOuterInsertRowid()
+    {
+        string[] setup =
+        [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE driver(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE marker(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY, parent_key TEXT UNIQUE)",
+            "CREATE TABLE child(parent_key TEXT REFERENCES parent(parent_key) ON UPDATE CASCADE)",
+            "CREATE TABLE audit(id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "INSERT INTO parent VALUES (1, 'old')",
+            "INSERT INTO child VALUES ('old')",
+            "INSERT INTO audit VALUES (1, 'duplicate')",
+            "INSERT INTO marker VALUES (99)",
+            """
+            CREATE TRIGGER child_update AFTER UPDATE ON child BEGIN
+                INSERT OR FAIL INTO audit VALUES (2, 'prefix'), (3, 'duplicate')
+                ON CONFLICT(id) DO NOTHING;
+            END
+            """,
+            """
+            CREATE TRIGGER driver_insert AFTER INSERT ON driver BEGIN
+                UPDATE parent SET parent_key = 'new' WHERE id = 1;
+            END
+            """,
+        ];
+        const string insert = "INSERT INTO driver VALUES (10)";
+
+        using var managedDatabase = new EmbeddedDatabase();
+        using var managed = managedDatabase.Connect();
+        foreach (var statement in setup)
+            Execute(managed, statement);
+        Assert.Throws<EmbeddedSqlException>(() => Execute(managed, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        foreach (var statement in setup)
+            Execute(sqlite, statement);
+        Assert.Throws<MsData.SqliteException>(() => Execute(sqlite, insert))!
+            .Message.Should().Contain("UNIQUE constraint failed");
+
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT * FROM driver"),
+            QuerySqlite(sqlite, "SELECT * FROM driver"));
+        AssertOutputsEqual(
+            QueryManaged(managed, "SELECT last_insert_rowid() AS lir"),
+            QuerySqlite(sqlite, "SELECT last_insert_rowid() AS lir"));
+    }
+
     private static TestCaseData Case(string name, string[] statements, string query)
         => new(new DifferentialCase(statements, query)) { TestName = name };
 

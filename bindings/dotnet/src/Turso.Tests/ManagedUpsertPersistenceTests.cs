@@ -193,6 +193,98 @@ public sealed class ManagedUpsertPersistenceTests
         }
     }
 
+    [Test]
+    public void BoundedCommitPersistsRecreatedIndexInferenceOrder()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var connection = OpenManaged(path, pooling: false))
+            {
+                connection.ExecuteNonQuery(
+                    """
+                    CREATE TABLE items(code TEXT, value INTEGER);
+                    CREATE UNIQUE INDEX z_binary ON items(code COLLATE BINARY);
+                    CREATE UNIQUE INDEX a_nocase ON items(code COLLATE NOCASE);
+                    CREATE TABLE mutations(id INTEGER PRIMARY KEY);
+                    INSERT INTO items VALUES ('item', 1);
+                    BEGIN;
+                    DROP INDEX z_binary;
+                    CREATE UNIQUE INDEX z_binary ON items(code COLLATE BINARY);
+                    INSERT INTO mutations VALUES (1);
+                    COMMIT;
+                    """);
+                connection.Invoking(value => value.ExecuteNonQuery(
+                        """
+                        INSERT INTO items VALUES ('ITEM', 2)
+                        ON CONFLICT(code) DO UPDATE SET value = excluded.value;
+                        """))
+                    .Should().Throw<SqliteException>().WithMessage("*UNIQUE constraint failed*");
+            }
+
+            using var reopened = OpenManaged(path, pooling: false);
+            reopened.Invoking(value => value.ExecuteNonQuery(
+                    """
+                    INSERT INTO items VALUES ('ITEM', 3)
+                    ON CONFLICT(code) DO UPDATE SET value = excluded.value;
+                    """))
+                .Should().Throw<SqliteException>().WithMessage("*UNIQUE constraint failed*");
+            reopened.ExecuteScalar<long>("SELECT value FROM items;").Should().Be(1);
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void NativeSchemaRowOrderDoesNotForceSchemaRewrite()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var setup = OpenManaged(path, pooling: false))
+            {
+                setup.ExecuteNonQuery(
+                    """
+                    CREATE TABLE z(id INTEGER PRIMARY KEY, value TEXT);
+                    CREATE TABLE a(id INTEGER PRIMARY KEY, value TEXT);
+                    INSERT INTO z VALUES (1, 'one');
+                    """);
+            }
+
+            using (var native = new NativeSqliteConnection($"Data Source={path};Pooling=False"))
+            {
+                native.Open();
+                using var command = native.CreateCommand();
+                command.CommandText =
+                    """
+                    PRAGMA writable_schema = ON;
+                    UPDATE sqlite_schema SET rowid = -1 WHERE type = 'table' AND name = 'a';
+                    UPDATE sqlite_schema SET rowid = -2 WHERE type = 'table' AND name = 'z';
+                    UPDATE sqlite_schema SET rowid = 1 WHERE type = 'table' AND name = 'z';
+                    UPDATE sqlite_schema SET rowid = 2 WHERE type = 'table' AND name = 'a';
+                    PRAGMA writable_schema = OFF;
+                    """;
+                command.ExecuteNonQuery();
+            }
+
+            using (var managed = OpenManaged(path, pooling: false))
+            {
+                var schemaVersion = managed.ExecuteScalar<long>("PRAGMA schema_version;");
+                managed.ExecuteNonQuery("INSERT INTO z VALUES (2, 'two');");
+                managed.ExecuteScalar<long>("PRAGMA schema_version;").Should().Be(schemaVersion);
+            }
+
+            using var reopened = OpenManaged(path, pooling: false);
+            reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM z;").Should().Be(2);
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
     private static void UpsertAndAssert(
         ManagedSqliteConnection connection,
         long candidateId,

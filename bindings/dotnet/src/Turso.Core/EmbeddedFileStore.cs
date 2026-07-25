@@ -9820,7 +9820,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static string ComputeSchemaSignature(IReadOnlyList<SchemaEntry> entries)
     {
         var builder = new StringBuilder();
-        foreach (var entry in entries.OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase))
+        foreach (var entry in EnumerateSignatureEntries(entries))
         {
             builder.Append(entry.Type).Append('\u0001')
                 .Append(entry.Name).Append('\u0001')
@@ -9830,6 +9830,42 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         return builder.ToString();
+    }
+
+    private static IEnumerable<SchemaEntry> EnumerateSignatureEntries(
+        IReadOnlyList<SchemaEntry> entries)
+    {
+        foreach (var entry in entries
+                     .Where(entry => entry.Type == "table")
+                     .OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            yield return entry;
+        }
+
+        var indexesByTable = entries
+            .Where(entry => entry.Type == "index")
+            .GroupBy(entry => entry.TableName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.ToArray(),
+                StringComparer.OrdinalIgnoreCase);
+        foreach (var tableName in indexesByTable.Keys.OrderBy(
+                     name => name,
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (var entry in indexesByTable[tableName])
+            {
+                yield return entry;
+            }
+        }
+
+        foreach (var entry in entries
+                     .Where(entry => entry.Type is "view" or "trigger")
+                     .OrderBy(entry => entry.Type, StringComparer.Ordinal)
+                     .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            yield return entry;
+        }
     }
 
     private static string RequireText(SqlValue value, string field)
