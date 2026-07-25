@@ -400,8 +400,10 @@ parent primary-key columns, UNIQUE parent keys, parent affinity and collation, g
 columns, and `WITHOUT ROWID` tables within the storage shapes supported by the managed
 pager. `ON DELETE` and `ON UPDATE` implement `CASCADE`, `SET NULL`, `SET DEFAULT`,
 `RESTRICT`, and `NO ACTION`, including bounded self-referential and multi-table cascades.
-Foreign-key actions run before the engine's existing AFTER-trigger subset, and the whole
-statement (actions and trigger effects included) rolls back on failure.
+Foreign-key actions run after the parent mutation and before its AFTER row triggers. Child
+row triggers caused by `CASCADE`, `SET NULL`, or `SET DEFAULT` finish before the parent
+AFTER trigger. The whole statement, including actions and trigger effects, rolls back on
+ABORT-class failures.
 
 `DEFERRABLE INITIALLY DEFERRED` and `PRAGMA defer_foreign_keys` participate in managed
 transactions and savepoints. A failed deferred `COMMIT` or outermost `RELEASE` leaves the
@@ -415,8 +417,49 @@ Foreign keys are always resolved within the database that owns the child table. 
 schema-qualified `REFERENCES` target is rejected, and an ATTACH transaction still may
 mutate only one database because independent files cannot be committed atomically.
 Managed schema rewriting still rejects `ALTER TABLE ADD COLUMN ... REFERENCES` and
-foreign-key-dependent column renames. Trigger forms outside the managed trigger subset
-(for example `UPDATE OF` with `OLD`/`NEW` row references) remain unsupported.
+foreign-key-dependent column renames.
+
+### Managed row-trigger semantics
+
+Managed local databases implement persistent SQLite row triggers plus connection-local
+triggers in the `temp` schema. Trigger programs run in the database that owns their target,
+remain statement-atomic with the outer DML, and persistent definitions are preserved by
+reopen, managed backup, and page-size migration.
+
+| Trigger surface | Managed local contract |
+| --- | --- |
+| Timing and targets | `BEFORE` and `AFTER` on tables and `INSTEAD OF` on views are supported. Omitting timing means `BEFORE`. Other timing/target combinations are rejected. |
+| Row selection | SQLite row-trigger behavior is used; optional `FOR EACH ROW`, per-row `WHEN`, and `UPDATE OF` are supported. Unknown `UPDATE OF` names are accepted and never match. |
+| Row images | Event-valid `OLD.column` and `NEW.column` references are supported in `WHEN`, body DML, SELECTs, and subqueries. Generated columns and `WITHOUT ROWID` primary-key columns are included. Rowid aliases are available only for rowid tables; automatic `NEW.rowid` in a BEFORE INSERT uses SQLite's undefined placeholder and must not be relied upon. |
+| Body statements | Reduced `INSERT`, `UPDATE`, `DELETE`, and SELECT programs are supported. SELECT bodies may use the managed operator, join, compound, CTE, and window-function subsets. Body statements run in lexical order; SELECT rows are discarded. |
+| RAISE | `RAISE(IGNORE)`, and literal-message `ROLLBACK`, `ABORT`, and `FAIL` are supported with SQLite rollback/prefix semantics. Dynamic message expressions from SQLite 3.47 and later are rejected. |
+| DML interactions | Row triggers participate in `INSERT OR` conflict handling, REPLACE delete-trigger dispatch, inferred/column/expression/partial-index VALUES UPSERT targets, partial/expression-index maintenance, AUTOINCREMENT sequence tracking, top-level limited UPDATE/DELETE, and top-level RETURNING. RETURNING captures the directly changed row before AFTER-trigger changes and emits nothing if a later error aborts execution. |
+| Foreign keys | Immediate/deferred checks and referential actions share the outer statement boundary. AFTER triggers may repair NO ACTION violations before statement completion. |
+| Recursion | With `recursive_triggers=OFF`, only an already-active trigger program is suppressed; distinct trigger chains and FK actions continue. Recursion-enabled trigger graph cycles are rejected before callbacks or mutation because the managed evaluator cannot safely recurse to SQLite's native depth. |
+| Ordering | Statements within one body are ordered. Separate matching triggers currently run newest declaration first, including after reopen/backup/migration, but applications must treat cross-trigger order as unspecified and place dependent work in one body. |
+| ATTACH | Same-database persistent triggers on `main` or an attached database are supported. Their unqualified body references bind to that database, preserving the one-write-file transaction rule. |
+| TEMP | `CREATE TRIGGER temp.name ... ON temp.table` creates a connection-local temp-schema trigger. The `CREATE TEMP TRIGGER` keyword spelling remains rejected. |
+| Cancellation | Cancellation rolls back the complete mutating statement; cancellation inside an explicit write transaction rolls back that transaction. Host callback side effects are not transactional. |
+| Schema maintenance | DROP COLUMN and table/column rename validate trigger targets, WHEN clauses, row images, UPSERT expressions, query bodies, and named windows against the candidate schema before mutation. VACUUM, backup, page migration, and reopen preserve persistent trigger text and declaration order. |
+
+The managed engine rejects these shapes before target-row mutation:
+
+- The `CREATE TEMP TRIGGER` keyword spelling; persistent declarations or body references
+  that cross database schemas; qualified body DML targets or schema-qualified body
+  dependencies.
+- `BEFORE UPDATE`/`BEFORE DELETE` programs that can directly or indirectly mutate their
+  own target table, whose result SQLite documents as undefined.
+- Trigger-body `INSERT ... DEFAULT VALUES`, DML `RETURNING`, UPDATE/DELETE
+  `ORDER BY`/`LIMIT`, `INDEXED BY`/`NOT INDEXED`, top-level DML CTE prefixes, bind
+  parameters, DDL, transaction control, PRAGMA, ATTACH, and DETACH.
+- Explicit `UPDATE OR` syntax, schema-level UPDATE conflict algorithms on row-trigger
+  targets, and INSTEAD OF view DML combined with conflict clauses, UPSERT, limited DML,
+  or RETURNING.
+- Table/column renames with structural trigger dependencies; independent column renames
+  remain supported.
+- File-backed trigger definitions that contain function calls, explicit custom
+  collations, or target/reference tables declaring custom collations, because
+  connection-local implementations cannot be reconstructed on reopen.
 
 ### Managed local encryption format
 

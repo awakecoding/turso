@@ -70,31 +70,37 @@ internal static class SqlScript
         switch (header)
         {
             case TriggerHeader.ExpectTrigger:
+                if (IsKeyword(token, "TEMP") || IsKeyword(token, "TEMPORARY"))
+                    return TriggerHeader.ExpectTrigger;
                 return IsKeyword(token, "TRIGGER") ? TriggerHeader.ExpectNameOrIf : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectNameOrIf:
                 if (IsKeyword(token, "IF"))
                     return TriggerHeader.ExpectNot;
 
-                return IsIdentifier(token) ? TriggerHeader.ExpectAfter : TriggerHeader.NotTrigger;
+                return IsIdentifier(token) ? TriggerHeader.SeekOn : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectNot:
                 return IsKeyword(token, "NOT") ? TriggerHeader.ExpectExists : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectExists:
                 return IsKeyword(token, "EXISTS") ? TriggerHeader.ExpectName : TriggerHeader.NotTrigger;
             case TriggerHeader.ExpectName:
-                return IsIdentifier(token) ? TriggerHeader.ExpectAfter : TriggerHeader.NotTrigger;
-            case TriggerHeader.ExpectAfter:
-                return IsKeyword(token, "AFTER") ? TriggerHeader.ExpectEvent : TriggerHeader.NotTrigger;
-            case TriggerHeader.ExpectEvent:
-                return IsKeyword(token, "INSERT") || IsKeyword(token, "UPDATE") || IsKeyword(token, "DELETE")
-                    ? TriggerHeader.ExpectOn
-                    : TriggerHeader.NotTrigger;
-            case TriggerHeader.ExpectOn:
-                return IsKeyword(token, "ON") ? TriggerHeader.ExpectTable : TriggerHeader.NotTrigger;
+                return IsIdentifier(token) ? TriggerHeader.SeekOn : TriggerHeader.NotTrigger;
+            case TriggerHeader.SeekOn:
+                return IsKeyword(token, "ON") ? TriggerHeader.ExpectTable : TriggerHeader.SeekOn;
             case TriggerHeader.ExpectTable:
-                return IsIdentifier(token) ? TriggerHeader.ExpectBegin : TriggerHeader.NotTrigger;
-            case TriggerHeader.ExpectBegin:
+                return IsIdentifier(token) ? TriggerHeader.AfterTableName : TriggerHeader.NotTrigger;
+            case TriggerHeader.AfterTableName:
+                if (token.Kind == TokenKind.Dot)
+                    return TriggerHeader.ExpectTableLocal;
                 if (!IsKeyword(token, "BEGIN"))
-                    return TriggerHeader.NotTrigger;
+                    return TriggerHeader.SeekBegin;
+                inTriggerBody = true;
+                triggerBodyAtStatementStart = true;
+                return TriggerHeader.None;
+            case TriggerHeader.ExpectTableLocal:
+                return IsIdentifier(token) ? TriggerHeader.SeekBegin : TriggerHeader.NotTrigger;
+            case TriggerHeader.SeekBegin:
+                if (!IsKeyword(token, "BEGIN"))
+                    return TriggerHeader.SeekBegin;
 
                 inTriggerBody = true;
                 triggerBodyAtStatementStart = true;
@@ -106,6 +112,7 @@ internal static class SqlScript
 
     private static bool IsKeyword(SqlToken token, string keyword)
         => token.Kind == TokenKind.Identifier
+            && !token.IsQuoted
             && token.Text.Equals(keyword, StringComparison.OrdinalIgnoreCase);
 
     private static bool IsIdentifier(SqlToken token) => token.Kind == TokenKind.Identifier;
@@ -119,11 +126,11 @@ internal static class SqlScript
         ExpectNot,
         ExpectExists,
         ExpectName,
-        ExpectAfter,
-        ExpectEvent,
-        ExpectOn,
+        SeekOn,
         ExpectTable,
-        ExpectBegin,
+        AfterTableName,
+        ExpectTableLocal,
+        SeekBegin,
     }
 
     private static void AddStatement(string sql, int start, int end, List<string> statements)
@@ -256,7 +263,7 @@ internal sealed class SqlLexer
                 continue;
             }
 
-            return new SqlToken(TokenKind.Identifier, value.ToString(), start);
+            return new SqlToken(TokenKind.Identifier, value.ToString(), start, IsQuoted: true);
         }
 
         throw new EmbeddedSqlException($"Unterminated quoted identifier at offset {start}.");
@@ -370,7 +377,11 @@ internal sealed class SqlLexer
     private static bool IsIdentifierContinue(char value) => char.IsAsciiLetterOrDigit(value) || value is '_' or '$';
 }
 
-internal readonly record struct SqlToken(TokenKind Kind, string Text, int Offset);
+internal readonly record struct SqlToken(
+    TokenKind Kind,
+    string Text,
+    int Offset,
+    bool IsQuoted = false);
 
 internal readonly record struct LexerState(int Offset, SqlToken Token);
 

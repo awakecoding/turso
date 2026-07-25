@@ -49,6 +49,24 @@ public sealed class SqliteManagedTriggerScriptSplitterTests
         connection.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger';").Should().Be(0);
     }
 
+    [Test]
+    public void ManagedProviderDoesNotTreatTableNamedBeginAsTheBodyDelimiter()
+    {
+        using var connection = OpenManagedConnection();
+
+        connection.ExecuteNonQuery("""
+            CREATE TABLE begin(value INTEGER);
+            CREATE TABLE audit(value INTEGER);
+            CREATE TRIGGER begin_after AFTER INSERT ON begin
+            BEGIN
+                INSERT INTO audit VALUES (NEW.value);
+            END;
+            INSERT INTO begin VALUES (7);
+            """);
+
+        connection.ExecuteScalar<long>("SELECT value FROM audit;").Should().Be(7);
+    }
+
     private static SqliteConnection OpenManagedConnection()
     {
         var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");

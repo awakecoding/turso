@@ -17,7 +17,8 @@ public sealed class ManagedDefaultValuesTests
         Execute(connection, "CREATE TABLE audit(event TEXT DEFAULT 'inserted');");
         Execute(
             connection,
-            "CREATE TRIGGER item_insert AFTER INSERT ON items BEGIN INSERT INTO audit DEFAULT VALUES; END;");
+            "CREATE TRIGGER item_insert AFTER INSERT ON items "
+                + "BEGIN INSERT INTO audit VALUES ('inserted'); END;");
 
         using var insert = connection.Prepare(
             "INSERT INTO items DEFAULT VALUES RETURNING id, label, quantity, doubled;");
