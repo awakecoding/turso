@@ -286,7 +286,11 @@ internal static class IndexExpressionSemantics
         };
     }
 
-    public static bool PredicateImplies(Expression? queryPredicate, Expression? indexPredicate)
+    public static bool PredicateImplies(
+        Expression? queryPredicate,
+        Expression? indexPredicate,
+        string tableName,
+        string? alias)
     {
         if (indexPredicate is null)
             return true;
@@ -296,11 +300,62 @@ internal static class IndexExpressionSemantics
         var queryTerms = SplitConjuncts(queryPredicate);
         foreach (var required in SplitConjuncts(indexPredicate))
         {
-            if (!queryTerms.Any(candidate => ExpressionsEqual(candidate, required)))
+            if (!queryTerms.Any(candidate =>
+                    UsesOnlySourceColumns(candidate, tableName, alias)
+                    && ExpressionsEqual(candidate, required)))
                 return false;
         }
 
         return true;
+    }
+
+    private static bool UsesOnlySourceColumns(
+        Expression expression,
+        string tableName,
+        string? alias)
+    {
+        return expression switch
+        {
+            ColumnExpression { Qualifier: null } => true,
+            ColumnExpression column => string.Equals(
+                column.Qualifier,
+                alias ?? tableName,
+                StringComparison.OrdinalIgnoreCase),
+            FunctionExpression function => function.Arguments.All(argument =>
+                    UsesOnlySourceColumns(argument, tableName, alias))
+                && (function.Filter is null
+                    || UsesOnlySourceColumns(function.Filter, tableName, alias)),
+            CollationExpression collation => UsesOnlySourceColumns(
+                collation.Expression,
+                tableName,
+                alias),
+            CastExpression cast => UsesOnlySourceColumns(cast.Expression, tableName, alias),
+            CaseExpression @case => (@case.Operand is null
+                    || UsesOnlySourceColumns(@case.Operand, tableName, alias))
+                && @case.Clauses.All(clause =>
+                    UsesOnlySourceColumns(clause.When, tableName, alias)
+                    && UsesOnlySourceColumns(clause.Then, tableName, alias))
+                && (@case.Else is null
+                    || UsesOnlySourceColumns(@case.Else, tableName, alias)),
+            LikeExpression like => UsesOnlySourceColumns(like.Value, tableName, alias)
+                && UsesOnlySourceColumns(like.Pattern, tableName, alias)
+                && (like.Escape is null
+                    || UsesOnlySourceColumns(like.Escape, tableName, alias)),
+            GlobExpression glob => UsesOnlySourceColumns(glob.Value, tableName, alias)
+                && UsesOnlySourceColumns(glob.Pattern, tableName, alias),
+            InExpression @in => UsesOnlySourceColumns(@in.Value, tableName, alias)
+                && @in.Values.All(value => UsesOnlySourceColumns(value, tableName, alias)),
+            InSubqueryExpression or ScalarSubqueryExpression or ExistsExpression => false,
+            BetweenExpression between => UsesOnlySourceColumns(between.Value, tableName, alias)
+                && UsesOnlySourceColumns(between.Lower, tableName, alias)
+                && UsesOnlySourceColumns(between.Upper, tableName, alias),
+            UnaryExpression unary => UsesOnlySourceColumns(unary.Operand, tableName, alias),
+            BinaryExpression binary => UsesOnlySourceColumns(binary.Left, tableName, alias)
+                && UsesOnlySourceColumns(binary.Right, tableName, alias),
+            RowValueExpression rowValue => rowValue.Values.All(value =>
+                UsesOnlySourceColumns(value, tableName, alias)),
+            _ => true,
+        };
     }
 
     public static bool ContainsFunction(

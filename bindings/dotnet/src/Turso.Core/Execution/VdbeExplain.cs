@@ -139,6 +139,12 @@ public static class VdbeExplain
                 filterRegisters.Row.Count,
                 null,
                 filterRegisters.Description),
+            GroupKeyInstruction groupKey => (
+                groupKey.Row.Start.Index,
+                groupKey.Destination.Index,
+                groupKey.KeyCount,
+                $"group-set[{groupKey.GroupSetIndex}]",
+                $"r[{groupKey.Destination.Index}]=group key {FormatRange(groupKey.Row)} in set {groupKey.GroupSetIndex}"),
             ProjectRegistersInstruction project => (
                 project.Input.Start.Index,
                 project.Output.Start.Index,
@@ -265,6 +271,12 @@ public static class VdbeExplain
                 distinct.DistinctSetIndex,
                 null,
                 $"{FormatResultRow(distinct.Values)} if new to distinct set {distinct.DistinctSetIndex}"),
+            DistinctGateInstruction distinctGate => (
+                distinctGate.Values.Start.Index,
+                distinctGate.DuplicateTarget.Offset,
+                distinctGate.DistinctSetIndex,
+                null,
+                $"goto {distinctGate.DuplicateTarget.Offset} if {FormatRange(distinctGate.Values)} is in distinct set {distinctGate.DistinctSetIndex}"),
             RowSetInsertInstruction rowSetInsert => (
                 rowSetInsert.Values.Start.Index,
                 rowSetInsert.Values.Count,

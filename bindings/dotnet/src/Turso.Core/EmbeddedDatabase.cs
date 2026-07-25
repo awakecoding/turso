@@ -323,7 +323,10 @@ public sealed class EmbeddedDatabase : IDisposable
         ForeignKeyStatementState? ForeignKeyStatement = null,
         bool IndexExpression = false,
         CancellationToken CancellationToken = default,
-        bool SchemaValidation = false);
+        bool SchemaValidation = false,
+        TableSource? CollationSource = null,
+        IReadOnlyDictionary<string, string?>? CollationScope = null,
+        IReadOnlyList<IReadOnlyDictionary<string, string?>>? OuterCollationScopes = null);
 
     internal sealed class ForeignKeyStatementState
     {
@@ -4230,11 +4233,17 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] row,
         long? rowId)
     {
+        var qualifiedColumns = BuildQualifiedColumns(table.Name, table.Columns);
         var source = new SourceRow(
             table.Columns,
             row,
+            qualifiedColumns,
             RowId: table.HasRowid ? rowId : null,
-            RowIdQualifier: table.Name);
+            RowIdQualifier: table.Name,
+            ColumnDefinitions: table.ColumnDefinitions,
+            QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
+                table.Name,
+                table.ColumnDefinitions));
         return Evaluate(
             expression,
             EmptyParameters,
@@ -4918,6 +4927,9 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        context = EnterCollationSource(
+            context,
+            new NamedTableSource(statement.TableName));
         if (CanRouteUpdateThroughCompiler(statement, context)
             && TryCompileUpdate(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning, parameters);
@@ -6204,6 +6216,34 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             if (index.Unique)
                 ValidateUniqueIndex(tableName, table, index, rows);
+            else
+                ValidateIndexExpressions(table, index, rows);
+        }
+    }
+
+    private void ValidateIndexExpressions(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        IReadOnlyList<SqlValue[]> rows)
+    {
+        foreach (var row in rows)
+        {
+            if (!IndexExpressionSemantics.Qualifies(
+                    index,
+                    table,
+                    row,
+                    rowId: null,
+                    EvaluateIndexExpression))
+            {
+                continue;
+            }
+
+            _ = IndexExpressionSemantics.ProjectKey(
+                index,
+                table,
+                row,
+                rowId: null,
+                EvaluateIndexExpression);
         }
     }
 
@@ -6332,6 +6372,9 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
+        context = EnterCollationSource(
+            context,
+            new NamedTableSource(statement.TableName));
         if (CanCompileDml(context)
             && TryCompileDelete(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning, parameters);
@@ -6738,12 +6781,17 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         context.CancellationToken.ThrowIfCancellationRequested();
+        ValidateGroupByCollations(select.GroupBy);
+        var canUseCompiledRoute = !context.CancellationToken.CanBeCanceled
+            || IsAggregateSelect(select);
         CompiledSelect? compiled = null;
-        if (!context.CancellationToken.CanBeCanceled)
+        if (canUseCompiledRoute)
         {
-            var indexPlan = TryPlanManagedIndexScan(select, context);
-            if (indexPlan is not null)
-                TryCompileManagedIndexSelect(
+            var compiledIndex = false;
+            if ((!context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
+                && TryPlanManagedIndexScan(select, context) is { } indexPlan)
+            {
+                compiledIndex = TryCompileManagedIndexSelect(
                     select,
                     indexPlan,
                     parameters,
@@ -6751,7 +6799,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     outerRow,
                     materializeIndexRows: true,
                     out compiled);
-            else
+            }
+
+            if (!compiledIndex)
                 TryCompileSelect(select, parameters, context, outerRow, out compiled);
         }
 
@@ -6764,11 +6814,18 @@ public sealed class EmbeddedDatabase : IDisposable
             return RunCompiledProgram(
                 compiled,
                 columns,
-                BuildValuesBinding(compiled.ParameterIndices ?? [], parameters));
+                BuildValuesBinding(compiled.ParameterIndices ?? [], parameters),
+                context.CancellationToken);
         }
 
         return ExecuteSelect(select, parameters, context, outerRow);
     }
+
+    private bool IsAggregateSelect(SelectStatement select) =>
+        select.GroupBy.Count > 0
+        || select.Projections.Any(projection => ContainsAggregate(projection.Expression))
+        || select.Having is not null && ContainsAggregate(select.Having)
+        || select.OrderBy.Any(term => ContainsAggregate(term.Expression));
 
     private bool TryCompileSelect(
         SelectStatement select,
@@ -6778,6 +6835,7 @@ public sealed class EmbeddedDatabase : IDisposable
         out CompiledSelect compiled)
     {
         select = ResolveNamedWindows(select);
+        context = EnterCollationSource(context, select.Source);
 
         // A SELECT carrying LIMIT/OFFSET lowers only when its LIMIT/OFFSET-free base is a
         // gate-able route. Direct scans, constant projections, source-less scalar Function programs,
@@ -6914,6 +6972,134 @@ public sealed class EmbeddedDatabase : IDisposable
         bool materializeIndexRows,
         out CompiledSelect compiled)
     {
+        select = ResolveNamedWindows(select);
+        context = EnterCollationSource(context, select.Source);
+
+        ScanTarget CreateTarget(
+            IReadOnlyList<SqlValue[]> targetRows,
+            IReadOnlyList<long>? targetRowIds)
+        {
+            var qualifier = plan.Source.Alias ?? plan.Source.Name;
+            var qualifiedColumns = BuildQualifiedColumns(qualifier, plan.Table.Columns);
+            return new ScanTarget(
+                plan.Source.Name,
+                qualifier,
+                plan.Table.Columns,
+                targetRows,
+                name => ResolveScanColumnIndex(
+                    name,
+                    plan.Table.Columns,
+                    qualifiedColumns),
+                targetRowIds,
+                plan.Index.Name,
+                plan.Table.ColumnDefinitions,
+                BuildQualifiedColumnDefinitions(
+                    qualifier,
+                    plan.Table.ColumnDefinitions));
+        }
+
+        var compileSelect = select;
+        var aggregateSelect = IsAggregateSelect(select);
+        if (aggregateSelect)
+        {
+            if ((select.Limit is not null || select.Offset is not null)
+                && select.Distinct
+                && select.Projections.Any(projection =>
+                    IsCustomCollation(
+                        GetEffectiveCollation(projection.Expression, context))))
+            {
+                compiled = null!;
+                return false;
+            }
+
+            var baseSelect = select with { Limit = null, Offset = null };
+            var probeTarget = CreateTarget(
+                plan.Table.Rows,
+                plan.Table.HasRowid ? plan.Table.RowIds : null);
+            if (!TryCompileAggregateSelect(
+                    baseSelect,
+                    parameters,
+                    context,
+                    outerRow,
+                    out _,
+                    probeTarget))
+            {
+                compiled = null!;
+                return false;
+            }
+
+            if (select.Limit is not null || select.Offset is not null)
+            {
+                ResolveLimitOffset(
+                    select,
+                    parameters,
+                    context,
+                    outerRow,
+                    out var limit,
+                    out var offset);
+                if (limit == 0)
+                {
+                    compiled = CompileLimitZeroSelect(select, context, outerRow);
+                    return true;
+                }
+
+                compileSelect = WithResolvedBounds(select, limit, offset);
+
+                var refreshedPlan = TryPlanManagedIndexScan(select, context);
+                if (refreshedPlan is null)
+                {
+                    context = RefreshCollationSource(context, select.Source);
+                    var refreshedTarget = ResolveScanTarget(select.Source, context)
+                        ?? MaterializeAggregateScanTarget(
+                            select.Source,
+                            parameters,
+                            context,
+                            outerRow);
+
+                    if (TryCompileLimitedSelect(
+                            compileSelect,
+                            parameters,
+                            context,
+                            outerRow,
+                            out compiled,
+                            refreshedTarget))
+                    {
+                        return true;
+                    }
+
+                    compiled = CompileMaterializedSelect(
+                        ExecuteSelect(
+                            compileSelect,
+                            parameters,
+                            context,
+                            outerRow));
+                    return true;
+                }
+
+                plan = refreshedPlan;
+                context = RefreshCollationSource(context, select.Source);
+                var refreshedProbe = CreateTarget(
+                    plan.Table.Rows,
+                    plan.Table.HasRowid ? plan.Table.RowIds : null);
+                if (!TryCompileAggregateSelect(
+                        baseSelect,
+                        parameters,
+                        context,
+                        outerRow,
+                        out _,
+                        refreshedProbe))
+                {
+                    compiled = CompileMaterializedSelect(
+                        ExecuteSelect(
+                            compileSelect,
+                            parameters,
+                            context,
+                            outerRow));
+                    return true;
+                }
+            }
+        }
+
         IReadOnlyList<SqlValue[]> rows;
         IReadOnlyList<long>? rowIds;
         if (materializeIndexRows)
@@ -6931,16 +7117,40 @@ public sealed class EmbeddedDatabase : IDisposable
             rowIds = plan.Table.HasRowid ? plan.Table.RowIds : null;
         }
 
-        var qualifier = plan.Source.Alias ?? plan.Source.Name;
-        var qualifiedColumns = BuildQualifiedColumns(qualifier, plan.Table.Columns);
-        var target = new ScanTarget(
-            plan.Source.Name,
-            qualifier,
-            plan.Table.Columns,
-            rows,
-            name => ResolveScanColumnIndex(name, plan.Table.Columns, qualifiedColumns),
-            rowIds,
-            plan.Index.Name);
+        var target = CreateTarget(rows, rowIds);
+        if (aggregateSelect)
+        {
+            if (compileSelect.Limit is not null || compileSelect.Offset is not null)
+            {
+                return TryCompileLimitedSelect(
+                    compileSelect,
+                    parameters,
+                    context,
+                    outerRow,
+                    out compiled,
+                    target);
+            }
+
+            return TryCompileAggregateSelect(
+                compileSelect,
+                parameters,
+                context,
+                outerRow,
+                out compiled,
+                target);
+        }
+        if (select.Projections.Any(projection =>
+                ContainsWindowFunction(projection.Expression)))
+        {
+            return TryCompileWindowSelect(
+                select,
+                parameters,
+                context,
+                outerRow,
+                out compiled,
+                target);
+        }
+
         var compiler = new SelectStatementCompiler(
             IsConstantScalarExpression,
             expression => Evaluate(expression, parameters, null, context),
@@ -7223,8 +7433,8 @@ public sealed class EmbeddedDatabase : IDisposable
     //    equi-join or cross-join shape; DISTINCT, aggregate/window shapes, non-base sources, computed
     //    projections, and non-column order keys all need semantics this pipeline does not
     //    represent exactly.
-    //  - DISTINCT: the base carries DISTINCT, which every gate-able route rejects, so the
-    //    evaluator applies de-duplication before trimming.
+    //  - DISTINCT outside row-aware aggregation: direct DISTINCT still combines de-duplication
+    //    and emission in DistinctResultRow, which cannot be gated without counting duplicates.
     //  - LIMIT 0: the evaluator validates every projection/WHERE/GROUP BY/HAVING/ORDER BY
     //    expression against a synthetic row and returns empty WITHOUT scanning, so its
     //    validation-and-evaluation timing differs from a gate that would scan first; keep it
@@ -7237,19 +7447,200 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context,
         SourceRow? outerRow,
-        out CompiledSelect compiled)
+        out CompiledSelect compiled,
+        ScanTarget? targetOverride = null)
     {
         compiled = null!;
 
-        // DISTINCT de-duplicates before applying the row window. Its direct scan emits
-        // DistinctResultRow, which LimitOffsetProgramBuilder deliberately cannot gate.
-        if (select.Distinct)
+        if (select.OrderBy.Count != 0)
+            ValidateOrderByCollations(ResolveOrderBy(select.OrderBy, select.Projections));
+        var windowFunctions = CollectSelectWindowFunctions(select);
+        foreach (var function in windowFunctions)
+        {
+            ValidateOrderByCollations(function.Window!.OrderBy);
+            ValidateGroupByCollations(function.Window.PartitionBy);
+        }
+        if (windowFunctions.Count != 0)
             return false;
 
+        var baseSelect = select with { Limit = null, Offset = null };
+
+        // Row-aware aggregate DISTINCT lowers to DistinctGate + ResultRow, so its limit
+        // gates see only novel finalized rows. Other DISTINCT routes still emit through
+        // DistinctResultRow and remain ineligible for this transform.
+        if (select.Distinct)
+        {
+            if (!IsAggregateSelect(select)
+                || select.Projections.Any(projection =>
+                    IsCustomCollation(GetEffectiveCollation(projection.Expression, context))))
+            {
+                return false;
+            }
+
+            if (!TryCompileAggregateSelect(
+                    baseSelect,
+                    parameters,
+                    context,
+                    outerRow,
+                    out var compiledDistinct,
+                    targetOverride))
+            {
+                return false;
+            }
+            ResolveLimitOffset(
+                select,
+                parameters,
+                context,
+                outerRow,
+                out var distinctLimit,
+                out var distinctOffset);
+            if (distinctLimit == 0)
+            {
+                compiled = CompileLimitZeroSelect(select, context, outerRow);
+                return true;
+            }
+            var resolvedDistinct = WithResolvedBounds(
+                select,
+                distinctLimit,
+                distinctOffset);
+            if (targetOverride is null
+                && !TryCompileRefreshedAggregate(
+                    baseSelect,
+                    resolvedDistinct,
+                    parameters,
+                    context,
+                    outerRow,
+                    out compiledDistinct))
+            {
+                return false;
+            }
+
+            var gatedDistinct = LimitOffsetProgramBuilder.Apply(
+                compiledDistinct.Program,
+                distinctOffset,
+                distinctLimit);
+            compiled = ReferenceEquals(gatedDistinct, compiledDistinct.Program)
+                ? compiledDistinct
+                : new CompiledSelect(
+                    gatedDistinct,
+                    compiledDistinct.CursorSources,
+                    compiledDistinct.ParameterIndices);
+            return true;
+        }
+
         // ORDER BY needs a sorter before row gates run. Its bounded subset has an explicit
-        // preflight below; every other ordered shape remains evaluator-owned.
+        // preflight below. A row-aware aggregate already owns its post-group output sorter,
+        // so gate that compiled stream directly before considering the plain sorted-scan route.
         if (select.OrderBy.Count != 0)
+        {
+            if (IsAggregateSelect(baseSelect))
+            {
+                if (!TryCompileAggregateSelect(
+                        baseSelect,
+                        parameters,
+                        context,
+                        outerRow,
+                        out var compiledAggregate,
+                        targetOverride))
+                {
+                    return false;
+                }
+                ResolveLimitOffset(
+                    select,
+                    parameters,
+                    context,
+                    outerRow,
+                    out var orderedLimit,
+                    out var orderedOffset);
+                if (orderedLimit == 0)
+                {
+                    compiled = CompileLimitZeroSelect(select, context, outerRow);
+                    return true;
+                }
+                var resolvedOrdered = WithResolvedBounds(
+                    select,
+                    orderedLimit,
+                    orderedOffset);
+                if (targetOverride is null
+                    && !TryCompileRefreshedAggregate(
+                        baseSelect,
+                        resolvedOrdered,
+                        parameters,
+                        context,
+                        outerRow,
+                        out compiledAggregate))
+                {
+                    return false;
+                }
+
+                var gatedAggregate = LimitOffsetProgramBuilder.Apply(
+                    compiledAggregate.Program,
+                    orderedOffset,
+                    orderedLimit);
+                compiled = ReferenceEquals(gatedAggregate, compiledAggregate.Program)
+                    ? compiledAggregate
+                    : new CompiledSelect(
+                        gatedAggregate,
+                        compiledAggregate.CursorSources,
+                        compiledAggregate.ParameterIndices);
+                return true;
+            }
+
             return TryCompileLimitedSortedSelect(select, parameters, context, outerRow, out compiled);
+        }
+
+        if (IsAggregateSelect(baseSelect))
+        {
+            if (!TryCompileAggregateSelect(
+                    baseSelect,
+                    parameters,
+                    context,
+                    outerRow,
+                    out var compiledAggregate,
+                    targetOverride))
+            {
+                return false;
+            }
+            ResolveLimitOffset(
+                select,
+                parameters,
+                context,
+                outerRow,
+                out var aggregateLimit,
+                out var aggregateOffset);
+            if (aggregateLimit == 0)
+            {
+                compiled = CompileLimitZeroSelect(select, context, outerRow);
+                return true;
+            }
+            var resolvedAggregate = WithResolvedBounds(
+                select,
+                aggregateLimit,
+                aggregateOffset);
+            if (targetOverride is null
+                && !TryCompileRefreshedAggregate(
+                    baseSelect,
+                    resolvedAggregate,
+                    parameters,
+                    context,
+                    outerRow,
+                    out compiledAggregate))
+            {
+                return false;
+            }
+
+            var gatedAggregate = LimitOffsetProgramBuilder.Apply(
+                compiledAggregate.Program,
+                aggregateOffset,
+                aggregateLimit);
+            compiled = ReferenceEquals(gatedAggregate, compiledAggregate.Program)
+                ? compiledAggregate
+                : new CompiledSelect(
+                    gatedAggregate,
+                    compiledAggregate.CursorSources,
+                    compiledAggregate.ParameterIndices);
+            return true;
+        }
 
         // Resolve bounds before compiling the base. This keeps a bad bound's error ahead of
         // any projection folding or source work, as in ExecuteSelect.
@@ -7267,7 +7658,6 @@ public sealed class EmbeddedDatabase : IDisposable
         // candidate row; scan projections remain direct-only so an early gate cannot change
         // expression error timing. Bounded joins claim only direct INNER/LEFT equi-joins or
         // INNER cross joins over two base tables with direct projections.
-        var baseSelect = select with { Limit = null, Offset = null };
         var directProjectionIsGateSafe = baseSelect.Source is null
             || baseSelect.Projections.All(projection =>
                 projection.Expression is StarExpression
@@ -7276,7 +7666,6 @@ public sealed class EmbeddedDatabase : IDisposable
                 || IsConstantScalarExpression(projection.Expression));
         if (!(directProjectionIsGateSafe
                 && TryCompileScanOrConstant(baseSelect, parameters, context, outerRow, out var compiledBase))
-            && !TryCompileAggregateSelect(baseSelect, parameters, context, outerRow, out compiledBase)
             && !TryCompileLimitedJoinSelect(baseSelect, parameters, context, outerRow, out compiledBase))
         {
             return false;
@@ -7289,6 +7678,108 @@ public sealed class EmbeddedDatabase : IDisposable
             ? compiledBase
             : new CompiledSelect(gated, compiledBase.CursorSources, compiledBase.ParameterIndices);
         return true;
+    }
+
+    private bool TryCompileRefreshedAggregate(
+        SelectStatement baseSelect,
+        SelectStatement resolvedSelect,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
+        context = RefreshCollationSource(context, baseSelect.Source);
+        var target = ResolveScanTarget(baseSelect.Source, context)
+            ?? MaterializeAggregateScanTarget(
+                baseSelect.Source,
+                parameters,
+                context,
+                outerRow);
+        if (TryCompileAggregateSelect(
+                baseSelect,
+                parameters,
+                context,
+                outerRow,
+                out compiled,
+                target))
+        {
+            return true;
+        }
+
+        compiled = CompileMaterializedSelect(
+            ExecuteSelect(
+                resolvedSelect,
+                parameters,
+                context,
+                outerRow));
+        return true;
+    }
+
+    private static SelectStatement WithResolvedBounds(
+        SelectStatement select,
+        long? limit,
+        long offset) => select with
+        {
+            Limit = limit is null
+            ? null
+            : new LiteralExpression(SqlValue.Integer(limit.Value)),
+            Offset = offset == 0
+            ? null
+            : new LiteralExpression(SqlValue.Integer(offset)),
+        };
+
+    private static CompiledSelect CompileMaterializedSelect(ExecutionResult result)
+    {
+        var program = result.Rows.Count == 0
+            ? new VdbeProgram(
+                registerCount: 0,
+                cursorCount: 0,
+                [new HaltInstruction()])
+            : ValuesProgramBuilder.Build(
+                result.Rows
+                    .Select(row => (IReadOnlyList<SqlValue>)row)
+                    .ToArray());
+        return new CompiledSelect(program, []);
+    }
+
+    private ScanTarget MaterializeAggregateScanTarget(
+        TableSource? source,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        var materialized = GetSourceRows(
+            source,
+            parameters,
+            context,
+            maximumRows: null,
+            outerRow);
+        var qualifier = source switch
+        {
+            NamedTableSource named => named.Alias ?? named.Name,
+            DerivedTableSource { Alias: { } alias } => alias,
+            _ => "__aggregate_source",
+        };
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, materialized.Columns);
+        var firstRow = materialized.Rows.FirstOrDefault();
+        return new ScanTarget(
+            "__materialized_aggregate_source",
+            qualifier,
+            materialized.Columns,
+            materialized.Rows.Select(row => row.Values.ToArray()).ToArray(),
+            name => ResolveScanColumnIndex(
+                name,
+                materialized.Columns,
+                qualifiedColumns),
+            ColumnDefinitions: firstRow?.ColumnDefinitions
+                ?? (source is null
+                    ? []
+                    : GetSourceColumnDefinitions(source, context)),
+            QualifiedColumnDefinitions: firstRow?.QualifiedColumnDefinitions
+                ?? (source is null
+                    ? new Dictionary<string, EmbeddedColumn>(
+                        StringComparer.OrdinalIgnoreCase)
+                    : GetSourceQualifiedColumnDefinitions(source, context)));
     }
 
     // Bounded joins are deliberately a smaller contract than TryCompileJoinSelect. A LIMIT/OFFSET gate is
@@ -7522,12 +8013,7 @@ public sealed class EmbeddedDatabase : IDisposable
         offset = 0;
         try
         {
-            limit = select.Limit is null
-                ? null
-                : RequireLimitInteger(Evaluate(select.Limit, parameters, outerRow, context));
-            offset = select.Offset is null
-                ? 0
-                : Math.Max(0, RequireLimitInteger(Evaluate(select.Offset, parameters, outerRow, context)));
+            ResolveLimitOffset(select, parameters, context, outerRow, out limit, out offset);
             return true;
         }
         catch (EmbeddedSqlException)
@@ -7536,6 +8022,40 @@ public sealed class EmbeddedDatabase : IDisposable
             // failure, preserving its exact error text and timing.
             return false;
         }
+    }
+
+    private void ResolveLimitOffset(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out long? limit,
+        out long offset)
+    {
+        limit = select.Limit is null
+            ? null
+            : RequireLimitInteger(Evaluate(select.Limit, parameters, outerRow, context));
+        offset = select.Offset is null
+            ? 0
+            : Math.Max(0, RequireLimitInteger(Evaluate(select.Offset, parameters, outerRow, context)));
+    }
+
+    private CompiledSelect CompileLimitZeroSelect(
+        SelectStatement select,
+        QueryContext context,
+        SourceRow? outerRow)
+    {
+        ValidateLimitZeroExpressions(
+            select,
+            GetSourceColumns(select.Source, context),
+            context,
+            outerRow);
+        return new CompiledSelect(
+            new VdbeProgram(
+                registerCount: 0,
+                cursorCount: 0,
+                [new HaltInstruction()]),
+            []);
     }
 
     // Lowers a compound SELECT whose terms are lowerable queries sequenced by a single uniform
@@ -7560,7 +8080,7 @@ public sealed class EmbeddedDatabase : IDisposable
     //    These are precisely what BuildUnionAll/BuildUnionDistinct/BuildIntersect/BuildExcept emit,
     //    so flattening is order-, duplicate-, and membership-identical.
     //  - every term is a lowerable SELECT, VALUES row set, or nested compound, and every term projects
-    //    the same number of result columns. Nested row-set state is retained by the builder.
+    //    the same number of result columns. Nested row-set and aggregate group state is retained.
     //  - for UNION/DISTINCT, INTERSECT, and EXCEPT (every operator that de-duplicates or probes rows),
     //    the first term's projection list maps one-to-one onto the output columns so the evaluator's
     //    per-output-column collation vector aligns with the row width; a star-expanded first term
@@ -7613,6 +8133,15 @@ public sealed class EmbeddedDatabase : IDisposable
 
         // Every term must lower on its own and project the same number of result
         // columns; otherwise fall back so the evaluator produces the value or its exact error.
+        if (statement.Terms.Any(ContainsLimitedCompoundTerm))
+            return false;
+        if (compoundOperator == CompoundOperator.UnionAll
+            && statement.Terms.Any(term =>
+                ContainsObservableAggregateCompoundTerm(term, context)))
+        {
+            return false;
+        }
+
         var terms = new List<CompoundTerm>(statement.Terms.Count);
         var parameterIndices = new List<int>();
         var columnCount = -1;
@@ -7632,7 +8161,10 @@ public sealed class EmbeddedDatabase : IDisposable
                 parameterIndices.AddRange(termParameterIndices);
         }
 
-        if (terms.Any(term => !IsConservativeCompoundTerm(term.Program)))
+        if (terms.Any(term =>
+                !IsConservativeCompoundTerm(term.Program)
+                && !(compoundOperator == CompoundOperator.UnionAll
+                    && IsSequentialAggregateCompoundTerm(term.Program))))
             return false;
 
         CompoundTerm compound;
@@ -7650,7 +8182,7 @@ public sealed class EmbeddedDatabase : IDisposable
             // The collation vector only aligns with the row width when the first term projects one
             // column per output, so a star-expanded first term declines rather than index a too-short
             // vector (the same range the evaluator's own RowsEqual would fault on).
-            var collations = GetQueryOutputCollations(statement.Terms[0], context);
+            var collations = GetCompoundCollations(statement.Terms, columnCount, context);
             if (collations.Count != columnCount
                 || collations.Any(collation => !IsStreamingSafeDistinctCollation(collation)))
                 return false;
@@ -7682,6 +8214,86 @@ public sealed class EmbeddedDatabase : IDisposable
             or ProjectRegistersInstruction
             or DistinctFilterInstruction));
 
+    private static bool IsSequentialAggregateCompoundTerm(VdbeProgram program) =>
+        program.Instructions.Any(instruction => instruction is AggStepInstruction)
+        && program.Instructions.All(instruction => instruction is not (
+            OpenJoinCursorInstruction
+            or ProjectRegistersInstruction
+            or DistinctFilterInstruction
+            or FunctionInstruction
+            or LimitGateInstruction
+            or OffsetGateInstruction));
+
+    private bool ContainsLimitedCompoundTerm(QueryStatement term)
+    {
+        return term switch
+        {
+            SelectStatement select => select.Limit is not null || select.Offset is not null
+                || select.Source is DerivedTableSource derived
+                    && ContainsLimitedCompoundTerm(derived.Query),
+            CompoundSelectStatement compound => compound.Terms.Any(ContainsLimitedCompoundTerm),
+            WithSelectStatement with => ContainsLimitedCompoundTerm(with.Query)
+                || with.CommonTableExpressions.Any(cte =>
+                    ContainsLimitedCompoundTerm(cte.Query)),
+            _ => false,
+        };
+    }
+
+    private bool ContainsObservableAggregateCompoundTerm(
+        QueryStatement term,
+        QueryContext context)
+    {
+        switch (term)
+        {
+            case SelectStatement select when IsAggregateSelect(select):
+                var selectContext = EnterCollationSource(context, select.Source);
+                return select.Projections.Any(projection =>
+                    ContainsDeferredAggregateHazard(
+                        projection.Expression,
+                        sumIsHazard: false)
+                    || ContainsEffectiveCustomCollation(
+                        projection.Expression,
+                        selectContext))
+                || select.GroupBy.Any(expression =>
+                    ContainsDeferredAggregateHazard(expression, sumIsHazard: false)
+                    || ContainsEffectiveCustomCollation(expression, selectContext))
+                || select.Where is not null
+                    && (ContainsDeferredAggregateHazard(
+                            select.Where,
+                            sumIsHazard: false)
+                        || ContainsEffectiveCustomCollation(
+                            select.Where,
+                            selectContext))
+                || select.Having is not null
+                    && (ContainsDeferredAggregateHazard(
+                            select.Having,
+                            sumIsHazard: false)
+                        || ContainsEffectiveCustomCollation(
+                            select.Having,
+                            selectContext))
+                || select.OrderBy.Any(order =>
+                    ContainsDeferredAggregateHazard(
+                        order.Expression,
+                        sumIsHazard: false)
+                    || ContainsEffectiveCustomCollation(
+                        order.Expression,
+                        selectContext));
+            case SelectStatement { Source: DerivedTableSource derived }:
+                return ContainsObservableAggregateCompoundTerm(derived.Query, context);
+            case CompoundSelectStatement compound:
+                return compound.Terms.Any(child =>
+                    ContainsObservableAggregateCompoundTerm(child, context));
+            case WithSelectStatement with:
+                return ContainsObservableAggregateCompoundTerm(
+                    with.Query,
+                    context)
+                    || with.CommonTableExpressions.Any(cte =>
+                        ContainsObservableAggregateCompoundTerm(cte.Query, context));
+            default:
+                return false;
+        }
+    }
+
     private bool TryCompileCompoundTerm(
         QueryStatement term,
         SqlValue[] parameters,
@@ -7695,7 +8307,12 @@ public sealed class EmbeddedDatabase : IDisposable
                 when TryCompileUnfoldedSourceLessSelect(select, parameters, context, out compiled):
                 return true;
             case SelectStatement select:
-                return TryCompileSelect(select, parameters, context, outerRow, out compiled);
+                return TryCompileCompoundSelectTerm(
+                    select,
+                    parameters,
+                    context,
+                    outerRow,
+                    out compiled);
             case ValuesClause values:
                 return TryCompileCompoundValues(values, parameters, context, out compiled);
             case CompoundSelectStatement compound:
@@ -7704,6 +8321,35 @@ public sealed class EmbeddedDatabase : IDisposable
                 compiled = null!;
                 return false;
         }
+    }
+
+    private bool TryCompileCompoundSelectTerm(
+        SelectStatement select,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out CompiledSelect compiled)
+    {
+        if (TryPlanManagedIndexScan(select, context) is { } indexPlan)
+        {
+            if (IsAggregateSelect(select)
+                || CollectSelectWindowFunctions(select).Count != 0)
+            {
+                compiled = null!;
+                return false;
+            }
+
+            return TryCompileManagedIndexSelect(
+                select,
+                indexPlan,
+                parameters,
+                context,
+                outerRow,
+                materializeIndexRows: true,
+                out compiled);
+        }
+
+        return TryCompileSelect(select, parameters, context, outerRow, out compiled);
     }
 
     // Compiles source-less terms without eager arithmetic folding. Runtime evaluation preserves the
@@ -8385,6 +9031,16 @@ public sealed class EmbeddedDatabase : IDisposable
         if (select.Source is not JoinTableSource || select.Projections.Count == 0)
             return false;
 
+        var hasAggregate = select.Projections.Any(projection => ContainsAggregate(projection.Expression))
+            || select.GroupBy.Count != 0
+            || select.Having is not null && ContainsAggregate(select.Having)
+            || select.OrderBy.Any(term => ContainsAggregate(term.Expression));
+        if (hasAggregate && (select.Limit is not null || select.Offset is not null)
+            || CollectSelectWindowFunctions(select).Count != 0)
+        {
+            return false;
+        }
+
         if (!TryResolveGeneralJoinLimit(select, parameters, context, outerRow, out var limit, out var offset))
             return false;
 
@@ -8393,9 +9049,6 @@ public sealed class EmbeddedDatabase : IDisposable
         if (limit is < 0)
             limit = null;
 
-        var hasAggregate = select.Projections.Any(projection => ContainsAggregate(projection.Expression))
-            || select.GroupBy.Count != 0
-            || select.Having is not null && ContainsAggregate(select.Having);
         if (hasAggregate)
         {
             return TryCompileGeneralJoinAggregate(
@@ -8565,69 +9218,6 @@ public sealed class EmbeddedDatabase : IDisposable
         if (select.Where is not null && !IsSafeCompiledJoinPredicate(select.Where, source))
             return false;
 
-        var grouped = select.GroupBy.Count != 0;
-        var groupKeyColumns = new List<int>(select.GroupBy.Count);
-        var groupKeyNames = new List<string>(select.GroupBy.Count);
-        foreach (var expression in select.GroupBy)
-        {
-            if (expression is not ColumnExpression column
-                || source.IsCoalescedColumn(column)
-                || source.ResolveColumnIndex(column.Name) is not { } ordinal)
-            {
-                return false;
-            }
-
-            groupKeyColumns.Add(ordinal);
-            groupKeyNames.Add(column.Name);
-        }
-
-        var aggregates = new List<AggregateFunctionSpec>();
-        var outputs = new List<AggregateOutput>();
-        foreach (var projection in select.Projections)
-        {
-            if (projection.Expression is FunctionExpression function
-                && (IsBuiltInAggregate(function) || IsManagedPercentileAggregate(function.Name))
-                && !function.Arguments.OfType<ColumnExpression>().Any(source.IsCoalescedColumn)
-                && TryClassifyAggregateCall(
-                    function,
-                    source.CreateScanTarget(grouped),
-                    parameters,
-                    context,
-                    outerRow,
-                    aggregates,
-                    out var aggregateOutput))
-            {
-                outputs.Add(aggregateOutput);
-                continue;
-            }
-
-            if (grouped
-                && TryResolveGroupKeyOutput(
-                    projection.Expression,
-                    select.GroupBy,
-                    out var groupKeyOutput))
-            {
-                outputs.Add(groupKeyOutput);
-                continue;
-            }
-
-            if (IsConstantScalarExpression(projection.Expression)
-                && IsAggregateExpression(projection.Expression))
-            {
-                outputs.Add(AggregateOutput.ForConstant(Evaluate(
-                    projection.Expression,
-                    parameters,
-                    null,
-                    context)));
-                continue;
-            }
-
-            return false;
-        }
-
-        if (aggregates.Count == 0)
-            return false;
-
         VdbeJoinedRowPredicate? filter = null;
         if (select.Where is not null)
         {
@@ -8638,53 +9228,93 @@ public sealed class EmbeddedDatabase : IDisposable
                 context));
         }
 
-        VdbeJoinGroupKey? groupKey = null;
-        if (grouped)
+        var grouped = select.GroupBy.Count != 0;
+        var target = source.CreateScanTarget(grouped: false);
+        if (select.Projections.Any(projection =>
+                !CanCompileAggregateExpression(projection.Expression, target))
+            || select.GroupBy.Any(expression =>
+                !CanCompileAggregateExpression(expression, target)))
         {
-            groupKey = row => GetGroupKey(
-                select.GroupBy,
-                parameters,
-                source.CreateSourceRow(row, outerRow),
-                context);
+            return false;
         }
 
-        var plan = new VdbeJoinPlan(source.Plan, source.Description, filter, groupKey);
-        var target = source.CreateScanTarget(grouped);
+        CompiledAggregateContext CreateContext() => new();
+        object? CollectRow(object? stateObject, SqlValue[] values)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var state = (CompiledAggregateContext)stateObject!;
+            state.Rows.Add(source.CreateSourceRow(values, outerRow));
+            return state;
+        }
+
+        SourceRow? GetRepresentative(CompiledAggregateContext state) =>
+            state.GetRepresentative(() =>
+                GetAggregateRepresentative(select, state.Rows, parameters, context));
+
+        VdbeAggregate BuildFinalizer(Expression expression, bool aggregateMode) => new()
+        {
+            Name = GetAggregateExplainName(expression, "projection"),
+            CreateContext = CreateContext,
+            Accumulate = CollectRow,
+            Finalize = stateObject =>
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                var state = (CompiledAggregateContext)stateObject!;
+                var representative = GetRepresentative(state);
+                return aggregateMode
+                    ? EvaluateAggregate(expression, state.Rows, parameters, context, representative)
+                    : Evaluate(expression, parameters, representative, context);
+            },
+        };
+
+        var collector = new VdbeAggregate
+        {
+            Name = "rows",
+            CreateContext = CreateContext,
+            Accumulate = CollectRow,
+            Finalize = _ => throw new InvalidOperationException(
+                "The row collector is stepped but never finalized directly."),
+        };
+        var outputs = select.Projections
+            .Select(projection => BuildFinalizer(
+                projection.Expression,
+                aggregateMode: !grouped || ContainsAggregate(projection.Expression)))
+            .ToArray();
+
+        var plan = new VdbeJoinPlan(source.Plan, source.Description, filter, groupKey: null);
         VdbeProgram baseProgram;
         if (grouped)
         {
-            var rankColumn = plan.RecordColumnCount - 1;
-            VdbeRowComparer orderComparer = (left, right) =>
-                left[rankColumn].AsInteger().CompareTo(right[rankColumn].AsInteger());
-            var keyNames = groupKeyNames.ToArray();
-            VdbeGroupComparer groupComparer = (left, right) =>
-                string.Equals(
-                    GetGroupKey(
-                        select.GroupBy,
-                        parameters,
-                        new SourceRow(keyNames, left, Parent: outerRow),
-                        context),
-                    GetGroupKey(
-                        select.GroupBy,
-                        parameters,
-                        new SourceRow(keyNames, right, Parent: outerRow),
-                        context),
-                    StringComparison.Ordinal);
-            baseProgram = AggregateProgramBuilder.BuildGrouped(
+            var groupCollations = select.GroupBy
+                .Select(expression => GetEffectiveCollation(expression, context))
+                .ToArray();
+            VdbeGroupKeyProjector groupKeyProjector = values =>
+                EvaluateGroupKey(
+                    select.GroupBy,
+                    parameters,
+                    source.CreateSourceRow(values, outerRow),
+                    context);
+            VdbeGroupComparer groupEquality = (left, right) =>
+                GroupKeysEqual(left, right, groupCollations);
+            baseProgram = AggregateProgramBuilder.BuildRowGrouped(
                 source.Description,
                 target.Columns.Length,
-                groupKeyColumns,
-                aggregates,
+                select.GroupBy.Count,
+                groupKeyProjector,
+                groupEquality,
+                collector,
                 outputs,
-                orderComparer,
-                groupComparer);
+                orderKeys: [],
+                outputOrderComparer: (left, right) =>
+                    left[0].AsInteger().CompareTo(right[0].AsInteger()),
+                groupHasher: BuildGroupHasher(groupCollations));
         }
         else
         {
-            baseProgram = AggregateProgramBuilder.BuildScalar(
+            baseProgram = AggregateProgramBuilder.BuildRowScalar(
                 source.Description,
                 target.Columns.Length,
-                aggregates,
+                collector,
                 outputs);
         }
 
@@ -9208,111 +9838,93 @@ public sealed class EmbeddedDatabase : IDisposable
     // sorter and SameGroup/Goto control flow for grouping), or returns false so the
     // evaluator keeps ownership of shapes the aggregate route cannot preserve exactly.
     //
-    // Supported (routed to the VDBE): a single real base table; optional row-at-a-time
-    // WHERE and aggregate-only HAVING predicates; and projections that are each a supported
-    // built-in or registered aggregate call over bare, backed columns (COUNT(*)/COUNT()/
-    // COUNT(col)/SUM/TOTAL/AVG/MIN/MAX/GROUP_CONCAT(col)), a bare-column GROUP BY key
-    // (grouped only), or a folded constant that is also an aggregate expression.
-    // Accumulation, empty-input identities, group ordering (first-seen), and group equality all
-    // reuse the evaluator's own helpers, so a routed result row is byte-identical to the evaluator's.
+    // The row-aware accumulator stores complete source rows, allowing finalizers to reuse
+    // EvaluateAggregate for computed arguments, DISTINCT/FILTER, composite projections,
+    // HAVING, and SQLite's representative-row MIN/MAX rules. Group keys are projected once
+    // in filtered source order before the grouping sorter.
     //
-    // Deliberately excluded (kept on the evaluator): DISTINCT, ORDER
-    // BY, window functions, DISTINCT/FILTER aggregate modifiers, aggregate arguments that
-    // are not bare columns (e.g. sum(x+1), group_concat(x,'-')), composite aggregate
-    // expressions (e.g. sum(x)+1), non-aggregate/non-constant projections that force the
-    // evaluator's mixing/GROUP BY errors, group keys or group-key projections that are not
-    // bare columns, grouped queries with no aggregate, and joins/derived/CTE/view/schema or
-    // source-less selects.
+    // Grouped HAVING/ORDER expressions whose callbacks or failures would run at a different
+    // phase remain evaluator-owned. The grouped VM finalizes one group at a time before its
+    // output sorter drains, whereas the evaluator finalizes all projections before HAVING
+    // and sorting; declining those observable shapes preserves callback and error order.
     private bool TryCompileAggregateSelect(
         SelectStatement select,
         SqlValue[] parameters,
         QueryContext context,
         SourceRow? outerRow,
-        out CompiledSelect compiled)
+        out CompiledSelect compiled,
+        ScanTarget? targetOverride = null)
     {
         compiled = null!;
 
-        if (select.Distinct
-            || select.Limit is not null
+        if (select.Limit is not null
             || select.Offset is not null
-            || select.OrderBy.Count != 0
             || select.Projections.Count == 0)
         {
             return false;
         }
 
         var grouped = select.GroupBy.Count > 0;
-        var hasAggregate = select.Projections.Any(projection => ContainsAggregate(projection.Expression));
+        var hasAggregate = select.Projections.Any(projection => ContainsAggregate(projection.Expression))
+            || select.Having is not null && ContainsAggregate(select.Having)
+            || select.OrderBy.Any(term => ContainsAggregate(term.Expression));
         if (!grouped && !hasAggregate)
             return false;
+        if (select.GroupBy.Any(ContainsAggregate))
+            return false;
+        if (select.Projections.Any(projection => ContainsWindowFunction(projection.Expression))
+            || select.GroupBy.Any(ContainsWindowFunction)
+            || select.Having is not null && ContainsWindowFunction(select.Having)
+            || select.OrderBy.Any(term => ContainsWindowFunction(term.Expression)))
+        {
+            return false;
+        }
 
-        var target = ResolveScanTarget(select.Source, context);
+        var target = targetOverride ?? ResolveScanTarget(select.Source, context);
         if (target is null)
             return false;
 
-        // Every GROUP BY key must be a bare column resolvable to a real ordinal; anything
-        // else (expressions, unbacked rowids) declines so the evaluator keeps ownership.
-        var groupKeyColumns = new List<int>();
-        var groupKeyNames = new List<string>();
-        foreach (var expression in select.GroupBy)
+        var resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
+        ValidateOrderByCollations(resolvedOrderBy);
+        ValidateGroupByCollations(select.GroupBy);
+
+        var aggregateExpressions = select.Projections
+            .Select(projection => projection.Expression)
+            .Concat(select.GroupBy)
+            .Concat(select.Having is null ? [] : [select.Having])
+            .Concat(resolvedOrderBy.Select(term => term.Expression));
+        foreach (var expression in aggregateExpressions)
         {
-            if (expression is not ColumnExpression column
-                || target.ResolveColumnIndex(column.Name) is not { } ordinal)
-            {
+            if (!CanCompileAggregateExpression(expression, target))
                 return false;
-            }
-
-            groupKeyColumns.Add(ordinal);
-            groupKeyNames.Add(column.Name);
         }
 
-        // Classify each projection into exactly one of: a supported aggregate call, a group
-        // key (grouped only), or a folded constant. Any other shape declines the route so
-        // the evaluator produces the value or raises its exact error on fallback.
-        var aggregates = new List<AggregateFunctionSpec>();
-        var outputs = new List<AggregateOutput>();
-        foreach (var projection in select.Projections)
+        var groupKeyHasObservableEvaluation = grouped && select.GroupBy.Any(expression =>
+            ContainsDeferredAggregateHazard(expression, sumIsHazard: false)
+            || ContainsEffectiveCustomCollation(expression, context));
+        if (groupKeyHasObservableEvaluation
+            && select.Where is not null
+            && (ContainsDeferredAggregateHazard(
+                    select.Where,
+                    sumIsHazard: false)
+                || ContainsEffectiveCustomCollation(select.Where, context)))
         {
-            if (TryClassifyAggregateCall(
-                    projection.Expression, target, parameters, context, outerRow, aggregates, out var aggregateOutput))
-            {
-                outputs.Add(aggregateOutput);
-                continue;
-            }
-
-            if (grouped && TryResolveGroupKeyOutput(projection.Expression, select.GroupBy, out var groupKeyOutput))
-            {
-                outputs.Add(groupKeyOutput);
-                continue;
-            }
-
-            // A constant is only foldable here when the evaluator also treats it as an
-            // aggregate expression; otherwise the evaluator would raise a mixing/GROUP BY
-            // error that the route must preserve by declining.
-            if (IsConstantScalarExpression(projection.Expression) && IsAggregateExpression(projection.Expression))
-            {
-                outputs.Add(AggregateOutput.ForConstant(Evaluate(projection.Expression, parameters, null, context)));
-                continue;
-            }
-
             return false;
         }
 
-        // The builder requires at least one aggregate; a grouped projection list of only
-        // keys/constants (e.g. SELECT x FROM t GROUP BY x) falls back to the evaluator.
-        if (aggregates.Count == 0)
+        if (grouped && select.Having is not null
+            && (ContainsDeferredAggregateHazard(select.Having, sumIsHazard: true)
+                || ContainsEffectiveCustomCollation(select.Having, context)))
+        {
             return false;
+        }
 
-        AggregateHavingFilter? having = null;
-        if (select.Having is not null
-            && !TryCompileAggregateHaving(
-                select.Having,
-                target,
-                parameters,
-                context,
-                outerRow,
-                aggregates,
-                out having))
+        if (grouped && resolvedOrderBy.Any(term =>
+                ContainsDeferredAggregateHazard(
+                    term.Expression,
+                    sumIsHazard: !select.Projections.Any(projection =>
+                        ReferenceEquals(projection.Expression, term.Expression)))
+                || ContainsEffectiveCustomCollation(term.Expression, context)))
         {
             return false;
         }
@@ -9325,201 +9937,438 @@ public sealed class EmbeddedDatabase : IDisposable
                 return false;
         }
 
+        CompiledAggregateContext CreateContext() => new();
+
+        object? CollectRow(object? stateObject, SqlValue[] values)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var state = (CompiledAggregateContext)stateObject!;
+            state.Rows.Add(CreateScanSourceRow(target, values, context, outerRow));
+            return state;
+        }
+
+        SourceRow? GetRepresentative(CompiledAggregateContext state) =>
+            state.GetRepresentative(() =>
+                GetAggregateRepresentative(select, state.Rows, parameters, context));
+
+        VdbeAggregate BuildFinalizer(Expression expression, bool aggregateMode, string role)
+        {
+            return new VdbeAggregate
+            {
+                Name = GetAggregateExplainName(expression, role),
+                CreateContext = CreateContext,
+                Accumulate = CollectRow,
+                Finalize = stateObject =>
+                {
+                    context.CancellationToken.ThrowIfCancellationRequested();
+                    var state = (CompiledAggregateContext)stateObject!;
+                    var representative = GetRepresentative(state);
+                    var value = aggregateMode
+                        ? EvaluateAggregate(expression, state.Rows, parameters, context, representative)
+                        : Evaluate(expression, parameters, representative, context);
+                    context.CancellationToken.ThrowIfCancellationRequested();
+                    return value;
+                },
+            };
+        }
+
+        var collector = new VdbeAggregate
+        {
+            Name = "rows",
+            CreateContext = CreateContext,
+            Accumulate = CollectRow,
+            Finalize = _ => throw new InvalidOperationException(
+                "The row collector is stepped but never finalized directly."),
+        };
+        var outputs = select.Projections
+            .Select(projection => BuildFinalizer(
+                projection.Expression,
+                aggregateMode: !grouped || ContainsAggregate(projection.Expression),
+                role: "projection"))
+            .ToArray();
+        var having = select.Having is null
+            ? null
+            : new AggregateFinalizerFilter(
+                BuildFinalizer(
+                    select.Having,
+                    aggregateMode: !grouped || hasAggregate,
+                    role: "having"),
+                values => IsTrue(values[0]),
+                "skip aggregate result when HAVING is false");
+        var distinctEquality = select.Distinct
+            ? BuildAggregateResultEquality(select.Projections, context)
+            : null;
+
         VdbeProgram program;
         if (grouped)
         {
-            var (orderComparer, groupComparer) = BuildGroupComparers(
-                select.GroupBy, groupKeyNames, target, predicate, parameters, context, outerRow);
-            program = AggregateProgramBuilder.BuildGrouped(
+            var groupCollations = select.GroupBy
+                .Select(expression => GetEffectiveCollation(expression, context))
+                .ToArray();
+            VdbeGroupKeyProjector groupKeyProjector = values =>
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                var row = CreateScanSourceRow(target, values, context, outerRow);
+                var key = new SqlValue[select.GroupBy.Count];
+                for (var index = 0; index < key.Length; index++)
+                {
+                    context.CancellationToken.ThrowIfCancellationRequested();
+                    key[index] = Evaluate(select.GroupBy[index], parameters, row, context);
+                }
+
+                return key;
+            };
+            VdbeGroupComparer groupEquality = (left, right) =>
+                GroupKeysEqual(left, right, groupCollations);
+
+            var orderKeys = resolvedOrderBy
+                .Select(term => BuildFinalizer(
+                    term.Expression,
+                    ContainsAggregate(term.Expression),
+                    role: "order"))
+                .ToArray();
+            VdbeRowComparer outputOrderComparer = (left, right) =>
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                for (var index = 0; index < resolvedOrderBy.Count; index++)
+                {
+                    var term = resolvedOrderBy[index];
+                    var comparison = CompareForOrdering(
+                        left[index],
+                        right[index],
+                        term,
+                        GetEffectiveCollation(term.Expression, context));
+                    if (comparison != 0)
+                        return comparison;
+                }
+
+                return left[resolvedOrderBy.Count].AsInteger()
+                    .CompareTo(right[resolvedOrderBy.Count].AsInteger());
+            };
+
+            program = AggregateProgramBuilder.BuildRowGrouped(
                 target.TableName,
                 target.Columns.Length,
-                groupKeyColumns,
-                aggregates,
+                select.GroupBy.Count,
+                groupKeyProjector,
+                groupEquality,
+                collector,
                 outputs,
-                orderComparer,
-                groupComparer,
+                orderKeys,
+                outputOrderComparer,
                 predicate,
-                having);
+                having,
+                distinctEquality,
+                BuildGroupHasher(groupCollations));
         }
         else
         {
-            program = AggregateProgramBuilder.BuildScalar(
+            program = AggregateProgramBuilder.BuildRowScalar(
                 target.TableName,
                 target.Columns.Length,
-                aggregates,
+                collector,
                 outputs,
                 predicate,
-                having);
+                having,
+                distinctEquality);
         }
 
         compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows)]);
         return true;
     }
 
-    // Rewrites an aggregate-only HAVING expression into a predicate over finalized aggregate
-    // registers. This keeps comparison, NULL, affinity, and parameter semantics in Evaluate while
-    // the VDBE owns the group finalization and conditional result emission.
-    private bool TryCompileAggregateHaving(
-        Expression expression,
-        ScanTarget target,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow,
-        List<AggregateFunctionSpec> aggregates,
-        out AggregateHavingFilter having)
+    private static bool CanCompileAggregateExpression(Expression expression, ScanTarget target)
     {
-        var inputs = new List<AggregateOutput>();
-        var inputNames = new List<string>();
-        if (!TryRewriteAggregateHaving(
-                expression,
-                target,
-                parameters,
-                context,
-                outerRow,
-                aggregates,
-                inputs,
-                inputNames,
-                out var rewritten))
+        return expression switch
         {
-            having = null!;
+            LiteralExpression or CurrentTimeExpression or ParameterExpression => true,
+            ColumnExpression column => target.ResolveColumnIndex(column.Name) is not null,
+            FunctionExpression function => function.Window is null
+                && function.Arguments.All(argument => CanCompileAggregateExpression(argument, target))
+                && (function.Filter is null || CanCompileAggregateExpression(function.Filter, target)),
+            UnaryExpression unary => CanCompileAggregateExpression(unary.Operand, target),
+            BinaryExpression binary => CanCompileAggregateExpression(binary.Left, target)
+                && CanCompileAggregateExpression(binary.Right, target),
+            CollationExpression collation => CanCompileAggregateExpression(collation.Expression, target),
+            CastExpression cast => CanCompileAggregateExpression(cast.Expression, target),
+            CaseExpression @case => (@case.Operand is null
+                    || CanCompileAggregateExpression(@case.Operand, target))
+                && @case.Clauses.All(clause =>
+                    CanCompileAggregateExpression(clause.When, target)
+                    && CanCompileAggregateExpression(clause.Then, target))
+                && (@case.Else is null || CanCompileAggregateExpression(@case.Else, target)),
+            LikeExpression like => CanCompileAggregateExpression(like.Value, target)
+                && CanCompileAggregateExpression(like.Pattern, target)
+                && (like.Escape is null || CanCompileAggregateExpression(like.Escape, target)),
+            GlobExpression glob => CanCompileAggregateExpression(glob.Value, target)
+                && CanCompileAggregateExpression(glob.Pattern, target),
+            InExpression @in => CanCompileAggregateExpression(@in.Value, target)
+                && @in.Values.All(value => CanCompileAggregateExpression(value, target)),
+            BetweenExpression between => CanCompileAggregateExpression(between.Value, target)
+                && CanCompileAggregateExpression(between.Lower, target)
+                && CanCompileAggregateExpression(between.Upper, target),
+            _ => false,
+        };
+    }
+
+    // Grouped finalizers run one group at a time in the VDBE, while the evaluator
+    // finishes every projection before its HAVING and ORDER BY phases. Keep expressions
+    // with observable callbacks or failures on the evaluator at those deferred phases.
+    private bool ContainsDeferredAggregateHazard(
+        Expression expression,
+        bool sumIsHazard)
+    {
+        return expression switch
+        {
+            FunctionExpression function when function.Window is not null => true,
+            FunctionExpression { Name: "SUM" } when sumIsHazard => true,
+            FunctionExpression function when IsManagedPercentileAggregate(function.Name) => true,
+            FunctionExpression function
+                when TryGetAggregateFunction(function.Name, function.Arguments.Count, out _) => true,
+            FunctionExpression function when !IsBuiltInAggregate(function) => true,
+            FunctionExpression function => function.Arguments.Any(argument =>
+                    ContainsDeferredAggregateHazard(argument, sumIsHazard))
+                || function.Filter is not null
+                    && ContainsDeferredAggregateHazard(function.Filter, sumIsHazard),
+            BinaryExpression binary when binary.Operator is BinaryOperator.Add
+                or BinaryOperator.Subtract
+                or BinaryOperator.Multiply
+                or BinaryOperator.Divide
+                or BinaryOperator.Modulo
+                or BinaryOperator.JsonArrow
+                or BinaryOperator.JsonArrowText => true,
+            UnaryExpression unary => ContainsDeferredAggregateHazard(
+                unary.Operand,
+                sumIsHazard),
+            BinaryExpression binary => ContainsDeferredAggregateHazard(
+                    binary.Left,
+                    sumIsHazard)
+                || ContainsDeferredAggregateHazard(binary.Right, sumIsHazard),
+            CollationExpression collation when IsCustomCollation(collation.Name) => true,
+            CollationExpression collation => ContainsDeferredAggregateHazard(
+                collation.Expression,
+                sumIsHazard),
+            CastExpression cast => ContainsDeferredAggregateHazard(
+                cast.Expression,
+                sumIsHazard),
+            CaseExpression @case => (@case.Operand is not null
+                    && ContainsDeferredAggregateHazard(
+                        @case.Operand,
+                        sumIsHazard))
+                || @case.Clauses.Any(clause =>
+                    ContainsDeferredAggregateHazard(clause.When, sumIsHazard)
+                    || ContainsDeferredAggregateHazard(clause.Then, sumIsHazard))
+                || @case.Else is not null
+                    && ContainsDeferredAggregateHazard(
+                        @case.Else,
+                        sumIsHazard),
+            LikeExpression or GlobExpression or ScalarSubqueryExpression or ExistsExpression
+                or InSubqueryExpression => true,
+            InExpression @in => ContainsDeferredAggregateHazard(
+                    @in.Value,
+                    sumIsHazard)
+                || @in.Values.Any(value =>
+                    ContainsDeferredAggregateHazard(value, sumIsHazard)),
+            BetweenExpression between => ContainsDeferredAggregateHazard(
+                    between.Value,
+                    sumIsHazard)
+                || ContainsDeferredAggregateHazard(between.Lower, sumIsHazard)
+                || ContainsDeferredAggregateHazard(between.Upper, sumIsHazard),
+            _ => false,
+        };
+    }
+
+    private bool ContainsEffectiveCustomCollation(
+        Expression expression,
+        QueryContext context)
+    {
+        if (IsCustomCollation(GetEffectiveCollation(expression, context)))
+            return true;
+
+        return expression switch
+        {
+            FunctionExpression function => function.Arguments.Any(argument =>
+                    ContainsEffectiveCustomCollation(argument, context))
+                || function.Filter is not null
+                    && ContainsEffectiveCustomCollation(function.Filter, context),
+            UnaryExpression unary => ContainsEffectiveCustomCollation(unary.Operand, context),
+            BinaryExpression binary => ContainsEffectiveCustomCollation(binary.Left, context)
+                || ContainsEffectiveCustomCollation(binary.Right, context),
+            CollationExpression collation => ContainsEffectiveCustomCollation(
+                collation.Expression,
+                context),
+            CastExpression cast => ContainsEffectiveCustomCollation(cast.Expression, context),
+            CaseExpression @case => @case.Operand is not null
+                    && ContainsEffectiveCustomCollation(@case.Operand, context)
+                || @case.Clauses.Any(clause =>
+                    ContainsEffectiveCustomCollation(clause.When, context)
+                    || ContainsEffectiveCustomCollation(clause.Then, context))
+                || @case.Else is not null
+                    && ContainsEffectiveCustomCollation(@case.Else, context),
+            LikeExpression like => ContainsEffectiveCustomCollation(like.Value, context)
+                || ContainsEffectiveCustomCollation(like.Pattern, context)
+                || like.Escape is not null
+                    && ContainsEffectiveCustomCollation(like.Escape, context),
+            GlobExpression glob => ContainsEffectiveCustomCollation(glob.Value, context)
+                || ContainsEffectiveCustomCollation(glob.Pattern, context),
+            InExpression @in => ContainsEffectiveCustomCollation(@in.Value, context)
+                || @in.Values.Any(value => ContainsEffectiveCustomCollation(value, context)),
+            InSubqueryExpression @in => ContainsEffectiveCustomCollation(@in.Value, context),
+            BetweenExpression between => ContainsEffectiveCustomCollation(between.Value, context)
+                || ContainsEffectiveCustomCollation(between.Lower, context)
+                || ContainsEffectiveCustomCollation(between.Upper, context),
+            _ => false,
+        };
+    }
+
+    private static bool IsCustomCollation(string? collation) =>
+        collation is not null
+        && !collation.Equals("BINARY", StringComparison.OrdinalIgnoreCase)
+        && !collation.Equals("NOCASE", StringComparison.OrdinalIgnoreCase)
+        && !collation.Equals("RTRIM", StringComparison.OrdinalIgnoreCase);
+
+    private static bool CollationsEquivalent(string? left, string? right) =>
+        string.Equals(
+            left ?? "BINARY",
+            right ?? "BINARY",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static string GetAggregateExplainName(Expression expression, string role) =>
+        expression is FunctionExpression function && function.Window is null
+            ? function.Name.ToLowerInvariant()
+            : role;
+
+    private VdbeRowEquality BuildAggregateResultEquality(
+        IReadOnlyList<Projection> projections,
+        QueryContext context)
+    {
+        var collations = projections
+            .Select(projection => GetEffectiveCollation(projection.Expression, context))
+            .ToArray();
+        return (left, right) => RowsEqual(left, right, collations);
+    }
+
+    private bool GroupKeysEqual(
+        SqlValue[] left,
+        SqlValue[] right,
+        IReadOnlyList<string?> collations)
+    {
+        if (left.Length != right.Length || left.Length != collations.Count)
             return false;
+
+        for (var index = 0; index < left.Length; index++)
+        {
+            if (!DistinctValuesEqual(left[index], right[index], collations[index]))
+                return false;
         }
 
-        var names = inputNames.ToArray();
-        having = new AggregateHavingFilter(
-            inputs,
-            values => IsTrue(Evaluate(
-                rewritten,
-                parameters,
-                new SourceRow(names, values, Parent: outerRow),
-                context)),
-            "skip aggregate result when HAVING is false");
         return true;
     }
 
-    // The VDBE filter receives only a fixed register tuple. Restrict HAVING to aggregate calls
-    // and scalar syntax whose remaining leaves are parameters or literals, so no representative-row,
-    // subquery, collation-state, or non-deterministic function dependency can leak into the route.
-    private bool TryRewriteAggregateHaving(
-        Expression expression,
-        ScanTarget target,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow,
-        List<AggregateFunctionSpec> aggregates,
-        List<AggregateOutput> inputs,
-        List<string> inputNames,
-        out Expression rewritten)
+    private static VdbeGroupHasher? BuildGroupHasher(
+        IReadOnlyList<string?> collations)
     {
-        switch (expression)
-        {
-            case LiteralExpression or ParameterExpression:
-                rewritten = expression;
-                return true;
-            case FunctionExpression function:
-                if (!TryClassifyAggregateCall(
-                        function,
-                        target,
-                        parameters,
-                        context,
-                        outerRow,
-                        aggregates,
-                        out var output))
-                {
-                    rewritten = null!;
-                    return false;
-                }
+        if (collations.Any(IsCustomCollation))
+            return null;
 
-                var inputIndex = inputs.Count;
-                inputs.Add(output);
-                var inputName = $"__turso_having_aggregate_{inputIndex}__";
-                inputNames.Add(inputName);
-                rewritten = new ColumnExpression(inputName);
-                return true;
-            case RowValueExpression rowValue:
-                var rewrittenValues = new Expression[rowValue.Values.Count];
-                for (var index = 0; index < rowValue.Values.Count; index++)
+        return key =>
+        {
+            if (key.Length != collations.Count)
+                throw new InvalidOperationException("GROUP BY hash key width does not match its collation vector.");
+
+            var hash = new HashCode();
+            for (var index = 0; index < key.Length; index++)
+                AddGroupHash(ref hash, key[index], collations[index]);
+            return hash.ToHashCode();
+        };
+    }
+
+    private static void AddGroupHash(
+        ref HashCode hash,
+        SqlValue value,
+        string? collation)
+    {
+        switch (value.Kind)
+        {
+            case SqlValueKind.Null:
+                hash.Add(0);
+                return;
+            case SqlValueKind.Integer:
+                hash.Add(1);
+                hash.Add((double)value.AsInteger());
+                return;
+            case SqlValueKind.Real:
+                hash.Add(1);
+                hash.Add(value.AsReal() == 0 ? 0d : value.AsReal());
+                return;
+            case SqlValueKind.Text:
+                hash.Add(2);
+                var text = value.AsText();
+                if (string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!TryRewriteAggregateHaving(
-                            rowValue.Values[index],
-                            target,
-                            parameters,
-                            context,
-                            outerRow,
-                            aggregates,
-                            inputs,
-                            inputNames,
-                            out rewrittenValues[index]))
+                    var bytes = System.Text.Encoding.UTF8.GetBytes(text);
+                    foreach (var octet in bytes)
                     {
-                        rewritten = null!;
-                        return false;
+                        var folded = FoldNoCaseAscii(octet);
+                        hash.Add(folded);
+                        if (folded == 0)
+                        {
+                            hash.Add(bytes.Length);
+                            break;
+                        }
                     }
                 }
+                else
+                {
+                    if (string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase))
+                        text = text.TrimEnd(' ');
+                    hash.Add(text, StringComparer.Ordinal);
+                }
 
-                rewritten = rowValue with { Values = rewrittenValues };
-                return true;
-            case UnaryExpression unary when TryRewriteAggregateHaving(
-                    unary.Operand,
-                    target,
-                    parameters,
-                    context,
-                    outerRow,
-                    aggregates,
-                    inputs,
-                    inputNames,
-                    out var operand):
-                rewritten = unary with { Operand = operand };
-                return true;
-            case BinaryExpression binary
-                when TryRewriteAggregateHaving(
-                        binary.Left,
-                        target,
-                        parameters,
-                        context,
-                        outerRow,
-                        aggregates,
-                        inputs,
-                        inputNames,
-                        out var left)
-                    && TryRewriteAggregateHaving(
-                        binary.Right,
-                        target,
-                        parameters,
-                        context,
-                        outerRow,
-                        aggregates,
-                        inputs,
-                        inputNames,
-                        out var right):
-                rewritten = binary with { Left = left, Right = right };
-                return true;
-            case CastExpression cast when TryRewriteAggregateHaving(
-                    cast.Expression,
-                    target,
-                    parameters,
-                    context,
-                    outerRow,
-                    aggregates,
-                    inputs,
-                    inputNames,
-                    out var castInput):
-                rewritten = cast with { Expression = castInput };
-                return true;
-            case CollationExpression collation when TryRewriteAggregateHaving(
-                    collation.Expression,
-                    target,
-                    parameters,
-                    context,
-                    outerRow,
-                    aggregates,
-                    inputs,
-                    inputNames,
-                    out var collationInput):
-                rewritten = collation with { Expression = collationInput };
-                return true;
+                return;
+            case SqlValueKind.Blob:
+                hash.Add(3);
+                foreach (var octet in value.AsBlob().Span)
+                    hash.Add(octet);
+                return;
             default:
-                rewritten = null!;
-                return false;
+                throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}.");
+        }
+    }
+
+    private static byte FoldNoCaseAscii(byte value) =>
+        value is >= (byte)'A' and <= (byte)'Z'
+            ? (byte)(value + 0x20)
+            : value;
+
+    private sealed class GroupKeyEqualityComparer(
+        VdbeGroupComparer equality,
+        VdbeGroupHasher hasher) : IEqualityComparer<SqlValue[]>
+    {
+        public bool Equals(SqlValue[]? left, SqlValue[]? right) =>
+            left is not null
+            && right is not null
+            && equality(left, right);
+
+        public int GetHashCode(SqlValue[] key) => hasher(key);
+    }
+
+    private sealed class CompiledAggregateContext
+    {
+        private bool _representativeInitialized;
+        private SourceRow? _representative;
+
+        public List<SourceRow> Rows { get; } = [];
+
+        public SourceRow? GetRepresentative(Func<SourceRow?> factory)
+        {
+            if (!_representativeInitialized)
+            {
+                _representative = factory();
+                _representativeInitialized = true;
+            }
+
+            return _representative;
         }
     }
 
@@ -9549,7 +10398,8 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context,
         SourceRow? outerRow,
-        out CompiledSelect compiled)
+        out CompiledSelect compiled,
+        ScanTarget? targetOverride = null)
     {
         compiled = null!;
 
@@ -9577,7 +10427,7 @@ public sealed class EmbeddedDatabase : IDisposable
         if (select.Projections.Any(projection => ContainsAggregate(projection.Expression)))
             return false;
 
-        var target = ResolveScanTarget(select.Source, context);
+        var target = targetOverride ?? ResolveScanTarget(select.Source, context);
         if (target is null)
             return false;
 
@@ -9626,6 +10476,14 @@ public sealed class EmbeddedDatabase : IDisposable
             return false;
 
         ValidateOrderByCollations(spec.OrderBy);
+        ValidateGroupByCollations(spec.PartitionBy);
+        if (spec.PartitionBy.Any(expression =>
+                ContainsEffectiveCustomCollation(expression, context))
+            || spec.OrderBy.Any(term =>
+                ContainsEffectiveCustomCollation(term.Expression, context)))
+        {
+            return false;
+        }
 
         // PARTITION BY keys must be bare, backed columns so the builder can copy them into the
         // partition-key registers and the reused group-key equality can compare them.
@@ -9633,7 +10491,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var partitionNames = new List<string>();
         foreach (var partitionExpression in spec.PartitionBy)
         {
-            if (partitionExpression is not ColumnExpression column
+            if (UnwrapCollation(partitionExpression) is not ColumnExpression column
                 || target.ResolveColumnIndex(column.Name) is not { } ordinal)
             {
                 return false;
@@ -9654,6 +10512,13 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var partitionCount = partitionColumns.Count;
         var windowOrderCount = spec.OrderBy.Count;
+        if (partitionCount > 0
+            && CollectSelectWindowFunctions(select).Any(function =>
+                !IsBuiltInAggregate(function)
+                && TryGetAggregateFunction(function.Name, function.Arguments.Count, out _)))
+        {
+            return false;
+        }
 
         VdbeRowPredicate? predicate = null;
         if (select.Where is not null)
@@ -9682,6 +10547,11 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             var resolvedOrderBy = ResolveOrderBy(select.OrderBy, select.Projections);
             ValidateOrderByCollations(resolvedOrderBy);
+            if (resolvedOrderBy.Any(term =>
+                    ContainsEffectiveCustomCollation(term.Expression, context)))
+            {
+                return false;
+            }
             if (resolvedOrderBy.Count != partitionCount + windowOrderCount)
                 return false;
 
@@ -9689,10 +10559,19 @@ public sealed class EmbeddedDatabase : IDisposable
             var seenOrdinals = new HashSet<int>();
             for (var index = 0; index < partitionCount; index++)
             {
-                if (resolvedOrderBy[index].Expression is not ColumnExpression column
+                var topExpression = resolvedOrderBy[index].Expression;
+                if (UnwrapCollation(topExpression) is not ColumnExpression column
                     || target.ResolveColumnIndex(column.Name) is not { } ordinal
                     || !partitionOrdinals.Contains(ordinal)
                     || !seenOrdinals.Add(ordinal))
+                {
+                    return false;
+                }
+
+                var partitionIndex = partitionColumns.IndexOf(ordinal);
+                if (!CollationsEquivalent(
+                        GetEffectiveCollation(topExpression, context),
+                        GetEffectiveCollation(spec.PartitionBy[partitionIndex], context)))
                 {
                     return false;
                 }
@@ -9848,58 +10727,6 @@ public sealed class EmbeddedDatabase : IDisposable
         return Equals(left.Frame, right.Frame);
     }
 
-    // Recognizes a top-level supported aggregate call over bare, backed columns, appends its
-    // VdbeAggregate to <paramref name="aggregates"/>, and yields the output that projects the
-    // accumulator's finalized value. Declines (returns false) for windowed calls,
-    // DISTINCT/FILTER modifiers, unsupported functions, or arguments that are not bare
-    // columns, so those shapes fall back to the evaluator.
-    private bool TryClassifyAggregateCall(
-        Expression expression,
-        ScanTarget target,
-        SqlValue[] parameters,
-        QueryContext context,
-        SourceRow? outerRow,
-        List<AggregateFunctionSpec> aggregates,
-        out AggregateOutput output)
-    {
-        output = default;
-        if (expression is not FunctionExpression function
-            || function.Window is not null
-            || function.Filter is not null
-            || function.Distinct)
-        {
-            return false;
-        }
-
-        if (!IsBuiltInAggregate(function)
-            && !IsManagedPercentileAggregate(function.Name)
-            && !TryGetAggregateFunction(function.Name, function.Arguments.Count, out _))
-        {
-            return false;
-        }
-
-        var argumentColumns = new List<int>(function.Arguments.Count);
-        var argumentNames = new string[function.Arguments.Count];
-        for (var i = 0; i < function.Arguments.Count; i++)
-        {
-            if (function.Arguments[i] is not ColumnExpression column
-                || target.ResolveColumnIndex(column.Name) is not { } ordinal)
-            {
-                return false;
-            }
-
-            argumentColumns.Add(ordinal);
-            argumentNames[i] = column.Name;
-        }
-
-        var accumulator = aggregates.Count;
-        aggregates.Add(new AggregateFunctionSpec(
-            BuildAccumulatorAggregate(function, argumentNames, parameters, context, outerRow),
-            argumentColumns));
-        output = AggregateOutput.ForAggregate(accumulator);
-        return true;
-    }
-
     // Builds a VdbeAggregate whose accumulation replays the evaluator's own aggregate
     // semantics: it buffers each scanned argument tuple as a synthetic single-row source
     // keyed by the argument column names, then finalizes by handing those rows to
@@ -9934,36 +10761,13 @@ public sealed class EmbeddedDatabase : IDisposable
         };
     }
 
-    // Matches a projection that is structurally one of the GROUP BY key expressions, so it
-    // projects that group's saved key. Mirrors the evaluator's rule that a non-aggregate
-    // projection must appear in GROUP BY: a group-key column projects from the saved key,
-    // and anything else declines so the evaluator raises its error on fallback.
-    private static bool TryResolveGroupKeyOutput(
-        Expression expression,
-        IReadOnlyList<Expression> groupBy,
-        out AggregateOutput output)
-    {
-        for (var index = 0; index < groupBy.Count; index++)
-        {
-            if (groupBy[index].Equals(expression))
-            {
-                output = AggregateOutput.ForGroupKey(index);
-                return true;
-            }
-        }
-
-        output = default;
-        return false;
-    }
-
     // Builds the two delegates a grouped aggregate program needs: an order comparer that
     // makes each group's rows contiguous and sequences groups by first appearance (so the
-    // stable sorter reproduces the evaluator's first-seen Dictionary order with scan-order
-    // rows inside each group), and an equality comparer that decides group membership. Both
-    // reuse GetGroupKey so grouping keys, NULL grouping, and integer/real key coalescing are
-    // byte-identical to the evaluator. The first-seen map is built lazily (so EXPLAIN, which
-    // never runs the program, does no data work) and rebuilt on a miss (so it stays correct
-    // across append-only reset/replay).
+    // stable sorter reproduces first-seen group order with scan-order rows inside each group),
+    // and an equality comparer that decides group membership. Both evaluate the key tuple and
+    // apply its effective collations, so NULL/numeric equivalence and collated text grouping
+    // match the evaluator. The first-seen list is built lazily (so EXPLAIN does no data work)
+    // and rebuilt on a miss (so append-only reset/replay remains correct).
     private (VdbeRowComparer OrderComparer, VdbeGroupComparer GroupComparer) BuildGroupComparers(
         IReadOnlyList<Expression> groupBy,
         IReadOnlyList<string> groupKeyNames,
@@ -9975,53 +10779,106 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         var columns = target.Columns;
         var keyNames = groupKeyNames.ToArray();
+        var collations = groupBy
+            .Select(expression => GetEffectiveCollation(expression, context))
+            .ToArray();
+        VdbeGroupComparer keyEquality = (left, right) =>
+            GroupKeysEqual(left, right, collations);
+        var keyHasher = BuildGroupHasher(collations);
 
-        string KeyOfRow(SqlValue[] row) =>
-            GetGroupKey(
+        SqlValue[] KeyOfRow(SqlValue[] row) =>
+            EvaluateGroupKey(
                 groupBy,
                 parameters,
                 CreateScanSourceRow(target, row, context, outerRow),
                 context);
-        string KeyOfSlice(SqlValue[] slice) =>
-            GetGroupKey(groupBy, parameters, new SourceRow(keyNames, slice, Parent: outerRow), context);
+        SqlValue[] KeyOfSlice(SqlValue[] slice) =>
+            EvaluateGroupKey(
+                groupBy,
+                parameters,
+                new SourceRow(keyNames, slice, Parent: outerRow),
+                context);
 
-        Dictionary<string, int>? firstSeen = null;
+        List<SqlValue[]>? firstSeen = null;
+        Dictionary<SqlValue[], int>? firstSeenIndex = null;
+        int FindKey(IReadOnlyList<SqlValue[]> keys, SqlValue[] key)
+        {
+            for (var index = 0; index < keys.Count; index++)
+            {
+                if (GroupKeysEqual(keys[index], key, collations))
+                    return index;
+            }
+
+            return -1;
+        }
+
         void BuildFirstSeen()
         {
-            var map = new Dictionary<string, int>(StringComparer.Ordinal);
-            var sequence = 0;
+            var keys = new List<SqlValue[]>();
+            var index = keyHasher is null
+                ? null
+                : new Dictionary<SqlValue[], int>(
+                    new GroupKeyEqualityComparer(keyEquality, keyHasher));
             foreach (var row in target.Rows)
             {
                 if (predicate is not null && !predicate(row))
                     continue;
 
                 var key = KeyOfRow(row);
-                if (!map.ContainsKey(key))
-                    map[key] = sequence++;
+                var exists = index is not null
+                    ? index.ContainsKey(key)
+                    : FindKey(keys, key) >= 0;
+                if (!exists)
+                {
+                    index?.Add(key, keys.Count);
+                    keys.Add(key);
+                }
             }
 
-            firstSeen = map;
+            firstSeen = keys;
+            firstSeenIndex = index;
         }
 
         VdbeRowComparer orderComparer = (left, right) =>
         {
             var leftKey = KeyOfRow(left);
             var rightKey = KeyOfRow(right);
-            if (string.Equals(leftKey, rightKey, StringComparison.Ordinal))
+            if (keyEquality(leftKey, rightKey))
                 return 0;
 
-            if (firstSeen is null
-                || !firstSeen.ContainsKey(leftKey)
-                || !firstSeen.ContainsKey(rightKey))
+            if (firstSeen is null)
+                BuildFirstSeen();
+
+            var keys = firstSeen!;
+            var leftIndex = firstSeenIndex is not null
+                && firstSeenIndex.TryGetValue(leftKey, out var indexedLeft)
+                    ? indexedLeft
+                    : FindKey(keys, leftKey);
+            var rightIndex = firstSeenIndex is not null
+                && firstSeenIndex.TryGetValue(rightKey, out var indexedRight)
+                    ? indexedRight
+                    : FindKey(keys, rightKey);
+            if (leftIndex < 0 || rightIndex < 0)
             {
                 BuildFirstSeen();
+                keys = firstSeen!;
+                leftIndex = firstSeenIndex is not null
+                    && firstSeenIndex.TryGetValue(leftKey, out indexedLeft)
+                        ? indexedLeft
+                        : FindKey(keys, leftKey);
+                rightIndex = firstSeenIndex is not null
+                    && firstSeenIndex.TryGetValue(rightKey, out indexedRight)
+                        ? indexedRight
+                        : FindKey(keys, rightKey);
             }
 
-            return firstSeen![leftKey].CompareTo(firstSeen[rightKey]);
+            if (leftIndex < 0 || rightIndex < 0)
+                throw new InvalidOperationException("Window partition key is absent from its source rows.");
+            return leftIndex.CompareTo(rightIndex);
         };
 
         VdbeGroupComparer groupComparer = (left, right) =>
-            string.Equals(KeyOfSlice(left), KeyOfSlice(right), StringComparison.Ordinal);
+            keyEquality(KeyOfSlice(left), KeyOfSlice(right));
 
         return (orderComparer, groupComparer);
     }
@@ -10052,7 +10909,11 @@ public sealed class EmbeddedDatabase : IDisposable
             columns,
             table.Rows,
             name => ResolveScanColumnIndex(name, columns, qualifiedColumns),
-            table.HasRowid ? table.RowIds : null);
+            table.HasRowid ? table.RowIds : null,
+            ColumnDefinitions: table.ColumnDefinitions,
+            QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
+                qualifier,
+                table.ColumnDefinitions));
     }
 
     private static int? ResolveScanColumnIndex(
@@ -10127,6 +10988,19 @@ public sealed class EmbeddedDatabase : IDisposable
         long? rowId = null)
     {
         var qualifiedColumns = BuildQualifiedColumns(target.Qualifier, target.Columns);
+        if (target.ColumnDefinitions is not null)
+        {
+            return new SourceRow(
+                target.Columns,
+                row,
+                qualifiedColumns,
+                outerRow,
+                RowId: rowId,
+                RowIdQualifier: rowId is null ? null : target.Qualifier,
+                ColumnDefinitions: target.ColumnDefinitions,
+                QualifiedColumnDefinitions: target.QualifiedColumnDefinitions);
+        }
+
         if (!context.Tables.TryGetValue(target.TableName, out var table))
         {
             return new SourceRow(
@@ -10300,7 +11174,8 @@ public sealed class EmbeddedDatabase : IDisposable
     private static ExecutionResult RunCompiledProgram(
         CompiledSelect compiled,
         string[] columns,
-        VdbeParameterBinding? parameterBinding)
+        VdbeParameterBinding? parameterBinding,
+        CancellationToken cancellationToken = default)
     {
         using var runtime = new ResumableStatement(
             compiled.Program,
@@ -10309,7 +11184,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var rows = new List<SqlValue[]>();
         while (true)
         {
-            switch (runtime.StepResumable())
+            switch (runtime.StepResumable(cancellationToken))
             {
                 case ResumableStatementStepResult.Row:
                     rows.Add([.. runtime.CurrentRow!]);
@@ -10797,6 +11672,7 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         var compilationContext = EnsureAutoIncrementStatementState(context);
         if (statement.Inner is SelectStatement plannedSelect
+            && HasExplainSafeBounds(plannedSelect)
             && TryPlanManagedIndexScan(plannedSelect, compilationContext) is { } indexPlan)
         {
             if (TryCompileManagedIndexSelect(
@@ -10819,7 +11695,13 @@ public sealed class EmbeddedDatabase : IDisposable
         switch (statement.Inner)
         {
             case SelectStatement select
-                when TryCompileSelect(select, parameters, compilationContext, outerRow: null, out var compiledSelect):
+                when HasExplainSafeBounds(select)
+                    && TryCompileSelect(
+                        select,
+                        parameters,
+                        compilationContext,
+                        outerRow: null,
+                        out var compiledSelect):
                 return DescribeProgram(compiledSelect.Program);
             case CompoundSelectStatement compound
                 when TryCompileCompoundSelect(
@@ -10905,7 +11787,8 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var usesCompiledProgram = statement.Inner switch
         {
-            SelectStatement select => !compilationContext.CancellationToken.CanBeCanceled
+            SelectStatement select => HasExplainSafeBounds(select)
+                && (!compilationContext.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
                 && TryCompileSelect(select, parameters, compilationContext, outerRow: null, out _),
             CompoundSelectStatement compound => !compilationContext.CancellationToken.CanBeCanceled
                 && TryCompileCompoundSelect(
@@ -10947,6 +11830,21 @@ public sealed class EmbeddedDatabase : IDisposable
             ],
             0);
     }
+
+    private static bool HasExplainSafeBounds(SelectStatement select) =>
+        IsExplainSafeBound(select.Limit) && IsExplainSafeBound(select.Offset);
+
+    private static bool IsExplainSafeBound(Expression? expression) =>
+        expression switch
+        {
+            null or LiteralExpression or ParameterExpression => true,
+            UnaryExpression unary => IsExplainSafeBound(unary.Operand),
+            BinaryExpression binary => IsExplainSafeBound(binary.Left)
+                && IsExplainSafeBound(binary.Right),
+            CastExpression cast => IsExplainSafeBound(cast.Expression),
+            CollationExpression collation => IsExplainSafeBound(collation.Expression),
+            _ => false,
+        };
 
     private static QueryContext EnsureAutoIncrementStatementState(QueryContext context)
         => context.AutoIncrementState is null
@@ -11059,6 +11957,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 filterRegisters.Row.Count,
                 null,
                 filterRegisters.Description),
+            GroupKeyInstruction => VdbeExplain.Describe(instruction),
             ProjectRegistersInstruction => VdbeExplain.Describe(instruction),
             DistinctFilterInstruction => VdbeExplain.Describe(instruction),
             NextInstruction next => (
@@ -11115,6 +12014,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 distinct.DistinctSetIndex,
                 null,
                 $"{DescribeResultRow(distinct.Values)} if new to distinct set {distinct.DistinctSetIndex}"),
+            DistinctGateInstruction => VdbeExplain.Describe(instruction),
             YieldInstruction => (0, 0, 0, null, "yield"),
             DeleteInstruction delete => (
                 delete.Cursor.Index,
@@ -11296,7 +12196,11 @@ public sealed class EmbeddedDatabase : IDisposable
         foreach (var index in table.Indexes.OrderBy(candidate => candidate.Name, StringComparer.OrdinalIgnoreCase))
         {
             if ((!index.IsPartial && index.Columns.All(term => !term.IsExpression))
-                || !IndexExpressionSemantics.PredicateImplies(statement.Where, index.Where)
+                || !IndexExpressionSemantics.PredicateImplies(
+                    statement.Where,
+                    index.Where,
+                    source.Name,
+                    source.Alias)
                 || IndexUsesRegisteredFunctions(index))
             {
                 continue;
@@ -11420,7 +12324,11 @@ public sealed class EmbeddedDatabase : IDisposable
                 qualifiedColumns,
                 outerRow,
                 RowId: rowId,
-                RowIdQualifier: qualifier);
+                RowIdQualifier: qualifier,
+                ColumnDefinitions: table.ColumnDefinitions,
+                QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(
+                    qualifier,
+                    table.ColumnDefinitions));
         }
 
         return new SourceData(table.Columns, rows);
@@ -11482,15 +12390,16 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         statement = ResolveNamedWindows(statement);
+        context = EnterCollationSource(context, statement.Source);
+        ValidateGroupByCollations(statement.GroupBy);
         var resolvedOrderBy = ResolveOrderBy(statement.OrderBy, statement.Projections);
         ValidateOrderByCollations(resolvedOrderBy);
         var windowFunctions = CollectSelectWindowFunctions(statement);
         foreach (var function in windowFunctions)
         {
-            foreach (var partition in function.Window!.PartitionBy)
-                ValidateCollation(GetCollation(partition));
-            ValidateOrderByCollations(function.Window!.OrderBy);
             ValidateWindowFunction(function);
+            ValidateOrderByCollations(function.Window!.OrderBy);
+            ValidateGroupByCollations(function.Window.PartitionBy);
         }
         var limit = statement.Limit is null
             ? (long?)null
@@ -11534,6 +12443,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var selectedRows = new List<SourceRow>();
         foreach (var row in source.Rows)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
             if (statement.Where is null || IsTrue(Evaluate(statement.Where, parameters, row, context)))
                 selectedRows.Add(row);
         }
@@ -11587,25 +12497,46 @@ public sealed class EmbeddedDatabase : IDisposable
                         statement.Distinct,
                         offset,
                         limit,
-                        statement.Projections.Select(projection => GetCollation(projection.Expression)).ToArray()),
+                        statement.Projections
+                            .Select(projection => GetEffectiveCollation(projection.Expression, context))
+                            .ToArray()),
                     0);
             }
 
-            var groups = new Dictionary<string, List<SourceRow>>(StringComparer.Ordinal);
+            var groupCollations = statement.GroupBy
+                .Select(expression => GetEffectiveCollation(expression, context))
+                .ToArray();
+            VdbeGroupComparer groupEquality = (left, right) =>
+                GroupKeysEqual(left, right, groupCollations);
+            var groupHasher = BuildGroupHasher(groupCollations);
+            var groupIndexByKey = groupHasher is null
+                ? null
+                : new Dictionary<SqlValue[], int>(
+                    new GroupKeyEqualityComparer(groupEquality, groupHasher));
+            var groups = new List<(SqlValue[] Key, List<SourceRow> Rows)>();
             foreach (var row in selectedRows)
             {
-                var key = GetGroupKey(statement.GroupBy, parameters, row, context);
-                if (!groups.TryGetValue(key, out var group))
+                context.CancellationToken.ThrowIfCancellationRequested();
+                var key = EvaluateGroupKey(statement.GroupBy, parameters, row, context);
+                var groupIndex = groupIndexByKey is not null
+                    && groupIndexByKey.TryGetValue(key, out var indexedGroup)
+                        ? indexedGroup
+                        : groupIndexByKey is null
+                            ? groups.FindIndex(group => groupEquality(group.Key, key))
+                            : -1;
+                if (groupIndex < 0)
                 {
-                    group = [];
-                    groups.Add(key, group);
+                    groupIndex = groups.Count;
+                    groups.Add((key, []));
+                    groupIndexByKey?.Add(key, groupIndex);
                 }
 
-                group.Add(row);
+                groups[groupIndex].Rows.Add(row);
             }
 
-            var groupedRows = groups.Values.Select(group =>
+            var groupedRows = groups.Select(entry =>
             {
+                var group = entry.Rows;
                 var representative = GetAggregateRepresentative(statement, group, parameters, context)
                     ?? group[0];
                 return new GroupedResult(
@@ -11636,8 +12567,22 @@ public sealed class EmbeddedDatabase : IDisposable
             }
             if (statement.OrderBy.Count > 0)
             {
-                groupedRows.Sort((left, right) =>
-                    CompareGroupedRows(left, right, resolvedOrderBy, parameters, context));
+                var orderedGroups = groupedRows
+                    .Select((group, index) => (Group: group, FirstSeen: index))
+                    .ToList();
+                orderedGroups.Sort((left, right) =>
+                {
+                    var comparison = CompareGroupedRows(
+                        left.Group,
+                        right.Group,
+                        resolvedOrderBy,
+                        parameters,
+                        context);
+                    return comparison != 0
+                        ? comparison
+                        : left.FirstSeen.CompareTo(right.FirstSeen);
+                });
+                groupedRows = orderedGroups.Select(group => group.Group).ToList();
             }
             return new ExecutionResult(
                 columnNames,
@@ -11646,7 +12591,9 @@ public sealed class EmbeddedDatabase : IDisposable
                     statement.Distinct,
                     offset,
                     limit,
-                    statement.Projections.Select(projection => GetCollation(projection.Expression)).ToArray()),
+                    statement.Projections
+                        .Select(projection => GetEffectiveCollation(projection.Expression, context))
+                        .ToArray()),
                 0);
         }
 
@@ -11738,7 +12685,8 @@ public sealed class EmbeddedDatabase : IDisposable
             {
                 case StarExpression:
                     collations.AddRange(outputColumns.Select(column =>
-                        GetDeclaredOutputColumnCollation(source, column, context)));
+                        NormalizeDeclaredCollation(
+                            GetDeclaredOutputColumnCollation(source, column, context))));
                     break;
                 case QualifiedStarExpression qualifiedStar:
                     foreach (var raw in rawOutputColumns.Where(raw =>
@@ -11747,15 +12695,20 @@ public sealed class EmbeddedDatabase : IDisposable
                         var output = outputColumns.FirstOrDefault(column =>
                             string.Equals(column.Qualifier, qualifiedStar.Qualifier, StringComparison.OrdinalIgnoreCase)
                             && column.Index == raw.Index) ?? raw;
-                        collations.Add(GetDeclaredOutputColumnCollation(source, output, context));
+                        collations.Add(NormalizeDeclaredCollation(
+                            GetDeclaredOutputColumnCollation(source, output, context)));
                     }
 
                     break;
                 case ColumnExpression column:
-                    collations.Add(GetDeclaredColumnCollation(source, column.Name, context));
+                    collations.Add(GetEffectiveCollation(
+                        column,
+                        EnterCollationSource(context, source)));
                     break;
                 default:
-                    collations.Add(GetCollation(projection.Expression));
+                    collations.Add(GetEffectiveCollation(
+                        projection.Expression,
+                        EnterCollationSource(context, source)));
                     break;
             }
         }
@@ -11768,6 +12721,24 @@ public sealed class EmbeddedDatabase : IDisposable
         string columnName,
         QueryContext context)
     {
+        return TryGetDeclaredColumnCollation(
+            source,
+            columnName,
+            context,
+            out var collation)
+            ? NormalizeDeclaredCollation(collation)
+            : null;
+    }
+
+    private static string NormalizeDeclaredCollation(string? collation) =>
+        collation ?? "BINARY";
+
+    private static bool TryGetDeclaredColumnCollation(
+        TableSource? source,
+        string columnName,
+        QueryContext context,
+        out string? collation)
+    {
         var separator = columnName.IndexOf('.');
         var qualifier = separator < 0 ? null : columnName[..separator];
         var name = separator < 0 ? columnName : columnName[(separator + 1)..];
@@ -11775,9 +12746,14 @@ public sealed class EmbeddedDatabase : IDisposable
             string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase)
             && (qualifier is null
                 || string.Equals(candidate.Qualifier, qualifier, StringComparison.OrdinalIgnoreCase)));
-        return column is null
-            ? null
-            : GetDeclaredOutputColumnCollation(source, column, context);
+        if (column is null)
+        {
+            collation = null;
+            return false;
+        }
+
+        collation = GetDeclaredOutputColumnCollation(source, column, context);
+        return true;
     }
 
     private static string? GetDeclaredOutputColumnCollation(
@@ -12058,13 +13034,17 @@ public sealed class EmbeddedDatabase : IDisposable
 
         var first = ExecuteCompoundTerm(statement.Terms[0], parameters, context, outerRow);
         var rows = first.Rows.Select(row => row.ToArray()).ToList();
-        var collations = GetCompoundCollations(statement.Terms[0], first.Columns.Length);
+        var leftCollations = GetQueryOutputCollations(statement.Terms[0], context);
         for (var index = 1; index < statement.Terms.Count; index++)
         {
             var next = ExecuteCompoundTerm(statement.Terms[index], parameters, context, outerRow);
             if (next.Columns.Length != first.Columns.Length)
                 throw new EmbeddedSqlException("SELECTs to the left and right of a compound operator do not have the same number of result columns");
 
+            var collations = MergeCompoundCollations(
+                leftCollations,
+                GetQueryOutputCollations(statement.Terms[index], context),
+                first.Columns.Length);
             rows = statement.Operators[index - 1] switch
             {
                 CompoundOperator.Union => ApplyUnion(rows, next.Rows, collations),
@@ -12073,6 +13053,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 CompoundOperator.Except => ApplyExcept(rows, next.Rows, collations),
                 _ => throw new EmbeddedSqlException($"Unsupported compound operator {statement.Operators[index - 1]}."),
             };
+            leftCollations = collations;
         }
 
         if (statement.OrderBy.Count > 0)
@@ -12105,12 +13086,35 @@ public sealed class EmbeddedDatabase : IDisposable
 
     // Per-output-column collations for a compound; only SELECT terms carry projection
     // collations, so VALUES (and other) terms contribute no collation.
-    private IReadOnlyList<string?> GetCompoundCollations(QueryStatement firstTerm, int columnCount)
+    private static IReadOnlyList<string?> GetCompoundCollations(
+        IReadOnlyList<QueryStatement> terms,
+        int columnCount,
+        QueryContext context)
     {
-        if (firstTerm is SelectStatement select)
-            return select.Projections.Select(projection => GetCollation(projection.Expression)).ToArray();
+        var collations = new string?[columnCount];
+        foreach (var term in terms)
+        {
+            var termCollations = GetQueryOutputCollations(term, context);
+            for (var index = 0; index < columnCount; index++)
+                collations[index] ??= termCollations.ElementAtOrDefault(index);
+        }
 
-        return Enumerable.Repeat((string?)null, columnCount).ToArray();
+        return collations;
+    }
+
+    private static IReadOnlyList<string?> MergeCompoundCollations(
+        IReadOnlyList<string?> left,
+        IReadOnlyList<string?> right,
+        int columnCount)
+    {
+        var collations = new string?[columnCount];
+        for (var index = 0; index < columnCount; index++)
+        {
+            collations[index] = left.ElementAtOrDefault(index)
+                ?? right.ElementAtOrDefault(index);
+        }
+
+        return collations;
     }
 
     // Routes a top-level source-less VALUES through the bytecode compiler when every cell is a
@@ -13389,45 +14393,20 @@ public sealed class EmbeddedDatabase : IDisposable
         return rows.ToArray();
     }
 
-    private string GetGroupKey(
+    private SqlValue[] EvaluateGroupKey(
         IReadOnlyList<Expression> groupBy,
         SqlValue[] parameters,
         SourceRow row,
         QueryContext context)
     {
-        var key = new System.Text.StringBuilder();
-        foreach (var expression in groupBy)
+        var key = new SqlValue[groupBy.Count];
+        for (var index = 0; index < key.Length; index++)
         {
-            var value = Evaluate(expression, parameters, row, context);
-            switch (value.Kind)
-            {
-                case SqlValueKind.Null:
-                    key.Append("N;");
-                    break;
-                case SqlValueKind.Integer:
-                    key.Append("N:").Append(value.AsInteger().ToString(CultureInfo.InvariantCulture)).Append(';');
-                    break;
-                case SqlValueKind.Real:
-                    key.Append("N:").Append(value.AsReal() == 0
-                        ? "0"
-                        : value.AsReal().ToString("R", CultureInfo.InvariantCulture)).Append(';');
-                    break;
-                case SqlValueKind.Text:
-                    {
-                        var bytes = System.Text.Encoding.UTF8.GetBytes(value.AsText());
-                        key.Append("T:").Append(bytes.Length).Append(':').Append(Convert.ToBase64String(bytes)).Append(';');
-                        break;
-                    }
-                case SqlValueKind.Blob:
-                    key.Append("B:").Append(value.AsBlob().Length).Append(':')
-                        .Append(Convert.ToBase64String(value.AsBlob().Span)).Append(';');
-                    break;
-                default:
-                    throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}.");
-            }
+            context.CancellationToken.ThrowIfCancellationRequested();
+            key[index] = Evaluate(groupBy[index], parameters, row, context);
         }
 
-        return key.ToString();
+        return key;
     }
 
     private static string[] GetSourceColumns(TableSource? source, QueryContext context)
@@ -15057,10 +16036,7 @@ public sealed class EmbeddedDatabase : IDisposable
             expression.Operator,
             left,
             right,
-            GetCollation(expression.Left)
-                ?? GetCollation(expression.Right)
-                ?? leftColumn?.Collation
-                ?? rightColumn?.Collation);
+            GetComparisonCollation(expression.Left, expression.Right, context));
     }
 
     private SqlValue EvaluateComparison(
@@ -15348,17 +16324,32 @@ public sealed class EmbeddedDatabase : IDisposable
         SourceRow? row,
         QueryContext context)
     {
-        var operand = expression.Operand is null
-            ? (SqlValue?)null
-            : Evaluate(expression.Operand, parameters, row, context);
+        SqlValue[]? operand = null;
+        var operandCount = 0;
+        if (expression.Operand is not null)
+        {
+            operandCount = GetExpressionValueCount(expression.Operand, context);
+            operand = EvaluateExpressionValues(
+                expression.Operand,
+                operandCount,
+                parameters,
+                row,
+                context);
+        }
+
         foreach (var clause in expression.Clauses)
         {
-            var when = Evaluate(clause.When, parameters, row, context);
             var matches = operand is null
-                ? IsTrue(when)
-                : operand.Value.Kind != SqlValueKind.Null
-                    && when.Kind != SqlValueKind.Null
-                    && Compare(operand.Value, when) == 0;
+                ? IsTrue(Evaluate(clause.When, parameters, row, context))
+                : EvaluateMaterializedExpressionComparison(
+                    BinaryOperator.Equal,
+                    operand,
+                    expression.Operand!,
+                    clause.When,
+                    parameters,
+                    row,
+                    context) is { Kind: SqlValueKind.Integer } equality
+                    && equality.AsInteger() != 0;
             if (matches)
                 return Evaluate(clause.Then, parameters, row, context);
         }
@@ -15680,7 +16671,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var value = Evaluate(expression.Value, parameters, row, context);
         var valueIsNull = value.Kind == SqlValueKind.Null;
         var foundNull = false;
-        var collation = GetComparisonCollation(expression.Value, null, row);
+        var collation = GetEffectiveCollation(expression.Value, context);
         foreach (var candidateExpression in expression.Values)
         {
             var candidate = Evaluate(candidateExpression, parameters, row, context);
@@ -15757,6 +16748,7 @@ public sealed class EmbeddedDatabase : IDisposable
         if (left.Count != right.Count)
             throw new EmbeddedSqlException("row value misused");
 
+        var isOperator = operation is BinaryOperator.Is or BinaryOperator.IsNot;
         var foundNull = false;
         for (var index = 0; index < left.Count; index++)
         {
@@ -15764,6 +16756,13 @@ public sealed class EmbeddedDatabase : IDisposable
             var rightValue = right[index];
             if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
             {
+                if (isOperator)
+                {
+                    if (leftValue.Kind != rightValue.Kind)
+                        return SqlValue.Integer(operation == BinaryOperator.IsNot ? 1 : 0);
+                    continue;
+                }
+
                 foundNull = true;
                 if (operation is not (BinaryOperator.Equal or BinaryOperator.NotEqual))
                     return SqlValue.Null;
@@ -15777,10 +16776,11 @@ public sealed class EmbeddedDatabase : IDisposable
             ApplyComparisonAffinities(leftElement, rightElement, row, ref leftValue, ref rightValue);
             var collation = GetComparisonCollation(leftElement, rightElement, row);
             var comparison = Compare(leftValue, rightValue, collation);
-            if (operation is BinaryOperator.Equal or BinaryOperator.NotEqual)
+            if (operation is BinaryOperator.Equal or BinaryOperator.NotEqual || isOperator)
             {
                 if (comparison != 0)
-                    return SqlValue.Integer(operation == BinaryOperator.NotEqual ? 1 : 0);
+                    return SqlValue.Integer(
+                        operation is BinaryOperator.NotEqual or BinaryOperator.IsNot ? 1 : 0);
                 continue;
             }
             if (comparison != 0)
@@ -15789,8 +16789,11 @@ public sealed class EmbeddedDatabase : IDisposable
 
         if (foundNull)
             return SqlValue.Null;
-        if (operation is BinaryOperator.Equal or BinaryOperator.NotEqual)
-            return SqlValue.Integer(operation == BinaryOperator.Equal ? 1 : 0);
+        if (operation is BinaryOperator.Equal or BinaryOperator.NotEqual || isOperator)
+        {
+            return SqlValue.Integer(
+                operation is BinaryOperator.Equal or BinaryOperator.Is ? 1 : 0);
+        }
         return EvaluateOrderingComparison(operation, comparison: 0);
     }
 
@@ -15810,7 +16813,28 @@ public sealed class EmbeddedDatabase : IDisposable
             var value = Evaluate(expression.Value, parameters, row, context);
             var lower = Evaluate(expression.Lower, parameters, row, context);
             var upper = Evaluate(expression.Upper, parameters, row, context);
-            return EvaluateBetweenValues(value, lower, upper, expression.Negated);
+            var lowerValue = value;
+            var upperValue = value;
+            ApplyComparisonAffinities(
+                expression.Value,
+                expression.Lower,
+                row,
+                ref lowerValue,
+                ref lower);
+            ApplyComparisonAffinities(
+                expression.Value,
+                expression.Upper,
+                row,
+                ref upperValue,
+                ref upper);
+            return EvaluateBetweenValues(
+                lowerValue,
+                lower,
+                upperValue,
+                upper,
+                expression.Negated,
+                GetComparisonCollation(expression.Value, expression.Lower, context),
+                GetComparisonCollation(expression.Value, expression.Upper, context));
         }
 
         var valueRow = EvaluateExpressionValues(expression.Value, valueCount, parameters, row, context);
@@ -15853,6 +16877,8 @@ public sealed class EmbeddedDatabase : IDisposable
         SqlValue[]? rightSubqueryValues = rightExpression is ScalarSubqueryExpression subquery
             ? EvaluateSubqueryValues(subquery.Query, rightCount, parameters, row, context)
             : null;
+        var foundNull = false;
+        var isOperator = operation is BinaryOperator.Is or BinaryOperator.IsNot;
         for (var index = 0; index < left.Count; index++)
         {
             var leftValue = left[index];
@@ -15868,25 +16894,67 @@ public sealed class EmbeddedDatabase : IDisposable
             var rightElement = GetExpressionElement(rightExpression, index);
             ApplyComparisonAffinities(leftElement, rightElement, row, ref leftValue, ref rightValue);
             if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
-                return SqlValue.Null;
+            {
+                if (isOperator)
+                {
+                    if (leftValue.Kind != rightValue.Kind)
+                        return SqlValue.Integer(operation == BinaryOperator.IsNot ? 1 : 0);
+                    continue;
+                }
+
+                foundNull = true;
+                if (operation is not (BinaryOperator.Equal or BinaryOperator.NotEqual))
+                    return SqlValue.Null;
+                continue;
+            }
 
             var comparison = Compare(
                 leftValue,
                 rightValue,
                 GetComparisonCollation(leftElement, rightElement, row));
             if (comparison != 0)
+            {
+                if (operation is BinaryOperator.Equal or BinaryOperator.NotEqual || isOperator)
+                {
+                    return SqlValue.Integer(
+                        operation is BinaryOperator.NotEqual or BinaryOperator.IsNot ? 1 : 0);
+                }
+
                 return EvaluateOrderingComparison(operation, comparison);
+            }
         }
 
+        if (foundNull)
+            return SqlValue.Null;
+        if (operation is BinaryOperator.Equal or BinaryOperator.NotEqual || isOperator)
+        {
+            return SqlValue.Integer(
+                operation is BinaryOperator.Equal or BinaryOperator.Is ? 1 : 0);
+        }
         return EvaluateOrderingComparison(operation, comparison: 0);
     }
 
-    private SqlValue EvaluateBetweenValues(SqlValue value, SqlValue lower, SqlValue upper, bool negated)
+    private SqlValue EvaluateBetweenValues(
+        SqlValue lowerValue,
+        SqlValue lower,
+        SqlValue upperValue,
+        SqlValue upper,
+        bool negated,
+        string? lowerCollation = null,
+        string? upperCollation = null)
     {
         var result = EvaluateBinaryValues(
             BinaryOperator.And,
-            EvaluateBinaryValues(BinaryOperator.GreaterThanOrEqual, value, lower),
-            EvaluateBinaryValues(BinaryOperator.LessThanOrEqual, value, upper));
+            EvaluateBinaryValues(
+                BinaryOperator.GreaterThanOrEqual,
+                lowerValue,
+                lower,
+                lowerCollation),
+            EvaluateBinaryValues(
+                BinaryOperator.LessThanOrEqual,
+                upperValue,
+                upper,
+                upperCollation));
         if (result.Kind == SqlValueKind.Null || !negated)
             return result;
 
@@ -16060,16 +17128,20 @@ public sealed class EmbeddedDatabase : IDisposable
             return rows[0];
 
         var maximum = controllingExtremum.Name == "MAX";
+        var collation = GetEffectiveCollation(controllingExtremum.Arguments[0], context);
         var extreme = SqlValue.Null;
         SourceRow? representative = null;
         foreach (var row in effectiveRows)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
             var value = Evaluate(controllingExtremum.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
 
             if (representative is null
-                || (maximum ? Compare(value, extreme) > 0 : Compare(value, extreme) < 0))
+                || (maximum
+                    ? Compare(value, extreme, collation) > 0
+                    : Compare(value, extreme, collation) < 0))
             {
                 extreme = value;
                 representative = row;
@@ -16159,7 +17231,8 @@ public sealed class EmbeddedDatabase : IDisposable
             BinaryExpression binary => EvaluateBinaryValues(
                 binary.Operator,
                 EvaluateAggregate(binary.Left, rows, parameters, context, representative),
-                EvaluateAggregate(binary.Right, rows, parameters, context, representative)),
+                EvaluateAggregate(binary.Right, rows, parameters, context, representative),
+                GetComparisonCollation(binary.Left, binary.Right, context)),
             CollationExpression collation
                 => EvaluateAggregate(collation.Expression, rows, parameters, context, representative),
             CastExpression cast => CastValue(
@@ -16201,25 +17274,121 @@ public sealed class EmbeddedDatabase : IDisposable
         if (leftCount != rightCount)
             throw new EmbeddedSqlException("row value misused");
 
-        return EvaluateMaterializedComparison(
-            expression.Operator,
-            EvaluateAggregateExpressionValues(
+        SqlValue[]? leftSubqueryValues = null;
+        SqlValue[]? rightSubqueryValues = null;
+        var foundNull = false;
+        var isOperator = expression.Operator is BinaryOperator.Is or BinaryOperator.IsNot;
+        for (var index = 0; index < leftCount; index++)
+        {
+            var leftValue = EvaluateAggregateExpressionElement(
                 expression.Left,
+                index,
                 leftCount,
                 rows,
                 parameters,
                 context,
-                representative),
-            EvaluateAggregateExpressionValues(
+                representative,
+                ref leftSubqueryValues);
+            var rightValue = EvaluateAggregateExpressionElement(
                 expression.Right,
+                index,
                 rightCount,
                 rows,
                 parameters,
                 context,
+                representative,
+                ref rightSubqueryValues);
+            var leftElement = GetExpressionElement(expression.Left, index);
+            var rightElement = GetExpressionElement(expression.Right, index);
+            ApplyComparisonAffinities(
+                leftElement,
+                rightElement,
+                representative,
+                ref leftValue,
+                ref rightValue);
+            if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+            {
+                if (isOperator)
+                {
+                    if (leftValue.Kind != rightValue.Kind)
+                    {
+                        return SqlValue.Integer(
+                            expression.Operator == BinaryOperator.IsNot ? 1 : 0);
+                    }
+
+                    continue;
+                }
+
+                foundNull = true;
+                if (expression.Operator is not (BinaryOperator.Equal or BinaryOperator.NotEqual))
+                    return SqlValue.Null;
+                continue;
+            }
+
+            var comparison = Compare(
+                leftValue,
+                rightValue,
+                GetComparisonCollation(leftElement, rightElement, representative));
+            if (expression.Operator is BinaryOperator.Equal or BinaryOperator.NotEqual || isOperator)
+            {
+                if (comparison != 0)
+                {
+                    return SqlValue.Integer(
+                        expression.Operator is BinaryOperator.NotEqual or BinaryOperator.IsNot
+                            ? 1
+                            : 0);
+                }
+
+                continue;
+            }
+            if (comparison != 0)
+                return EvaluateOrderingComparison(expression.Operator, comparison);
+        }
+
+        if (foundNull)
+            return SqlValue.Null;
+        if (expression.Operator is BinaryOperator.Equal or BinaryOperator.NotEqual || isOperator)
+        {
+            return SqlValue.Integer(
+                expression.Operator is BinaryOperator.Equal or BinaryOperator.Is ? 1 : 0);
+        }
+
+        return EvaluateOrderingComparison(expression.Operator, comparison: 0);
+    }
+
+    private SqlValue EvaluateAggregateExpressionElement(
+        Expression expression,
+        int index,
+        int count,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? representative,
+        ref SqlValue[]? subqueryValues)
+    {
+        return expression switch
+        {
+            RowValueExpression rowValue => EvaluateAggregate(
+                rowValue.Values[index],
+                rows,
+                parameters,
+                context,
                 representative),
-            expression.Left,
-            expression.Right,
-            representative);
+            ScalarSubqueryExpression subquery => (subqueryValues ??=
+                EvaluateSubqueryValues(
+                    subquery.Query,
+                    count,
+                    parameters,
+                    representative,
+                    context))[index],
+            _ when count == 1 => EvaluateAggregate(
+                expression,
+                rows,
+                parameters,
+                context,
+                representative),
+            _ => throw new EmbeddedSqlException("row value misused"),
+        };
     }
 
     private SqlValue EvaluateAggregateIn(
@@ -16233,6 +17402,18 @@ public sealed class EmbeddedDatabase : IDisposable
             return SqlValue.Integer(expression.Negated ? 1 : 0);
 
         var valueCount = GetExpressionValueCount(expression.Value, context);
+        if (valueCount == 1
+            && expression.Values.All(candidate =>
+                GetExpressionValueCount(candidate, context) == 1))
+        {
+            return EvaluateAggregateScalarIn(
+                expression,
+                rows,
+                parameters,
+                context,
+                representative);
+        }
+
         var candidates = new List<SqlValue[]>(expression.Values.Count);
         foreach (var candidate in expression.Values)
         {
@@ -16267,6 +17448,48 @@ public sealed class EmbeddedDatabase : IDisposable
             expression.Values[^1],
             representative,
             expression.Negated);
+    }
+
+    private SqlValue EvaluateAggregateScalarIn(
+        InExpression expression,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? representative)
+    {
+        var value = EvaluateAggregate(
+            expression.Value,
+            rows,
+            parameters,
+            context,
+            representative);
+        var valueIsNull = value.Kind == SqlValueKind.Null;
+        var foundNull = false;
+        var collation = GetEffectiveCollation(expression.Value, context);
+        foreach (var candidateExpression in expression.Values)
+        {
+            var candidate = EvaluateAggregate(
+                candidateExpression,
+                rows,
+                parameters,
+                context,
+                representative);
+            if (valueIsNull)
+                continue;
+            if (candidate.Kind == SqlValueKind.Null)
+            {
+                foundNull = true;
+                continue;
+            }
+
+            ApplyInComparisonAffinity(expression.Value, representative, ref candidate);
+            if (Compare(value, candidate, collation) == 0)
+                return SqlValue.Integer(expression.Negated ? 0 : 1);
+        }
+
+        if (valueIsNull || foundNull)
+            return SqlValue.Null;
+        return SqlValue.Integer(expression.Negated ? 1 : 0);
     }
 
     private SqlValue EvaluateAggregateInSubquery(
@@ -16320,37 +17543,82 @@ public sealed class EmbeddedDatabase : IDisposable
             parameters,
             context,
             representative);
-        var result = ApplyLogical(
-            BinaryOperator.And,
-            EvaluateMaterializedComparison(
-                BinaryOperator.GreaterThanOrEqual,
-                value,
-                EvaluateAggregateExpressionValues(
-                    expression.Lower,
-                    count,
-                    rows,
-                    parameters,
-                    context,
-                    representative),
-                expression.Value,
-                expression.Lower,
-                representative),
-            EvaluateMaterializedComparison(
-                BinaryOperator.LessThanOrEqual,
-                value,
-                EvaluateAggregateExpressionValues(
-                    expression.Upper,
-                    count,
-                    rows,
-                    parameters,
-                    context,
-                    representative),
-                expression.Value,
-                expression.Upper,
-                representative));
+        var lowerResult = EvaluateAggregateMaterializedExpressionComparison(
+            BinaryOperator.GreaterThanOrEqual,
+            value,
+            expression.Value,
+            expression.Lower,
+            rows,
+            parameters,
+            context,
+            representative);
+        var result = lowerResult.Kind == SqlValueKind.Integer
+            && lowerResult.AsInteger() == 0
+                ? lowerResult
+                : ApplyLogical(
+                    BinaryOperator.And,
+                    lowerResult,
+                    EvaluateAggregateMaterializedExpressionComparison(
+                        BinaryOperator.LessThanOrEqual,
+                        value,
+                        expression.Value,
+                        expression.Upper,
+                        rows,
+                        parameters,
+                        context,
+                        representative));
         if (result.Kind == SqlValueKind.Null || !expression.Negated)
             return result;
         return SqlValue.Integer(result.AsInteger() == 0 ? 1 : 0);
+    }
+
+    private SqlValue EvaluateAggregateMaterializedExpressionComparison(
+        BinaryOperator operation,
+        IReadOnlyList<SqlValue> left,
+        Expression leftExpression,
+        Expression rightExpression,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? representative)
+    {
+        var count = GetExpressionValueCount(rightExpression, context);
+        if (left.Count != count)
+            throw new EmbeddedSqlException("row value misused");
+
+        SqlValue[]? subqueryValues = null;
+        for (var index = 0; index < count; index++)
+        {
+            var leftValue = left[index];
+            var rightValue = EvaluateAggregateExpressionElement(
+                rightExpression,
+                index,
+                count,
+                rows,
+                parameters,
+                context,
+                representative,
+                ref subqueryValues);
+            var leftElement = GetExpressionElement(leftExpression, index);
+            var rightElement = GetExpressionElement(rightExpression, index);
+            ApplyComparisonAffinities(
+                leftElement,
+                rightElement,
+                representative,
+                ref leftValue,
+                ref rightValue);
+            if (leftValue.Kind == SqlValueKind.Null || rightValue.Kind == SqlValueKind.Null)
+                return SqlValue.Null;
+
+            var comparison = Compare(
+                leftValue,
+                rightValue,
+                GetComparisonCollation(leftElement, rightElement, representative));
+            if (comparison != 0)
+                return EvaluateOrderingComparison(operation, comparison);
+        }
+
+        return EvaluateOrderingComparison(operation, comparison: 0);
     }
 
     private SqlValue[] EvaluateAggregateExpressionValues(
@@ -16402,9 +17670,15 @@ public sealed class EmbeddedDatabase : IDisposable
         var result = rows;
         if (function.Filter is not null)
         {
-            result = result
-                .Where(row => IsTrue(Evaluate(function.Filter, parameters, row, context)))
-                .ToList();
+            var filtered = new List<SourceRow>();
+            foreach (var row in result)
+            {
+                context.CancellationToken.ThrowIfCancellationRequested();
+                if (IsTrue(Evaluate(function.Filter, parameters, row, context)))
+                    filtered.Add(row);
+            }
+
+            result = filtered;
         }
 
         if (function.Distinct)
@@ -16412,11 +17686,12 @@ public sealed class EmbeddedDatabase : IDisposable
             if (function.Arguments.Count != 1)
                 throw new EmbeddedSqlException("DISTINCT aggregates must have exactly one argument.");
 
-            var collation = GetCollation(function.Arguments[0]);
+            var collation = GetEffectiveCollation(function.Arguments[0], context);
             var seen = new List<SqlValue>();
             var deduplicated = new List<SourceRow>();
             foreach (var row in result)
             {
+                context.CancellationToken.ThrowIfCancellationRequested();
                 var value = Evaluate(function.Arguments[0], parameters, row, context);
                 if (seen.Any(existing => DistinctValuesEqual(existing, value, collation)))
                     continue;
@@ -16451,6 +17726,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var count = 0L;
         foreach (var row in rows)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
             if (Evaluate(function.Arguments[0], parameters, row, context).Kind != SqlValueKind.Null)
                 count++;
         }
@@ -16510,6 +17786,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var count = 0L;
         foreach (var row in rows)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -16553,14 +17830,18 @@ public sealed class EmbeddedDatabase : IDisposable
         bool maximum)
     {
         RequireAggregateArgumentCount(function.Name.ToLowerInvariant(), function.Arguments, 1);
+        var collation = GetEffectiveCollation(function.Arguments[0], context);
         var result = SqlValue.Null;
         foreach (var row in rows)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
             if (result.Kind == SqlValueKind.Null
-                || (maximum ? Compare(value, result) > 0 : Compare(value, result) < 0))
+                || (maximum
+                    ? Compare(value, result, collation) > 0
+                    : Compare(value, result, collation) < 0))
             {
                 result = value;
             }
@@ -16582,6 +17863,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var hasValue = false;
         foreach (var row in rows)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -16621,6 +17903,7 @@ public sealed class EmbeddedDatabase : IDisposable
         var accumulator = aggregate.Seed;
         foreach (var row in rows)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
             var arguments = function.Arguments
                 .Select(argument => Evaluate(argument, parameters, row, context))
                 .ToArray();
@@ -16649,6 +17932,7 @@ public sealed class EmbeddedDatabase : IDisposable
 
         foreach (var row in rows)
         {
+            context.CancellationToken.ThrowIfCancellationRequested();
             if (!TryGetPercentileNumericValue(
                     Evaluate(function.Arguments[0], parameters, row, context),
                     out var value))
@@ -16758,17 +18042,38 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? representative)
     {
-        var operand = expression.Operand is null
-            ? (SqlValue?)null
-            : EvaluateAggregate(expression.Operand, rows, parameters, context, representative);
+        SqlValue[]? operand = null;
+        var operandCount = 0;
+        if (expression.Operand is not null)
+        {
+            operandCount = GetExpressionValueCount(expression.Operand, context);
+            operand = EvaluateAggregateExpressionValues(
+                expression.Operand,
+                operandCount,
+                rows,
+                parameters,
+                context,
+                representative);
+        }
+
         foreach (var clause in expression.Clauses)
         {
-            var when = EvaluateAggregate(clause.When, rows, parameters, context, representative);
             var matches = operand is null
-                ? IsTrue(when)
-                : operand.Value.Kind != SqlValueKind.Null
-                    && when.Kind != SqlValueKind.Null
-                    && Compare(operand.Value, when) == 0;
+                ? IsTrue(EvaluateAggregate(
+                    clause.When,
+                    rows,
+                    parameters,
+                    context,
+                    representative))
+                : EvaluateAggregateCaseEquality(
+                    operand,
+                    expression.Operand!,
+                    clause.When,
+                    rows,
+                    parameters,
+                    context,
+                    representative) is { Kind: SqlValueKind.Integer } equality
+                    && equality.AsInteger() != 0;
             if (matches)
                 return EvaluateAggregate(clause.Then, rows, parameters, context, representative);
         }
@@ -16776,6 +18081,58 @@ public sealed class EmbeddedDatabase : IDisposable
         return expression.Else is null
             ? SqlValue.Null
             : EvaluateAggregate(expression.Else, rows, parameters, context, representative);
+    }
+
+    private SqlValue EvaluateAggregateCaseEquality(
+        IReadOnlyList<SqlValue> operand,
+        Expression operandExpression,
+        Expression whenExpression,
+        IReadOnlyList<SourceRow> rows,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? representative)
+    {
+        var count = GetExpressionValueCount(whenExpression, context);
+        if (operand.Count != count)
+            throw new EmbeddedSqlException("row value misused");
+
+        SqlValue[]? subqueryValues = null;
+        var foundNull = false;
+        for (var index = 0; index < count; index++)
+        {
+            var left = operand[index];
+            var right = EvaluateAggregateExpressionElement(
+                whenExpression,
+                index,
+                count,
+                rows,
+                parameters,
+                context,
+                representative,
+                ref subqueryValues);
+            var leftElement = GetExpressionElement(operandExpression, index);
+            var rightElement = GetExpressionElement(whenExpression, index);
+            ApplyComparisonAffinities(
+                leftElement,
+                rightElement,
+                representative,
+                ref left,
+                ref right);
+            if (left.Kind == SqlValueKind.Null || right.Kind == SqlValueKind.Null)
+            {
+                foundNull = true;
+                continue;
+            }
+            if (Compare(
+                    left,
+                    right,
+                    GetComparisonCollation(leftElement, rightElement, representative)) != 0)
+            {
+                return SqlValue.Integer(0);
+            }
+        }
+
+        return foundNull ? SqlValue.Null : SqlValue.Integer(1);
     }
 
     private SqlValue EvaluateScalarFunction(
@@ -16826,9 +18183,9 @@ public sealed class EmbeddedDatabase : IDisposable
             "LENGTH" => EvaluateLength(arguments),
             "LIKE" => EvaluateLikeFunction(arguments),
             "LOWER" => EvaluateCase(arguments, ToSqliteLower),
-            "MIN" => EvaluateScalarMinMax(arguments, maximum: false),
-            "MAX" => EvaluateScalarMinMax(arguments, maximum: true),
-            "NULLIF" => EvaluateNullIf(function, arguments),
+            "MIN" => EvaluateScalarMinMax(function, arguments, context, maximum: false),
+            "MAX" => EvaluateScalarMinMax(function, arguments, context, maximum: true),
+            "NULLIF" => EvaluateNullIf(function, arguments, context),
             "FORMAT" or "PRINTF" => EvaluatePrintf(arguments),
             "STRFTIME" => SqliteDateTime.Strftime(arguments),
             "TIME" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.Time),
@@ -17911,14 +19268,25 @@ public sealed class EmbeddedDatabase : IDisposable
         return SqlValue.Integer(context.LastInsertRowId);
     }
 
-    private SqlValue EvaluateNullIf(FunctionExpression function, IReadOnlyList<SqlValue> arguments)
+    private SqlValue EvaluateNullIf(
+        FunctionExpression function,
+        IReadOnlyList<SqlValue> arguments,
+        QueryContext context)
     {
         RequireArgumentCount("nullif", arguments, 2);
         var value = arguments[0];
         if (value.Kind == SqlValueKind.Null)
             return SqlValue.Null;
 
-        return Compare(value, arguments[1], GetCollation(function.Arguments[0])) == 0 ? SqlValue.Null : value;
+        return Compare(
+            value,
+            arguments[1],
+            GetComparisonCollation(
+                function.Arguments[0],
+                function.Arguments[1],
+                context)) == 0
+            ? SqlValue.Null
+            : value;
     }
 
     private static SqlValue EvaluateAbsoluteValue(IReadOnlyList<SqlValue> arguments)
@@ -18169,17 +19537,26 @@ public sealed class EmbeddedDatabase : IDisposable
             negated: false);
     }
 
-    private SqlValue EvaluateScalarMinMax(IReadOnlyList<SqlValue> arguments, bool maximum)
+    private SqlValue EvaluateScalarMinMax(
+        FunctionExpression function,
+        IReadOnlyList<SqlValue> arguments,
+        QueryContext context,
+        bool maximum)
     {
         if (arguments.Count < 2)
             throw new EmbeddedSqlException($"wrong number of arguments to function {(maximum ? "max" : "min")}()");
 
+        var collation = function.Arguments
+                .Select(argument => GetEffectiveCollation(argument, context))
+                .FirstOrDefault(candidate => candidate is not null);
         var result = arguments[0];
         foreach (var value in arguments.Skip(1))
         {
             if (result.Kind == SqlValueKind.Null || value.Kind == SqlValueKind.Null)
                 return SqlValue.Null;
-            if (maximum ? Compare(value, result) > 0 : Compare(value, result) < 0)
+            if (maximum
+                    ? Compare(value, result, collation) > 0
+                    : Compare(value, result, collation) < 0)
                 result = value;
         }
 
@@ -18328,13 +19705,152 @@ public sealed class EmbeddedDatabase : IDisposable
         };
     }
 
-    private static string? GetCollation(Expression expression)
+    private static string? GetCollation(Expression expression) =>
+        GetExplicitCollation(expression);
+
+    private static string? GetEffectiveCollation(Expression expression, QueryContext context) =>
+        GetExplicitCollation(expression) ?? GetInheritedDeclaredCollation(expression, context);
+
+    private static string? GetComparisonCollation(
+        Expression left,
+        Expression right,
+        QueryContext context) =>
+        GetExplicitCollation(left)
+            ?? GetExplicitCollation(right)
+            ?? GetInheritedDeclaredCollation(left, context)
+            ?? GetInheritedDeclaredCollation(right, context);
+
+    private static string? GetExplicitCollation(Expression? expression)
     {
         return expression switch
         {
+            null => null,
             CollationExpression collation => collation.Name,
+            FunctionExpression function => function.Arguments
+                    .Select(GetExplicitCollation)
+                    .FirstOrDefault(collation => collation is not null),
+            UnaryExpression unary => GetExplicitCollation(unary.Operand),
+            BinaryExpression binary => GetExplicitCollation(binary.Left)
+                ?? GetExplicitCollation(binary.Right),
+            CastExpression cast => GetExplicitCollation(cast.Expression),
+            CaseExpression @case => GetExplicitCollation(@case.Operand)
+                ?? @case.Clauses
+                    .SelectMany(clause => new[]
+                    {
+                        GetExplicitCollation(clause.When),
+                        GetExplicitCollation(clause.Then),
+                    })
+                    .FirstOrDefault(collation => collation is not null)
+                ?? GetExplicitCollation(@case.Else),
+            LikeExpression like => GetExplicitCollation(like.Value)
+                ?? GetExplicitCollation(like.Pattern)
+                ?? GetExplicitCollation(like.Escape),
+            GlobExpression glob => GetExplicitCollation(glob.Value)
+                ?? GetExplicitCollation(glob.Pattern),
+            InExpression @in => GetExplicitCollation(@in.Value)
+                ?? @in.Values
+                    .Select(GetExplicitCollation)
+                    .FirstOrDefault(collation => collation is not null),
+            InSubqueryExpression @in => GetExplicitCollation(@in.Value),
+            BetweenExpression between => GetExplicitCollation(between.Value)
+                ?? GetExplicitCollation(between.Lower)
+                ?? GetExplicitCollation(between.Upper),
             _ => null,
         };
+    }
+
+    private static string? GetInheritedDeclaredCollation(
+        Expression expression,
+        QueryContext context)
+    {
+        var column = expression switch
+        {
+            ColumnExpression direct => direct,
+            CastExpression cast => cast.Expression as ColumnExpression,
+            _ => null,
+        };
+        if (column is null)
+            return expression is CastExpression cast
+                ? GetInheritedDeclaredCollation(cast.Expression, context)
+                : null;
+
+        if (context.CollationScope is not null
+            && context.CollationScope.TryGetValue(column.Name, out var collation))
+        {
+            return collation;
+        }
+
+        if (context.OuterCollationScopes is not null)
+        {
+            foreach (var scope in context.OuterCollationScopes)
+            {
+                if (scope.TryGetValue(column.Name, out collation))
+                    return collation;
+            }
+        }
+
+        return null;
+    }
+
+    private static QueryContext EnterCollationSource(QueryContext context, TableSource? source)
+    {
+        if (ReferenceEquals(context.CollationSource, source))
+            return context;
+
+        IReadOnlyList<IReadOnlyDictionary<string, string?>>? outerScopes =
+            context.OuterCollationScopes;
+        if (context.CollationScope is not null)
+        {
+            var scopes = new List<IReadOnlyDictionary<string, string?>>(
+                1 + (outerScopes?.Count ?? 0))
+            {
+                context.CollationScope,
+            };
+            if (outerScopes is not null)
+                scopes.AddRange(outerScopes);
+            outerScopes = scopes;
+        }
+
+        return context with
+        {
+            CollationSource = source,
+            CollationScope = source is null ? null : BuildCollationScope(source, context),
+            OuterCollationScopes = outerScopes,
+        };
+    }
+
+    private static QueryContext RefreshCollationSource(
+        QueryContext context,
+        TableSource? source) => context with
+        {
+            CollationSource = source,
+            CollationScope = source is null ? null : BuildCollationScope(source, context),
+        };
+
+    private static IReadOnlyDictionary<string, string?> BuildCollationScope(
+        TableSource source,
+        QueryContext context)
+    {
+        var scope = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        if (source is NamedTableSource named
+            && !IsSchemaTable(named.Name)
+            && !context.Tables.ContainsKey(named.Name)
+            && !context.CommonTableExpressions.ContainsKey(named.Name)
+            && !TryGetView(context, named.Name, out _))
+        {
+            return scope;
+        }
+
+        foreach (var column in GetRawOutputColumns(source, context))
+        {
+            var collation = NormalizeDeclaredCollation(
+                GetDeclaredOutputColumnCollation(source, column, context));
+            scope.TryAdd(column.Name, collation);
+            if (column.Qualifier is not null)
+                scope[$"{column.Qualifier}.{column.Name}"] = collation;
+        }
+
+        return scope;
     }
 
     private static void ApplyComparisonAffinities(
@@ -18373,7 +19889,9 @@ public sealed class EmbeddedDatabase : IDisposable
         {
             CollationExpression collation => GetComparisonAffinity(collation.Expression, row),
             ColumnExpression column => row?.GetColumnDefinition(column) is { } definition
-                ? EmbeddedTable.GetAffinity(definition.DeclaredType)
+                ? definition.StrictAny
+                    ? null
+                    : EmbeddedTable.GetAffinity(definition.DeclaredType)
                 : null,
             CastExpression cast => EmbeddedTable.GetAffinity(cast.TypeName),
             _ => null,
@@ -18420,15 +19938,24 @@ public sealed class EmbeddedDatabase : IDisposable
     {
         while (expression is CollationExpression collation)
             expression = collation.Expression;
+        if (expression is CastExpression cast)
+            return GetDeclaredCollation(cast.Expression, row);
         return expression is ColumnExpression column
-            ? row?.GetColumnDefinition(column)?.Collation
-            : null;
+            && row?.GetColumnDefinition(column) is { } definition
+                ? NormalizeDeclaredCollation(definition.Collation)
+                : null;
     }
 
     private void ValidateOrderByCollations(IReadOnlyList<OrderByTerm> orderBy)
     {
         foreach (var term in orderBy)
             ValidateCollation(GetCollation(term.Expression));
+    }
+
+    private void ValidateGroupByCollations(IReadOnlyList<Expression> groupBy)
+    {
+        foreach (var expression in groupBy)
+            ValidateCollation(GetCollation(expression));
     }
 
     private void ValidateCollation(string? collation)
@@ -19121,7 +20648,7 @@ public sealed class EmbeddedDatabase : IDisposable
                         leftValue,
                         rightValue,
                         term,
-                        GetCollation(term.Expression));
+                        GetEffectiveCollation(term.Expression, context));
                     if (comparison == 0)
                         continue;
 
@@ -19226,17 +20753,35 @@ public sealed class EmbeddedDatabase : IDisposable
             switch (projection.Expression)
             {
                 case StarExpression:
-                    for (var index = 0; index < outputColumns.Count; index++)
-                        collations.Add(null);
+                    collations.AddRange(outputColumns.Select(column =>
+                        NormalizeDeclaredCollation(
+                            GetDeclaredOutputColumnCollation(statement.Source, column, context))));
                     break;
                 case QualifiedStarExpression qualifiedStar:
-                    var count = GetRawOutputColumns(statement.Source, context)
-                        .Count(column => string.Equals(column.Qualifier, qualifiedStar.Qualifier, StringComparison.OrdinalIgnoreCase));
-                    for (var index = 0; index < count; index++)
-                        collations.Add(null);
+                    foreach (var raw in GetRawOutputColumns(statement.Source, context).Where(raw =>
+                                 string.Equals(
+                                     raw.Qualifier,
+                                     qualifiedStar.Qualifier,
+                                     StringComparison.OrdinalIgnoreCase)))
+                    {
+                        var output = outputColumns.FirstOrDefault(column =>
+                            string.Equals(
+                                column.Qualifier,
+                                qualifiedStar.Qualifier,
+                                StringComparison.OrdinalIgnoreCase)
+                            && column.Index == raw.Index) ?? raw;
+                        collations.Add(NormalizeDeclaredCollation(
+                            GetDeclaredOutputColumnCollation(
+                                statement.Source,
+                                output,
+                                context)));
+                    }
+
                     break;
                 default:
-                    collations.Add(GetCollation(projection.Expression));
+                    collations.Add(GetEffectiveCollation(
+                        projection.Expression,
+                        EnterCollationSource(context, statement.Source)));
                     break;
             }
         }
@@ -19300,21 +20845,39 @@ public sealed class EmbeddedDatabase : IDisposable
         foreach (var function in functions)
             results.Add(function, new SqlValue[rows.Count]);
 
-        var partitionCollations = spec.PartitionBy.Select(GetCollation).ToArray();
+        var partitionCollations = spec.PartitionBy
+            .Select(expression => GetEffectiveCollation(expression, context))
+            .ToArray();
+        VdbeGroupComparer partitionEquality = (left, right) =>
+            GroupKeysEqual(left, right, partitionCollations);
+        var partitionHasher = BuildGroupHasher(partitionCollations);
+        var partitionIndexByKey = partitionHasher is null
+            ? null
+            : new Dictionary<SqlValue[], WindowPartition>(
+                new GroupKeyEqualityComparer(partitionEquality, partitionHasher));
         var partitions = new List<WindowPartition>();
         var orderKeysBySource = new SqlValue[rows.Count][];
         for (var index = 0; index < rows.Count; index++)
         {
             context.CancellationToken.ThrowIfCancellationRequested();
-            var keys = spec.PartitionBy
-                .Select(expression => Evaluate(expression, parameters, rows[index], context))
-                .ToArray();
-            var partition = partitions.FirstOrDefault(candidate =>
-                WindowPartitionKeysEqual(candidate.Keys, keys, partitionCollations));
+            var keys = spec.PartitionBy.Count == 0
+                ? []
+                : EvaluateGroupKey(spec.PartitionBy, parameters, rows[index], context);
+            WindowPartition? partition;
+            if (partitionIndexByKey is not null)
+            {
+                partitionIndexByKey.TryGetValue(keys, out partition);
+            }
+            else
+            {
+                partition = partitions.FirstOrDefault(candidate =>
+                    partitionEquality(candidate.Keys, keys));
+            }
             if (partition is null)
             {
                 partition = new WindowPartition(keys);
                 partitions.Add(partition);
+                partitionIndexByKey?.Add(keys, partition);
             }
 
             partition.Members.Add(index);
@@ -20013,7 +21576,7 @@ public sealed class EmbeddedDatabase : IDisposable
                 Evaluate(term.Expression, parameters, left, context),
                 Evaluate(term.Expression, parameters, right, context),
                 term,
-                GetCollation(term.Expression));
+                GetEffectiveCollation(term.Expression, context));
             if (comparison == 0)
                 continue;
 
@@ -20050,7 +21613,7 @@ public sealed class EmbeddedDatabase : IDisposable
                         right.Representative)
                     : Evaluate(term.Expression, parameters, right.Representative, context),
                 term,
-                GetCollation(term.Expression));
+                GetEffectiveCollation(term.Expression, context));
             if (comparison == 0)
                 continue;
 
@@ -23882,15 +25445,52 @@ public sealed class EmbeddedConnection : IDisposable
             UpdateStatement update => RouteDataStatement(update),
             DeleteStatement delete => RouteDataStatement(delete),
             QueryStatement query => RouteQuery(query),
-            ExplainStatement { Inner: var inner } when ContainsSchemaQualification(inner)
+            ExplainStatement { Inner: var inner } when ContainsAttachedSchemaQualification(inner)
                 => throw new EmbeddedSqlException("EXPLAIN for schema-qualified managed ATTACH statements is not supported."),
-            ExplainQueryPlanStatement { Inner: var inner } when ContainsSchemaQualification(inner)
+            ExplainQueryPlanStatement { Inner: var inner } when ContainsAttachedSchemaQualification(inner)
                 => throw new EmbeddedSqlException(
                     "EXPLAIN QUERY PLAN for schema-qualified managed ATTACH statements is not supported."),
+            ExplainStatement explain => RouteExplain(
+                explain.Inner,
+                rewritten => new ExplainStatement(rewritten)),
+            ExplainQueryPlanStatement explainQueryPlan => RouteExplain(
+                explainQueryPlan.Inner,
+                rewritten => new ExplainQueryPlanStatement(rewritten)),
             _ when ContainsSchemaQualification(statement)
                 => throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH."),
             _ => new RoutedStatement(_database, statement, IsAttached: false),
         };
+    }
+
+    private RoutedStatement RouteExplain(
+        ParsedStatement inner,
+        Func<ParsedStatement, ParsedStatement> wrap)
+    {
+        var routed = inner switch
+        {
+            QueryStatement query => RouteQuery(query),
+            WithDmlStatement or InsertStatement or UpdateStatement or DeleteStatement
+                => RouteDataStatement(inner),
+            _ => new RoutedStatement(_database, inner, IsAttached: false),
+        };
+        return routed with { Statement = wrap(routed.Statement) };
+    }
+
+    private static bool ContainsAttachedSchemaQualification(ParsedStatement statement)
+    {
+        var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var commonTableExpressions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (statement is QueryStatement query)
+            CollectQuerySchemas(query, schemas, commonTableExpressions);
+        else if (statement is WithDmlStatement or InsertStatement or UpdateStatement or DeleteStatement)
+            CollectStatementSchemas(statement, schemas, commonTableExpressions);
+        else
+            return false;
+        return schemas.Any(schema =>
+            schema.Length != 0
+            && schema[0] != UnqualifiedSchemaMarker
+            && !schema.Equals("main", StringComparison.OrdinalIgnoreCase)
+            && !schema.Equals("temp", StringComparison.OrdinalIgnoreCase));
     }
 
     private RoutedStatement RouteNamedStatement(string objectName, Func<string, ParsedStatement> rewrite)
@@ -25763,10 +27363,26 @@ public sealed class EmbeddedStatement : IDisposable
             return;
         }
 
-        _result = _connection.Execute(_statement, _boundValues, cancellationToken);
-        if (!EmbeddedDatabase.MayMutate(_statement))
-            cancellationToken.ThrowIfCancellationRequested();
-        OpenReaderLeaseIfNeeded();
+        IDisposable? executionLease = _statement is
+            VacuumStatement or PragmaJournalModeStatement or PragmaPageSizeStatement
+            ? null
+            : _connection.OpenStatementReaderLease();
+        try
+        {
+            _result = _connection.Execute(_statement, _boundValues, cancellationToken);
+            if (!EmbeddedDatabase.MayMutate(_statement))
+                cancellationToken.ThrowIfCancellationRequested();
+            if (_result.Rows.Count != 0)
+            {
+                _readerLease = executionLease
+                    ?? _connection.OpenStatementReaderLease();
+                executionLease = null;
+            }
+        }
+        finally
+        {
+            executionLease?.Dispose();
+        }
     }
 
     private void OpenReaderLeaseIfNeeded()
@@ -25845,7 +27461,15 @@ internal sealed class EmbeddedTable
         bool strict = false)
     {
         Name = name;
-        ColumnDefinitions = columns.ToArray();
+        ColumnDefinitions = columns
+            .Select(column => strict
+                    && string.Equals(
+                        column.DeclaredType?.Trim(),
+                        "ANY",
+                        StringComparison.OrdinalIgnoreCase)
+                ? column with { StrictAny = true }
+                : column)
+            .ToArray();
         Columns = ColumnDefinitions.Select(column => column.Name).ToArray();
         _columnIndices = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         for (var index = 0; index < Columns.Length; index++)

@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Runtime.ExceptionServices;
 
 namespace Turso.Core.Execution;
 
@@ -9,6 +10,7 @@ public enum ResumableStatementState
     Yielded,
     Done,
     Disposed,
+    Faulted,
 }
 
 public enum ResumableStatementStepResult
@@ -38,6 +40,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly object?[] _accumulatorContexts;
     private readonly bool[] _accumulatorInitialized;
     private readonly List<SqlValue[]>?[] _distinctSets;
+    private readonly Dictionary<SqlValue[], int>?[] _groupIndexes;
     private readonly int[] _rowSetPositions;
     private readonly WorkTableRuntime?[] _workTables;
     private readonly IReadOnlyList<VdbeCursorSource?>? _cursorSources;
@@ -83,6 +86,7 @@ public sealed class ResumableStatement : IDisposable
         _accumulatorContexts = new object?[program.AccumulatorCount];
         _accumulatorInitialized = new bool[program.AccumulatorCount];
         _distinctSets = new List<SqlValue[]>?[program.DistinctSetCount];
+        _groupIndexes = new Dictionary<SqlValue[], int>?[program.DistinctSetCount];
         _rowSetPositions = new int[program.DistinctSetCount];
         _workTables = new WorkTableRuntime?[program.WorkTableCount];
         _cursorSources = cursorSources;
@@ -137,9 +141,13 @@ public sealed class ResumableStatement : IDisposable
         };
     }
 
-    public ResumableStatementStepResult StepResumable()
+    public ResumableStatementStepResult StepResumable() =>
+        StepResumable(CancellationToken.None);
+
+    public ResumableStatementStepResult StepResumable(CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
 
         if (State == ResumableStatementState.Yielded)
         {
@@ -149,10 +157,16 @@ public sealed class ResumableStatement : IDisposable
 
         if (State == ResumableStatementState.Done)
             return ResumableStatementStepResult.Done;
+        if (State == ResumableStatementState.Faulted)
+        {
+            throw new InvalidOperationException(
+                "Statement execution faulted. Call Reset before stepping it again.");
+        }
 
         _currentRow = null;
         while (_instructionPointer.Offset < Program.Instructions.Count)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var instruction = Program.Instructions[_instructionPointer.Offset];
             switch (instruction)
             {
@@ -281,6 +295,51 @@ public sealed class ResumableStatement : IDisposable
                         else
                             _instructionPointer = filterRegisters.FalseTarget;
 
+                        break;
+                    }
+                case GroupKeyInstruction groupKey:
+                    {
+                        var key = groupKey.Projector(ReadRegisters(groupKey.Row));
+                        if (key.Length != groupKey.KeyCount)
+                        {
+                            throw new InvalidOperationException(
+                                $"GROUP BY projector returned {key.Length} value(s), expected {groupKey.KeyCount}.");
+                        }
+
+                        var groups = _distinctSets[groupKey.GroupSetIndex] ??= [];
+                        var groupIndex = -1;
+                        if (groupKey.Hasher is not null)
+                        {
+                            var index = _groupIndexes[groupKey.GroupSetIndex] ??=
+                                new Dictionary<SqlValue[], int>(
+                                    new GroupKeyEqualityComparer(
+                                        groupKey.Equality,
+                                        groupKey.Hasher));
+                            if (index.TryGetValue(key, out var existing))
+                                groupIndex = existing;
+                        }
+                        else
+                        {
+                            for (var index = 0; index < groups.Count; index++)
+                            {
+                                if (groupKey.Equality(groups[index], key))
+                                {
+                                    groupIndex = index;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (groupIndex < 0)
+                        {
+                            groupIndex = groups.Count;
+                            var storedKey = key.ToArray();
+                            groups.Add(storedKey);
+                            _groupIndexes[groupKey.GroupSetIndex]?.Add(storedKey, groupIndex);
+                        }
+
+                        _registers[groupKey.Destination.Index] = SqlValue.Integer(groupIndex);
+                        AdvanceInstructionPointer();
                         break;
                     }
                 case ProjectRegistersInstruction project:
@@ -421,29 +480,48 @@ public sealed class ResumableStatement : IDisposable
                     break;
                 case AggStepInstruction aggStep:
                     {
-                        var index = aggStep.Accumulator.Index;
-                        if (!_accumulatorInitialized[index])
+                        try
                         {
-                            _accumulatorContexts[index] = aggStep.Aggregate.CreateContext();
-                            _accumulatorInitialized[index] = true;
+                            var index = aggStep.Accumulator.Index;
+                            if (!_accumulatorInitialized[index])
+                            {
+                                _accumulatorContexts[index] = aggStep.Aggregate.CreateContext();
+                                _accumulatorInitialized[index] = true;
+                            }
+
+                            _accumulatorContexts[index] = aggStep.Aggregate.Accumulate(
+                                _accumulatorContexts[index],
+                                ReadRegisters(aggStep.Arguments));
+                            AdvanceInstructionPointer();
+                        }
+                        catch
+                        {
+                            State = ResumableStatementState.Faulted;
+                            throw;
                         }
 
-                        _accumulatorContexts[index] = aggStep.Aggregate.Accumulate(
-                            _accumulatorContexts[index],
-                            ReadRegisters(aggStep.Arguments));
-                        AdvanceInstructionPointer();
                         break;
                     }
                 case AggFinalizeInstruction aggFinalize:
                     {
-                        var index = aggFinalize.Accumulator.Index;
-                        // Finalizing an accumulator that was reset but never stepped yields the
-                        // aggregate's empty-input value, so empty groups still produce a result.
-                        var context = _accumulatorInitialized[index]
-                            ? _accumulatorContexts[index]
-                            : aggFinalize.Aggregate.CreateContext();
-                        _registers[aggFinalize.Destination.Index] = aggFinalize.Aggregate.Finalize(context);
-                        AdvanceInstructionPointer();
+                        try
+                        {
+                            var index = aggFinalize.Accumulator.Index;
+                            // Finalizing an accumulator that was reset but never stepped yields the
+                            // aggregate's empty-input value, so empty groups still produce a result.
+                            var context = _accumulatorInitialized[index]
+                                ? _accumulatorContexts[index]
+                                : aggFinalize.Aggregate.CreateContext();
+                            _registers[aggFinalize.Destination.Index] =
+                                aggFinalize.Aggregate.Finalize(context);
+                            AdvanceInstructionPointer();
+                        }
+                        catch
+                        {
+                            State = ResumableStatementState.Faulted;
+                            throw;
+                        }
+
                         break;
                     }
                 case SameGroupInstruction sameGroup:
@@ -491,6 +569,32 @@ public sealed class ResumableStatement : IDisposable
                         _currentRow = Array.AsReadOnly(candidate);
                         State = ResumableStatementState.Row;
                         return ResumableStatementStepResult.Row;
+                    }
+                case DistinctGateInstruction distinctGate:
+                    {
+                        var candidate = ReadRegisters(distinctGate.Values);
+                        var seen = _distinctSets[distinctGate.DistinctSetIndex] ??= [];
+                        var duplicate = false;
+                        foreach (var emitted in seen)
+                        {
+                            if (distinctGate.Equality(emitted, candidate))
+                            {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+
+                        if (duplicate)
+                        {
+                            _instructionPointer = distinctGate.DuplicateTarget;
+                        }
+                        else
+                        {
+                            seen.Add(candidate);
+                            AdvanceInstructionPointer();
+                        }
+
+                        break;
                     }
                 case RowSetInsertInstruction rowSetInsert:
                     {
@@ -797,6 +901,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
+        Array.Clear(_groupIndexes);
         Array.Clear(_rowSetPositions);
         Array.Clear(_workTables);
         _transaction.Reset();
@@ -861,6 +966,7 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
+        Array.Clear(_groupIndexes);
         Array.Clear(_rowSetPositions);
         Array.Clear(_workTables);
         _transaction.Reset();
@@ -1114,6 +1220,18 @@ public sealed class ResumableStatement : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
+    private sealed class GroupKeyEqualityComparer(
+        VdbeGroupComparer equality,
+        VdbeGroupHasher hasher) : IEqualityComparer<SqlValue[]>
+    {
+        public bool Equals(SqlValue[]? left, SqlValue[]? right) =>
+            left is not null
+            && right is not null
+            && equality(left, right);
+
+        public int GetHashCode(SqlValue[] key) => hasher(key);
+    }
+
     // Holds one sorter's buffered records and its drain cursor. Records are copied on
     // insert so overwriting the source registers between iterations cannot mutate rows
     // already stored. Sorting is stable: equal-key rows keep their insertion order.
@@ -1161,11 +1279,20 @@ public sealed class ResumableStatement : IDisposable
             for (var index = 0; index < order.Length; index++)
                 order[index] = index;
 
-            Array.Sort(order, (left, right) =>
+            try
             {
-                var comparison = _comparer(_rows[left], _rows[right]);
-                return comparison != 0 ? comparison : left.CompareTo(right);
-            });
+                Array.Sort(order, (left, right) =>
+                {
+                    var comparison = _comparer(_rows[left], _rows[right]);
+                    return comparison != 0 ? comparison : left.CompareTo(right);
+                });
+            }
+            catch (InvalidOperationException exception)
+                when (exception.InnerException is OperationCanceledException cancellation)
+            {
+                ExceptionDispatchInfo.Capture(cancellation).Throw();
+                throw;
+            }
 
             var sorted = new List<SqlValue[]>(_rows.Count);
             foreach (var index in order)

@@ -422,7 +422,8 @@ internal sealed record EmbeddedColumn(
     bool ExplicitNull = false,
     bool GenerationAlways = false,
     bool AutoIncrement = false,
-    IReadOnlyList<ForeignKeyDefinition>? AdditionalForeignKeys = null)
+    IReadOnlyList<ForeignKeyDefinition>? AdditionalForeignKeys = null,
+    bool StrictAny = false)
 {
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether

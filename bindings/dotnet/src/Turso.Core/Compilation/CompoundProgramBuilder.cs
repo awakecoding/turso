@@ -37,10 +37,9 @@ public sealed record CompoundTerm(VdbeProgram Program, IReadOnlyList<VdbeCursorS
 /// (NULL==NULL together with affinity- and collation-aware comparison) rather than re-deriving it here.
 /// </para>
 /// <para>
-/// <c>UNION ALL</c> preserves any de-duplication a term already performs internally (its
-/// <c>DistinctResultRow</c> opcodes and distinct sets are relocated intact), so a distinct sub-query can
-/// appear as a <c>UNION ALL</c> term. <see cref="BuildUnionDistinct"/> appends its outer distinct guard
-/// after each term's existing output guards, retaining nested de-duplication and membership semantics.
+/// <c>UNION ALL</c> preserves internal grouping, de-duplication, and membership state by relocating
+/// each term's sets intact. <see cref="BuildUnionDistinct"/> appends its outer distinct guard after
+/// each term's existing output guards, retaining nested semantics.
 /// </para>
 /// </remarks>
 public static class CompoundProgramBuilder
@@ -159,7 +158,8 @@ public static class CompoundProgramBuilder
             totalSorters += program.SorterCount;
             totalAccumulators += program.AccumulatorCount;
             totalDistinctSets += program.DistinctSetCount;
-            totalInstructions += KeptInstructionCount(program, isLast: i == count - 1);
+            totalInstructions += KeptInstructionCount(program, isLast: i == count - 1)
+                + (i == count - 1 ? 0 : program.AccumulatorCount);
             totalParameterSlots += program.ParameterSlotCount;
         }
 
@@ -188,6 +188,14 @@ public static class CompoundProgramBuilder
                     parameterSlotBase[i],
                     distinctEquality,
                     outerDistinctSet));
+            }
+            if (i != count - 1)
+            {
+                for (var accumulator = 0; accumulator < program.AccumulatorCount; accumulator++)
+                {
+                    instructions.Add(new AggResetInstruction(
+                        new Accumulator(accumulatorBase[i] + accumulator)));
+                }
             }
 
             cursorSources.AddRange(term.CursorSources);
@@ -275,7 +283,8 @@ public static class CompoundProgramBuilder
             totalSorters += program.SorterCount;
             totalAccumulators += program.AccumulatorCount;
             totalDistinctSets += program.DistinctSetCount;
-            totalInstructions += KeptInstructionCount(program, isLast: false);
+            totalInstructions += KeptInstructionCount(program, isLast: false)
+                + program.AccumulatorCount;
             totalParameterSlots += program.ParameterSlotCount;
         }
 
@@ -309,6 +318,11 @@ public static class CompoundProgramBuilder
                     parameterSlotBase[termIndex],
                     rowEquality,
                     captureSets[termIndex]));
+            }
+            for (var accumulator = 0; accumulator < program.AccumulatorCount; accumulator++)
+            {
+                instructions.Add(new AggResetInstruction(
+                    new Accumulator(accumulatorBase[termIndex] + accumulator)));
             }
 
             cursorSources.AddRange(term.CursorSources);
@@ -412,9 +426,24 @@ public static class CompoundProgramBuilder
 
         Register Reg(Register register) => new(register.Index + registerBase);
         RegisterRange Range(RegisterRange range) => new(Reg(range.Start), range.Count);
+        ProgramCounter Pc(ProgramCounter counter) => new(counter.Offset + instructionBase);
 
         return instruction switch
         {
+            GroupKeyInstruction x => new GroupKeyInstruction(
+                Range(x.Row),
+                Reg(x.Destination),
+                x.KeyCount,
+                x.Projector,
+                x.Equality,
+                x.GroupSetIndex + distinctBase,
+                x.Hasher),
+            DistinctGateInstruction x => new DistinctGateInstruction(
+                Range(x.Values),
+                x.Equality,
+                x.DistinctSetIndex + distinctBase,
+                Pc(x.DuplicateTarget)),
+            RowSetInsertInstruction x => new RowSetInsertInstruction(Range(x.Values), x.Equality, x.RowSetIndex + distinctBase),
             DistinctResultRowInstruction x when distinctEquality is null
                 => new DistinctResultRowInstruction(
                     Range(x.Values),
@@ -491,9 +520,23 @@ public static class CompoundProgramBuilder
 
         Register Reg(Register register) => new(register.Index + registerBase);
         RegisterRange Range(RegisterRange range) => new(Reg(range.Start), range.Count);
+        ProgramCounter Pc(ProgramCounter counter) => new(counter.Offset + instructionBase);
 
         return instruction switch
         {
+            GroupKeyInstruction x => new GroupKeyInstruction(
+                Range(x.Row),
+                Reg(x.Destination),
+                x.KeyCount,
+                x.Projector,
+                x.Equality,
+                x.GroupSetIndex + distinctBase,
+                x.Hasher),
+            DistinctGateInstruction x => new DistinctGateInstruction(
+                Range(x.Values),
+                x.Equality,
+                x.DistinctSetIndex + distinctBase,
+                Pc(x.DuplicateTarget)),
             ResultRowInstruction x
                 => new RowSetInsertInstruction(Range(x.Values), equality, captureSet),
             DistinctResultRowInstruction x => new GuardedRowInstruction(
@@ -520,8 +563,8 @@ public static class CompoundProgramBuilder
         };
     }
 
-    // Relocates every non-output opcode, returning null for result destinations so each caller can
-    // preserve, de-duplicate, or capture output according to the outer compound semantics.
+    // Relocates every non-output opcode, returning null for group/set/output instructions so each
+    // caller can preserve, de-duplicate, or capture it according to the outer compound semantics.
     private static VdbeInstruction? RelocateStructural(
         VdbeInstruction instruction,
         int registerBase,
@@ -596,7 +639,9 @@ public static class CompoundProgramBuilder
             YieldInstruction => instruction,
             HaltInstruction => instruction,
             ResultRowInstruction => null,
+            GroupKeyInstruction => null,
             DistinctResultRowInstruction => null,
+            DistinctGateInstruction => null,
             CompoundResultRowInstruction => null,
             GuardedRowInstruction => null,
             _ => throw new StatementCompilationException(

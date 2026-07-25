@@ -127,64 +127,66 @@ public readonly record struct ParameterSlot
 
 public enum VdbeOpcode
 {
-    LoadConstant,
-    LoadParameter,
-    Copy,
-    Function,
-    Arithmetic,
-    NumericAffinity,
-    OpenReadCursor,
-    OpenJoinCursor,
-    OpenWriteCursor,
-    Rewind,
-    Column,
-    RowId,
-    Filter,
-    FilterRowId,
-    FilterRegisters,
-    ProjectRegisters,
-    DistinctFilter,
-    Next,
-    Delete,
-    Insert,
-    Update,
-    Commit,
-    CloseCursor,
-    OpenSorter,
-    SorterInsert,
-    SorterSort,
-    SorterData,
-    SorterNext,
-    CloseSorter,
-    Goto,
-    JumpIf,
-    AggReset,
-    AggStep,
-    AggFinalize,
-    SameGroup,
-    Yield,
-    ResultRow,
-    DistinctResultRow,
-    RowSetInsert,
-    RowSetRewind,
-    RowSetNext,
-    CompoundResultRow,
-    GuardedRow,
-    OffsetGate,
-    LimitGate,
-    BeginTransaction,
-    CommitTransaction,
-    RollbackTransaction,
-    Savepoint,
-    ReleaseSavepoint,
-    RollbackToSavepoint,
-    OpenWorkTable,
-    SeedWorkTable,
-    WorkTableStep,
-    WorkTableExpand,
-    WorkTableExpandGeneration,
-    CloseWorkTable,
-    Halt,
+    LoadConstant = 0,
+    LoadParameter = 1,
+    Copy = 2,
+    Function = 3,
+    Arithmetic = 4,
+    NumericAffinity = 5,
+    OpenReadCursor = 6,
+    OpenWriteCursor = 7,
+    Rewind = 8,
+    Column = 9,
+    RowId = 10,
+    Filter = 11,
+    FilterRowId = 12,
+    FilterRegisters = 13,
+    Next = 14,
+    Delete = 15,
+    Insert = 16,
+    Update = 17,
+    Commit = 18,
+    CloseCursor = 19,
+    OpenSorter = 20,
+    SorterInsert = 21,
+    SorterSort = 22,
+    SorterData = 23,
+    SorterNext = 24,
+    CloseSorter = 25,
+    Goto = 26,
+    JumpIf = 27,
+    AggReset = 28,
+    AggStep = 29,
+    AggFinalize = 30,
+    SameGroup = 31,
+    Yield = 32,
+    ResultRow = 33,
+    DistinctResultRow = 34,
+    RowSetInsert = 35,
+    CompoundResultRow = 36,
+    OffsetGate = 37,
+    LimitGate = 38,
+    BeginTransaction = 39,
+    CommitTransaction = 40,
+    RollbackTransaction = 41,
+    Savepoint = 42,
+    ReleaseSavepoint = 43,
+    RollbackToSavepoint = 44,
+    OpenWorkTable = 45,
+    SeedWorkTable = 46,
+    WorkTableStep = 47,
+    WorkTableExpand = 48,
+    CloseWorkTable = 49,
+    Halt = 50,
+    GroupKey = 51,
+    DistinctGate = 52,
+    OpenJoinCursor = 53,
+    ProjectRegisters = 54,
+    DistinctFilter = 55,
+    RowSetRewind = 56,
+    RowSetNext = 57,
+    GuardedRow = 58,
+    WorkTableExpandGeneration = 59,
 }
 
 /// <summary>
@@ -258,6 +260,16 @@ public delegate int VdbeRowComparer(SqlValue[] left, SqlValue[] right);
 /// so a single linear pass sees each group as a contiguous run.
 /// </remarks>
 public delegate bool VdbeGroupComparer(SqlValue[] left, SqlValue[] right);
+
+/// <summary>
+/// Computes a GROUP BY key tuple from one materialized source row. The executor
+/// invokes it once per filtered source row, before sorting, so expression
+/// callbacks and errors retain source order.
+/// </summary>
+public delegate SqlValue[] VdbeGroupKeyProjector(SqlValue[] row);
+
+/// <summary>Computes a hash code consistent with a GROUP BY equality delegate.</summary>
+public delegate int VdbeGroupHasher(SqlValue[] key);
 
 /// <summary>
 /// Decides whether two result-row tuples are duplicates for compound-select de-duplication
@@ -1081,6 +1093,23 @@ public sealed record FilterRegistersInstruction(
     public override VdbeOpcode Opcode => VdbeOpcode.FilterRegisters;
 }
 
+/// <summary>
+/// Projects a GROUP BY key from <paramref name="Row"/>, finds or creates its
+/// first-seen group in <paramref name="GroupSetIndex"/>, and writes that stable
+/// zero-based group id to <paramref name="Destination"/>.
+/// </summary>
+public sealed record GroupKeyInstruction(
+    RegisterRange Row,
+    Register Destination,
+    int KeyCount,
+    VdbeGroupKeyProjector Projector,
+    VdbeGroupComparer Equality,
+    int GroupSetIndex,
+    VdbeGroupHasher? Hasher = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.GroupKey;
+}
+
 /// <summary>Projects one register tuple into another with caller-supplied SQL value semantics.</summary>
 public sealed record ProjectRegistersInstruction(
     RegisterRange Input,
@@ -1132,6 +1161,21 @@ public sealed record DistinctResultRowInstruction(
     int DistinctSetIndex) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.DistinctResultRow;
+}
+
+/// <summary>
+/// Records <paramref name="Values"/> in a distinct set and falls through when
+/// they are novel, or jumps to <paramref name="DuplicateTarget"/> when an equal
+/// row was already recorded. Keeping de-duplication separate from ResultRow lets
+/// LIMIT/OFFSET gates count only rows that will actually be emitted.
+/// </summary>
+public sealed record DistinctGateInstruction(
+    RegisterRange Values,
+    VdbeRowEquality Equality,
+    int DistinctSetIndex,
+    ProgramCounter DuplicateTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DistinctGate;
 }
 
 /// <summary>
@@ -1747,6 +1791,29 @@ public sealed class VdbeProgram
                     ValidateRegisterRange(filterRegisters.Row, instructionIndex);
                     ValidateJumpTarget(filterRegisters.FalseTarget, instructionIndex);
                     break;
+                case GroupKeyInstruction groupKey:
+                    ValidateRegisterRange(groupKey.Row, instructionIndex);
+                    ValidateRegister(groupKey.Destination, instructionIndex);
+                    if (groupKey.KeyCount <= 0)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} projects a non-positive GROUP BY key width.");
+                    }
+
+                    if (groupKey.Projector is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} projects a GROUP BY key with a null projector.");
+                    }
+
+                    if (groupKey.Equality is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} projects a GROUP BY key with a null equality.");
+                    }
+
+                    ValidateDistinctSet(groupKey.GroupSetIndex, instructionIndex);
+                    break;
                 case ProjectRegistersInstruction project:
                     ValidateRegisterRange(project.Input, instructionIndex);
                     ValidateRegisterRange(project.Output, instructionIndex);
@@ -1884,6 +1951,17 @@ public sealed class VdbeProgram
                     }
 
                     ValidateDistinctSet(distinctRow.DistinctSetIndex, instructionIndex);
+                    break;
+                case DistinctGateInstruction distinctGate:
+                    ValidateRegisterRange(distinctGate.Values, instructionIndex);
+                    if (distinctGate.Equality is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} gates a distinct row with a null equality.");
+                    }
+
+                    ValidateDistinctSet(distinctGate.DistinctSetIndex, instructionIndex);
+                    ValidateJumpTarget(distinctGate.DuplicateTarget, instructionIndex);
                     break;
                 case RowSetInsertInstruction rowSetInsert:
                     ValidateRegisterRange(rowSetInsert.Values, instructionIndex);

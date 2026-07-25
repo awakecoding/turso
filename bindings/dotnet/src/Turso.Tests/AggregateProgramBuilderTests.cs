@@ -500,6 +500,176 @@ public class AggregateProgramBuilderTests
     }
 
     [Test]
+    public void RowAwareGroupedProgramResumesAndClearsBothSortersAndGroupIdsOnReset()
+    {
+        var program = AggregateProgramBuilder.BuildRowGrouped(
+            "t",
+            tableColumnCount: 2,
+            groupKeyCount: 1,
+            groupKeyProjector: row => [row[0]],
+            groupEquality: (left, right) => left[0].Equals(right[0]),
+            collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
+            outputs:
+            [
+                CollectedRowsAggregate("group-key", rows => rows[0][0]),
+                CollectedRowsAggregate(
+                    "sum",
+                    rows => SqlValue.Integer(rows.Sum(row => row[1].AsInteger()))),
+            ],
+            orderKeys: [],
+            outputOrderComparer: (left, right) => left[0].AsInteger().CompareTo(right[0].AsInteger()));
+        var rows = new List<SqlValue[]>
+        {
+            new[] { SqlValue.Integer(2), SqlValue.Integer(20) },
+            new[] { SqlValue.Integer(1), SqlValue.Integer(10) },
+            new[] { SqlValue.Integer(2), SqlValue.Integer(5) },
+            new[] { SqlValue.Integer(1), SqlValue.Integer(7) },
+        };
+        using var statement = new ResumableStatement(program, [new VdbeCursorSource(rows)]);
+
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+        statement.CurrentRow.Should().Equal(SqlValue.Integer(2), SqlValue.Integer(25));
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+        statement.CurrentRow.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(17));
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Done);
+
+        statement.Reset();
+        rows.Add([SqlValue.Integer(3), SqlValue.Integer(4)]);
+        rows.Add([SqlValue.Integer(2), SqlValue.Integer(1)]);
+
+        var replay = Drain(statement);
+        replay.Should().HaveCount(3);
+        replay[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(26));
+        replay[1].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(17));
+        replay[2].Should().Equal(SqlValue.Integer(3), SqlValue.Integer(4));
+    }
+
+    [Test]
+    public void CancellationRaisedBySorterComparisonIsNotWrapped()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var program = AggregateProgramBuilder.BuildRowGrouped(
+            "t",
+            tableColumnCount: 1,
+            groupKeyCount: 1,
+            groupKeyProjector: row => [row[0]],
+            groupEquality: (left, right) => left[0].Equals(right[0]),
+            collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
+            outputs: [CollectedRowsAggregate("group-key", rows => rows[0][0])],
+            orderKeys: [],
+            outputOrderComparer: (_, _) =>
+            {
+                cancellation.Cancel();
+                cancellation.Token.ThrowIfCancellationRequested();
+                return 0;
+            });
+        using var statement = new ResumableStatement(
+            program,
+            [Rows([1], [2], [3])]);
+
+        Assert.Throws<OperationCanceledException>(
+            () => statement.StepResumable(cancellation.Token));
+    }
+
+    [Test]
+    public void HashableGroupKeysAvoidQuadraticEqualityProbes()
+    {
+        var equalityCalls = 0;
+        var program = AggregateProgramBuilder.BuildRowGrouped(
+            "t",
+            tableColumnCount: 1,
+            groupKeyCount: 1,
+            groupKeyProjector: row => [row[0]],
+            groupEquality: (left, right) =>
+            {
+                equalityCalls++;
+                return left[0].Equals(right[0]);
+            },
+            collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
+            outputs: [CollectedRowsAggregate("group-key", rows => rows[0][0])],
+            orderKeys: [],
+            outputOrderComparer: (left, right) => left[0].AsInteger().CompareTo(right[0].AsInteger()),
+            groupHasher: key => key[0].AsInteger().GetHashCode());
+        var rows = Enumerable.Range(0, 1_000)
+            .Select(value => new[] { SqlValue.Integer(value) })
+            .ToArray();
+
+        Run(program, new VdbeCursorSource(rows)).Should().HaveCount(1_000);
+        equalityCalls.Should().BeLessThan(100);
+    }
+
+    [Test]
+    public void CompoundTermsResetCompletedAggregateContexts()
+    {
+        VdbeProgram Build(string table) => AggregateProgramBuilder.BuildRowScalar(
+            table,
+            tableColumnCount: 1,
+            collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
+            outputs:
+            [
+                CollectedRowsAggregate(
+                    "count",
+                    rows => SqlValue.Integer(rows.Count)),
+            ]);
+        var combined = CompoundProgramBuilder.BuildUnionAll(
+        [
+            new CompoundTerm(Build("first"), [Rows([1])]),
+            new CompoundTerm(Build("second"), [Rows([2])]),
+        ]);
+
+        var secondOpen = combined.Program.Instructions
+            .Select((instruction, index) => (instruction, index))
+            .Single(entry => entry.instruction is OpenReadCursorInstruction { Cursor.Index: 1 })
+            .index;
+        combined.Program.Instructions[secondOpen - 1]
+            .Should().BeOfType<AggResetInstruction>()
+            .Which.Accumulator.Should().Be(new Accumulator(0));
+
+        RunToCompletion(combined.Program, combined.CursorSources)
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(1, 1);
+    }
+
+    [Test]
+    public void SetOperationsRelocateGroupedAggregateState()
+    {
+        static VdbeProgram Build() => AggregateProgramBuilder.BuildRowGrouped(
+            "t",
+            tableColumnCount: 1,
+            groupKeyCount: 1,
+            groupKeyProjector: row => [row[0]],
+            groupEquality: (left, right) => left[0].Equals(right[0]),
+            collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
+            outputs:
+            [
+                CollectedRowsAggregate("key", rows => rows[0][0]),
+                CollectedRowsAggregate("count", rows => SqlValue.Integer(rows.Count)),
+            ],
+            orderKeys: [],
+            outputOrderComparer: (left, right) =>
+                left[0].AsInteger().CompareTo(right[0].AsInteger()),
+            groupHasher: key => key[0].GetHashCode());
+        static CompoundTerm Term(VdbeCursorSource source) =>
+            new(Build(), [source]);
+        static bool Equality(SqlValue[] left, SqlValue[] right) =>
+            left.SequenceEqual(right);
+
+        var intersect = CompoundProgramBuilder.BuildIntersect(
+            [Term(Rows([1], [2])), Term(Rows([2], [3]))],
+            Equality);
+        RunToCompletion(intersect.Program, intersect.CursorSources)
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(2), SqlValue.Integer(1));
+
+        var except = CompoundProgramBuilder.BuildExcept(
+            [Term(Rows([1], [2])), Term(Rows([2], [3]))],
+            Equality);
+        RunToCompletion(except.Program, except.CursorSources)
+            .Should().ContainSingle()
+            .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
+    }
+
+    [Test]
     public void BuildGroupedValidatesItsArguments()
     {
         var order = AggregateTestSupport.OrderByColumns(0);
@@ -547,6 +717,20 @@ public class AggregateProgramBuilderTests
             groupOrderComparer: AggregateTestSupport.OrderByColumns(0),
             groupComparer: AggregateTestSupport.GroupKeysEqual());
 
+    private static VdbeAggregate CollectedRowsAggregate(
+        string name,
+        Func<IReadOnlyList<SqlValue[]>, SqlValue> finalize) => new()
+        {
+            Name = name,
+            CreateContext = static () => new List<SqlValue[]>(),
+            Accumulate = static (context, row) =>
+            {
+                ((List<SqlValue[]>)context!).Add(row);
+                return context;
+            },
+            Finalize = context => finalize((List<SqlValue[]>)context!),
+        };
+
     private static VdbeCursorSource Rows(params object?[][] rows)
     {
         var materialized = new List<SqlValue[]>(rows.Length);
@@ -574,6 +758,14 @@ public class AggregateProgramBuilderTests
     private static List<SqlValue[]> Run(VdbeProgram program, VdbeCursorSource source)
     {
         using var statement = new ResumableStatement(program, [source]);
+        return Drain(statement);
+    }
+
+    private static List<SqlValue[]> RunToCompletion(
+        VdbeProgram program,
+        IReadOnlyList<VdbeCursorSource> sources)
+    {
+        using var statement = new ResumableStatement(program, sources);
         return Drain(statement);
     }
 

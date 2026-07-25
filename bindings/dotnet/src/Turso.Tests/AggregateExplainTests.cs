@@ -92,6 +92,39 @@ public class AggregateExplainTests
     }
 
     [Test]
+    public void DescribesComputedGroupKeyAssignment()
+    {
+        var description = VdbeExplain.Describe(new GroupKeyInstruction(
+            new RegisterRange(new Register(2), 3),
+            new Register(5),
+            KeyCount: 2,
+            Projector: row => [row[0], row[1]],
+            Equality: AggregateTestSupport.GroupKeysEqual(),
+            GroupSetIndex: 0));
+
+        description.P1.Should().Be(2);
+        description.P2.Should().Be(5);
+        description.P3.Should().Be(2);
+        description.P4.Should().Be("group-set[0]");
+        description.Comment.Should().Be("r[5]=group key r[2..4] in set 0");
+    }
+
+    [Test]
+    public void DescribesDistinctAggregateGate()
+    {
+        var description = VdbeExplain.Describe(new DistinctGateInstruction(
+            new RegisterRange(new Register(4), 2),
+            static (left, right) => left.SequenceEqual(right),
+            DistinctSetIndex: 1,
+            DuplicateTarget: new ProgramCounter(9)));
+
+        description.P1.Should().Be(4);
+        description.P2.Should().Be(9);
+        description.P3.Should().Be(1);
+        description.Comment.Should().Be("goto 9 if r[4..5] is in distinct set 1");
+    }
+
+    [Test]
     public void DescribesAWholeBuiltScalarProgram()
     {
         var program = AggregateProgramBuilder.BuildScalar(
