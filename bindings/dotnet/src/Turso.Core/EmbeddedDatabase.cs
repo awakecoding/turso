@@ -12136,6 +12136,13 @@ public sealed class EmbeddedDatabase : IDisposable
                 when TryCompileValues(values, out var compiledValues, out _):
                 return DescribeProgram(compiledValues.Program);
             case WithSelectStatement with
+                when TryBuildNotMaterializedPassThroughExplainProgram(
+                    with,
+                    parameters,
+                    compilationContext,
+                    out var passThroughProgram):
+                return DescribeProgram(passThroughProgram);
+            case WithSelectStatement with
                 when TryBuildRecursiveCteExplainProgram(
                     with,
                     parameters,
@@ -12191,11 +12198,16 @@ public sealed class EmbeddedDatabase : IDisposable
                     out _),
             ValuesClause values => TryPrepareValuesLowering(values, out _),
             WithSelectStatement with => !compilationContext.CancellationToken.CanBeCanceled
-                && TryBuildRecursiveCteExplainProgram(
-                    with,
-                    parameters,
-                    compilationContext,
-                    out _),
+                && (TryBuildNotMaterializedPassThroughExplainProgram(
+                        with,
+                        parameters,
+                        compilationContext,
+                        out _)
+                    || TryBuildRecursiveCteExplainProgram(
+                        with,
+                        parameters,
+                        compilationContext,
+                        out _)),
             InsertStatement insert => CanRouteInsertThroughCompiler(insert, compilationContext)
                 && TryCompileInsert(insert, parameters, compilationContext, out _, out _, out _),
             UpdateStatement update => CanRouteUpdateThroughCompiler(update, compilationContext)
@@ -14270,6 +14282,16 @@ public sealed class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
+        if (TryExecuteNotMaterializedPassThrough(
+                statement,
+                parameters,
+                context,
+                outerRow,
+                out var passThrough))
+        {
+            return passThrough;
+        }
+
         var cteContext = MaterializeCommonTableExpressions(
             statement.CommonTableExpressions,
             parameters,
@@ -14277,6 +14299,34 @@ public sealed class EmbeddedDatabase : IDisposable
             outerRow);
 
         return ExecuteQuery(statement.Query, parameters, cteContext, outerRow);
+    }
+
+    // NOT MATERIALIZED is advisory in SQLite. The only managed flattening proof is a single
+    // nonrecursive CTE consumed by a bare SELECT *: removing that metadata-only outer scan cannot
+    // duplicate work, reorder callbacks, or move an error. Every other shape keeps the one-shot
+    // materialization boundary, including multiple references, DML, and recursive CTEs.
+    private bool TryExecuteNotMaterializedPassThrough(
+        WithSelectStatement statement,
+        SqlValue[] parameters,
+        QueryContext context,
+        SourceRow? outerRow,
+        out ExecutionResult result)
+    {
+        result = null!;
+        if (!TryGetNotMaterializedPassThrough(statement, out var commonTableExpression))
+            return false;
+
+        var body = commonTableExpression.Query is ValuesClause values
+            ? context.CancellationToken.CanBeCanceled
+                ? ExecuteValues(values, parameters, context, outerRow)
+                : ExecuteValuesStatement(values, parameters, context, outerRow)
+            : ExecuteQuery(commonTableExpression.Query, parameters, context, outerRow);
+        body = MaterializeQueryResult(body);
+        result = body with
+        {
+            Columns = ResolveCommonTableExpressionColumns(commonTableExpression, body.Columns),
+        };
+        return true;
     }
 
     private ExecutionResult ExecuteWithDml(
@@ -14794,9 +14844,10 @@ public sealed class EmbeddedDatabase : IDisposable
         return true;
     }
 
-    // Whether a query is a bare `SELECT * FROM <name>` with no DISTINCT, WHERE, GROUP BY/HAVING, ORDER BY,
-    // or LIMIT/OFFSET -- the pass-through outer query whose output is exactly the CTE's materialized rows,
-    // so a recursive-worktable program is a faithful whole-statement lowering EXPLAIN may describe.
+    // Whether a query is a bare `SELECT * FROM <name>` with no DISTINCT, WHERE, GROUP BY/HAVING, WINDOW,
+    // ORDER BY, or LIMIT/OFFSET -- the pass-through outer query whose output is exactly the CTE's
+    // materialized rows, so a recursive-worktable program is a faithful whole-statement lowering EXPLAIN
+    // may describe.
     private static bool IsBareSelectStarFrom(QueryStatement query, string name)
         => query is SelectStatement select
             && !select.Distinct
@@ -14805,11 +14856,99 @@ public sealed class EmbeddedDatabase : IDisposable
             && select.Where is null
             && select.GroupBy.Count == 0
             && select.Having is null
+            && select.NamedWindows.Count == 0
             && select.OrderBy.Count == 0
             && select.Limit is null
             && select.Offset is null
             && select.Source is NamedTableSource named
             && string.Equals(named.Name, name, StringComparison.OrdinalIgnoreCase);
+
+    private static bool TryGetNotMaterializedPassThrough(
+        WithSelectStatement statement,
+        out CommonTableExpression commonTableExpression)
+    {
+        commonTableExpression = null!;
+        if (statement.CommonTableExpressions.Count != 1)
+            return false;
+
+        var candidate = statement.CommonTableExpressions[0];
+        if (candidate.MaterializationHint != CteMaterializationHint.NotMaterialized
+            || CountAllReferences(candidate.Query, candidate.Name) != 0
+            || !IsBareSelectStarFrom(statement.Query, candidate.Name))
+        {
+            return false;
+        }
+
+        commonTableExpression = candidate;
+        return true;
+    }
+
+    // Produces a faithful program for the route selected by the pass-through execution path. MATERIALIZED and
+    // unspecified CTEs never reach this method, so their optimization fence remains visible as an
+    // evaluator fallback in EXPLAIN QUERY PLAN.
+    private bool TryBuildNotMaterializedPassThroughExplainProgram(
+        WithSelectStatement statement,
+        SqlValue[] parameters,
+        QueryContext context,
+        out VdbeProgram program)
+    {
+        program = null!;
+        if (context.CancellationToken.CanBeCanceled
+            || !TryGetNotMaterializedPassThrough(statement, out var commonTableExpression))
+        {
+            return false;
+        }
+
+        ResolveCommonTableExpressionColumns(
+            commonTableExpression,
+            DescribeQuery(commonTableExpression.Query, context));
+
+        CompiledSelect compiled;
+        switch (commonTableExpression.Query)
+        {
+            case SelectStatement select:
+                var indexPlan = TryPlanManagedIndexScan(select, context);
+                if (indexPlan is not null)
+                {
+                    if (!TryCompileManagedIndexSelect(
+                            select,
+                            indexPlan,
+                            parameters,
+                            context,
+                            outerRow: null,
+                            materializeIndexRows: false,
+                            out compiled))
+                    {
+                        return false;
+                    }
+                }
+                else if (!TryCompileSelect(select, parameters, context, outerRow: null, out compiled))
+                {
+                    return false;
+                }
+                break;
+            case CompoundSelectStatement compound:
+                if (!TryCompileCompoundSelect(
+                        compound,
+                        parameters,
+                        context,
+                        outerRow: null,
+                        out compiled))
+                {
+                    return false;
+                }
+                break;
+            case ValuesClause values:
+                if (!TryCompileValues(values, out compiled, out _))
+                    return false;
+                break;
+            default:
+                return false;
+        }
+
+        program = compiled.Program;
+        return true;
+    }
 
     // EXPLAIN lowering for the routed recursive-CTE subset. Only a WITH whose single common table
     // expression is a routable linear recursion and whose outer query is a bare `SELECT * FROM cte` is

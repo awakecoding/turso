@@ -1357,12 +1357,23 @@ internal sealed class SqlParser
             }
 
             ExpectKeyword("AS");
+            var materializationHint = CteMaterializationHint.Unspecified;
+            if (ConsumeKeyword("MATERIALIZED"))
+            {
+                materializationHint = CteMaterializationHint.Materialized;
+            }
+            else if (ConsumeKeyword("NOT"))
+            {
+                ExpectKeyword("MATERIALIZED");
+                materializationHint = CteMaterializationHint.NotMaterialized;
+            }
+
             Expect(TokenKind.LeftParen);
             if (!IsQueryStart())
                 throw Error("Managed common table expressions must contain a SELECT or VALUES query; writable CTEs are not supported.");
             var query = ParseQuery();
             Expect(TokenKind.RightParen);
-            commonTableExpressions.Add(new CommonTableExpression(name, columns, query));
+            commonTableExpressions.Add(new CommonTableExpression(name, columns, query, materializationHint));
         }
         while (Consume(TokenKind.Comma));
 

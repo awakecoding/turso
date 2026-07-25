@@ -281,10 +281,18 @@ internal sealed record WithDmlStatement(
     IReadOnlyList<CommonTableExpression> CommonTableExpressions,
     ParsedStatement Dml) : ParsedStatement;
 
+internal enum CteMaterializationHint
+{
+    Unspecified,
+    Materialized,
+    NotMaterialized,
+}
+
 internal sealed record CommonTableExpression(
     string Name,
     IReadOnlyList<string>? Columns,
-    QueryStatement Query);
+    QueryStatement Query,
+    CteMaterializationHint MaterializationHint);
 
 internal sealed record BeginStatement : ParsedStatement;
 
