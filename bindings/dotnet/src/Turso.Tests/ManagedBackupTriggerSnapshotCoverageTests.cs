@@ -47,6 +47,38 @@ public sealed class ManagedBackupTriggerSnapshotCoverageTests
     }
 
     [Test]
+    public void ManagedBackupCopiesRecursiveTriggerProgramsWithoutCopyingConnectionPragmaState()
+    {
+        using var source = OpenManagedConnection();
+        using var destination = OpenManagedConnection();
+        source.ExecuteNonQuery("""
+            PRAGMA recursive_triggers = ON;
+            CREATE TABLE event_data(id INTEGER PRIMARY KEY);
+            CREATE TABLE audit(id INTEGER);
+            CREATE TRIGGER event_data_recursive AFTER INSERT ON event_data WHEN NEW.id < 3
+            BEGIN
+                INSERT INTO audit VALUES (NEW.id);
+                INSERT INTO event_data VALUES (NEW.id + 1);
+            END;
+            INSERT INTO event_data VALUES (1);
+            """);
+
+        source.BackupDatabase(destination);
+
+        destination.ExecuteScalar<long>("PRAGMA recursive_triggers;").Should().Be(0);
+        destination.ExecuteScalar<long>("SELECT COUNT(*) FROM event_data;").Should().Be(3);
+        destination.ExecuteScalar<long>("SELECT COUNT(*) FROM audit;").Should().Be(2);
+        destination.ExecuteNonQuery("""
+            DELETE FROM event_data;
+            DELETE FROM audit;
+            PRAGMA recursive_triggers = ON;
+            INSERT INTO event_data VALUES (1);
+            """);
+        destination.ExecuteScalar<long>("SELECT COUNT(*) FROM event_data;").Should().Be(3);
+        destination.ExecuteScalar<long>("SELECT COUNT(*) FROM audit;").Should().Be(2);
+    }
+
+    [Test]
     public void ManagedBackupRollsBackCopiedTriggerSchemaWhenALaterTableCannotPreserveRowids()
     {
         using var source = OpenManagedConnection();
