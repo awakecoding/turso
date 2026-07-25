@@ -461,7 +461,9 @@ internal sealed record EmbeddedColumn(
     bool GenerationAlways = false,
     bool AutoIncrement = false,
     IReadOnlyList<ForeignKeyDefinition>? AdditionalForeignKeys = null,
-    bool StrictAny = false)
+    bool StrictAny = false,
+    int? PrimaryKeyDeclarationOrder = null,
+    int? UniqueDeclarationOrder = null)
 {
     // A column is generated when it carries a computed AS (...) expression. Generated
     // columns are materialized at write time; VIRTUAL and STORED differ only in whether
@@ -553,7 +555,8 @@ internal sealed record EmbeddedIndex(
     EmbeddedIndexOrigin Origin = EmbeddedIndexOrigin.Explicit,
     InsertConflictAlgorithm? ConflictAlgorithm = null,
     Expression? Where = null,
-    string? WhereSql = null)
+    string? WhereSql = null,
+    int? ConstraintOrdinal = null)
 {
     public bool IsPartial => Where is not null;
 }

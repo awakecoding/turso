@@ -1099,25 +1099,22 @@ internal sealed class SqlParser
             return null;
 
         ExpectKeyword("CONFLICT");
-        if (!Consume(TokenKind.LeftParen))
-        {
-            throw Error(
-                "Managed UPSERT requires a parenthesized PRIMARY KEY or UNIQUE conflict target.");
-        }
-
         var target = new List<UpsertTargetColumn>();
-        do
+        if (Consume(TokenKind.LeftParen))
         {
-            var term = ParseIndexedColumn();
-            target.Add(new UpsertTargetColumn(
-                term.Name,
-                term.Collation,
-                term.Descending,
-                term.Expression,
-                term.ExpressionSql));
+            do
+            {
+                var term = ParseIndexedColumn();
+                target.Add(new UpsertTargetColumn(
+                    term.Name,
+                    term.Collation,
+                    term.Descending,
+                    term.Expression,
+                    term.ExpressionSql));
+            }
+            while (Consume(TokenKind.Comma));
+            Expect(TokenKind.RightParen);
         }
-        while (Consume(TokenKind.Comma));
-        Expect(TokenKind.RightParen);
 
         Expression? targetWhere = null;
         string? targetWhereSql = null;
@@ -1133,6 +1130,12 @@ internal sealed class SqlParser
         ExpectKeyword("DO");
         if (ConsumeKeyword("NOTHING"))
             return new UpsertClause(target, new DoNothingUpsertAction(), targetWhere, targetWhereSql);
+
+        if (target.Count == 0)
+        {
+            throw Error(
+                "Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target.");
+        }
 
         ExpectKeyword("UPDATE");
         ExpectKeyword("SET");
@@ -2460,6 +2463,9 @@ internal sealed class SqlParser
         string? nullConstraintName = null;
         var explicitNull = false;
         var generationAlways = false;
+        var keyConstraintOrder = 0;
+        int? primaryKeyDeclarationOrder = null;
+        int? uniqueDeclarationOrder = null;
         string? pendingConstraintName = null;
         while (_lexer.Current.Kind == TokenKind.Identifier)
         {
@@ -2472,6 +2478,7 @@ internal sealed class SqlParser
             {
                 ExpectKeyword("KEY");
                 primaryKey = true;
+                primaryKeyDeclarationOrder ??= keyConstraintOrder++;
                 primaryKeyConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
 
@@ -2510,6 +2517,7 @@ internal sealed class SqlParser
             if (ConsumeKeyword("UNIQUE"))
             {
                 unique = true;
+                uniqueDeclarationOrder ??= keyConstraintOrder++;
                 uniqueConstraintName = pendingConstraintName;
                 pendingConstraintName = null;
                 uniqueConflictAlgorithm = ParseConflictClause();
@@ -2609,7 +2617,9 @@ internal sealed class SqlParser
             explicitNull,
             generationAlways,
             autoIncrement,
-            foreignKeys.Skip(1).ToArray());
+            foreignKeys.Skip(1).ToArray(),
+            primaryKeyDeclarationOrder,
+            uniqueDeclarationOrder);
     }
 
     private string? ParseDeclaredType()

@@ -145,6 +145,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         var triggers = new Dictionary<string, TriggerDefinition>(StringComparer.OrdinalIgnoreCase);
         var rootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         var indexRootPages = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        var loadedIndexes = new Dictionary<string, EmbeddedIndex>(StringComparer.OrdinalIgnoreCase);
 
         var schemaEntries = ReadSchemaEntries();
         ValidateSchemaEntries(schemaEntries);
@@ -197,18 +198,50 @@ internal sealed class EmbeddedFileStore : IDisposable
             }
             if (entry.Sql is null)
             {
-                var implicitIndex = table.Indexes.SingleOrDefault(index =>
+                var candidates = new List<EmbeddedIndex>();
+                var currentIndex = table.Indexes.SingleOrDefault(index =>
                     index.Origin != EmbeddedIndexOrigin.Explicit
                     && string.Equals(index.Name, entry.Name, StringComparison.OrdinalIgnoreCase));
-                if (implicitIndex is null)
+                if (currentIndex is not null)
+                    candidates.Add(currentIndex);
+                if (table.TryGetLegacyImplicitIndex(entry.Name, out var legacyIndex)
+                    && legacyIndex is not null)
+                {
+                    candidates.Add(legacyIndex);
+                }
+                if (candidates.Count == 0)
                 {
                     throw new EmbeddedSqlException(
                         $"Stored implicit index '{entry.Name}' does not match a UNIQUE or PRIMARY KEY constraint on table '{entry.TableName}'.");
                 }
 
-                ValidateIndexRepresentable(entry.TableName, table, implicitIndex);
-                ValidateStoredIndex(entry, table, implicitIndex, occupiedBtreePages);
+                EmbeddedIndex? validatedIndex = null;
+                EmbeddedSqlException? validationFailure = null;
+                foreach (var candidate in candidates)
+                {
+                    var candidatePages = new HashSet<uint>(occupiedBtreePages);
+                    try
+                    {
+                        ValidateIndexRepresentable(entry.TableName, table, candidate);
+                        ValidateStoredIndex(entry, table, candidate, candidatePages);
+                        occupiedBtreePages.UnionWith(candidatePages);
+                        validatedIndex = candidate;
+                        break;
+                    }
+                    catch (EmbeddedSqlException exception)
+                    {
+                        validationFailure ??= exception;
+                    }
+                }
+                if (validatedIndex is null)
+                {
+                    throw validationFailure
+                        ?? new EmbeddedSqlException(
+                            $"Stored implicit index '{entry.Name}' does not match table '{entry.TableName}'.");
+                }
+
                 indexRootPages.Add(entry.Name, entry.RootPage);
+                loadedIndexes.Add(entry.Name, validatedIndex);
                 continue;
             }
 
@@ -227,10 +260,11 @@ internal sealed class EmbeddedFileStore : IDisposable
             ValidateStoredIndex(entry, table, index, occupiedBtreePages);
             table.Indexes.Add(index);
             indexRootPages.Add(entry.Name, entry.RootPage);
+            loadedIndexes.Add(entry.Name, index);
         }
 
         EmbeddedDatabase.ValidateSqliteSequenceCatalog(tables);
-        ValidateAllocationMap(schemaEntries, tables);
+        ValidateAllocationMap(schemaEntries, tables, loadedIndexes);
 
         foreach (var entry in schemaEntries)
         {
@@ -268,7 +302,8 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private void ValidateAllocationMap(
         IReadOnlyList<SchemaEntry> schemaEntries,
-        IReadOnlyDictionary<string, EmbeddedTable> tables)
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, EmbeddedIndex> loadedIndexes)
     {
         try
         {
@@ -309,10 +344,11 @@ internal sealed class EmbeddedFileStore : IDisposable
                             throw new InvalidDataException(
                                 $"Managed file database is missing table '{entry.TableName}' for index '{entry.Name}'.");
                         }
-                        var index = indexedTable.Indexes.SingleOrDefault(candidate =>
-                            string.Equals(candidate.Name, entry.Name, StringComparison.OrdinalIgnoreCase))
-                            ?? throw new InvalidDataException(
+                        if (!loadedIndexes.TryGetValue(entry.Name, out var index))
+                        {
+                            throw new InvalidDataException(
                                 $"Managed file database is missing the loaded definition for index '{entry.Name}'.");
+                        }
                         CollectIndexTreePages(
                             entry,
                             activePages,
@@ -9333,7 +9369,7 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         foreach (var tableName in tables.Keys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
         {
-            foreach (var index in tables[tableName].Indexes.OrderBy(value => value.Name, StringComparer.OrdinalIgnoreCase))
+            foreach (var index in tables[tableName].Indexes)
             {
                 if (!indexRootPages.TryGetValue(index.Name, out var rootPage))
                 {
@@ -9389,7 +9425,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         foreach (var tableName in tableNames)
         {
             var table = tables[tableName];
-            foreach (var index in table.Indexes.OrderBy(value => value.Name, StringComparer.OrdinalIgnoreCase))
+            foreach (var index in table.Indexes)
             {
                 ValidateIndexRepresentable(tableName, table, index);
                 if (!names.Add(index.Name))
@@ -9824,7 +9860,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     private static string ComputeSchemaSignature(IReadOnlyList<SchemaEntry> entries)
     {
         var builder = new StringBuilder();
-        foreach (var entry in entries.OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase))
+        foreach (var entry in EnumerateSignatureEntries(entries))
         {
             builder.Append(entry.Type).Append('\u0001')
                 .Append(entry.Name).Append('\u0001')
@@ -9834,6 +9870,42 @@ internal sealed class EmbeddedFileStore : IDisposable
         }
 
         return builder.ToString();
+    }
+
+    private static IEnumerable<SchemaEntry> EnumerateSignatureEntries(
+        IReadOnlyList<SchemaEntry> entries)
+    {
+        foreach (var entry in entries
+                     .Where(entry => entry.Type == "table")
+                     .OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            yield return entry;
+        }
+
+        var indexesByTable = entries
+            .Where(entry => entry.Type == "index")
+            .GroupBy(entry => entry.TableName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.ToArray(),
+                StringComparer.OrdinalIgnoreCase);
+        foreach (var tableName in indexesByTable.Keys.OrderBy(
+                     name => name,
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (var entry in indexesByTable[tableName])
+            {
+                yield return entry;
+            }
+        }
+
+        foreach (var entry in entries
+                     .Where(entry => entry.Type is "view" or "trigger")
+                     .OrderBy(entry => entry.Type, StringComparer.Ordinal)
+                     .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            yield return entry;
+        }
     }
 
     private static string RequireText(SqlValue value, string field)
