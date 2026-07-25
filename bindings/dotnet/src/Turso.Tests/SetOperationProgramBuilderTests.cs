@@ -62,7 +62,7 @@ public class SetOperationProgramBuilderTests
             [ScanTerm("a", 1, 2, 2, 3), ScanTerm("b", 2, 3, 4)],
             ByteExactRows);
 
-        compound.Program.DistinctSetCount.Should().Be(2);
+        compound.Program.DistinctSetCount.Should().Be(3);
         Integers(Run(compound)).Should().Equal(2, 3);
     }
 
@@ -73,7 +73,7 @@ public class SetOperationProgramBuilderTests
             [ScanTerm("a", 1, 2, 3, 5), ScanTerm("b", 2, 3, 4), ScanTerm("c", 3, 5)],
             ByteExactRows);
 
-        compound.Program.DistinctSetCount.Should().Be(3);
+        compound.Program.DistinctSetCount.Should().Be(4);
         Integers(Run(compound)).Should().Equal(3);
     }
 
@@ -119,7 +119,7 @@ public class SetOperationProgramBuilderTests
             [ScanTerm("a", 1, 2, 3, 4), ScanTerm("b", 2), ScanTerm("c", 4)],
             ByteExactRows);
 
-        compound.Program.DistinctSetCount.Should().Be(3);
+        compound.Program.DistinctSetCount.Should().Be(4);
         Integers(Run(compound)).Should().Equal(1, 3);
     }
 
@@ -144,25 +144,23 @@ public class SetOperationProgramBuilderTests
     }
 
     [Test]
-    public void BuildIntersectEmitsProbeSetsBeforeThePrimaryTerm()
+    public void BuildIntersectEvaluatesTermsInSourceOrder()
     {
-        // Emission order places the non-primary (second) term first, so its cursor opens at index 0 and
-        // the primary term's cursor opens at index 1 — this is what preserves first-term output order.
         var compound = CompoundProgramBuilder.BuildIntersect(
             [ScanTerm("primary", 1), ScanTerm("probe", 1)],
             ByteExactRows);
 
         var opens = compound.Program.Instructions.OfType<OpenReadCursorInstruction>().ToList();
         opens.Should().HaveCount(2);
-        opens[0].TableName.Should().Be("probe");
+        opens[0].TableName.Should().Be("primary");
         opens[0].Cursor.Index.Should().Be(0);
-        opens[1].TableName.Should().Be("primary");
+        opens[1].TableName.Should().Be("probe");
         opens[1].Cursor.Index.Should().Be(1);
         compound.CursorSources.Should().HaveCount(2);
     }
 
     [Test]
-    public void BuildIntersectSubstitutesRowSetInsertForProbeTermsAndCompoundResultRowForPrimary()
+    public void BuildIntersectCapturesEveryTermThenIteratesThePrimarySet()
     {
         var compound = CompoundProgramBuilder.BuildIntersect(
             [ConstantTerm(1), ConstantTerm(1), ConstantTerm(1)],
@@ -170,13 +168,14 @@ public class SetOperationProgramBuilderTests
 
         compound.Program.Instructions.OfType<ResultRowInstruction>().Should().BeEmpty();
 
-        // Two non-primary terms become probe-set inserts; the single primary term becomes one filtered emit.
-        compound.Program.Instructions.OfType<RowSetInsertInstruction>().Should().HaveCount(2);
+        compound.Program.Instructions.OfType<RowSetInsertInstruction>().Should().HaveCount(3);
+        compound.Program.Instructions.OfType<RowSetRewindInstruction>().Should().ContainSingle();
+        compound.Program.Instructions.OfType<RowSetNextInstruction>().Should().ContainSingle();
         var emits = compound.Program.Instructions.OfType<CompoundResultRowInstruction>().ToList();
         emits.Should().HaveCount(1);
         emits[0].Mode.Should().Be(CompoundMembershipMode.PresentInAll);
-        emits[0].OutputSetIndex.Should().Be(2);
-        emits[0].MembershipSetIndices.Should().Equal(0, 1);
+        emits[0].OutputSetIndex.Should().Be(3);
+        emits[0].MembershipSetIndices.Should().Equal(1, 2);
     }
 
     [Test]
@@ -189,7 +188,7 @@ public class SetOperationProgramBuilderTests
         var emits = compound.Program.Instructions.OfType<CompoundResultRowInstruction>().ToList();
         emits.Should().HaveCount(1);
         emits[0].Mode.Should().Be(CompoundMembershipMode.AbsentFromAll);
-        emits[0].MembershipSetIndices.Should().Equal(0);
+        emits[0].MembershipSetIndices.Should().Equal(1);
     }
 
     [Test]
@@ -311,25 +310,32 @@ public class SetOperationProgramBuilderTests
     }
 
     [Test]
-    public void BuildIntersectRejectsTermsThatAlreadyUseRowSets()
+    public void BuildIntersectComposesTermsThatAlreadyUseRowSets()
     {
         var nested = CompoundProgramBuilder.BuildIntersect(
             [ConstantTerm(1), ConstantTerm(1)],
             ByteExactRows);
 
-        Assert.Throws<ArgumentException>(
-            () => CompoundProgramBuilder.BuildIntersect([nested, ConstantTerm(1)], ByteExactRows));
+        var composed = CompoundProgramBuilder.BuildIntersect(
+            [nested, ConstantTerm(1)],
+            ByteExactRows);
+
+        Integers(Run(composed)).Should().Equal(1);
+        composed.Program.Instructions.OfType<GuardedRowInstruction>().Should().NotBeEmpty();
     }
 
     [Test]
-    public void BuildExceptRejectsUnionDistinctTermsThatAlreadyDeduplicate()
+    public void BuildExceptComposesUnionDistinctTermsThatAlreadyDeduplicate()
     {
         var distinct = CompoundProgramBuilder.BuildUnionDistinct(
             [ConstantTerm(1), ConstantTerm(2)],
             ByteExactRows);
 
-        Assert.Throws<ArgumentException>(
-            () => CompoundProgramBuilder.BuildExcept([distinct, ConstantTerm(3)], ByteExactRows));
+        var composed = CompoundProgramBuilder.BuildExcept(
+            [distinct, ConstantTerm(2)],
+            ByteExactRows);
+
+        Integers(Run(composed)).Should().Equal(1);
     }
 
     // A constant projection term: loads each value into successive registers, emits them as one result

@@ -145,7 +145,7 @@ public class ManagedProviderRoutingTests
     }
 
     [Test]
-    public void ManagedFileBackupRejectsNonemptyDestinationWithoutMutatingIt()
+    public void ManagedFileBackupReplacesNonemptyDestination()
     {
         var sourcePath = CreateManagedDatabasePath();
         var destinationPath = CreateManagedDatabasePath();
@@ -158,12 +158,11 @@ public class ManagedProviderRoutingTests
             source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
             destination.ExecuteNonQuery("CREATE TABLE destination_data(value TEXT); INSERT INTO destination_data VALUES ('destination');");
 
-            Assert.Throws<InvalidOperationException>(() => source.BackupDatabase(destination))!
-                .Message.Should().Be("BackupDatabase requires an empty destination when Local Provider=Managed.");
+            source.BackupDatabase(destination);
 
             destination.State.Should().Be(System.Data.ConnectionState.Open);
             destination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(1);
-            destination.ExecuteScalar<string>("SELECT value FROM destination_data;").Should().Be("destination");
+            destination.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("source");
         }
         finally
         {
@@ -219,48 +218,75 @@ public class ManagedProviderRoutingTests
     {
         NativeProviderTestFixture.EnsureRegistered();
 
-        using var nativeSource = new SqliteConnection("Data Source=:memory:;Local Provider=Native");
+        using var nativeSource = new PretendOpenSqliteConnection("Data Source=:memory:;Local Provider=Native");
         using var managedDestination = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
-        nativeSource.Open();
-        nativeSource.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('native');");
+        managedDestination.Open();
+        managedDestination.ExecuteNonQuery("CREATE TABLE destination_data(value TEXT); INSERT INTO destination_data VALUES ('managed');");
 
         Assert.Throws<NotSupportedException>(() => nativeSource.BackupDatabase(managedDestination))!
             .Message.Should().Be("BackupDatabase does not support copying between managed and native providers.");
 
         nativeSource.State.Should().Be(System.Data.ConnectionState.Open);
-        managedDestination.State.Should().Be(System.Data.ConnectionState.Closed);
-        nativeSource.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("native");
-    }
-
-    [TestCase("attached", "main")]
-    [TestCase("main", "attached")]
-    public void ManagedBackupRejectsNonMainDatabaseNames(string destinationName, string sourceName)
-    {
-        using var source = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
-        using var destination = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
-        source.Open();
-        destination.Open();
-        source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
-
-        Assert.Throws<NotSupportedException>(() => source.BackupDatabase(destination, destinationName, sourceName))!
-            .Message.Should().Be("BackupDatabase supports only the main database when Local Provider=Managed.");
-
-        source.State.Should().Be(System.Data.ConnectionState.Open);
-        destination.State.Should().Be(System.Data.ConnectionState.Open);
-        destination.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';").Should().Be(0);
+        managedDestination.State.Should().Be(System.Data.ConnectionState.Open);
+        managedDestination.ExecuteScalar<string>("SELECT value FROM destination_data;").Should().Be("managed");
     }
 
     [Test]
-    public void ManagedBackupRejectsTheSameConnection()
+    public void ManagedBackupCopiesNamedAttachedDatabasesAndSupportsSameConnection()
+    {
+        var sourcePath = CreateManagedDatabasePath();
+        var destinationPath = CreateManagedDatabasePath();
+        var sourceAttachmentPath = CreateManagedDatabasePath();
+        var destinationAttachmentPath = CreateManagedDatabasePath();
+        try
+        {
+            using var source = new SqliteConnection($"Data Source={sourcePath};Local Provider=Managed");
+            using var destination = new SqliteConnection($"Data Source={destinationPath};Local Provider=Managed");
+            source.Open();
+            destination.Open();
+            source.ExecuteNonQuery($"ATTACH DATABASE '{sourceAttachmentPath}' AS source_aux;");
+            destination.ExecuteNonQuery($"ATTACH DATABASE '{destinationAttachmentPath}' AS destination_aux;");
+            source.ExecuteNonQuery("CREATE TABLE source_aux.attached_data(value TEXT); INSERT INTO source_aux.attached_data VALUES ('attached');");
+            destination.ExecuteNonQuery("CREATE TABLE old_data(value TEXT); INSERT INTO old_data VALUES ('old');");
+
+            source.BackupDatabase(destination, "main", "source_aux");
+
+            destination.ExecuteScalar<string>("SELECT value FROM attached_data;").Should().Be("attached");
+            source.ExecuteNonQuery("CREATE TABLE main_data(value TEXT); INSERT INTO main_data VALUES ('main');");
+            using var reader = source.ExecuteReader("SELECT value FROM main_data;");
+            reader.Read().Should().BeTrue();
+
+            var activeReader = Assert.Throws<SqliteException>(
+                () => source.BackupDatabase(source, "source_aux", "main"));
+
+            activeReader!.SqliteErrorCode.Should().Be(5);
+            source.ExecuteScalar<string>("SELECT value FROM source_aux.attached_data;").Should().Be("attached");
+            reader.Dispose();
+            source.BackupDatabase(source, "source_aux", "main");
+            source.ExecuteScalar<string>("SELECT value FROM source_aux.main_data;").Should().Be("main");
+            source.ExecuteScalar<long>(
+                "SELECT COUNT(*) FROM source_aux.sqlite_master WHERE type = 'table' AND name = 'attached_data';").Should().Be(0);
+        }
+        finally
+        {
+            DeleteManagedDatabase(sourcePath);
+            DeleteManagedDatabase(destinationPath);
+            DeleteManagedDatabase(sourceAttachmentPath);
+            DeleteManagedDatabase(destinationAttachmentPath);
+        }
+    }
+
+    [Test]
+    public void ManagedBackupRejectsTheSameDatabaseOnTheSameConnection()
     {
         using var source = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
         source.Open();
         source.ExecuteNonQuery("CREATE TABLE source_data(value TEXT); INSERT INTO source_data VALUES ('source');");
 
-        var exception = Assert.Throws<ArgumentException>(() => source.BackupDatabase(source));
+        var exception = Assert.Throws<SqliteException>(() => source.BackupDatabase(source));
 
-        exception!.Message.Should().Be(
-            "BackupDatabase requires distinct source and destination connections when Local Provider=Managed. (Parameter 'destination')");
+        exception!.SqliteErrorCode.Should().Be(1);
+        exception.Message.Should().Contain("source and destination must be distinct");
         source.State.Should().Be(System.Data.ConnectionState.Open);
         source.ExecuteScalar<string>("SELECT value FROM source_data;").Should().Be("source");
     }
@@ -306,5 +332,19 @@ public class ManagedProviderRoutingTests
         connection.Invoking(static value => value.Open())
             .Should().Throw<NotSupportedException>()
             .WithMessage("Local Provider=Managed is supported only for local database connections.");
+    }
+
+    private sealed class PretendOpenSqliteConnection : SqliteConnection
+    {
+        private bool _pretendOpen;
+
+        public PretendOpenSqliteConnection(string connectionString)
+        {
+            ConnectionString = connectionString;
+            _pretendOpen = true;
+        }
+
+        public override System.Data.ConnectionState State
+            => _pretendOpen ? System.Data.ConnectionState.Open : base.State;
     }
 }

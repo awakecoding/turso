@@ -4,8 +4,8 @@ using Turso.Core;
 namespace Turso.Tests;
 
 // Proves that EmbeddedDatabase routes the supported same-operator INTERSECT and EXCEPT compound-SELECT
-// subset through the real CompoundProgramBuilder bytecode (RowSetInsert probe sets over the non-primary
-// terms plus a CompoundResultRow primary emit) while keeping results byte-identical to the tree-walking
+// subset through the real CompoundProgramBuilder bytecode (source-ordered row-set capture followed by
+// first-set membership iteration) while keeping results byte-identical to the tree-walking
 // evaluator's ApplyIntersect/ApplyExcept fold. EXPLAIN is the ground truth for "was this lowered to
 // bytecode?": a routed compound dumps the sequenced opcode stream, while every deliberate fallback shape
 // throws because EXPLAIN only describes lowered programs. Fallback tests also assert the evaluator still
@@ -177,17 +177,17 @@ public class SetOperationSqlRoutingTests
         var rows = ReadRows(connection, "EXPLAIN SELECT a FROM t INTERSECT SELECT a FROM u;");
         var opcodes = Opcodes(rows).ToList();
 
-        // The non-primary term (u) materializes into one probe set; the primary term (t) emits a single
-        // membership-tested, de-duplicated result row. No plain or distinct result rows survive.
-        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(1);
+        // Both terms materialize in source order before the first set is iterated for membership output.
+        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(2);
         opcodes.Count(opcode => opcode == "CompoundResultRow").Should().Be(1);
         opcodes.Should().NotContain("ResultRow").And.NotContain("DistinctResultRow");
+        opcodes.Should().Contain("RowSetRewind").And.Contain("RowSetNext");
         opcodes.Should().Contain("OpenReadCursor").And.Contain("Halt");
 
         Comments(rows).Should().Contain("insert r[0] into row set 0");
         Comments(rows).Should().Contain(
-            "output=r[1] if new to distinct set 1 and present in all of sets {0}");
-        P4(rows).Should().Contain("sets {0}");
+            "output=r[2] if new to distinct set 2 and present in all of sets {1}");
+        P4(rows).Should().Contain("sets {1}");
     }
 
     [Test]
@@ -199,12 +199,12 @@ public class SetOperationSqlRoutingTests
         var rows = ReadRows(connection, "EXPLAIN SELECT a FROM t EXCEPT SELECT a FROM u;");
         var opcodes = Opcodes(rows).ToList();
 
-        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(1);
+        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(2);
         opcodes.Count(opcode => opcode == "CompoundResultRow").Should().Be(1);
         opcodes.Should().NotContain("ResultRow").And.NotContain("DistinctResultRow");
 
         Comments(rows).Should().Contain(
-            "output=r[1] if new to distinct set 1 and absent from all of sets {0}");
+            "output=r[2] if new to distinct set 2 and absent from all of sets {1}");
     }
 
     [Test]
@@ -220,14 +220,13 @@ public class SetOperationSqlRoutingTests
             "EXPLAIN SELECT a FROM t INTERSECT SELECT a FROM u INTERSECT SELECT a FROM v;");
         var opcodes = Opcodes(rows).ToList();
 
-        // Three terms flatten into two probe sets (u, v) and one primary emit (t).
-        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(2);
+        opcodes.Count(opcode => opcode == "RowSetInsert").Should().Be(3);
         opcodes.Count(opcode => opcode == "CompoundResultRow").Should().Be(1);
         opcodes.Count(opcode => opcode == "OpenReadCursor").Should().Be(3);
 
         Comments(rows).Should().Contain(
-            "output=r[2] if new to distinct set 2 and present in all of sets {0,1}");
-        P4(rows).Should().Contain("sets {0,1}");
+            "output=r[3] if new to distinct set 3 and present in all of sets {1,2}");
+        P4(rows).Should().Contain("sets {1,2}");
     }
 
     // ---- Deliberate fallbacks (kept on the evaluator) ---------------------------------------------
@@ -307,41 +306,83 @@ public class SetOperationSqlRoutingTests
     }
 
     [Test]
-    public void StarIntersectFallsBackToEvaluator()
+    public void StarIntersectRoutesWithExpandedMetadata()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedTwoColumn(connection);
 
-        // A star-expanded first term cannot supply a per-output-column collation vector, so the
-        // membership-driven INTERSECT declines and stays on the evaluator rather than indexing a
-        // too-short vector.
-        Assert.Throws<EmbeddedSqlException>(
+        ReadRows(connection, "SELECT * FROM t INTERSECT SELECT * FROM u;").Should().ContainSingle();
+        Assert.DoesNotThrow(
             () => ReadRows(connection, "EXPLAIN SELECT * FROM t INTERSECT SELECT * FROM u;"));
     }
 
     [Test]
-    public void StarExceptFallsBackToEvaluator()
+    public void StarExceptRoutesWithExpandedMetadata()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedTwoColumn(connection);
 
-        Assert.Throws<EmbeddedSqlException>(
+        ReadRows(connection, "SELECT * FROM t EXCEPT SELECT * FROM u;").Should().HaveCount(2);
+        Assert.DoesNotThrow(
             () => ReadRows(connection, "EXPLAIN SELECT * FROM t EXCEPT SELECT * FROM u;"));
     }
 
     [Test]
-    public void DistinctTermIntersectFallsBackToEvaluator()
+    public void DistinctTermIntersectRetainsInnerDeduplication()
     {
         using var connection = new EmbeddedDatabase().Connect();
         SeedSingleColumn(connection);
 
-        // A DISTINCT term is declined by every lowering route, so the whole compound stays on the
-        // evaluator, which still computes the correct value.
         Column0(ReadRows(connection, "SELECT DISTINCT a FROM t INTERSECT SELECT a FROM u;"))
             .Should().Equal(SqlValue.Integer(2));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT DISTINCT a FROM t INTERSECT SELECT a FROM u;"));
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT DISTINCT a FROM t INTERSECT SELECT a FROM u;"))
+            .Should().Contain("GuardedRow");
+    }
+
+    [TestCase("INTERSECT")]
+    [TestCase("EXCEPT")]
+    public void ErrorCapableTermsPreserveEvaluatorSourceOrder(string compoundOperator)
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE first_error(value);");
+        Execute(connection, "INSERT INTO first_error VALUES (-9223372036854775808);");
+        Execute(connection, "CREATE TABLE second_error(value);");
+        Execute(connection, "INSERT INTO second_error VALUES ('x');");
+        var query =
+            $"SELECT abs(value) FROM first_error {compoundOperator} SELECT instr(value) FROM second_error;";
+        var forcedEvaluator =
+            $"SELECT abs(value) FROM first_error {compoundOperator} SELECT instr(value) FROM second_error ORDER BY 1;";
+
+        var actual = Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query))!;
+        var expected = Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, forcedEvaluator))!;
+
+        actual.Message.Should().Be(expected.Message).And.Be("integer overflow");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query))!
+            .Message.Should().Contain("EXPLAIN is only supported");
+    }
+
+    [TestCase("INTERSECT")]
+    [TestCase("EXCEPT")]
+    public void ComputedArithmeticTermsRoute(string compoundOperator)
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE arithmetic_left(value);");
+        Execute(connection, "INSERT INTO arithmetic_left VALUES ('10');");
+        Execute(connection, "CREATE TABLE arithmetic_right(value);");
+        Execute(connection, "INSERT INTO arithmetic_right VALUES ('10');");
+        var query =
+            $"SELECT value + 1 FROM arithmetic_left {compoundOperator} SELECT value + 1 FROM arithmetic_right;";
+        var forcedEvaluator =
+            $"SELECT value + 1 FROM arithmetic_left {compoundOperator} SELECT value + 1 FROM arithmetic_right ORDER BY 1;";
+
+        var actual = ReadRows(connection, query);
+        var expected = ReadRows(connection, forcedEvaluator);
+
+        actual.Should().HaveCount(expected.Count);
+        for (var index = 0; index < actual.Count; index++)
+            actual[index].Should().Equal(expected[index]);
+        Assert.DoesNotThrow(() => ReadRows(connection, "EXPLAIN " + query));
     }
 
     [Test]
@@ -372,7 +413,7 @@ public class SetOperationSqlRoutingTests
     }
 
     [Test]
-    public void ExplicitCollateProjectionIntersectFallsBackToEvaluator()
+    public void ExplicitCollateProjectionIntersectRoutesWithFirstTermCollation()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(a TEXT);");
@@ -380,16 +421,16 @@ public class SetOperationSqlRoutingTests
         Execute(connection, "CREATE TABLE u(a TEXT);");
         Execute(connection, "INSERT INTO u VALUES ('x'), ('Y');");
 
-        // A COLLATE projection is not a bare column or constant, so no lowering route accepts the
-        // term and the whole compound stays on the evaluator. The evaluator still derives the NOCASE
-        // collation from the first term and applies it through RowsEqual: 'X'~'x' and 'y'~'Y' match,
-        // so the result is {'X','y'} in first-term order. Under BINARY this would be empty, which is
-        // how the test proves the collation is honored on the fallback path.
+        // The projection emitter treats COLLATE as a value-preserving wrapper, while the compound
+        // equality delegate derives NOCASE from the first term. 'X'~'x' and 'y'~'Y' therefore match,
+        // yielding {'X','y'} in first-term order; under BINARY the result would be empty.
         Column0(ReadRows(connection, "SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"))
             .Should().Equal(SqlValue.Text("X"), SqlValue.Text("y"));
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => ReadRows(connection, "EXPLAIN SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"));
+        Opcodes(ReadRows(
+                connection,
+                "EXPLAIN SELECT a COLLATE NOCASE FROM t INTERSECT SELECT a FROM u;"))
+            .Should().Contain("RowSetInsert").And.Contain("CompoundResultRow");
     }
 
     // ---- Seeding / helpers ------------------------------------------------------------------------

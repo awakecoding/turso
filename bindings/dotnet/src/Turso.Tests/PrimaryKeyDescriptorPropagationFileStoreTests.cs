@@ -33,26 +33,28 @@ public class PrimaryKeyDescriptorPropagationFileStoreTests
     }
 
     [Test]
-    public void TablePrimaryKeyTermCollationOverridesColumnCollationAtFileStoreBoundary()
+    public void TablePrimaryKeyTermCollationOverridesColumnCollationAcrossFileReopen()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var database = EmbeddedDatabase.OpenFile("primary-key-term-override.db", fileSystem);
-        using var connection = database.Connect();
+        const string path = "primary-key-term-override.db";
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE keyed(k TEXT COLLATE NOCASE, PRIMARY KEY(k COLLATE BINARY ASC));");
+            Execute(connection, "INSERT INTO keyed VALUES ('a'), ('A');");
+        }
 
-        var act = () => Execute(
-            connection,
-            "CREATE TABLE rejected(k TEXT COLLATE NOCASE, PRIMARY KEY(k COLLATE BINARY ASC));");
-
-        var exception = act.Should().Throw<EmbeddedSqlException>().Which;
-        exception.Message.Should().Contain("requires an on-disk index b-tree");
-        exception.Message.Should().NotContain("unavailable collation metadata");
-        exception.Message.Should().NotContain("uses NOCASE collation");
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Scalar(reopenedConnection, "SELECT COUNT(*) FROM keyed;").AsInteger().Should().Be(2);
+        Scalar(reopenedConnection, "SELECT sql FROM sqlite_master WHERE name = 'keyed';")
+            .AsText()
+            .Should()
+            .Contain("PRIMARY KEY (\"k\" COLLATE BINARY)");
     }
 
-    [TestCase("NOCASE")]
-    [TestCase("RTRIM")]
     [TestCase("custom_collation")]
-    public void UnsupportedWithoutRowidPrimaryKeyCollationRejectsBeforeWalWriteAndPreservesCatalog(string collation)
+    public void ApplicationDefinedWithoutRowidPrimaryKeyCollationRejectsBeforeWalWriteAndPreservesCatalog(string collation)
     {
         const string path = "primary-key-unsupported-collation.db";
         var faults = new DeterministicFaultInjector();
@@ -71,7 +73,7 @@ public class PrimaryKeyDescriptorPropagationFileStoreTests
                 $"CREATE TABLE rejected(k TEXT, PRIMARY KEY(k COLLATE {collation} ASC)) WITHOUT ROWID;");
 
             var exception = act.Should().Throw<EmbeddedSqlException>().Which;
-            exception.Message.Should().Contain($"uses {collation.ToUpperInvariant()} collation");
+            exception.Message.Should().Contain($"application-defined collation {collation.ToUpperInvariant()}");
             exception.Message.Should().NotContain("primary-key index b-tree that is not yet supported");
             faults.GetOperationCount(FileSystemOperation.Write).Should().Be(writesBeforeReject);
             Scalar(connection, "SELECT value FROM retained WHERE id = 1;").AsText().Should().Be("durable");
@@ -85,9 +87,8 @@ public class PrimaryKeyDescriptorPropagationFileStoreTests
         Assert.Throws<EmbeddedSqlException>(() => Scalar(reopenedConnection, "SELECT COUNT(*) FROM rejected;"));
     }
 
-    [TestCase("CREATE TABLE rejected(k TEXT, PRIMARY KEY(k DESC)) WITHOUT ROWID;", "is descending")]
     [TestCase("CREATE TABLE rejected(k TEXT, PRIMARY KEY(lower(k)));", "Expected RightParen")]
-    public void UnsupportedWithoutRowidPrimaryKeyDirectionOrExpressionRejectsBeforeWalWrite(string sql, string message)
+    public void UnsupportedPrimaryKeyExpressionRejectsBeforeWalWrite(string sql, string message)
     {
         var faults = new DeterministicFaultInjector();
         var fileSystem = new InMemoryFileSystem(faults);

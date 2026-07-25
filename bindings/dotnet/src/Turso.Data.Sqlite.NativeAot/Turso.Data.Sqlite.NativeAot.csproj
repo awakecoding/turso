@@ -6,7 +6,7 @@
 
     <PackageId>Turso.Data.Sqlite.NativeAot.$(NativeAotRid)</PackageId>
     <Title>Turso NativeAOT static library ($(NativeAotRid))</Title>
-    <Description>RID-specific static native library assets for NativeAOT publishing with Turso.Data.Sqlite.</Description>
+    <Description>RID-specific static native library assets for net8.0, net9.0, and net10.0 NativeAOT desktop publishing with Turso.Data.Sqlite.</Description>
     <Authors>Turso authors</Authors>
     <PackageTags>turso;sqlite;database;nativeaot;static;$(NativeAotRid)</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

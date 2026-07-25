@@ -68,8 +68,6 @@ public class ManagedFreelistReclamationInvariantTests
                 Execute(connection, "DELETE FROM t;");
                 QueryCount(connection, "SELECT COUNT(*) FROM t;").Should().Be(0);
 
-                var vacuum = () => Execute(connection, "VACUUM;");
-                vacuum.Should().Throw<EmbeddedSqlException>();
                 QueryCount(connection, "SELECT COUNT(*) FROM t;").Should().Be(0);
 
                 InsertRows(connection, 1, 12, "replacement-" + new string('r', 32));

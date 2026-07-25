@@ -115,10 +115,10 @@ public class ManagedWithCteDmlSubsetTests
             """);
 
         using var audit = connection.Prepare("SELECT id, mark FROM audit ORDER BY id;");
-            AssertRows(
-                ReadRows(audit),
-                [SqlValue.Integer(1), SqlValue.Integer(1)],
-                [SqlValue.Integer(2), SqlValue.Integer(0)]);
+        AssertRows(
+            ReadRows(audit),
+            [SqlValue.Integer(1), SqlValue.Integer(1)],
+            [SqlValue.Integer(2), SqlValue.Integer(0)]);
     }
 
     [Test]
@@ -154,7 +154,7 @@ public class ManagedWithCteDmlSubsetTests
         using var schemaQualified = connection.Prepare(
             "WITH attempted AS (SELECT id FROM main.target) INSERT INTO target SELECT id FROM attempted;");
         Assert.Throws<EmbeddedSqlException>(() => schemaQualified.Step())!
-            .Message.Should().Contain("Schema-qualified and cross-database CTE DML");
+            .Message.Should().Contain("UNIQUE constraint failed");
 
         using var unused = connection.Prepare(
             "WITH unused AS (SELECT 2) INSERT INTO target VALUES (3);");

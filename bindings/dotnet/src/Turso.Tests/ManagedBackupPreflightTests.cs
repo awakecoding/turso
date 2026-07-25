@@ -1,3 +1,4 @@
+using System.Reflection;
 using AwesomeAssertions;
 using Turso.Data.Sqlite;
 
@@ -5,6 +6,21 @@ namespace Turso.Tests;
 
 public sealed class ManagedBackupPreflightTests
 {
+    [TestCase(nameof(Data.Sqlite.Properties.Resources.ManagedBackupAttachedDatabasesNotSupported))]
+    [TestCase(nameof(Data.Sqlite.Properties.Resources.ManagedBackupSameConnectionNotSupported))]
+    [TestCase(nameof(Data.Sqlite.Properties.Resources.ManagedBackupDestinationMustBeEmpty))]
+    public void ManagedBackupLegacyResourcePropertiesRemainPublic(string propertyName)
+    {
+        var property = typeof(Data.Sqlite.Properties.Resources).GetProperty(
+            propertyName,
+            BindingFlags.Public | BindingFlags.Static);
+
+        property.Should().NotBeNull();
+        property!.PropertyType.Should().Be(typeof(string));
+        property.GetMethod.Should().NotBeNull();
+        property.GetValue(null).Should().BeOfType<string>();
+    }
+
     [Test]
     public void ManagedBackupRejectsClosedMixedProviderDestinationBeforeOpeningIt()
     {

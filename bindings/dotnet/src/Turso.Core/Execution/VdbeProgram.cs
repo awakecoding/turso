@@ -132,7 +132,9 @@ public enum VdbeOpcode
     Copy,
     Function,
     Arithmetic,
+    NumericAffinity,
     OpenReadCursor,
+    OpenJoinCursor,
     OpenWriteCursor,
     Rewind,
     Column,
@@ -140,6 +142,8 @@ public enum VdbeOpcode
     Filter,
     FilterRowId,
     FilterRegisters,
+    ProjectRegisters,
+    DistinctFilter,
     Next,
     Delete,
     Insert,
@@ -162,7 +166,10 @@ public enum VdbeOpcode
     ResultRow,
     DistinctResultRow,
     RowSetInsert,
+    RowSetRewind,
+    RowSetNext,
     CompoundResultRow,
+    GuardedRow,
     OffsetGate,
     LimitGate,
     BeginTransaction,
@@ -175,6 +182,7 @@ public enum VdbeOpcode
     SeedWorkTable,
     WorkTableStep,
     WorkTableExpand,
+    WorkTableExpandGeneration,
     CloseWorkTable,
     Halt,
 }
@@ -269,6 +277,9 @@ public delegate bool VdbeGroupComparer(SqlValue[] left, SqlValue[] right);
 /// </remarks>
 public delegate bool VdbeRowEquality(SqlValue[] left, SqlValue[] right);
 
+/// <summary>Projects one fixed-width register tuple into another.</summary>
+public delegate SqlValue[] VdbeRowTransform(SqlValue[] row);
+
 /// <summary>
 /// Expands one recursive-worktable frontier row into its immediate descendant rows. The compiler supplies
 /// the delegate so a <see cref="WorkTableExpandInstruction"/> reuses the evaluator's exact recursive-term
@@ -287,6 +298,13 @@ public delegate bool VdbeRowEquality(SqlValue[] left, SqlValue[] right);
 /// a row whose width differs from the worktable's column count is a hard error.
 /// </remarks>
 public delegate IReadOnlyList<SqlValue[]> VdbeRecursiveTransform(SqlValue[] frontierRow);
+
+/// <summary>
+/// Expands one complete recursive-worktable generation into the next generation. Joined and DISTINCT
+/// recursive terms use this contract so they execute once over the evaluator's full working set.
+/// </summary>
+public delegate IReadOnlyList<SqlValue[]> VdbeRecursiveGenerationTransform(
+    IReadOnlyList<SqlValue[]> frontierRows);
 
 /// <summary>
 /// A single aggregate function expressed as the three lifecycle operations the
@@ -355,6 +373,19 @@ public sealed class VdbeScalarFunction
 }
 
 /// <summary>
+/// Applies one named SQLite numeric-affinity rule to a materialized value. The compiler supplies the
+/// transformation so the opcode and tree-walking evaluator share one coercion implementation.
+/// </summary>
+public sealed class VdbeNumericAffinity
+{
+    /// <summary>The affinity name surfaced by <c>EXPLAIN</c>.</summary>
+    public required string Name { get; init; }
+
+    /// <summary>Coerces one value while preserving NULL.</summary>
+    public required Func<SqlValue, SqlValue> Apply { get; init; }
+}
+
+/// <summary>
 /// Raised by a scalar-function delegate to signal a function-level error (a domain error, an argument-type
 /// error, an overflow, and so on), the managed analogue of a SQLite function raising an error through
 /// <c>sqlite3_result_error</c>. The executor does not catch it: invoking a <see cref="FunctionInstruction"/>
@@ -402,6 +433,300 @@ public sealed class VdbeCursorSource
     /// these is a value-only cursor and cannot satisfy <see cref="RowIdInstruction"/>.
     /// </summary>
     public IReadOnlyList<long>? RowIds { get; }
+}
+
+public enum VdbeJoinKind
+{
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// <summary>A materialized row in a join plan, including one optional hidden rowid per leaf source.</summary>
+public sealed class VdbeJoinRow
+{
+    public VdbeJoinRow(SqlValue[] values, long?[] rowIds)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        ArgumentNullException.ThrowIfNull(rowIds);
+        Values = values;
+        RowIds = rowIds;
+    }
+
+    public SqlValue[] Values { get; }
+
+    public long?[] RowIds { get; }
+}
+
+public delegate bool VdbeJoinCondition(VdbeJoinRow left, VdbeJoinRow right, VdbeJoinRow combined);
+
+public delegate bool VdbeJoinedRowPredicate(VdbeJoinRow row);
+
+public delegate string VdbeJoinGroupKey(VdbeJoinRow row);
+
+/// <summary>A node in a left-deep materializing join plan.</summary>
+public abstract class VdbeJoinPlanNode
+{
+    protected VdbeJoinPlanNode(int columnCount, int sourceCount)
+    {
+        if (columnCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(columnCount));
+        if (sourceCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sourceCount));
+
+        ColumnCount = columnCount;
+        SourceCount = sourceCount;
+    }
+
+    public int ColumnCount { get; }
+
+    public int SourceCount { get; }
+
+    internal abstract IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows);
+}
+
+/// <summary>A base-table leaf in a materializing join plan.</summary>
+public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode
+{
+    public VdbeJoinScanPlan(string tableName, int columnCount, VdbeCursorSource source)
+        : base(columnCount, sourceCount: 1)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(tableName);
+        ArgumentNullException.ThrowIfNull(source);
+        TableName = tableName;
+        Source = source;
+    }
+
+    public string TableName { get; }
+
+    public VdbeCursorSource Source { get; }
+
+    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows)
+    {
+        if (Source.RowIds is not null && Source.RowIds.Count != Source.Rows.Count)
+        {
+            throw new InvalidOperationException(
+                $"Join source '{TableName}' has {Source.Rows.Count} rows but {Source.RowIds.Count} rowids.");
+        }
+
+        var count = maximumRows is { } maximum
+            ? Math.Min(Source.Rows.Count, maximum)
+            : Source.Rows.Count;
+        var rows = new List<VdbeJoinRow>(count);
+        for (var index = 0; index < count; index++)
+        {
+            var values = Source.Rows[index];
+            if (values.Length != ColumnCount)
+            {
+                throw new InvalidOperationException(
+                    $"Join source '{TableName}' declares {ColumnCount} columns but row {index} has {values.Length}.");
+            }
+
+            rows.Add(new VdbeJoinRow(
+                [.. values],
+                [Source.RowIds is null ? null : Source.RowIds[index]]));
+        }
+
+        return rows;
+    }
+}
+
+/// <summary>An INNER, LEFT, RIGHT, or FULL node in a materializing join plan.</summary>
+public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
+{
+    public VdbeJoinOperatorPlan(
+        VdbeJoinPlanNode left,
+        VdbeJoinPlanNode right,
+        VdbeJoinKind kind,
+        VdbeJoinCondition? condition)
+        : base(
+            checked((left ?? throw new ArgumentNullException(nameof(left))).ColumnCount
+                + (right ?? throw new ArgumentNullException(nameof(right))).ColumnCount),
+            checked(left.SourceCount + right.SourceCount))
+    {
+        if (!Enum.IsDefined(kind))
+            throw new ArgumentOutOfRangeException(nameof(kind));
+
+        Left = left;
+        Right = right;
+        Kind = kind;
+        Condition = condition;
+    }
+
+    public VdbeJoinPlanNode Left { get; }
+
+    public VdbeJoinPlanNode Right { get; }
+
+    public VdbeJoinKind Kind { get; }
+
+    public VdbeJoinCondition? Condition { get; }
+
+    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows)
+    {
+        var leftRows = Left.Materialize(maximumRows: null);
+        var rightRows = Right.Materialize(maximumRows: null);
+        var rows = new List<VdbeJoinRow>();
+        var rightMatched = new bool[rightRows.Count];
+
+        foreach (var left in leftRows)
+        {
+            var matched = false;
+            for (var rightIndex = 0; rightIndex < rightRows.Count; rightIndex++)
+            {
+                var right = rightRows[rightIndex];
+                var combined = Combine(left, right);
+                if (Condition is not null && !Condition(left, right, combined))
+                    continue;
+
+                matched = true;
+                rightMatched[rightIndex] = true;
+                rows.Add(combined);
+                if (ReachedMaximum(rows, maximumRows))
+                    return rows;
+            }
+
+            if (!matched && Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
+            {
+                rows.Add(Combine(left, NullRow(Right)));
+                if (ReachedMaximum(rows, maximumRows))
+                    return rows;
+            }
+        }
+
+        if (Kind is VdbeJoinKind.Right or VdbeJoinKind.Full)
+        {
+            var nullLeft = NullRow(Left);
+            for (var rightIndex = 0; rightIndex < rightRows.Count; rightIndex++)
+            {
+                if (rightMatched[rightIndex])
+                    continue;
+
+                rows.Add(Combine(nullLeft, rightRows[rightIndex]));
+                if (ReachedMaximum(rows, maximumRows))
+                    return rows;
+            }
+        }
+
+        return rows;
+    }
+
+    private static bool ReachedMaximum(IReadOnlyCollection<VdbeJoinRow> rows, int? maximumRows)
+        => maximumRows is { } maximum && rows.Count >= maximum;
+
+    private static VdbeJoinRow Combine(VdbeJoinRow left, VdbeJoinRow right)
+        => new(
+            [.. left.Values, .. right.Values],
+            [.. left.RowIds, .. right.RowIds]);
+
+    private static VdbeJoinRow NullRow(VdbeJoinPlanNode node)
+        => new(
+            Enumerable.Repeat(SqlValue.Null, node.ColumnCount).ToArray(),
+            new long?[node.SourceCount]);
+}
+
+/// <summary>
+/// A complete materializing join cursor plan. The root reproduces recursive FROM/JOIN ordering, the
+/// optional filter runs over every joined row before the cursor becomes visible, and an optional group
+/// key appends a first-seen ordinal used by grouped aggregation.
+/// </summary>
+public sealed class VdbeJoinPlan
+{
+    public VdbeJoinPlan(
+        VdbeJoinPlanNode root,
+        string description,
+        VdbeJoinedRowPredicate? filter = null,
+        VdbeJoinGroupKey? groupKey = null,
+        int? maximumRows = null)
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        ArgumentException.ThrowIfNullOrEmpty(description);
+        if (root is not VdbeJoinOperatorPlan)
+            throw new ArgumentException("A join cursor plan root must be a join operator.", nameof(root));
+        if (maximumRows is <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximumRows));
+        if (filter is not null && maximumRows is not null)
+        {
+            throw new ArgumentException(
+                "A join plan cannot cap raw joined rows before applying a post-join filter.",
+                nameof(maximumRows));
+        }
+
+        Root = root;
+        Description = description;
+        Filter = filter;
+        GroupKey = groupKey;
+        MaximumRows = maximumRows;
+    }
+
+    public VdbeJoinPlanNode Root { get; }
+
+    public string Description { get; }
+
+    public VdbeJoinedRowPredicate? Filter { get; }
+
+    public VdbeJoinGroupKey? GroupKey { get; }
+
+    public int? MaximumRows { get; }
+
+    public int ColumnCount => Root.ColumnCount;
+
+    public int SourceCount => Root.SourceCount;
+
+    public int RecordColumnCount => checked(ColumnCount + SourceCount + (GroupKey is null ? 0 : 1));
+
+    internal IReadOnlyList<SqlValue[]> Materialize()
+    {
+        var joined = Root.Materialize(MaximumRows);
+        IReadOnlyList<VdbeJoinRow> selected;
+        if (Filter is null)
+        {
+            selected = joined;
+        }
+        else
+        {
+            var filtered = new List<VdbeJoinRow>(joined.Count);
+            foreach (var row in joined)
+            {
+                if (Filter(row))
+                    filtered.Add(row);
+            }
+
+            selected = filtered;
+        }
+
+        Dictionary<string, long>? groupOrdinals = GroupKey is null
+            ? null
+            : new Dictionary<string, long>(StringComparer.Ordinal);
+        var rows = new List<SqlValue[]>(selected.Count);
+        foreach (var row in selected)
+        {
+            var record = new SqlValue[RecordColumnCount];
+            Array.Copy(row.Values, record, row.Values.Length);
+            for (var index = 0; index < row.RowIds.Length; index++)
+            {
+                record[ColumnCount + index] = row.RowIds[index] is { } rowId
+                    ? SqlValue.Integer(rowId)
+                    : SqlValue.Null;
+            }
+
+            if (GroupKey is not null)
+            {
+                var key = GroupKey(row);
+                if (!groupOrdinals!.TryGetValue(key, out var ordinal))
+                {
+                    ordinal = groupOrdinals.Count;
+                    groupOrdinals.Add(key, ordinal);
+                }
+
+                record[^1] = SqlValue.Integer(ordinal);
+            }
+
+            rows.Add(record);
+        }
+
+        return rows;
+    }
 }
 
 /// <summary>
@@ -539,10 +864,25 @@ public sealed record ArithmeticInstruction(
     public override VdbeOpcode Opcode => VdbeOpcode.Arithmetic;
 }
 
+/// <summary>
+/// Applies SQLite numeric affinity to one register before arithmetic consumes it. The value is replaced only
+/// after the supplied transformation succeeds, so a coercion error cannot publish a partial result.
+/// </summary>
+public sealed record NumericAffinityInstruction(Register Value, VdbeNumericAffinity Affinity) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.NumericAffinity;
+}
+
 public sealed record OpenReadCursorInstruction(Cursor Cursor, string? TableName = null, int ColumnCount = 0)
     : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.OpenReadCursor;
+}
+
+/// <summary>Materializes a recursive join plan and opens its result as a read cursor.</summary>
+public sealed record OpenJoinCursorInstruction(Cursor Cursor, VdbeJoinPlan Plan) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.OpenJoinCursor;
 }
 
 public sealed record OpenWriteCursorInstruction(Cursor Cursor, string TableName, int ColumnCount)
@@ -741,6 +1081,26 @@ public sealed record FilterRegistersInstruction(
     public override VdbeOpcode Opcode => VdbeOpcode.FilterRegisters;
 }
 
+/// <summary>Projects one register tuple into another with caller-supplied SQL value semantics.</summary>
+public sealed record ProjectRegistersInstruction(
+    RegisterRange Input,
+    RegisterRange Output,
+    VdbeRowTransform Transform,
+    string Description) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.ProjectRegisters;
+}
+
+/// <summary>Records novel tuples and jumps over duplicates without emitting a row.</summary>
+public sealed record DistinctFilterInstruction(
+    RegisterRange Values,
+    VdbeRowEquality Equality,
+    int DistinctSetIndex,
+    ProgramCounter DuplicateTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.DistinctFilter;
+}
+
 public sealed record NextInstruction(Cursor Cursor, ProgramCounter LoopTarget) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.Next;
@@ -795,6 +1155,31 @@ public sealed record RowSetInsertInstruction(
 }
 
 /// <summary>
+/// Positions a row set at its first stored row and copies that row into <paramref name="Destination"/>.
+/// Empty sets jump to <paramref name="EmptyTarget"/>. Row sets preserve first-insertion order, so this
+/// begins the output pass of an <c>INTERSECT</c>/<c>EXCEPT</c> after every source term has run.
+/// </summary>
+public sealed record RowSetRewindInstruction(
+    int RowSetIndex,
+    RegisterRange Destination,
+    ProgramCounter EmptyTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RowSetRewind;
+}
+
+/// <summary>
+/// Advances a row-set iteration, copies the next row into <paramref name="Destination"/>, and jumps to
+/// <paramref name="LoopTarget"/> while another row exists. It falls through when the set is exhausted.
+/// </summary>
+public sealed record RowSetNextInstruction(
+    int RowSetIndex,
+    RegisterRange Destination,
+    ProgramCounter LoopTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RowSetNext;
+}
+
+/// <summary>
 /// Emits the tuple held in the register block <paramref name="Values"/> as a result row for a compound
 /// set operation, but only the first time an equal tuple both satisfies the membership condition
 /// <paramref name="Mode"/> against the probe sets <paramref name="MembershipSetIndices"/> and is novel to
@@ -823,6 +1208,39 @@ public sealed record CompoundResultRowInstruction(
 {
     public override VdbeOpcode Opcode => VdbeOpcode.CompoundResultRow;
 }
+
+/// <summary>
+/// A composable result-row pipeline used when a compound program is embedded as another compound term.
+/// Guards run in order, preserving the nested program's de-duplication and membership checks. A surviving
+/// row is either emitted or inserted into another row set, allowing an outer operation to add its own
+/// semantics without flattening or bypassing the inner operation.
+/// </summary>
+public sealed record GuardedRowInstruction(
+    RegisterRange Values,
+    IReadOnlyList<VdbeRowGuard> Guards,
+    VdbeRowDestination Destination) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.GuardedRow;
+}
+
+public abstract record VdbeRowGuard;
+
+public sealed record DistinctRowGuard(
+    VdbeRowEquality Equality,
+    int RowSetIndex) : VdbeRowGuard;
+
+public sealed record MembershipRowGuard(
+    VdbeRowEquality Equality,
+    IReadOnlyList<int> RowSetIndices,
+    CompoundMembershipMode Mode) : VdbeRowGuard;
+
+public abstract record VdbeRowDestination;
+
+public sealed record ResultRowDestination : VdbeRowDestination;
+
+public sealed record RowSetDestination(
+    VdbeRowEquality Equality,
+    int RowSetIndex) : VdbeRowDestination;
 
 /// <summary>
 /// Skips the first N candidate result rows of a LIMIT/OFFSET pipeline. When <paramref name="Counter"/>
@@ -1007,6 +1425,18 @@ public sealed record WorkTableExpandInstruction(
     public override VdbeOpcode Opcode => VdbeOpcode.WorkTableExpand;
 }
 
+/// <summary>
+/// Collects the current frontier row and invokes <paramref name="Transform"/> after the final row at the
+/// same depth, admitting the returned rows as the next generation.
+/// </summary>
+public sealed record WorkTableExpandGenerationInstruction(
+    WorkTable WorkTable,
+    VdbeRecursiveGenerationTransform Transform,
+    RegisterRange Source) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.WorkTableExpandGeneration;
+}
+
 /// <summary>Releases worktable <paramref name="WorkTable"/>'s frontier and de-duplication buffers.</summary>
 public sealed record CloseWorkTableInstruction(WorkTable WorkTable) : VdbeInstruction
 {
@@ -1180,6 +1610,27 @@ public sealed class VdbeProgram
                     }
 
                     break;
+                case NumericAffinityInstruction numericAffinity:
+                    ValidateRegister(numericAffinity.Value, instructionIndex);
+                    if (numericAffinity.Affinity is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies a null numeric affinity.");
+                    }
+
+                    if (string.IsNullOrEmpty(numericAffinity.Affinity.Name))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies an unnamed numeric affinity.");
+                    }
+
+                    if (numericAffinity.Affinity.Apply is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies numeric affinity '{numericAffinity.Affinity.Name}' with a null delegate.");
+                    }
+
+                    break;
                 case OpenReadCursorInstruction open:
                     ValidateCursor(open.Cursor, instructionIndex);
                     if (openCursors[open.Cursor.Index])
@@ -1196,6 +1647,23 @@ public sealed class VdbeProgram
 
                     openCursors[open.Cursor.Index] = true;
                     cursorColumnCounts[open.Cursor.Index] = open.ColumnCount;
+                    break;
+                case OpenJoinCursorInstruction openJoin:
+                    ValidateCursor(openJoin.Cursor, instructionIndex);
+                    if (openCursors[openJoin.Cursor.Index])
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens cursor {openJoin.Cursor.Index} twice.");
+                    }
+
+                    if (openJoin.Plan is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} opens a null join plan.");
+                    }
+
+                    openCursors[openJoin.Cursor.Index] = true;
+                    cursorColumnCounts[openJoin.Cursor.Index] = openJoin.Plan.RecordColumnCount;
                     break;
                 case OpenWriteCursorInstruction openWrite:
                     ValidateCursor(openWrite.Cursor, instructionIndex);
@@ -1278,6 +1746,27 @@ public sealed class VdbeProgram
 
                     ValidateRegisterRange(filterRegisters.Row, instructionIndex);
                     ValidateJumpTarget(filterRegisters.FalseTarget, instructionIndex);
+                    break;
+                case ProjectRegistersInstruction project:
+                    ValidateRegisterRange(project.Input, instructionIndex);
+                    ValidateRegisterRange(project.Output, instructionIndex);
+                    if (project.Transform is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} projects with a null transform.");
+                    }
+
+                    break;
+                case DistinctFilterInstruction distinctFilter:
+                    ValidateRegisterRange(distinctFilter.Values, instructionIndex);
+                    if (distinctFilter.Equality is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} filters distinct rows with a null equality.");
+                    }
+
+                    ValidateDistinctSet(distinctFilter.DistinctSetIndex, instructionIndex);
+                    ValidateJumpTarget(distinctFilter.DuplicateTarget, instructionIndex);
                     break;
                 case NextInstruction next:
                     ValidateOpenCursor(next.Cursor, openCursors, instructionIndex);
@@ -1406,6 +1895,16 @@ public sealed class VdbeProgram
 
                     ValidateDistinctSet(rowSetInsert.RowSetIndex, instructionIndex);
                     break;
+                case RowSetRewindInstruction rowSetRewind:
+                    ValidateDistinctSet(rowSetRewind.RowSetIndex, instructionIndex);
+                    ValidateRegisterRange(rowSetRewind.Destination, instructionIndex);
+                    ValidateJumpTarget(rowSetRewind.EmptyTarget, instructionIndex);
+                    break;
+                case RowSetNextInstruction rowSetNext:
+                    ValidateDistinctSet(rowSetNext.RowSetIndex, instructionIndex);
+                    ValidateRegisterRange(rowSetNext.Destination, instructionIndex);
+                    ValidateJumpTarget(rowSetNext.LoopTarget, instructionIndex);
+                    break;
                 case CompoundResultRowInstruction compoundRow:
                     ValidateRegisterRange(compoundRow.Values, instructionIndex);
                     if (compoundRow.Equality is null)
@@ -1435,6 +1934,80 @@ public sealed class VdbeProgram
                             throw new VdbeProgramValidationException(
                                 $"VDBE instruction {instructionIndex} emits a compound row whose output set {compoundRow.OutputSetIndex} is also a membership set.");
                         }
+                    }
+
+                    break;
+                case GuardedRowInstruction guardedRow:
+                    ValidateRegisterRange(guardedRow.Values, instructionIndex);
+                    if (guardedRow.Guards is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} has a null guarded-row condition list.");
+                    }
+
+                    foreach (var guard in guardedRow.Guards)
+                    {
+                        switch (guard)
+                        {
+                            case DistinctRowGuard distinctGuard:
+                                if (distinctGuard.Equality is null)
+                                {
+                                    throw new VdbeProgramValidationException(
+                                        $"VDBE instruction {instructionIndex} has a distinct row guard with a null equality.");
+                                }
+
+                                ValidateDistinctSet(distinctGuard.RowSetIndex, instructionIndex);
+                                break;
+                            case MembershipRowGuard membershipGuard:
+                                if (membershipGuard.Equality is null)
+                                {
+                                    throw new VdbeProgramValidationException(
+                                        $"VDBE instruction {instructionIndex} has a membership row guard with a null equality.");
+                                }
+
+                                if (membershipGuard.RowSetIndices is null)
+                                {
+                                    throw new VdbeProgramValidationException(
+                                        $"VDBE instruction {instructionIndex} has a null membership row-set list.");
+                                }
+
+                                if (!Enum.IsDefined(membershipGuard.Mode))
+                                {
+                                    throw new VdbeProgramValidationException(
+                                        $"VDBE instruction {instructionIndex} has an undefined membership mode.");
+                                }
+
+                                foreach (var rowSetIndex in membershipGuard.RowSetIndices)
+                                    ValidateDistinctSet(rowSetIndex, instructionIndex);
+                                break;
+                            case null:
+                                throw new VdbeProgramValidationException(
+                                    $"VDBE instruction {instructionIndex} has a null row guard.");
+                            default:
+                                throw new VdbeProgramValidationException(
+                                    $"VDBE instruction {instructionIndex} has unsupported row guard {guard.GetType().Name}.");
+                        }
+                    }
+
+                    switch (guardedRow.Destination)
+                    {
+                        case ResultRowDestination:
+                            break;
+                        case RowSetDestination rowSetDestination:
+                            if (rowSetDestination.Equality is null)
+                            {
+                                throw new VdbeProgramValidationException(
+                                    $"VDBE instruction {instructionIndex} has a row-set destination with a null equality.");
+                            }
+
+                            ValidateDistinctSet(rowSetDestination.RowSetIndex, instructionIndex);
+                            break;
+                        case null:
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} has a null row destination.");
+                        default:
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} has unsupported row destination {guardedRow.Destination.GetType().Name}.");
                     }
 
                     break;
@@ -1540,6 +2113,21 @@ public sealed class VdbeProgram
                         expand.WorkTable,
                         expand.Source,
                         workTableColumnCounts[expand.WorkTable.Index],
+                        instructionIndex);
+                    break;
+                case WorkTableExpandGenerationInstruction expandGeneration:
+                    ValidateOpenWorkTable(expandGeneration.WorkTable, openWorkTables, instructionIndex);
+                    if (expandGeneration.Transform is null)
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} expands work table {expandGeneration.WorkTable.Index} with a null generation transform.");
+                    }
+
+                    ValidateRegisterRange(expandGeneration.Source, instructionIndex);
+                    ValidateWorkTableRecordWidth(
+                        expandGeneration.WorkTable,
+                        expandGeneration.Source,
+                        workTableColumnCounts[expandGeneration.WorkTable.Index],
                         instructionIndex);
                     break;
                 case CloseWorkTableInstruction closeWorkTable:

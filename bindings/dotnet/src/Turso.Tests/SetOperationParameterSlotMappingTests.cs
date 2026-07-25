@@ -5,15 +5,8 @@ using Turso.Core.Execution;
 
 namespace Turso.Tests;
 
-// Regression coverage for the INTERSECT/EXCEPT parameter-slot mapping in
-// CompoundProgramBuilder.BuildSetOperation. Those builders emit the probe terms (1..N) before the
-// primary term (0) so the primary can test membership against fully built probe sets, but the combined
-// program's parameter slots are its external binding interface: a caller binds by input-term order
-// (term 0's slots first, then term 1's, …), exactly as the UNION path lays them out. The bug allocated
-// slot bases in *emission* order, so a binding [A, B] fed `A EXCEPT B` as `B EXCEPT A`. These tests bind
-// deliberately DISTINCT values per term — never identical placeholders that would mask the reversal — and
-// assert the invariant: combined slot = (sum of ParameterSlotCount over input terms before this term) +
-// local slot, independent of emission order.
+// Regression coverage for INTERSECT/EXCEPT parameter slots. Set operations now evaluate and bind every
+// term in SQL source order before iterating the captured first-term set.
 public class SetOperationParameterSlotMappingTests
 {
     private static readonly VdbeRowEquality ByteExactRows = (left, right) =>
@@ -78,7 +71,7 @@ public class SetOperationParameterSlotMappingTests
     public void ExceptThreeTermChainMapsEachTermToItsInputSlots()
     {
         // A = {?0, 1, 2, 3} (primary), B = {?0} (probe 1), C = {?0} (probe 2).
-        // Slots lay out A -> 0, B -> 1, C -> 2, even though emission runs B, C, then A.
+        // Slots and execution both lay out A -> 0, B -> 1, C -> 2.
         var compound = CompoundProgramBuilder.BuildExcept(
             [
                 ValuesProgramBuilder.BuildTermCells(CellRows(
@@ -94,7 +87,7 @@ public class SetOperationParameterSlotMappingTests
         compound.Program.ParameterSlotCount.Should().Be(3);
 
         // Binding [10, 2, 3]: A -> {10, 1, 2, 3}, B -> {2}, C -> {3}; A EXCEPT (B ∪ C) = {10, 1}. The
-        // reversed emission-order mapping would send 10 -> B, 2 -> C, 3 -> A and yield {3, 1} instead.
+        // a reversed mapping would send 10 -> B, 2 -> C, 3 -> A and yield {3, 1} instead.
         var binding = VdbeParameterBinding.FromValues(
             SqlValue.Integer(10), SqlValue.Integer(2), SqlValue.Integer(3));
         Integers(RunCompoundWithBinding(compound, binding)).Should().Equal(10, 1);
@@ -184,10 +177,8 @@ public class SetOperationParameterSlotMappingTests
     }
 
     [Test]
-    public void SetOperationEmitsLoadParameterSlotsInTermIdentityOrderNotEmissionOrder()
+    public void SetOperationEmitsLoadParameterSlotsInSourceOrder()
     {
-        // A = {?0} (primary, term 0), B = {?0} (probe, term 1). Emission runs the probe first, the primary
-        // last, but each term's parameter keeps its input-term slot: probe -> slot 1, primary -> slot 0.
         var compound = CompoundProgramBuilder.BuildExcept(
             [
                 ValuesProgramBuilder.BuildTermCells(CellRows([ValuesCell.Parameter(0)])),
@@ -200,10 +191,8 @@ public class SetOperationParameterSlotMappingTests
             .ToList();
         loadParameters.Should().HaveCount(2);
 
-        // First emitted LoadParameter belongs to the probe (term 1) -> slot 1; the second, emitted last,
-        // belongs to the primary (term 0) -> slot 0. Slots follow term identity, not emission order.
-        loadParameters[0].Slot.Index.Should().Be(1);
-        loadParameters[1].Slot.Index.Should().Be(0);
+        loadParameters[0].Slot.Index.Should().Be(0);
+        loadParameters[1].Slot.Index.Should().Be(1);
     }
 
     [Test]
@@ -225,12 +214,10 @@ public class SetOperationParameterSlotMappingTests
             .ToList();
         paramRows.Should().HaveCount(2);
 
-        // Emission order is probe then primary, so EXPLAIN shows slot 1 (probe) before slot 0 (primary),
-        // rendering the corrected term-identity mapping rather than a monotonic emission-order layout.
-        paramRows[0][3].AsInteger().Should().Be(1);
-        paramRows[0][5].AsText().Should().Be("param[1]");
-        paramRows[1][3].AsInteger().Should().Be(0);
-        paramRows[1][5].AsText().Should().Be("param[0]");
+        paramRows[0][3].AsInteger().Should().Be(0);
+        paramRows[0][5].AsText().Should().Be("param[0]");
+        paramRows[1][3].AsInteger().Should().Be(1);
+        paramRows[1][5].AsText().Should().Be("param[1]");
     }
 
     [Test]

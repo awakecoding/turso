@@ -13,6 +13,9 @@ public sealed class DeterministicFaultInjector
     private readonly object _gate = new();
     private readonly Dictionary<FileSystemOperation, long> _counts = new();
     private readonly Dictionary<(FileSystemOperation Operation, long Occurrence), string> _scheduled = new();
+    private readonly Dictionary<
+        (FileSystemOperation Operation, long Occurrence),
+        (FileSystemOperation Operation, string Message)> _scheduledAfter = new();
 
     /// <summary>
     /// Schedules a fault for the <paramref name="occurrence"/>-th (1-based)
@@ -35,6 +38,24 @@ public sealed class DeterministicFaultInjector
         }
     }
 
+    /// <summary>
+    /// Schedules a fault on the first <paramref name="operation"/> after the next
+    /// <paramref name="trigger"/> invocation.
+    /// </summary>
+    public void FailNextAfter(
+        FileSystemOperation trigger,
+        FileSystemOperation operation,
+        string? message = null)
+    {
+        lock (_gate)
+        {
+            var nextTrigger = _counts.GetValueOrDefault(trigger) + 1;
+            _scheduledAfter[(trigger, nextTrigger)] = (
+                operation,
+                message ?? $"Injected {operation} fault after {trigger} occurrence {nextTrigger}.");
+        }
+    }
+
     /// <summary>Returns the number of times <paramref name="operation"/> has run.</summary>
     public long GetOperationCount(FileSystemOperation operation)
     {
@@ -46,7 +67,10 @@ public sealed class DeterministicFaultInjector
     public void ClearScheduled()
     {
         lock (_gate)
+        {
             _scheduled.Clear();
+            _scheduledAfter.Clear();
+        }
     }
 
     /// <summary>
@@ -62,6 +86,12 @@ public sealed class DeterministicFaultInjector
         {
             var count = _counts.GetValueOrDefault(operation) + 1;
             _counts[operation] = count;
+            if (_scheduledAfter.Remove((operation, count), out var delayed))
+            {
+                var delayedOccurrence = _counts.GetValueOrDefault(delayed.Operation) + 1;
+                _scheduled[(delayed.Operation, delayedOccurrence)] = delayed.Message;
+            }
+
             if (!_scheduled.Remove((operation, count), out message!))
                 return;
         }
@@ -79,7 +109,7 @@ public sealed class DeterministicFaultInjector
 /// the semantics of the engine's in-memory I/O backend. An optional
 /// <see cref="DeterministicFaultInjector"/> makes it usable for error-path tests.
 /// </summary>
-public sealed class InMemoryFileSystem : IFileSystem
+public sealed class InMemoryFileSystem : IFileSystem, IAtomicFileSystem
 {
     private const int BlockSize = 4096;
 
@@ -128,6 +158,32 @@ public sealed class InMemoryFileSystem : IFileSystem
         ArgumentException.ThrowIfNullOrEmpty(path);
         lock (_gate)
             _files.Remove(path);
+    }
+
+    void IAtomicFileSystem.ReplaceFileAtomically(
+        string sourcePath,
+        string destinationPath,
+        bool replaceEmptyDestination)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sourcePath);
+        ArgumentException.ThrowIfNullOrEmpty(destinationPath);
+        if (string.Equals(sourcePath, destinationPath, StringComparison.Ordinal))
+            throw new IOException("Atomic file replacement requires distinct source and destination paths.");
+
+        _faults?.BeforeOperation(FileSystemOperation.AtomicReplace);
+        lock (_gate)
+        {
+            if (!_files.TryGetValue(sourcePath, out var source))
+                throw new FileNotFoundException("The atomic replacement source does not exist.", sourcePath);
+            if (_files.TryGetValue(destinationPath, out var destination)
+                && (!replaceEmptyDestination || destination.Length != 0))
+            {
+                throw new IOException("output file already exists");
+            }
+
+            _files.Remove(sourcePath);
+            _files[destinationPath] = source;
+        }
     }
 
     internal void SignalOperation(FileSystemOperation operation) => _faults?.BeforeOperation(operation);
@@ -237,7 +293,7 @@ public sealed class InMemoryFileSystem : IFileSystem
             }
         }
 
-        private long Length
+        internal long Length
         {
             get
             {

@@ -158,28 +158,24 @@ public class TopLevelValuesSqlRoutingTests
     }
 
     [Test]
-    public void ValuesAsCompoundTermStaysOnEvaluator()
+    public void ValuesAsCompoundTermRoutes()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
-        // The compound compiler only lowers SELECT terms, so a VALUES term keeps the whole compound
-        // on the evaluator's left-associative fold: the value is right, the program is not lowered.
         Column0(ReadRows(connection, "SELECT 1 AS x UNION ALL VALUES (2)"))
             .Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
 
-        Assert.Throws<EmbeddedSqlException>(
+        Assert.DoesNotThrow(
             () => ReadRows(connection, "EXPLAIN SELECT 1 AS x UNION ALL VALUES (2)"));
     }
 
     [Test]
-    public void TopLevelValuesRoutesWhileTheSameRowsAsADerivedTableDoNot()
+    public void TopLevelAndBareDerivedValuesRoute()
     {
         using var connection = new EmbeddedDatabase().Connect();
 
-        // The routing boundary is exactly the top level: identical literal rows lower to bytecode as a
-        // standalone VALUES but stay on the evaluator once wrapped in a derived table.
         Assert.DoesNotThrow(() => ReadRows(connection, "EXPLAIN VALUES (1, 2)"));
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN SELECT * FROM (VALUES (1, 2))"));
+        Assert.DoesNotThrow(() => ReadRows(connection, "EXPLAIN SELECT * FROM (VALUES (1, 2))"));
     }
 
     [Test]

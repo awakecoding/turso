@@ -45,17 +45,17 @@ public sealed class SqliteIndexLeafPageView
     public IReadOnlyList<SqliteIndexLeafPageCell> Cells { get; }
 
     /// <summary>
-    /// Whether all index record payloads were available and verified in strict
-    /// SQLite BINARY order.
+    /// Whether all index record payloads were available and verified in the
+    /// configured strict SQLite index order.
     /// </summary>
     /// <remarks>
     /// When a page has overflowing cells, pass an overflow reader to
-    /// <see cref="Parse(ReadOnlySpan{byte}, int, SqliteTextEncoding, bool, SqliteOverflowChainReader?)"/>
+    /// <see cref="Parse"/>
     /// to validate logical key order as well as physical page layout.
     /// </remarks>
     public bool HasVerifiedRecordOrdering => _records is not null;
 
-    /// <summary>The BINARY record comparator used while validating this page.</summary>
+    /// <summary>The record comparator used while validating this page.</summary>
     public SqliteIndexRecordComparer RecordComparer => _recordComparer;
 
     /// <summary>
@@ -67,7 +67,8 @@ public sealed class SqliteIndexLeafPageView
         int usableSpace,
         SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8,
         bool isFirstPage = false,
-        SqliteOverflowChainReader? overflowReader = null)
+        SqliteOverflowChainReader? overflowReader = null,
+        SqliteIndexRecordComparer? recordComparer = null)
     {
         if (isFirstPage)
         {
@@ -107,7 +108,7 @@ public sealed class SqliteIndexLeafPageView
             header,
             ranges,
             "index-leaf");
-        var recordComparer = new SqliteIndexRecordComparer(textEncoding);
+        recordComparer ??= new SqliteIndexRecordComparer(textEncoding);
         var records = ReadAndValidateRecords(cells, recordComparer, overflowReader);
         return new SqliteIndexLeafPageView(
             page.Length,
@@ -177,7 +178,8 @@ public sealed class SqliteIndexLeafPageView
                 : overflowReader!.ReadPayload(pageCell.Cell);
             comparer.Validate(record);
             if (previousRecord is not null && comparer.Compare(previousRecord, record) >= 0)
-                throw new InvalidDataException("SQLite index-leaf records are not in strictly increasing BINARY order.");
+                throw new InvalidDataException(
+                    $"SQLite index-leaf records are not in strictly increasing declared order at cell {index}.");
 
             previousRecord = record;
             records[index] = record;

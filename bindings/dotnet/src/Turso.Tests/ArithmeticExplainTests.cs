@@ -30,6 +30,10 @@ public class ArithmeticExplainTests
         Symbol(ArithmeticOperator.Multiply).Should().Be("*");
         Symbol(ArithmeticOperator.Divide).Should().Be("/");
         Symbol(ArithmeticOperator.Modulo).Should().Be("%");
+        Symbol(ArithmeticOperator.BitwiseAnd).Should().Be("&");
+        Symbol(ArithmeticOperator.BitwiseOr).Should().Be("|");
+        Symbol(ArithmeticOperator.ShiftLeft).Should().Be("<<");
+        Symbol(ArithmeticOperator.ShiftRight).Should().Be(">>");
     }
 
     [Test]
@@ -89,6 +93,25 @@ public class ArithmeticExplainTests
         rendered.Should().OnlyContain(row => row.Length == VdbeExplain.Columns().Length);
         // The Arithmetic row names its opcode.
         rendered[2][1].Should().Be(SqlValue.Text(nameof(VdbeOpcode.Arithmetic)));
+    }
+
+    [Test]
+    public void DescribesNumericAffinity()
+    {
+        var affinity = new VdbeNumericAffinity
+        {
+            Name = "numeric",
+            Apply = value => value,
+        };
+
+        var (p1, p2, p3, p4, comment) = VdbeExplain.Describe(
+            new NumericAffinityInstruction(new Register(4), affinity));
+
+        p1.Should().Be(4);
+        p2.Should().Be(0);
+        p3.Should().Be(0);
+        p4.Should().Be("numeric");
+        comment.Should().Be("r[4]=numeric(r[4])");
     }
 
     private static string? Symbol(ArithmeticOperator op)

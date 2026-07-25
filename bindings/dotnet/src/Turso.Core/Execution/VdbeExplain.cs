@@ -76,6 +76,12 @@ public static class VdbeExplain
                 arithmetic.Operands.Count,
                 VdbeArithmetic.Symbol(arithmetic.Operator),
                 FormatArithmetic(arithmetic)),
+            NumericAffinityInstruction numericAffinity => (
+                numericAffinity.Value.Index,
+                0,
+                0,
+                numericAffinity.Affinity.Name,
+                $"r[{numericAffinity.Value.Index}]={numericAffinity.Affinity.Name}(r[{numericAffinity.Value.Index}])"),
             OpenReadCursorInstruction open => (
                 open.Cursor.Index,
                 0,
@@ -84,6 +90,12 @@ public static class VdbeExplain
                 open.TableName is null
                     ? $"open read cursor {open.Cursor.Index}"
                     : $"open read cursor {open.Cursor.Index} on {open.TableName} ({open.ColumnCount} cols)"),
+            OpenJoinCursorInstruction openJoin => (
+                openJoin.Cursor.Index,
+                openJoin.Plan.SourceCount,
+                openJoin.Plan.RecordColumnCount,
+                openJoin.Plan.Description,
+                $"materialize {openJoin.Plan.Description} into cursor {openJoin.Cursor.Index} ({openJoin.Plan.RecordColumnCount} cols)"),
             OpenWriteCursorInstruction openWrite => (
                 openWrite.Cursor.Index,
                 0,
@@ -127,6 +139,18 @@ public static class VdbeExplain
                 filterRegisters.Row.Count,
                 null,
                 filterRegisters.Description),
+            ProjectRegistersInstruction project => (
+                project.Input.Start.Index,
+                project.Output.Start.Index,
+                project.Output.Count,
+                null,
+                project.Description),
+            DistinctFilterInstruction distinctFilter => (
+                distinctFilter.Values.Start.Index,
+                distinctFilter.DuplicateTarget.Offset,
+                distinctFilter.DistinctSetIndex,
+                null,
+                $"goto {distinctFilter.DuplicateTarget.Offset} if {FormatRange(distinctFilter.Values)} is in distinct set {distinctFilter.DistinctSetIndex}"),
             NextInstruction next => (
                 next.Cursor.Index,
                 next.LoopTarget.Offset,
@@ -247,12 +271,30 @@ public static class VdbeExplain
                 rowSetInsert.RowSetIndex,
                 null,
                 $"insert {FormatRange(rowSetInsert.Values)} into row set {rowSetInsert.RowSetIndex}"),
+            RowSetRewindInstruction rowSetRewind => (
+                rowSetRewind.RowSetIndex,
+                rowSetRewind.EmptyTarget.Offset,
+                rowSetRewind.Destination.Start.Index,
+                FormatRange(rowSetRewind.Destination),
+                $"{FormatRange(rowSetRewind.Destination)}=row set {rowSetRewind.RowSetIndex} first, goto {rowSetRewind.EmptyTarget.Offset} if empty"),
+            RowSetNextInstruction rowSetNext => (
+                rowSetNext.RowSetIndex,
+                rowSetNext.LoopTarget.Offset,
+                rowSetNext.Destination.Start.Index,
+                FormatRange(rowSetNext.Destination),
+                $"{FormatRange(rowSetNext.Destination)}=row set {rowSetNext.RowSetIndex} next, goto {rowSetNext.LoopTarget.Offset} if present"),
             CompoundResultRowInstruction compound => (
                 compound.Values.Start.Index,
                 compound.Values.Count,
                 compound.OutputSetIndex,
                 FormatSetList(compound.MembershipSetIndices),
                 $"{FormatResultRow(compound.Values)} if new to distinct set {compound.OutputSetIndex} and {FormatMembership(compound.Mode)} {FormatSetList(compound.MembershipSetIndices)}"),
+            GuardedRowInstruction guarded => (
+                guarded.Values.Start.Index,
+                guarded.Values.Count,
+                guarded.Destination is RowSetDestination destination ? destination.RowSetIndex : -1,
+                FormatGuards(guarded.Guards),
+                $"{FormatDestination(guarded.Destination, guarded.Values)} if {FormatGuards(guarded.Guards)}"),
             OffsetGateInstruction offsetGate => (
                 offsetGate.Counter.Index,
                 offsetGate.SkipTarget.Offset,
@@ -295,6 +337,12 @@ public static class VdbeExplain
                 expand.Source.Count,
                 null,
                 $"expand work table {expand.WorkTable.Index} from {FormatRange(expand.Source)}"),
+            WorkTableExpandGenerationInstruction expandGeneration => (
+                expandGeneration.WorkTable.Index,
+                expandGeneration.Source.Start.Index,
+                expandGeneration.Source.Count,
+                null,
+                $"expand work table {expandGeneration.WorkTable.Index} generation from {FormatRange(expandGeneration.Source)}"),
             CloseWorkTableInstruction closeWorkTable => (
                 closeWorkTable.WorkTable.Index,
                 0,
@@ -324,7 +372,7 @@ public static class VdbeExplain
         var symbol = VdbeArithmetic.Symbol(arithmetic.Operator);
         var destination = arithmetic.Destination.Index;
         var start = arithmetic.Operands.Start.Index;
-        // Unary sign operators render as a prefix over their single operand; binary operators render infix.
+        // Unary operators render as a prefix over their single operand; binary operators render infix.
         return arithmetic.Operands.Count == 1
             ? $"r[{destination}]={symbol}r[{start}]"
             : $"r[{destination}]=r[{start}] {symbol} r[{start + 1}]";
@@ -332,6 +380,32 @@ public static class VdbeExplain
 
     private static string FormatResultRow(RegisterRange range)
         => $"output={FormatRange(range)}";
+
+    private static string FormatDestination(VdbeRowDestination destination, RegisterRange values)
+        => destination switch
+        {
+            ResultRowDestination => FormatResultRow(values),
+            RowSetDestination rowSet => $"insert {FormatRange(values)} into row set {rowSet.RowSetIndex}",
+            _ => throw new VdbeProgramValidationException(
+                $"Unknown guarded-row destination {destination.GetType().Name}."),
+        };
+
+    private static string FormatGuards(IReadOnlyList<VdbeRowGuard> guards)
+    {
+        if (guards.Count == 0)
+            return "accepted";
+
+        return string.Join(
+            " then ",
+            guards.Select(guard => guard switch
+            {
+                DistinctRowGuard distinct => $"new to distinct set {distinct.RowSetIndex}",
+                MembershipRowGuard membership
+                    => $"{FormatMembership(membership.Mode)} {FormatSetList(membership.RowSetIndices)}",
+                _ => throw new VdbeProgramValidationException(
+                    $"Unknown guarded-row condition {guard.GetType().Name}."),
+            }));
+    }
 
     private static string FormatMembership(CompoundMembershipMode mode) => mode switch
     {

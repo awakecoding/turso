@@ -50,7 +50,6 @@ public class ManagedFileCompactionDurabilityTests
                 Scalar(connection, $"SELECT id FROM entries WHERE category = '{retainedCategory}';")
                     .Should()
                     .Be(3);
-                Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "VACUUM;"));
             }
 
             VerifyWithSqlite(path);

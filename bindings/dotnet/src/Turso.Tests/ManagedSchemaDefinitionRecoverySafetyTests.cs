@@ -118,6 +118,37 @@ public sealed class ManagedSchemaDefinitionRecoverySafetyTests
         ScalarInteger(reopenedConnection, "SELECT COUNT(*) FROM events;").Should().Be(1);
     }
 
+    [Test]
+    public void OversizedEncryptedSchemaSqlPersistsThroughOverflowPages()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "oversized-encrypted-schema.db";
+        var oversizedDefault = new string('x', 5000);
+
+        using (var encryption = TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes256Gcm, Aes256Key))
+        using (var encryptedFileSystem = new TursoEncryptionFileSystem(fileSystem, encryption))
+        using (var database = EmbeddedDatabase.OpenFile(path, encryptedFileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE durable(id INTEGER PRIMARY KEY, value TEXT);");
+            Execute(connection, "INSERT INTO durable VALUES (1, 'before');");
+            Execute(connection, $"CREATE TABLE oversized(value TEXT DEFAULT '{oversizedDefault}');");
+            Execute(connection, "INSERT INTO oversized DEFAULT VALUES;");
+
+            ScalarInteger(connection, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'oversized';").Should().Be(1);
+            ScalarInteger(connection, "SELECT length(value) FROM oversized;").Should().Be(oversizedDefault.Length);
+            Scalar(connection, "SELECT value FROM durable WHERE id = 1;").Should().Be("before");
+        }
+
+        using var reopenEncryption = TursoEncryptionOptions.FromHex(TursoEncryptionCipher.Aes256Gcm, Aes256Key);
+        using var reopenedFileSystem = new TursoEncryptionFileSystem(fileSystem, reopenEncryption);
+        using var reopened = EmbeddedDatabase.OpenFile(path, reopenedFileSystem);
+        using var reopenedConnection = reopened.Connect();
+        ScalarInteger(reopenedConnection, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'oversized';").Should().Be(1);
+        ScalarInteger(reopenedConnection, "SELECT length(value) FROM oversized;").Should().Be(oversizedDefault.Length);
+        Scalar(reopenedConnection, "SELECT value FROM durable WHERE id = 1;").Should().Be("before");
+    }
+
     private static void CorruptTriggerSql(IFileSystem fileSystem, string path)
     {
         using var file = fileSystem.OpenFile(path, FileOpenMode.OpenExisting);

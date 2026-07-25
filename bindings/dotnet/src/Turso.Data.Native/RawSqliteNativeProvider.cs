@@ -36,16 +36,19 @@ internal sealed class RawSqliteNativeProviderFactory : SqliteNativeProviderFacto
         var context = GCHandle.Alloc(new RawScalarFunctionRegistration(invoke));
         try
         {
-            Execute(() => TursoBindings.RegisterScalarFunction(
-                rawDatabase.Handle,
-                name,
-                argc,
-                isDeterministic,
-                GCHandle.ToIntPtr(context),
-                ScalarFunctionCallback,
-                ContextDestructorCallback,
-                ValueDestructorCallback));
-            rawDatabase.AddNativeContext(context);
+            rawDatabase.ExecuteExclusive(() =>
+            {
+                Execute(() => TursoBindings.RegisterScalarFunction(
+                    rawDatabase.Handle,
+                    name,
+                    argc,
+                    isDeterministic,
+                    GCHandle.ToIntPtr(context),
+                    ScalarFunctionCallback,
+                    ContextDestructorCallback,
+                    ValueDestructorCallback));
+                rawDatabase.AddNativeContext(context);
+            });
         }
         catch
         {
@@ -67,19 +70,22 @@ internal sealed class RawSqliteNativeProviderFactory : SqliteNativeProviderFacto
         var context = GCHandle.Alloc(new RawAggregateRegistration(seed, step, resultSelector));
         try
         {
-            Execute(() => TursoBindings.RegisterAggregateFunction(
-                rawDatabase.Handle,
-                name,
-                argc,
-                isDeterministic,
-                GCHandle.ToIntPtr(context),
-                AggregateInitCallback,
-                AggregateStepCallback,
-                AggregateFinalCallback,
-                ContextDestructorCallback,
-                AggregateDestructorCallback,
-                ValueDestructorCallback));
-            rawDatabase.AddNativeContext(context);
+            rawDatabase.ExecuteExclusive(() =>
+            {
+                Execute(() => TursoBindings.RegisterAggregateFunction(
+                    rawDatabase.Handle,
+                    name,
+                    argc,
+                    isDeterministic,
+                    GCHandle.ToIntPtr(context),
+                    AggregateInitCallback,
+                    AggregateStepCallback,
+                    AggregateFinalCallback,
+                    ContextDestructorCallback,
+                    AggregateDestructorCallback,
+                    ValueDestructorCallback));
+                rawDatabase.AddNativeContext(context);
+            });
         }
         catch
         {
@@ -89,7 +95,11 @@ internal sealed class RawSqliteNativeProviderFactory : SqliteNativeProviderFacto
     }
 
     public override void UnregisterFunctions(TursoNativeDatabase database, string name)
-        => Execute(() => TursoBindings.UnregisterFunction(GetDatabase(database).Handle, name));
+    {
+        var rawDatabase = GetDatabase(database);
+        rawDatabase.ExecuteExclusive(
+            () => Execute(() => TursoBindings.UnregisterFunction(rawDatabase.Handle, name)));
+    }
 
     public override void RegisterCollation(
         TursoNativeDatabase database,
@@ -100,13 +110,16 @@ internal sealed class RawSqliteNativeProviderFactory : SqliteNativeProviderFacto
         var context = GCHandle.Alloc(compare);
         try
         {
-            Execute(() => TursoBindings.RegisterCollation(
-                rawDatabase.Handle,
-                name,
-                GCHandle.ToIntPtr(context),
-                CollationCallback,
-                ContextDestructorCallback));
-            rawDatabase.AddNativeContext(context);
+            rawDatabase.ExecuteExclusive(() =>
+            {
+                Execute(() => TursoBindings.RegisterCollation(
+                    rawDatabase.Handle,
+                    name,
+                    GCHandle.ToIntPtr(context),
+                    CollationCallback,
+                    ContextDestructorCallback));
+                rawDatabase.AddNativeContext(context);
+            });
         }
         catch
         {
@@ -116,13 +129,25 @@ internal sealed class RawSqliteNativeProviderFactory : SqliteNativeProviderFacto
     }
 
     public override void UnregisterCollation(TursoNativeDatabase database, string name)
-        => Execute(() => TursoBindings.UnregisterCollation(GetDatabase(database).Handle, name));
+    {
+        var rawDatabase = GetDatabase(database);
+        rawDatabase.ExecuteExclusive(
+            () => Execute(() => TursoBindings.UnregisterCollation(rawDatabase.Handle, name)));
+    }
 
     public override void EnableExtensions(TursoNativeDatabase database, bool enable)
-        => Execute(() => TursoBindings.EnableLoadExtension(GetDatabase(database).Handle, enable));
+    {
+        var rawDatabase = GetDatabase(database);
+        rawDatabase.ExecuteExclusive(
+            () => Execute(() => TursoBindings.EnableLoadExtension(rawDatabase.Handle, enable)));
+    }
 
     public override void LoadExtension(TursoNativeDatabase database, string file)
-        => Execute(() => TursoBindings.LoadExtension(GetDatabase(database).Handle, file));
+    {
+        var rawDatabase = GetDatabase(database);
+        rawDatabase.ExecuteExclusive(
+            () => Execute(() => TursoBindings.LoadExtension(rawDatabase.Handle, file)));
+    }
 
     private static RawNativeDatabase GetDatabase(TursoNativeDatabase database)
         => database as RawNativeDatabase

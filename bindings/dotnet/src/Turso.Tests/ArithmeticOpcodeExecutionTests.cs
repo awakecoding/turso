@@ -90,6 +90,38 @@ public class ArithmeticOpcodeExecutionTests
         EvalUnary(ArithmeticOperator.Identity, SqlValue.Real(1.25)).Should().Be(SqlValue.Real(1.25));
     }
 
+    [Test]
+    public void IdentityPreservesTextAndBlobStorageClasses()
+    {
+        EvalUnary(ArithmeticOperator.Identity, SqlValue.Text("10")).Should().Be(SqlValue.Text("10"));
+        EvalUnary(ArithmeticOperator.Identity, SqlValue.Blob([0x31, 0x30]))
+            .Should().Be(SqlValue.Blob([0x31, 0x30]));
+    }
+
+    [Test]
+    public void BitwiseOperatorsUseSignedIntegerSemantics()
+    {
+        EvalBinary(ArithmeticOperator.BitwiseAnd, SqlValue.Integer(10), SqlValue.Integer(3))
+            .Should().Be(SqlValue.Integer(2));
+        EvalBinary(ArithmeticOperator.BitwiseOr, SqlValue.Integer(8), SqlValue.Integer(3))
+            .Should().Be(SqlValue.Integer(11));
+        EvalUnary(ArithmeticOperator.BitwiseNot, SqlValue.Integer(10))
+            .Should().Be(SqlValue.Integer(-11));
+    }
+
+    [Test]
+    public void ShiftOperatorsSaturateAndReverseNegativeCounts()
+    {
+        EvalBinary(ArithmeticOperator.ShiftLeft, SqlValue.Integer(8), SqlValue.Integer(-1))
+            .Should().Be(SqlValue.Integer(4));
+        EvalBinary(ArithmeticOperator.ShiftRight, SqlValue.Integer(8), SqlValue.Integer(-1))
+            .Should().Be(SqlValue.Integer(16));
+        EvalBinary(ArithmeticOperator.ShiftLeft, SqlValue.Integer(1), SqlValue.Integer(64))
+            .Should().Be(SqlValue.Integer(0));
+        EvalBinary(ArithmeticOperator.ShiftRight, SqlValue.Integer(-1), SqlValue.Integer(64))
+            .Should().Be(SqlValue.Integer(-1));
+    }
+
     // ---- NULL propagation ----------------------------------------------------------------------------
 
     [Test]
@@ -235,6 +267,53 @@ public class ArithmeticOpcodeExecutionTests
 
         // The failed operation never published a result: r[2] is still its default NULL.
         statement.GetRegister(new Register(2)).Kind.Should().Be(SqlValueKind.Null);
+    }
+
+    [Test]
+    public void NumericAffinityTransformsARegisterBeforeArithmetic()
+    {
+        var affinity = new VdbeNumericAffinity
+        {
+            Name = "test-numeric",
+            Apply = value => value.Kind == SqlValueKind.Text
+                ? SqlValue.Integer(long.Parse(value.AsText()))
+                : value,
+        };
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Text("40")),
+            new NumericAffinityInstruction(new Register(0), affinity),
+            new LoadConstantInstruction(new Register(1), SqlValue.Integer(2)),
+            new ArithmeticInstruction(new Register(2), ArithmeticOperator.Add, new RegisterRange(new Register(0), 2)),
+            new ResultRowInstruction(new RegisterRange(new Register(2), 1)),
+            new HaltInstruction(),
+        ];
+
+        var program = new VdbeProgram(registerCount: 3, cursorCount: 0, instructions);
+
+        RunToCompletion(program)[0][0].Should().Be(SqlValue.Integer(42));
+    }
+
+    [Test]
+    public void ThrowingNumericAffinityLeavesTheRegisterUntouched()
+    {
+        var affinity = new VdbeNumericAffinity
+        {
+            Name = "throwing",
+            Apply = _ => throw new InvalidOperationException("coercion failed"),
+        };
+        VdbeInstruction[] instructions =
+        [
+            new LoadConstantInstruction(new Register(0), SqlValue.Text("unchanged")),
+            new NumericAffinityInstruction(new Register(0), affinity),
+            new HaltInstruction(),
+        ];
+        var program = new VdbeProgram(registerCount: 1, cursorCount: 0, instructions);
+        using var statement = new ResumableStatement(program);
+
+        Assert.Throws<InvalidOperationException>(() => statement.StepResumable())!
+            .Message.Should().Be("coercion failed");
+        statement.GetRegister(new Register(0)).Should().Be(SqlValue.Text("unchanged"));
     }
 
     // ---- Operand snapshotting ------------------------------------------------------------------------

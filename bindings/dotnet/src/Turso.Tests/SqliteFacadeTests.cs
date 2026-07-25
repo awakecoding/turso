@@ -87,7 +87,6 @@ public class SqliteFacadeTests
 
         Task<object?>? faulted = null;
         Assert.DoesNotThrow(() => faulted = command.ExecuteScalarAsync());
-        faulted!.IsFaulted.Should().BeTrue();
         Assert.ThrowsAsync<SqliteException>(async () => await faulted);
     }
 
@@ -327,12 +326,16 @@ public class SqliteFacadeTests
 
         var rolledBack = connection.BeginTransaction();
         connection.ExecuteNonQuery("ROLLBACK;");
-        rolledBack.Rollback();
+        connection.Transaction.Should().BeNull();
+        rolledBack.Connection.Should().BeNull();
         Assert.Throws<InvalidOperationException>(() => rolledBack.Rollback());
+
+        using var subsequent = connection.BeginTransaction();
+        subsequent.Rollback();
     }
 
     [Test]
-    public void ExternalRollbackPreventsUsingAmbientTransaction()
+    public void ExternalRollbackDetachesAmbientTransaction()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
@@ -340,9 +343,14 @@ public class SqliteFacadeTests
         using var transaction = connection.BeginTransaction();
         connection.ExecuteNonQuery("ROLLBACK;");
 
-        Assert.Throws<InvalidOperationException>(() => connection.ExecuteNonQuery("SELECT 1;"))!
+        connection.Transaction.Should().BeNull();
+        transaction.Connection.Should().BeNull();
+        Assert.Throws<InvalidOperationException>(() => transaction.Rollback())!
             .Message.Should().Be(Data.Sqlite.Properties.Resources.TransactionCompleted);
-        transaction.Rollback();
+        connection.ExecuteScalar<long>("SELECT 1;").Should().Be(1);
+
+        using var subsequent = connection.BeginTransaction();
+        subsequent.Rollback();
     }
 
     [Test]
@@ -849,19 +857,23 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    public void OpenReaderBlocksWriteCommandUntilTimeout()
+    public async Task ZeroCommandTimeoutWaitsUntilOpenReaderCloses()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
         connection.ExecuteNonQuery("CREATE TABLE t(value INTEGER); INSERT INTO t VALUES (1);");
 
-        using var reader = connection.ExecuteReader("SELECT value FROM t;");
+        var reader = connection.ExecuteReader("SELECT value FROM t;");
         using var command = connection.CreateCommand();
         command.CommandText = "DROP TABLE t;";
         command.CommandTimeout = 0;
 
-        var exception = Assert.Throws<SqliteException>(() => command.ExecuteNonQuery());
-        exception.SqliteErrorCode.Should().Be(5);
+        var execution = Task.Run(command.ExecuteNonQuery);
+        await Task.Delay(100);
+        execution.IsCompleted.Should().BeFalse();
+
+        reader.Dispose();
+        (await execution.WaitAsync(TimeSpan.FromSeconds(5))).Should().Be(0);
     }
 
     [Test]

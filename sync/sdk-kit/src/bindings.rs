@@ -2,6 +2,26 @@
 
 use turso_sdk_kit::capi::c::*;
 
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_IO_REQUEST: turso_sync_abi_type_t = 1;
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_OPERATION_RESULT: turso_sync_abi_type_t = 2;
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_SLICE: turso_sync_abi_type_t = 3;
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_DATABASE_CONFIG: turso_sync_abi_type_t = 4;
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_REPLICA_CONFIG: turso_sync_abi_type_t = 5;
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_HTTP_REQUEST: turso_sync_abi_type_t = 6;
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_HTTP_HEADER: turso_sync_abi_type_t = 7;
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_FULL_READ_REQUEST: turso_sync_abi_type_t = 8;
+pub const turso_sync_abi_type_t_TURSO_SYNC_ABI_TYPE_FULL_WRITE_REQUEST: turso_sync_abi_type_t = 9;
+pub type turso_sync_abi_type_t = ::std::os::raw::c_uint;
+unsafe extern "C" {
+    pub fn turso_sync_abi_version() -> u32;
+}
+unsafe extern "C" {
+    pub fn turso_sync_abi_sizeof(type_: u32) -> usize;
+}
+unsafe extern "C" {
+    pub fn turso_sync_abi_offsetof(type_: u32, field: u32) -> usize;
+}
+
 #[repr(u32)]
 #[doc = " TURSO_DATABASE_SYNC_IO_REQUEST"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]

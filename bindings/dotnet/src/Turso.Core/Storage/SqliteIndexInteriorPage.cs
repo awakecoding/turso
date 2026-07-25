@@ -144,7 +144,7 @@ public sealed class SqliteIndexInteriorPageBuilder
     /// <summary>The child selected when a target key exceeds every separator.</summary>
     public uint RightMostChildPage { get; }
 
-    /// <summary>The BINARY index comparator used for key validation.</summary>
+    /// <summary>The index comparator used for key validation.</summary>
     public SqliteIndexRecordComparer RecordComparer { get; }
 
     /// <summary>Separator cells in exact pointer-array order.</summary>
@@ -189,7 +189,7 @@ public sealed class SqliteIndexInteriorPageBuilder
 
         RecordComparer.Validate(record);
         if (_lastRecord is not null && RecordComparer.Compare(_lastRecord, record) >= 0)
-            throw new ArgumentException("SQLite index-interior records must be strictly increasing in BINARY order.", nameof(record));
+            throw new ArgumentException("SQLite index-interior records must be strictly increasing in configured order.", nameof(record));
         if (_cells.Count == ushort.MaxValue)
             throw new InvalidOperationException("A SQLite index-interior page cannot contain more than 65535 cells.");
 
@@ -329,10 +329,10 @@ public sealed class SqliteIndexInteriorPageView
     /// <summary>Decoded separator cells in logical record order.</summary>
     public IReadOnlyList<SqliteIndexInteriorPageCell> Cells { get; }
 
-    /// <summary>Whether every complete record was available for BINARY-order validation.</summary>
+    /// <summary>Whether every complete record was available for key-order validation.</summary>
     public bool HasVerifiedRecordOrdering => _records is not null;
 
-    /// <summary>The BINARY record comparator used while validating this page.</summary>
+    /// <summary>The record comparator used while validating this page.</summary>
     public SqliteIndexRecordComparer RecordComparer => _recordComparer;
 
     /// <summary>Parses and validates an index-interior page snapshot.</summary>
@@ -341,7 +341,8 @@ public sealed class SqliteIndexInteriorPageView
         int usableSpace,
         SqliteTextEncoding textEncoding = SqliteTextEncoding.Utf8,
         bool isFirstPage = false,
-        SqliteOverflowChainReader? overflowReader = null)
+        SqliteOverflowChainReader? overflowReader = null,
+        SqliteIndexRecordComparer? recordComparer = null)
     {
         if (isFirstPage)
         {
@@ -393,7 +394,7 @@ public sealed class SqliteIndexInteriorPageView
             ranges,
             "index-interior");
 
-        var recordComparer = new SqliteIndexRecordComparer(textEncoding);
+        recordComparer ??= new SqliteIndexRecordComparer(textEncoding);
         var records = ReadAndValidateRecords(cells, recordComparer, overflowReader);
         return new SqliteIndexInteriorPageView(
             page.Length,
@@ -461,7 +462,7 @@ public sealed class SqliteIndexInteriorPageView
                 : overflowReader!.ReadPayload(pageCell.Cell.Key);
             comparer.Validate(record);
             if (previousRecord is not null && comparer.Compare(previousRecord, record) >= 0)
-                throw new InvalidDataException("SQLite index-interior records are not in strictly increasing BINARY order.");
+                throw new InvalidDataException("SQLite index-interior records are not in strictly increasing configured order.");
 
             previousRecord = record;
             records[index] = record;

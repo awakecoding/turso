@@ -230,7 +230,7 @@ public sealed class ManagedPragmaRuntimeSliceTests
     }
 
     [Test]
-    public void JournalModeReportsTheFixedManagedModeAndUnsupportedRuntimePragmasDiagnoseClearly()
+    public void JournalAndPageSizePragmasFollowManagedStorageCapabilities()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -247,16 +247,14 @@ public sealed class ManagedPragmaRuntimeSliceTests
             setter.Step().Should().Be(StatementStepResult.Done);
         }
 
-        var unsupportedMode = () => Execute(connection, "PRAGMA journal_mode = WAL;");
-        unsupportedMode.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Managed PRAGMA journal_mode only supports the fixed MEMORY mode.");
+        ReadValue(connection, "PRAGMA journal_mode = WAL;").Should().Be(SqlValue.Text("memory"));
+        ReadValue(connection, "PRAGMA journal_mode;").Should().Be(SqlValue.Text("memory"));
 
         ColumnNames(connection, "PRAGMA page_size;").Should().Equal("page_size");
         ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(4_096));
         Execute(connection, "PRAGMA page_size = 4096;");
-        var unsupportedPageSize = () => Execute(connection, "PRAGMA page_size = 8192;");
-        unsupportedPageSize.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("Managed PRAGMA page_size only supports the fixed 4096-byte page size.");
+        Execute(connection, "PRAGMA page_size = 8192;");
+        ReadValue(connection, "PRAGMA page_size;").Should().Be(SqlValue.Integer(4_096));
 
         foreach (var pragma in new[] { "cache_size", "synchronous" })
         {
@@ -305,7 +303,14 @@ public sealed class ManagedPragmaRuntimeSliceTests
         unsupported.Should().Throw<EmbeddedSqlException>()
             .WithMessage("Unsupported PRAGMA automatic_index. At SQL offset *");
 
-        var unsupportedSchema = () => connection.Prepare("PRAGMA temp.table_list;");
+        using (var tempTableList = connection.Prepare("PRAGMA temp.table_list;"))
+        {
+            tempTableList.Step().Should().Be(StatementStepResult.Row);
+            tempTableList.GetValue(0).Should().Be(SqlValue.Text("temp"));
+            tempTableList.GetValue(1).Should().Be(SqlValue.Text("sqlite_temp_schema"));
+        }
+
+        var unsupportedSchema = () => connection.Prepare("PRAGMA temp.journal_mode;");
         unsupportedSchema.Should().Throw<EmbeddedSqlException>()
             .WithMessage("Unsupported PRAGMA database temp. At SQL offset *");
     }
