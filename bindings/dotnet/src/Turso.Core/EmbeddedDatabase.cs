@@ -10933,7 +10933,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (terms.Any(term =>
                 !IsConservativeCompoundTerm(term.Program)
                 && !(compoundOperator == CompoundOperator.UnionAll
-                    && IsSequentialAggregateCompoundTerm(term.Program))))
+                    && (IsTypeofFunctionCompoundTerm(term.Program)
+                        || IsSequentialAggregateCompoundTerm(term.Program)))))
             return false;
 
         CompoundTerm compound;
@@ -10983,7 +10984,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     private static bool IsConservativeCompoundTerm(VdbeProgram program)
-        => program.Instructions.All(instruction => instruction is not (
+        => program.Instructions.All(IsConservativeCompoundInstruction);
+
+    // UNION ALL runs each spliced child to completion in SQL source order, as does the evaluator.
+    // typeof(value) is the only scalar function admitted: its one materialized argument has a total,
+    // callback-free result. Other set operators retain their stricter eligibility because their row-set
+    // work can change when expression errors become observable.
+    private static bool IsTypeofFunctionCompoundTerm(VdbeProgram program)
+        => program.Instructions.All(instruction =>
+            IsConservativeCompoundInstruction(instruction)
+            || instruction is FunctionInstruction function
+                && string.Equals(function.Function.Name, "typeof", StringComparison.OrdinalIgnoreCase)
+                && function.Arguments.Count == 1);
+
+    private static bool IsConservativeCompoundInstruction(VdbeInstruction instruction)
+        => instruction is not (
             FunctionInstruction
             or AggResetInstruction
             or AggStepInstruction
@@ -10993,7 +11008,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             or FilterRegistersInstruction
             or OpenJoinCursorInstruction
             or ProjectRegistersInstruction
-            or DistinctFilterInstruction));
+            or DistinctFilterInstruction);
 
     private static bool IsSequentialAggregateCompoundTerm(VdbeProgram program) =>
         program.Instructions.Any(instruction => instruction is AggStepInstruction)
