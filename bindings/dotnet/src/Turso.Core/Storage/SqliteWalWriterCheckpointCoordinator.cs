@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Security.Cryptography;
 
 namespace Turso.Core.Storage;
 
@@ -134,20 +136,14 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             {
             }
 
-            try
-            {
-                wal = SqliteWalFile.Open(sharedFileSystem, walPath);
-            }
-            catch (InvalidDataException) when (recoveryHeader is { MaximumFrame: 0 })
-            {
-                wal = SqliteWalFile.Open(
-                    sharedFileSystem,
-                    walPath,
-                    truncatedHeader: CreateTruncatedWalHeader(recoveryHeader));
-            }
             mainFile = sharedFileSystem.OpenFile(canonicalPath, FileOpenMode.OpenExisting);
-            mainStore = new RawCheckpointStore(mainFile, wal.PageSize);
+            var mainPageSize = ReadMainDatabasePageSize(mainFile);
+            mainStore = new RawCheckpointStore(mainFile, mainPageSize);
             mainFile = null;
+            wal = SqliteWalFile.Open(
+                sharedFileSystem,
+                walPath,
+                truncatedHeader: CreateTruncatedWalHeader(mainPageSize));
             var coordinator = new SqliteWalWriterCheckpointCoordinator(
                 mainStore,
                 wal,
@@ -195,6 +191,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
 
             var prior = _index.ReadValidatedHeader(_wal);
+            ValidateAppendableWal(prior.Header);
             var appended = new List<SqliteWalFrame>(pages.Count);
             try
             {
@@ -366,7 +363,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            region = _index.ReadValidatedHeader(_wal);
+            region = ReadValidatedCheckpointHeader(mode, timeout, stopwatch, cancellationToken);
             readMarks = TryAcquireReadMarks(region);
             if (mode == SqliteWalCheckpointMode.Passive || readMarks.AllExclusive)
                 break;
@@ -390,7 +387,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             var attemptedFrameCount = region.CheckpointInfo.BackfillAttemptedFrameCount;
             if (safeFrame > attemptedFrameCount)
             {
-                _index.PublishBackfillAttemptedFrameCount(safeFrame, _wal);
+                _index.PublishBackfillAttemptedFrameCount(region.Header, safeFrame, _wal);
                 attemptedFrameCount = safeFrame;
             }
 
@@ -404,7 +401,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
                 // WAL recovery evidence for every copied frame is durable.
                 _wal.Flush();
                 InstallBackfill(safeFrame);
-                _index.PublishBackfilledFrameCount(safeFrame, _wal);
+                _index.PublishBackfilledFrameCount(region.Header, safeFrame, _wal);
                 backfilledFrameCount = safeFrame;
             }
 
@@ -422,12 +419,18 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
                     // complete committed state is backfilled as well.
                     if (confirmation.CheckpointInfo.BackfillAttemptedFrameCount < confirmation.Header.MaximumFrame)
                     {
-                        _index.PublishBackfillAttemptedFrameCount(confirmation.Header.MaximumFrame, _wal);
+                        _index.PublishBackfillAttemptedFrameCount(
+                            confirmation.Header,
+                            confirmation.Header.MaximumFrame,
+                            _wal);
                         attemptedFrameCount = confirmation.Header.MaximumFrame;
                     }
                     _wal.Flush();
                     InstallBackfill(confirmation.Header.MaximumFrame);
-                    _index.PublishBackfilledFrameCount(confirmation.Header.MaximumFrame, _wal);
+                    _index.PublishBackfilledFrameCount(
+                        confirmation.Header,
+                        confirmation.Header.MaximumFrame,
+                        _wal);
                     maximumFrame = confirmation.Header.MaximumFrame;
                     safeFrame = maximumFrame;
                     backfilledFrameCount = maximumFrame;
@@ -652,6 +655,55 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         _fault = exception;
     }
 
+    private void ValidateAppendableWal(SqliteWalIndexHeader publishedHeader)
+    {
+        var recovery = _wal.ScanRecovery();
+        if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
+            || recovery.LastValidFrameNumber != recovery.LastCommittedFrameNumber
+            || recovery.LastCommittedFrameNumber != publishedHeader.MaximumFrame
+            || (publishedHeader.MaximumFrame != 0
+                && recovery.LastCommittedDatabaseSizeInPages != publishedHeader.DatabasePageCount))
+        {
+            throw new InvalidDataException(
+                "Cannot append to a SQLite WAL whose valid frames do not exactly match the published committed boundary; recover it under the recovery lock set first.");
+        }
+    }
+
+    private SqliteWalIndexHeaderRegion ReadValidatedCheckpointHeader(
+        SqliteWalCheckpointMode mode,
+        TimeSpan timeout,
+        Stopwatch? stopwatch,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            try
+            {
+                return _index.ReadValidatedHeader(_wal);
+            }
+            catch (InvalidDataException) when (mode == SqliteWalCheckpointMode.Passive)
+            {
+                // A writer publishes WAL bytes before the new index header. If it
+                // owns the writer byte, wait rather than treating that transient
+                // mismatch as corruption or checkpointing an unstable boundary.
+                if (!_locks.TryAcquireShared(WriteLockOffset, length: 1, out var writerProbe))
+                {
+                    WaitForRetry(timeout, stopwatch, cancellationToken);
+                    continue;
+                }
+
+                using (writerProbe
+                       ?? throw new InvalidOperationException(
+                           "SQLite WAL writer probing reported success without returning a lease."))
+                {
+                    // With no exclusive writer, a persistent validation failure is
+                    // corrupt state rather than a publication race and must escape.
+                    return _index.ReadValidatedHeader(_wal);
+                }
+            }
+        }
+    }
+
     private SqliteWalRecoveryInfo RecoverAndRebuild(
         TimeSpan timeout,
         CancellationToken cancellationToken,
@@ -685,12 +737,23 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
     private void RebuildIndexFromWal(SqliteWalIndexHeader? recoveryHeader)
         => _ = RecoverAndRebuild(TimeSpan.Zero, CancellationToken.None, recoveryHeader);
 
-    private static SqliteWalHeader CreateTruncatedWalHeader(SqliteWalIndexHeader header)
-        => SqliteWalHeader.Create(
-            header.PageSize,
-            header.Salt1,
-            header.Salt2,
-            checksumByteOrder: header.WalChecksumByteOrder);
+    private static int ReadMainDatabasePageSize(IFile mainFile)
+    {
+        Span<byte> encodedPageSize = stackalloc byte[sizeof(ushort)];
+        if (mainFile.Read(position: 16, encodedPageSize) != encodedPageSize.Length)
+            throw new InvalidDataException("SQLite main database is too small to contain its page-size field.");
+        return SqlitePageSize.Decode(BinaryPrimitives.ReadUInt16BigEndian(encodedPageSize));
+    }
+
+    private static SqliteWalHeader CreateTruncatedWalHeader(int pageSize)
+    {
+        Span<byte> salts = stackalloc byte[sizeof(uint) * 2];
+        RandomNumberGenerator.Fill(salts);
+        return SqliteWalHeader.Create(
+            pageSize,
+            BinaryPrimitives.ReadUInt32BigEndian(salts),
+            BinaryPrimitives.ReadUInt32BigEndian(salts[sizeof(uint)..]));
+    }
 
     private void ThrowIfUnavailable()
     {
