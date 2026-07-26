@@ -239,12 +239,11 @@ ranges, timeout reporting, and release on disposal. This primitive is not
 connected to `SqliteWalSharedMemoryLocks`, normal `-shm` activity, the pager,
 or any read-mark, writer, or checkpoint role.
 
-**Remaining gate:** attach shared reader locks to WAL-index initialization and
-the read-mark snapshot protocol; implement runtime writer/checkpointer
-coordination; and run differential cross-process stress while all of those
-mechanisms are attached to the pager. Until all of those are complete, there
-is no shared runtime WAL-index behavior or concurrent stock-SQLite
-interoperability.
+**Remaining pager gate:** attach the detached reader protocol to managed
+connections; implement runtime writer/checkpointer coordination; and run
+differential cross-process stress while all of those mechanisms are attached
+to the pager. Until all of those are complete, the managed pager has no shared
+runtime WAL-index behavior or concurrent stock-SQLite interoperability.
 
 ### Stage 2 — read marks and the reader protocol
 
@@ -260,6 +259,34 @@ Linux OFD read locks — must be added first.
 
 *Exit criteria:* many managed readers share one mark, and managed and SQLite
 readers coexist on the same mark.
+
+#### Stage 2 detached foundation currently present
+
+`SqliteWalReadSnapshotCoordinator` composes the Stage 1 physical mapping,
+validated WAL-index accessor, and shared byte-range lease primitive into a
+detached read-snapshot coordinator. It opens only existing `-wal` and `-shm`
+artifacts, validates a stable header against an independent WAL checksum scan,
+uses `WAL_READ_LOCK(0)` for an already-backfilled database-only view, otherwise
+shares an existing current mark, advances any exclusively acquired idle mark to
+the current committed boundary, or falls back to the greatest usable existing
+mark. An advanced mark is exclusively held while changed and then reacquired
+shared. Every selected mark is confirmed after its shared lease is obtained and
+its boundary must name a WAL commit frame.
+
+The resulting `SqliteWalReadSnapshot` exposes only direct, bounded WAL-frame
+reads. It does not consult a live hash lookup after the boundary is pinned and
+retains no page cache, so a writer may append later frames without changing the
+snapshot. A changed read mark, a stale/torn header, a changed WAL incarnation,
+or an invalid frame fails the snapshot closed and releases its lease. `Reset`,
+`Dispose`, coordinator disposal, failed acquisition, and cancellation all
+release any acquired mark.
+
+This is deliberately still not pager behavior. It neither acquires nor relaxes
+the Stage 0 512-byte main-file ownership guard, and it does not attach to a
+managed connection, writer, recovery, or checkpoint path. Its process-isolated
+tests operate on ordinary SQLite-produced artifacts to validate lock and frame
+semantics only; they do not establish concurrent stock-SQLite client
+interoperability for the managed pager.
 
 ### Stage 3 — writer and checkpointer protocol
 
