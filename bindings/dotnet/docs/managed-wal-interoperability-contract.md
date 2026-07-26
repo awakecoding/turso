@@ -205,13 +205,34 @@ no pager reads, maps, writes, or publishes a WAL-index through it. In particular
 the `-shm` file remains a zero-length lock carrier during managed database
 operation and the 512-byte Stage 0 main-file ownership lock remains unchanged.
 
+`SqliteWalIndexSharedMemory` is a detached Stage 1 access component over an
+explicit `ISqliteWalSharedMemoryMapping`. It reads header copy 0, executes the
+shared-memory barrier, then reads copy 1; torn, malformed, or persistently
+changing pairs are retried a bounded number of times and then rejected. Its
+publisher validates the requested header against the independently scanned WAL,
+then writes copy 1, executes the barrier, and writes copy 0, matching
+SQLite's `walIndexTryHdr` and `walIndexWriteHdr` ordering. Lookups use the
+native-endian `aHash`/`aPgno` tables, reject out-of-block hash references,
+validate salts, page size, checksum byte order, committed boundary, database
+size, final-frame checksum, and the selected WAL frame, and confirm the header
+did not change before returning. It deliberately owns only an in-process gate:
+callers must supply any future SQLite role lock.
+
+This component is not reachable from a pager, lock coordinator, or normal
+managed database execution. It never creates or writes a live WAL-index for
+managed pager activity, does not initialize or recover an index, and does not
+modify read marks, backfill accounting, or lock bytes. Focused tests compare
+lookups against independent scans of SQLite-produced 512- and 4096-byte WAL/
+`-shm` artifacts, verify the publication order, and use separate processes to
+hold persistent torn and corrupt publications. Those tests characterize the
+format component only; they do not establish concurrent interoperability.
+
 **Remaining gate:** shared reader locks (`LockFileEx` and Linux OFD read locks);
-SQLite's
-barrier-aware second-header-then-first-header publication; lookup validation
-against an independent WAL scan across a SQLite-produced corpus; and
-process-isolated corruption/recovery tests. Until all of those are complete,
-there is no shared runtime WAL-index behavior or concurrent stock-SQLite
-interoperability.
+WAL-index initialization/recovery and read-mark snapshot protocol; runtime
+writer/checkpointer coordination; and differential cross-process stress while
+all of those mechanisms are attached to the pager. Until all of those are
+complete, there is no shared runtime WAL-index behavior or concurrent
+stock-SQLite interoperability.
 
 ### Stage 2 — read marks and the reader protocol
 
