@@ -453,8 +453,29 @@ public sealed record SqliteWalIndexCheckpointInfo(
     /// <summary>Size in bytes of the checkpoint information and lock area.</summary>
     public const int Size = 40;
 
+    /// <summary>Number of SQLite WAL read-mark slots.</summary>
+    public const int ReadMarkCount = 5;
+
+    /// <summary>Value SQLite uses for an unclaimed read-mark slot.</summary>
+    public const uint ReadMarkNotUsed = uint.MaxValue;
+
     /// <summary>Offset of SQLite's eight lock bytes within the complete header region.</summary>
     public const int LockOffset = 120;
+
+    /// <summary>Returns the read-mark value for a SQLite reader slot.</summary>
+    public uint GetReadMark(int readMarkIndex)
+        => readMarkIndex switch
+        {
+            0 => ReadMark0,
+            1 => ReadMark1,
+            2 => ReadMark2,
+            3 => ReadMark3,
+            4 => ReadMark4,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(readMarkIndex),
+                readMarkIndex,
+                $"SQLite WAL read-mark index must be between zero and {ReadMarkCount - 1}."),
+        };
 
     internal static SqliteWalIndexCheckpointInfo Parse(
         ReadOnlySpan<byte> source,
@@ -598,6 +619,48 @@ public sealed class SqliteWalIndexSharedMemory
             _mapping.Write(SqliteWalIndexHeader.Size, bytes);
             _mapping.MemoryBarrier();
             _mapping.Write(position: 0, bytes);
+        }
+    }
+
+    /// <summary>
+    /// Publishes one nonzero WAL read mark while its caller holds that mark's
+    /// exclusive SQLite byte-range lock.
+    /// </summary>
+    /// <remarks>
+    /// Read mark zero is a placeholder for database-only readers and must never
+    /// be written. This method deliberately does not acquire a role lock: the
+    /// caller owns the cross-process protocol and must downgrade to a shared
+    /// lock before exposing the selected boundary to a reader.
+    /// </remarks>
+    public void PublishReadMark(int readMarkIndex, uint maximumFrame)
+    {
+        if (readMarkIndex <= 0 || readMarkIndex >= SqliteWalIndexCheckpointInfo.ReadMarkCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(readMarkIndex),
+                readMarkIndex,
+                $"SQLite WAL writable read-mark indexes must be between one and {SqliteWalIndexCheckpointInfo.ReadMarkCount - 1}.");
+        }
+        if (maximumFrame == 0 || maximumFrame == SqliteWalIndexCheckpointInfo.ReadMarkNotUsed)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumFrame),
+                maximumFrame,
+                "SQLite WAL read marks must name a nonzero committed frame.");
+        }
+
+        lock (_gate)
+        {
+            if (_mapping.IsReadOnly)
+                throw new InvalidOperationException("Cannot publish a SQLite WAL read mark through a read-only mapping.");
+
+            EnsureMappedBlocks(blockCount: 1);
+            Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            WriteUInt32(bytes, maximumFrame);
+            _mapping.Write(
+                SqliteWalIndexHeader.Size * 2L + sizeof(uint) + readMarkIndex * sizeof(uint),
+                bytes);
+            _mapping.MemoryBarrier();
         }
     }
 
@@ -808,6 +871,14 @@ public sealed class SqliteWalIndexSharedMemory
         return SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian
             ? BinaryPrimitives.ReadUInt16LittleEndian(source)
             : BinaryPrimitives.ReadUInt16BigEndian(source);
+    }
+
+    private static void WriteUInt32(Span<byte> destination, uint value)
+    {
+        if (SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian)
+            BinaryPrimitives.WriteUInt32LittleEndian(destination, value);
+        else
+            BinaryPrimitives.WriteUInt32BigEndian(destination, value);
     }
 
     private static uint GetBlockFrameZero(int blockIndex)
