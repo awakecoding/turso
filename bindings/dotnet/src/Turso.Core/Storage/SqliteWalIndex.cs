@@ -283,6 +283,63 @@ public sealed record SqliteWalIndexHeader
             checksum2);
     }
 
+    /// <summary>Serializes this header to a new exact-length native-endian buffer.</summary>
+    public byte[] ToArray()
+    {
+        var destination = new byte[Size];
+        WriteTo(destination);
+        return destination;
+    }
+
+    /// <summary>
+    /// Serializes this header to an exact-length native-endian destination.
+    /// </summary>
+    public void WriteTo(Span<byte> destination)
+    {
+        RequireExactLength(destination.Length, Size, "SQLite WAL-index header destination");
+        if (MaximumFrame != 0 && DatabasePageCount == 0)
+        {
+            throw new InvalidOperationException(
+                "SQLite WAL-index header cannot publish frames without a committed database page count.");
+        }
+
+        var encodedPageSize = PageSize == SqlitePageSize.Maximum
+            ? (ushort)1
+            : checked((ushort)PageSize);
+        if (DecodePageSize(encodedPageSize) != PageSize)
+            throw new InvalidOperationException("SQLite WAL-index header has an invalid page size.");
+
+        WriteUInt32(destination, NativeByteOrder, CurrentFormatVersion);
+        WriteUInt32(destination[4..], NativeByteOrder, value: 0);
+        WriteUInt32(destination[8..], NativeByteOrder, ChangeCounter);
+        destination[12] = 1;
+        destination[13] = WalChecksumByteOrder switch
+        {
+            SqliteWalChecksumByteOrder.LittleEndian => 0,
+            SqliteWalChecksumByteOrder.BigEndian => 1,
+            _ => throw new InvalidOperationException("SQLite WAL-index header has an unsupported checksum byte order."),
+        };
+        WriteUInt16(
+            destination[14..],
+            NativeByteOrder,
+            encodedPageSize);
+        WriteUInt32(destination[16..], NativeByteOrder, MaximumFrame);
+        WriteUInt32(destination[20..], NativeByteOrder, DatabasePageCount);
+        WriteUInt32(destination[24..], NativeByteOrder, FrameChecksum1);
+        WriteUInt32(destination[28..], NativeByteOrder, FrameChecksum2);
+        BinaryPrimitives.WriteUInt32BigEndian(destination[32..], Salt1);
+        BinaryPrimitives.WriteUInt32BigEndian(destination[36..], Salt2);
+
+        var checksum = SqliteWalChecksum.Calculate(
+            destination[..40],
+            ToWalChecksumByteOrder(NativeByteOrder));
+        if (checksum != (Checksum1, Checksum2))
+            throw new InvalidOperationException("SQLite WAL-index header has stale checksum fields.");
+
+        WriteUInt32(destination[40..], NativeByteOrder, Checksum1);
+        WriteUInt32(destination[44..], NativeByteOrder, Checksum2);
+    }
+
     private static int DecodePageSize(ushort encodedPageSize)
     {
         if (encodedPageSize == 1)
@@ -313,6 +370,48 @@ public sealed record SqliteWalIndexHeader
             SqliteWalIndexByteOrder.BigEndian => BinaryPrimitives.ReadUInt16BigEndian(source),
             _ => throw new ArgumentOutOfRangeException(nameof(byteOrder), byteOrder, "Unsupported SQLite WAL-index byte order."),
         };
+
+    private static void WriteUInt32(
+        Span<byte> destination,
+        SqliteWalIndexByteOrder byteOrder,
+        uint value)
+    {
+        switch (byteOrder)
+        {
+            case SqliteWalIndexByteOrder.LittleEndian:
+                BinaryPrimitives.WriteUInt32LittleEndian(destination, value);
+                return;
+            case SqliteWalIndexByteOrder.BigEndian:
+                BinaryPrimitives.WriteUInt32BigEndian(destination, value);
+                return;
+            default:
+                throw new ArgumentOutOfRangeException(
+                    nameof(byteOrder),
+                    byteOrder,
+                    "Unsupported SQLite WAL-index byte order.");
+        }
+    }
+
+    private static void WriteUInt16(
+        Span<byte> destination,
+        SqliteWalIndexByteOrder byteOrder,
+        ushort value)
+    {
+        switch (byteOrder)
+        {
+            case SqliteWalIndexByteOrder.LittleEndian:
+                BinaryPrimitives.WriteUInt16LittleEndian(destination, value);
+                return;
+            case SqliteWalIndexByteOrder.BigEndian:
+                BinaryPrimitives.WriteUInt16BigEndian(destination, value);
+                return;
+            default:
+                throw new ArgumentOutOfRangeException(
+                    nameof(byteOrder),
+                    byteOrder,
+                    "Unsupported SQLite WAL-index byte order.");
+        }
+    }
 
     private static SqliteWalChecksumByteOrder ToWalChecksumByteOrder(SqliteWalIndexByteOrder byteOrder)
         => byteOrder == SqliteWalIndexByteOrder.LittleEndian
@@ -437,4 +536,293 @@ public sealed record SqliteWalIndexHeaderRegion(
             nativeByteOrder);
         return new SqliteWalIndexHeaderRegion(firstHeader, checkpointInfo);
     }
+}
+
+/// <summary>
+/// Reads and publishes SQLite WAL-index headers and resolves page numbers through
+/// the transient native-endian hash tables.
+/// </summary>
+/// <remarks>
+/// This is deliberately detached from <see cref="SqlitePager"/>. Callers must
+/// provide any SQLite role lock required for their operation; the instance lock
+/// only serializes operations issued through this instance. A valid result is
+/// authenticated against the WAL file and never authorizes pager behavior.
+/// </remarks>
+public sealed class SqliteWalIndexSharedMemory
+{
+    private const int StableHeaderReadAttempts = 8;
+    private const uint HashMultiplier = 383;
+
+    private readonly object _gate = new();
+    private readonly ISqliteWalSharedMemoryMapping _mapping;
+
+    /// <summary>Creates an accessor over an already mapped SQLite <c>-shm</c> region.</summary>
+    public SqliteWalIndexSharedMemory(ISqliteWalSharedMemoryMapping mapping)
+    {
+        ArgumentNullException.ThrowIfNull(mapping);
+        _mapping = mapping;
+    }
+
+    /// <summary>
+    /// Reads a stable dual-header snapshot and validates it against the WAL.
+    /// </summary>
+    public SqliteWalIndexHeaderRegion ReadValidatedHeader(SqliteWalFile wal)
+    {
+        ArgumentNullException.ThrowIfNull(wal);
+        lock (_gate)
+        {
+            var region = ReadStableHeaderRegion();
+            ValidateHeaderAgainstWal(region.Header, wal);
+            return region;
+        }
+    }
+
+    /// <summary>
+    /// Publishes a validated WAL-index header using SQLite's second-copy,
+    /// barrier, first-copy ordering.
+    /// </summary>
+    public void PublishHeader(SqliteWalIndexHeader header, SqliteWalFile wal)
+    {
+        ArgumentNullException.ThrowIfNull(header);
+        ArgumentNullException.ThrowIfNull(wal);
+
+        lock (_gate)
+        {
+            if (_mapping.IsReadOnly)
+                throw new InvalidOperationException("Cannot publish a SQLite WAL-index header through a read-only mapping.");
+
+            EnsureMappedBlocks(SqliteWalIndexLayout.GetRequiredBlockCount(header.MaximumFrame));
+            ValidateHeaderAgainstWal(header, wal);
+
+            var bytes = header.ToArray();
+            _mapping.Write(SqliteWalIndexHeader.Size, bytes);
+            _mapping.MemoryBarrier();
+            _mapping.Write(position: 0, bytes);
+        }
+    }
+
+    /// <summary>
+    /// Resolves the newest frame for <paramref name="pageNumber"/> within the
+    /// currently validated committed WAL boundary, or returns <see langword="null"/>.
+    /// </summary>
+    public uint? FindFrame(SqliteWalFile wal, uint pageNumber)
+    {
+        ArgumentNullException.ThrowIfNull(wal);
+        if (pageNumber == 0)
+            throw new ArgumentOutOfRangeException(nameof(pageNumber), "SQLite database page numbers start at one.");
+
+        lock (_gate)
+        {
+            for (var attempt = 0; attempt < StableHeaderReadAttempts; attempt++)
+            {
+                var region = ReadStableHeaderRegion();
+                ValidateHeaderAgainstWal(region.Header, wal);
+                var frameNumber = FindFrame(region.Header, pageNumber);
+                if (frameNumber is { } frame)
+                    ValidateMatchedFrame(wal, region.Header, frame, pageNumber);
+
+                var confirmation = ReadStableHeaderRegion();
+                if (region.Header == confirmation.Header)
+                    return frameNumber;
+            }
+        }
+
+        throw new InvalidDataException(
+            "SQLite WAL-index header changed while resolving a page number; refusing a stale lookup.");
+    }
+
+    private SqliteWalIndexHeaderRegion ReadStableHeaderRegion()
+    {
+        EnsureMappedBlocks(blockCount: 1);
+        InvalidDataException? failure = null;
+        for (var attempt = 0; attempt < StableHeaderReadAttempts; attempt++)
+        {
+            try
+            {
+                Span<byte> source = stackalloc byte[SqliteWalIndexLayout.HeaderRegionSize];
+                _mapping.Read(position: 0, source[..SqliteWalIndexHeader.Size]);
+                _mapping.MemoryBarrier();
+                _mapping.Read(
+                    SqliteWalIndexHeader.Size,
+                    source.Slice(SqliteWalIndexHeader.Size, SqliteWalIndexHeader.Size));
+                _mapping.Read(
+                    SqliteWalIndexHeader.Size * 2,
+                    source[(SqliteWalIndexHeader.Size * 2)..]);
+
+                return SqliteWalIndexHeaderRegion.Parse(source);
+            }
+            catch (InvalidDataException exception)
+            {
+                failure = exception;
+            }
+        }
+
+        throw new InvalidDataException(
+            $"SQLite WAL-index header remained malformed or torn after {StableHeaderReadAttempts} stable-read attempts.",
+            failure);
+    }
+
+    private uint? FindFrame(SqliteWalIndexHeader header, uint pageNumber)
+    {
+        if (header.MaximumFrame == 0)
+            return null;
+
+        var blockIndex = SqliteWalIndexLayout.GetBlockIndex(header.MaximumFrame);
+        EnsureMappedBlocks(checked(blockIndex + 1));
+        for (; blockIndex >= 0; blockIndex--)
+        {
+            var frameZero = GetBlockFrameZero(blockIndex);
+            var frameCapacity = GetBlockFrameCapacity(blockIndex);
+            var hashSlot = (int)(unchecked(pageNumber * HashMultiplier)
+                                 & (SqliteWalIndexLayout.HashSlotCount - 1));
+            uint? result = null;
+
+            for (var probe = 0; probe < SqliteWalIndexLayout.HashSlotCount; probe++)
+            {
+                var hashValue = ReadUInt16(
+                    SqliteWalIndexLayout.GetHashSlotOffset(blockIndex, hashSlot));
+                if (hashValue == 0)
+                    break;
+                if (hashValue > frameCapacity)
+                {
+                    throw new InvalidDataException(
+                        $"SQLite WAL-index hash slot {hashSlot} in block {blockIndex} refers to page-number slot {hashValue}, outside the block.");
+                }
+
+                var frameNumber = checked(frameZero + hashValue);
+                if (frameNumber <= header.MaximumFrame)
+                {
+                    var indexedPageNumber = ReadUInt32(
+                        SqliteWalIndexLayout.GetPageNumberOffset(frameNumber));
+                    if (indexedPageNumber == 0)
+                    {
+                        throw new InvalidDataException(
+                            $"SQLite WAL-index page-number slot for frame {frameNumber} is zero within the committed boundary.");
+                    }
+                    if (indexedPageNumber == pageNumber
+                        && (result is null || frameNumber > result.Value))
+                    {
+                        result = frameNumber;
+                    }
+                }
+
+                hashSlot = (hashSlot + 1) & (SqliteWalIndexLayout.HashSlotCount - 1);
+            }
+
+            if (result is { })
+                return result;
+        }
+
+        return null;
+    }
+
+    private void EnsureMappedBlocks(int blockCount)
+    {
+        if (blockCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockCount), "SQLite WAL-index block count must be positive.");
+
+        var requiredLength = checked((long)blockCount * SqliteWalIndexLayout.BlockSize);
+        if (_mapping.Length < requiredLength)
+        {
+            throw new InvalidDataException(
+                $"SQLite WAL-index mapping is {_mapping.Length} bytes but requires at least {requiredLength} bytes.");
+        }
+    }
+
+    private static void ValidateHeaderAgainstWal(SqliteWalIndexHeader header, SqliteWalFile wal)
+    {
+        var walHeader = wal.Header;
+        if (header.PageSize != walHeader.PageSize)
+            throw new InvalidDataException("SQLite WAL-index page size does not match the WAL header.");
+        if (header.WalChecksumByteOrder != walHeader.ChecksumByteOrder)
+            throw new InvalidDataException("SQLite WAL-index checksum byte order does not match the WAL header.");
+        if (header.Salt1 != walHeader.Salt1 || header.Salt2 != walHeader.Salt2)
+            throw new InvalidDataException("SQLite WAL-index salts do not match the WAL header.");
+
+        var recovery = wal.ScanRecovery();
+        if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile)
+        {
+            throw new InvalidDataException(
+                $"SQLite WAL contains a {recovery.StopReason} tail; refusing to trust its WAL-index.");
+        }
+        if (recovery.LastCommittedFrameNumber != header.MaximumFrame)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL-index committed-frame boundary does not match the independently validated WAL.");
+        }
+
+        if (header.MaximumFrame == 0)
+            return;
+
+        if (recovery.LastCommittedDatabaseSizeInPages != header.DatabasePageCount)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL-index database page count does not match the independently validated WAL.");
+        }
+
+        var committedFrame = wal.ReadFrame(header.MaximumFrame);
+        if (!committedFrame.Header.IsCommit)
+            throw new InvalidDataException("SQLite WAL-index maximum frame is not a WAL commit frame.");
+        if (committedFrame.Header.DatabaseSizeInPages != header.DatabasePageCount)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL-index database page count does not match its maximum WAL frame.");
+        }
+        if (committedFrame.Header.Checksum1 != header.FrameChecksum1
+            || committedFrame.Header.Checksum2 != header.FrameChecksum2)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL-index frame checksum does not match its maximum WAL frame.");
+        }
+    }
+
+    private static void ValidateMatchedFrame(
+        SqliteWalFile wal,
+        SqliteWalIndexHeader header,
+        uint frameNumber,
+        uint pageNumber)
+    {
+        var frame = wal.ReadFrame(frameNumber);
+        if (frame.Header.PageNumber != pageNumber)
+        {
+            throw new InvalidDataException(
+                $"SQLite WAL-index frame {frameNumber} maps page {pageNumber} but the WAL frame stores page {frame.Header.PageNumber}.");
+        }
+        if (frame.Header.Salt1 != header.Salt1 || frame.Header.Salt2 != header.Salt2)
+            throw new InvalidDataException("SQLite WAL-index lookup frame salts do not match its header.");
+    }
+
+    private uint ReadUInt32(long position)
+    {
+        Span<byte> source = stackalloc byte[sizeof(uint)];
+        _mapping.Read(position, source);
+        return SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian
+            ? BinaryPrimitives.ReadUInt32LittleEndian(source)
+            : BinaryPrimitives.ReadUInt32BigEndian(source);
+    }
+
+    private ushort ReadUInt16(long position)
+    {
+        Span<byte> source = stackalloc byte[sizeof(ushort)];
+        _mapping.Read(position, source);
+        return SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian
+            ? BinaryPrimitives.ReadUInt16LittleEndian(source)
+            : BinaryPrimitives.ReadUInt16BigEndian(source);
+    }
+
+    private static uint GetBlockFrameZero(int blockIndex)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(blockIndex);
+        if (blockIndex == 0)
+            return 0;
+
+        return checked(
+            (uint)SqliteWalIndexLayout.FirstBlockFrameCapacity
+            + checked((uint)(blockIndex - 1) * SqliteWalIndexLayout.SubsequentBlockFrameCapacity));
+    }
+
+    private static ushort GetBlockFrameCapacity(int blockIndex)
+        => checked((ushort)(blockIndex == 0
+            ? SqliteWalIndexLayout.FirstBlockFrameCapacity
+            : SqliteWalIndexLayout.SubsequentBlockFrameCapacity));
 }
