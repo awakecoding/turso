@@ -288,6 +288,39 @@ tests operate on ordinary SQLite-produced artifacts to validate lock and frame
 semantics only; they do not establish concurrent stock-SQLite client
 interoperability for the managed pager.
 
+#### Stage 3 detached foundation currently present
+
+`SqliteWalWriterCheckpointCoordinator` is a detached protocol over an explicit
+main database file, WAL, mapped index, and byte-range lock carrier. It takes
+only `WAL_WRITE_LOCK` while appending a complete transaction, flushes the WAL
+before publishing page/hash entries and the duplicate `WalIndexHdr`, and faults
+rather than reusing an artifact when a failure occurs after a commit might have
+become durable. Recovery takes `WAL_WRITE_LOCK`, `WAL_RECOVER_LOCK`, and every
+read-mark lock before truncating an uncommitted tail.
+
+The checkpointer takes `WAL_CKPT_LOCK` independently of the pager. `PASSIVE`
+calculates `mxSafeFrame` from only the read marks it cannot exclusively lock;
+an active read-mark zero limits progress to `nBackfill`, and every other held
+mark limits it to its committed boundary. It releases unheld marks before
+copying pages so it does not block new readers. `FULL`, `RESTART`, and
+`TRUNCATE` take `WAL_WRITE_LOCK` before waiting for all marks. They flush the
+WAL before copying, flush the main file before advancing `nBackfill`, and reset
+only after every read mark is exclusive. Restart first writes a durable
+checkpoint-reset WAL marker, allowing detached open to repair the stale-index
+interruption window; truncate removes that reset WAL header only after the
+zero-frame index is visible.
+`nBackfillAttempted` is published before installation; `nBackfill` is advanced
+only after the main-store flush. On open, it rebuilds all transient index
+progress and lookup state from a clean WAL that it independently authenticates
+under the full recovery lock set; this makes an unverified `nBackfill` unable
+to authorize a reset. Corruption that reaches before the last recoverable
+committed boundary is rejected fail-closed. Focused tests use SQLite-produced
+artifacts and separate reader/writer/lock-worker processes.
+
+This remains unreachable from `SqlitePager`, normal managed execution, cache
+invalidation, and managed recovery. It does not relax the Stage 0 ownership
+lock or establish any stock-SQLite concurrent interoperability claim.
+
 ### Stage 3 — writer and checkpointer protocol
 
 - The writer takes only `WAL_WRITE_LOCK`, verifies the index header is unchanged,

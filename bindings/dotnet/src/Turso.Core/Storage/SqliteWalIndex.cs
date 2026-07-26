@@ -340,6 +340,111 @@ public sealed record SqliteWalIndexHeader
         WriteUInt32(destination[44..], NativeByteOrder, Checksum2);
     }
 
+    /// <summary>
+    /// Creates the next header after a writer has durably appended and committed
+    /// frames to the associated WAL.
+    /// </summary>
+    public SqliteWalIndexHeader WithCommittedFrames(
+        uint maximumFrame,
+        uint databasePageCount,
+        uint frameChecksum1,
+        uint frameChecksum2)
+    {
+        if (maximumFrame <= MaximumFrame)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumFrame),
+                maximumFrame,
+                "A SQLite WAL writer must publish a committed frame beyond the prior boundary.");
+        }
+        if (databasePageCount == 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(databasePageCount),
+                "A SQLite WAL commit must publish a nonzero database page count.");
+        }
+
+        return Create(
+            changeCounter: unchecked(ChangeCounter + 1),
+            maximumFrame,
+            databasePageCount,
+            frameChecksum1,
+            frameChecksum2);
+    }
+
+    /// <summary>
+    /// Creates the empty-WAL header used only after a checkpointer holds the
+    /// writer and every read-mark lock, and has durably installed the main store.
+    /// </summary>
+    public SqliteWalIndexHeader WithRestartedWal(uint databasePageCount)
+    {
+        if (databasePageCount == 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(databasePageCount),
+                "A restarted SQLite WAL must retain a nonzero main-database page count.");
+        }
+
+        return Create(
+            changeCounter: unchecked(ChangeCounter + 1),
+            maximumFrame: 0,
+            databasePageCount,
+            frameChecksum1: 0,
+            frameChecksum2: 0);
+    }
+
+    private SqliteWalIndexHeader Create(
+        uint changeCounter,
+        uint maximumFrame,
+        uint databasePageCount,
+        uint frameChecksum1,
+        uint frameChecksum2)
+        => Create(
+            changeCounter,
+            WalChecksumByteOrder,
+            PageSize,
+            maximumFrame,
+            databasePageCount,
+            frameChecksum1,
+            frameChecksum2,
+            Salt1,
+            Salt2);
+
+    internal static SqliteWalIndexHeader Create(
+        uint changeCounter,
+        SqliteWalChecksumByteOrder walChecksumByteOrder,
+        int pageSize,
+        uint maximumFrame,
+        uint databasePageCount,
+        uint frameChecksum1,
+        uint frameChecksum2,
+        uint salt1,
+        uint salt2)
+    {
+        Span<byte> bytes = stackalloc byte[Size];
+        WriteUInt32(bytes, NativeByteOrder, CurrentFormatVersion);
+        WriteUInt32(bytes[4..], NativeByteOrder, value: 0);
+        WriteUInt32(bytes[8..], NativeByteOrder, changeCounter);
+        bytes[12] = 1;
+        bytes[13] = walChecksumByteOrder == SqliteWalChecksumByteOrder.BigEndian ? (byte)1 : (byte)0;
+        WriteUInt16(
+            bytes[14..],
+            NativeByteOrder,
+            pageSize == SqlitePageSize.Maximum ? (ushort)1 : checked((ushort)pageSize));
+        WriteUInt32(bytes[16..], NativeByteOrder, maximumFrame);
+        WriteUInt32(bytes[20..], NativeByteOrder, databasePageCount);
+        WriteUInt32(bytes[24..], NativeByteOrder, frameChecksum1);
+        WriteUInt32(bytes[28..], NativeByteOrder, frameChecksum2);
+        BinaryPrimitives.WriteUInt32BigEndian(bytes[32..], salt1);
+        BinaryPrimitives.WriteUInt32BigEndian(bytes[36..], salt2);
+        var checksum = SqliteWalChecksum.Calculate(
+            bytes[..40],
+            ToWalChecksumByteOrder(NativeByteOrder));
+        WriteUInt32(bytes[40..], NativeByteOrder, checksum.First);
+        WriteUInt32(bytes[44..], NativeByteOrder, checksum.Second);
+        return Parse(bytes);
+    }
+
     private static int DecodePageSize(ushort encodedPageSize)
     {
         if (encodedPageSize == 1)
@@ -599,6 +704,71 @@ public sealed class SqliteWalIndexSharedMemory
     }
 
     /// <summary>
+    /// Reads a stable, checksum-valid WAL-index header region without trusting it
+    /// as a WAL snapshot. Recovery uses this only while it owns the recovery and
+    /// all reader locks, before truncating an uncommitted tail.
+    /// </summary>
+    public SqliteWalIndexHeaderRegion ReadStableHeader()
+    {
+        lock (_gate)
+            return ReadStableHeaderRegion();
+    }
+
+    /// <summary>
+    /// Reads either checksum-valid WAL-index header copy for recovery only. A
+    /// caller must first own writer, recovery, checkpoint, and every read mark;
+    /// normal snapshot paths must use <see cref="ReadValidatedHeader"/>.
+    /// </summary>
+    public SqliteWalIndexHeader ReadRecoverableHeader()
+    {
+        lock (_gate)
+        {
+            EnsureMappedBlocks(blockCount: 1);
+            Span<byte> first = stackalloc byte[SqliteWalIndexHeader.Size];
+            Span<byte> second = stackalloc byte[SqliteWalIndexHeader.Size];
+            _mapping.Read(position: 0, first);
+            _mapping.MemoryBarrier();
+            _mapping.Read(SqliteWalIndexHeader.Size, second);
+
+            SqliteWalIndexHeader? firstHeader = null;
+            SqliteWalIndexHeader? secondHeader = null;
+            try
+            {
+                firstHeader = SqliteWalIndexHeader.Parse(first);
+            }
+            catch (InvalidDataException)
+            {
+            }
+            try
+            {
+                secondHeader = SqliteWalIndexHeader.Parse(second);
+            }
+            catch (InvalidDataException)
+            {
+            }
+
+            if (firstHeader is null && secondHeader is null)
+            {
+                throw new InvalidDataException(
+                    "Neither SQLite WAL-index header copy is valid enough to recover the WAL index.");
+            }
+            if (firstHeader is not null && secondHeader is not null)
+            {
+                if (firstHeader == secondHeader)
+                    return firstHeader;
+                if (firstHeader.MaximumFrame == 0)
+                    return firstHeader;
+                if (secondHeader.MaximumFrame == 0)
+                    return secondHeader;
+                throw new InvalidDataException(
+                    "SQLite WAL-index header copies disagree on nonempty committed state; recovery cannot select an incarnation.");
+            }
+
+            return firstHeader ?? secondHeader!;
+        }
+    }
+
+    /// <summary>
     /// Publishes a validated WAL-index header using SQLite's second-copy,
     /// barrier, first-copy ordering.
     /// </summary>
@@ -661,6 +831,213 @@ public sealed class SqliteWalIndexSharedMemory
                 SqliteWalIndexHeader.Size * 2L + sizeof(uint) + readMarkIndex * sizeof(uint),
                 bytes);
             _mapping.MemoryBarrier();
+        }
+    }
+
+    /// <summary>
+    /// Publishes the page-number and hash entries for frames that were already
+    /// durably appended, then makes their committed boundary visible by publishing
+    /// the supplied header. The caller must own <c>WAL_WRITE_LOCK</c>.
+    /// </summary>
+    public void PublishCommittedFrames(
+        SqliteWalIndexHeader priorHeader,
+        IReadOnlyList<SqliteWalFrame> frames,
+        SqliteWalIndexHeader committedHeader,
+        SqliteWalFile wal)
+    {
+        ArgumentNullException.ThrowIfNull(priorHeader);
+        ArgumentNullException.ThrowIfNull(frames);
+        ArgumentNullException.ThrowIfNull(committedHeader);
+        ArgumentNullException.ThrowIfNull(wal);
+        if (frames.Count == 0)
+            throw new ArgumentException("A SQLite WAL commit must contain at least one frame.", nameof(frames));
+        if (priorHeader.PageSize != committedHeader.PageSize
+            || priorHeader.WalChecksumByteOrder != committedHeader.WalChecksumByteOrder
+            || priorHeader.Salt1 != committedHeader.Salt1
+            || priorHeader.Salt2 != committedHeader.Salt2)
+        {
+            throw new InvalidOperationException(
+                "A SQLite WAL commit cannot change its page size, checksum order, or WAL incarnation.");
+        }
+        if (committedHeader.MaximumFrame != checked(priorHeader.MaximumFrame + (uint)frames.Count))
+        {
+            throw new InvalidOperationException(
+                "SQLite WAL frame publication must advance the committed boundary by exactly the appended frame count.");
+        }
+
+        lock (_gate)
+        {
+            if (_mapping.IsReadOnly)
+                throw new InvalidOperationException("Cannot publish SQLite WAL frames through a read-only mapping.");
+
+            EnsureWritableBlocks(SqliteWalIndexLayout.GetRequiredBlockCount(committedHeader.MaximumFrame));
+            var recovery = wal.ScanRecovery();
+            if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
+                || recovery.LastCommittedFrameNumber != committedHeader.MaximumFrame
+                || recovery.LastCommittedDatabaseSizeInPages != committedHeader.DatabasePageCount)
+            {
+                throw new InvalidDataException(
+                    "The SQLite WAL does not contain exactly the committed frame boundary being published.");
+            }
+
+            for (var index = 0; index < frames.Count; index++)
+            {
+                var frameNumber = checked(priorHeader.MaximumFrame + (uint)index + 1);
+                var frame = frames[index]
+                    ?? throw new ArgumentException("SQLite WAL frame collections cannot contain null frames.", nameof(frames));
+                var expected = wal.ReadFrame(frameNumber);
+                if (frame.Header != expected.Header || !frame.PageData.AsSpan().SequenceEqual(expected.PageData))
+                {
+                    throw new InvalidDataException(
+                        $"SQLite WAL frame {frameNumber} changed before its WAL-index entry could be published.");
+                }
+
+                PublishFrameIndex(frameNumber, frame.Header.PageNumber);
+            }
+
+            // The frame/hash arrays must be globally visible before either header
+            // copy exposes their new committed boundary.
+            _mapping.MemoryBarrier();
+            PublishHeader(committedHeader, wal);
+        }
+    }
+
+    /// <summary>
+    /// Records how far the active checkpointer attempted to backfill. Callers
+    /// must own <c>WAL_CKPT_LOCK</c> and must not move the value backwards.
+    /// </summary>
+    public void PublishBackfillAttemptedFrameCount(uint attemptedFrameCount, SqliteWalFile wal)
+    {
+        ArgumentNullException.ThrowIfNull(wal);
+        lock (_gate)
+        {
+            var region = ReadStableHeaderRegion();
+            ValidateHeaderAgainstWal(region.Header, wal);
+            if (attemptedFrameCount < region.CheckpointInfo.BackfilledFrameCount
+                || attemptedFrameCount < region.CheckpointInfo.BackfillAttemptedFrameCount
+                || attemptedFrameCount > region.Header.MaximumFrame)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(attemptedFrameCount),
+                    "SQLite WAL backfill-attempt progress must be monotonic and within the committed boundary.");
+            }
+
+            WriteUInt32(
+                SqliteWalIndexHeader.Size * 2L + 32,
+                attemptedFrameCount);
+            _mapping.MemoryBarrier();
+        }
+    }
+
+    /// <summary>
+    /// Publishes durable main-store backfill progress. The caller must own
+    /// <c>WAL_CKPT_LOCK</c> and must call this only after flushing the installed
+    /// database pages to durable storage.
+    /// </summary>
+    public void PublishBackfilledFrameCount(uint backfilledFrameCount, SqliteWalFile wal)
+    {
+        ArgumentNullException.ThrowIfNull(wal);
+        lock (_gate)
+        {
+            var region = ReadStableHeaderRegion();
+            ValidateHeaderAgainstWal(region.Header, wal);
+            if (backfilledFrameCount < region.CheckpointInfo.BackfilledFrameCount
+                || backfilledFrameCount > region.CheckpointInfo.BackfillAttemptedFrameCount
+                || backfilledFrameCount > region.Header.MaximumFrame)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(backfilledFrameCount),
+                    "SQLite WAL durable backfill progress must be monotonic and no later than the attempted boundary.");
+            }
+
+            WriteUInt32(SqliteWalIndexHeader.Size * 2L, backfilledFrameCount);
+            _mapping.MemoryBarrier();
+        }
+    }
+
+    /// <summary>
+    /// Clears frame lookup state and checkpoint accounting after a fully exclusive
+    /// restart or truncate. The caller must own writer, checkpoint, and all
+    /// read-mark locks, and must already have durably reset the WAL.
+    /// </summary>
+    public void ResetAfterDurableRestart(SqliteWalIndexHeader restartedHeader)
+    {
+        ArgumentNullException.ThrowIfNull(restartedHeader);
+        if (restartedHeader.MaximumFrame != 0)
+        {
+            throw new ArgumentException(
+                "A SQLite WAL restart header must publish no committed frames.",
+                nameof(restartedHeader));
+        }
+
+        lock (_gate)
+        {
+            if (_mapping.IsReadOnly)
+                throw new InvalidOperationException("Cannot reset SQLite WAL-index state through a read-only mapping.");
+
+            EnsureWritableBlocks(blockCount: 1);
+            ClearFrameIndex();
+            PublishResetCheckpointInfo();
+            _mapping.MemoryBarrier();
+            PublishHeaderWithoutWalValidation(restartedHeader);
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds every frame/hash entry and both header copies from a clean,
+    /// independently scanned WAL. Callers must hold writer, recovery, checkpoint,
+    /// and all read-mark locks before invoking this crash-recovery operation.
+    /// </summary>
+    public void RebuildFromWal(SqliteWalFile wal, uint mainDatabasePageCount)
+    {
+        ArgumentNullException.ThrowIfNull(wal);
+        if (mainDatabasePageCount == 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(mainDatabasePageCount),
+                "SQLite WAL-index recovery requires a nonzero main-database page count.");
+        }
+
+        lock (_gate)
+        {
+            if (_mapping.IsReadOnly)
+                throw new InvalidOperationException("Cannot rebuild SQLite WAL-index state through a read-only mapping.");
+
+            var recovery = wal.ScanRecovery();
+            if (recovery.StopReason != SqliteWalRecoveryStopReason.EndOfFile
+                || recovery.LastValidFrameNumber != recovery.LastCommittedFrameNumber
+                || recovery.LastCommittedFrameNumber > uint.MaxValue)
+            {
+                throw new InvalidDataException(
+                    "SQLite WAL-index recovery requires a complete WAL ending at its last committed frame.");
+            }
+
+            var maximumFrame = checked((uint)recovery.LastCommittedFrameNumber);
+            var header = maximumFrame == 0
+                ? SqliteWalIndexHeader.Create(
+                    changeCounter: 1,
+                    wal.Header.ChecksumByteOrder,
+                    wal.PageSize,
+                    maximumFrame: 0,
+                    mainDatabasePageCount,
+                    frameChecksum1: 0,
+                    frameChecksum2: 0,
+                    wal.Header.Salt1,
+                    wal.Header.Salt2)
+                : CreateHeaderFromCommittedWal(wal, maximumFrame, recovery.LastCommittedDatabaseSizeInPages);
+
+            EnsureWritableBlocks(SqliteWalIndexLayout.GetRequiredBlockCount(maximumFrame));
+            ClearFrameIndex();
+            PublishResetCheckpointInfo();
+            for (var frameNumber = 1U; maximumFrame != 0; frameNumber++)
+            {
+                PublishFrameIndex(frameNumber, wal.ReadFrame(frameNumber).Header.PageNumber);
+                if (frameNumber == maximumFrame)
+                    break;
+            }
+
+            _mapping.MemoryBarrier();
+            PublishHeaderWithoutWalValidation(header);
         }
     }
 
@@ -792,6 +1169,110 @@ public sealed class SqliteWalIndexSharedMemory
         }
     }
 
+    private static SqliteWalIndexHeader CreateHeaderFromCommittedWal(
+        SqliteWalFile wal,
+        uint maximumFrame,
+        uint databasePageCount)
+    {
+        var committedFrame = wal.ReadFrame(maximumFrame).Header;
+        if (!committedFrame.IsCommit || committedFrame.DatabaseSizeInPages != databasePageCount)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL-index recovery found a non-commit frame at its recovered committed boundary.");
+        }
+
+        return SqliteWalIndexHeader.Create(
+            changeCounter: 1,
+            wal.Header.ChecksumByteOrder,
+            wal.PageSize,
+            maximumFrame,
+            databasePageCount,
+            committedFrame.Checksum1,
+            committedFrame.Checksum2,
+            wal.Header.Salt1,
+            wal.Header.Salt2);
+    }
+
+    private void EnsureWritableBlocks(int blockCount)
+    {
+        EnsureMappedBlocks(blockCount: 1);
+        var requiredLength = checked((long)blockCount * SqliteWalIndexLayout.BlockSize);
+        if (_mapping.Length >= requiredLength)
+            return;
+
+        _mapping.Write(requiredLength - 1, stackalloc byte[1]);
+        if (_mapping.Length < requiredLength)
+        {
+            throw new InvalidDataException(
+                $"SQLite WAL-index mapping did not grow to its required {requiredLength} bytes.");
+        }
+    }
+
+    private void PublishFrameIndex(uint frameNumber, uint pageNumber)
+    {
+        var blockIndex = SqliteWalIndexLayout.GetBlockIndex(frameNumber);
+        var frameZero = GetBlockFrameZero(blockIndex);
+        var frameSlot = checked(frameNumber - frameZero);
+        var frameCapacity = GetBlockFrameCapacity(blockIndex);
+        if (frameSlot == 0 || frameSlot > frameCapacity)
+            throw new InvalidOperationException("SQLite WAL frame resolved outside its WAL-index block.");
+
+        WriteUInt32(SqliteWalIndexLayout.GetPageNumberOffset(frameNumber), pageNumber);
+        var hashSlot = (int)(unchecked(pageNumber * HashMultiplier)
+                             & (SqliteWalIndexLayout.HashSlotCount - 1));
+        for (var probe = 0; probe < SqliteWalIndexLayout.HashSlotCount; probe++)
+        {
+            if (ReadUInt16(SqliteWalIndexLayout.GetHashSlotOffset(blockIndex, hashSlot)) == 0)
+            {
+                WriteUInt16(
+                    SqliteWalIndexLayout.GetHashSlotOffset(blockIndex, hashSlot),
+                    checked((ushort)frameSlot));
+                return;
+            }
+
+            hashSlot = (hashSlot + 1) & (SqliteWalIndexLayout.HashSlotCount - 1);
+        }
+
+        throw new InvalidDataException(
+            $"SQLite WAL-index hash table for block {blockIndex} has no free slot for page {pageNumber}.");
+    }
+
+    private void ClearFrameIndex()
+    {
+        var length = _mapping.Length;
+        if (length <= SqliteWalIndexLayout.HeaderRegionSize)
+            return;
+
+        var cleared = new byte[Math.Min(SqliteWalIndexLayout.BlockSize, checked((int)(length - SqliteWalIndexLayout.HeaderRegionSize)))];
+        for (var position = (long)SqliteWalIndexLayout.HeaderRegionSize; position < length;)
+        {
+            var count = (int)Math.Min(cleared.Length, length - position);
+            _mapping.Write(position, cleared.AsSpan(0, count));
+            position += count;
+        }
+    }
+
+    private void PublishResetCheckpointInfo()
+    {
+        Span<byte> readMarks = stackalloc byte[24];
+        WriteUInt32(readMarks, 0);
+        for (var index = 1; index < SqliteWalIndexCheckpointInfo.ReadMarkCount; index++)
+            WriteUInt32(readMarks.Slice(index * sizeof(uint), sizeof(uint)), SqliteWalIndexCheckpointInfo.ReadMarkNotUsed);
+        _mapping.Write(SqliteWalIndexHeader.Size * 2L, readMarks);
+
+        Span<byte> tail = stackalloc byte[8];
+        _mapping.Write(SqliteWalIndexHeader.Size * 2L + 32, tail);
+    }
+
+    private void PublishHeaderWithoutWalValidation(SqliteWalIndexHeader header)
+    {
+        EnsureWritableBlocks(SqliteWalIndexLayout.GetRequiredBlockCount(header.MaximumFrame));
+        var bytes = header.ToArray();
+        _mapping.Write(SqliteWalIndexHeader.Size, bytes);
+        _mapping.MemoryBarrier();
+        _mapping.Write(position: 0, bytes);
+    }
+
     private static void ValidateHeaderAgainstWal(SqliteWalIndexHeader header, SqliteWalFile wal)
     {
         var walHeader = wal.Header;
@@ -879,6 +1360,23 @@ public sealed class SqliteWalIndexSharedMemory
             BinaryPrimitives.WriteUInt32LittleEndian(destination, value);
         else
             BinaryPrimitives.WriteUInt32BigEndian(destination, value);
+    }
+
+    private void WriteUInt32(long position, uint value)
+    {
+        Span<byte> destination = stackalloc byte[sizeof(uint)];
+        WriteUInt32(destination, value);
+        _mapping.Write(position, destination);
+    }
+
+    private void WriteUInt16(long position, ushort value)
+    {
+        Span<byte> destination = stackalloc byte[sizeof(ushort)];
+        if (SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian)
+            BinaryPrimitives.WriteUInt16LittleEndian(destination, value);
+        else
+            BinaryPrimitives.WriteUInt16BigEndian(destination, value);
+        _mapping.Write(position, destination);
     }
 
     private static uint GetBlockFrameZero(int blockIndex)

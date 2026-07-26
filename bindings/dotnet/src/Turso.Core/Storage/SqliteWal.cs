@@ -402,6 +402,7 @@ public sealed class SqliteWalFile : IDisposable
     private readonly IFile _file;
     private readonly TursoPageEncryption? _encryption;
     private SqliteWalHeader _header;
+    private bool _truncatedAfterCheckpoint;
     private bool _disposed;
 
     private SqliteWalFile(IFile file, SqliteWalHeader header, TursoPageEncryption? encryption)
@@ -523,7 +524,8 @@ public sealed class SqliteWalFile : IDisposable
         IFileSystem fileSystem,
         string path,
         bool readOnly = false,
-        TursoEncryptionOptions? encryption = null)
+        TursoEncryptionOptions? encryption = null,
+        SqliteWalHeader? truncatedHeader = null)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentException.ThrowIfNullOrEmpty(path);
@@ -532,6 +534,14 @@ public sealed class SqliteWalFile : IDisposable
         TursoPageEncryption? pageEncryption = null;
         try
         {
+            if (file.Length == 0 && truncatedHeader is not null)
+            {
+                pageEncryption = encryption?.CreatePageEncryption(truncatedHeader.PageSize);
+                return new SqliteWalFile(file, truncatedHeader, pageEncryption)
+                {
+                    _truncatedAfterCheckpoint = true,
+                };
+            }
             if (file.Length < SqliteWalHeader.Size)
                 throw new InvalidDataException("File is too small to contain a SQLite WAL header.");
 
@@ -568,6 +578,7 @@ public sealed class SqliteWalFile : IDisposable
                 nameof(pageData));
         }
 
+        MaterializeHeaderAfterCheckpointTruncate();
         var scan = ScanCore();
         if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile)
         {
@@ -670,6 +681,9 @@ public sealed class SqliteWalFile : IDisposable
         ThrowIfReadOnly();
 
         var scan = ScanCore();
+        if (_truncatedAfterCheckpoint && _file.Length == 0)
+            return scan.Info;
+
         var targetLength = scan.Info.LastCommittedByteLength;
         if (_file.Length != targetLength)
         {
@@ -735,6 +749,36 @@ public sealed class SqliteWalFile : IDisposable
         _file.FlushToDisk();
     }
 
+    /// <summary>
+    /// Truncates the WAL to zero bytes after a caller has durably checkpointed its
+    /// complete committed view and excluded writers and every read mark.
+    /// </summary>
+    /// <remarks>
+    /// A retained coordinator can begin a later write: it recreates this file's
+    /// validated WAL header before appending its first frame. A separate opener
+    /// must wait for that writer, as SQLite's normal WAL protocol does.
+    /// </remarks>
+    internal void TruncateAfterDurableCheckpoint()
+    {
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+
+        var scan = ScanCore();
+        if (scan.Info.StopReason != SqliteWalRecoveryStopReason.EndOfFile
+            || scan.Info.LastValidFrameNumber != scan.Info.LastCommittedFrameNumber)
+        {
+            throw new InvalidDataException(
+                "Cannot truncate a SQLite WAL with a partial, corrupt, or uncommitted frame tail.");
+        }
+
+        _file.SetLength(0);
+        if (_file.Length != 0)
+            throw new InvalidDataException("SQLite WAL truncation did not reach zero bytes.");
+
+        _file.FlushToDisk();
+        _truncatedAfterCheckpoint = true;
+    }
+
     /// <inheritdoc />
     public void Dispose()
     {
@@ -749,6 +793,15 @@ public sealed class SqliteWalFile : IDisposable
     private ScanState ScanCore()
     {
         var length = _file.Length;
+        if (_truncatedAfterCheckpoint && length == 0)
+        {
+            return CreateScanState(
+                lastValidFrameNumber: 0,
+                lastCommittedFrameNumber: 0,
+                lastCommittedDatabaseSizeInPages: 0,
+                SqliteWalRecoveryStopReason.EndOfFile,
+                (Header.Checksum1, Header.Checksum2));
+        }
         var fullFrameCount = CompleteFrameCount(length);
         var hasPartialFrame = (length - SqliteWalHeader.Size) % FrameSize != 0;
         var previousChecksum = (Header.Checksum1, Header.Checksum2);
@@ -870,6 +923,23 @@ public sealed class SqliteWalFile : IDisposable
 
             throw;
         }
+    }
+
+    private void MaterializeHeaderAfterCheckpointTruncate()
+    {
+        if (!_truncatedAfterCheckpoint)
+            return;
+        if (_file.Length != 0)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL changed after a checkpoint truncate; refusing to overwrite an unexpected artifact.");
+        }
+
+        _file.Write(position: 0, Header.ToArray());
+        if (_file.Length != SqliteWalHeader.Size)
+            throw new InvalidDataException("Recreating a truncated SQLite WAL header produced an invalid file length.");
+
+        _truncatedAfterCheckpoint = false;
     }
 
     private byte[] ReadFrameBytes(long offset)
