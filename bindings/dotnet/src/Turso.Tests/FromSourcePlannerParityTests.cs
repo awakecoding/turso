@@ -265,7 +265,7 @@ public sealed class FromSourcePlannerParityTests
         ReadPlanDetail(
                 connection,
                 "EXPLAIN QUERY PLAN SELECT id FROM entries NOT INDEXED WHERE id>0;")
-            .Should().Be("MANAGED COMPILED VDBE");
+            .Should().Be("MANAGED EVALUATOR FALLBACK");
         ReadOpenReadTargets(
                 connection,
                 "EXPLAIN SELECT id FROM entries NOT INDEXED WHERE id>0;")

@@ -171,6 +171,47 @@ public sealed class ExplainQueryPlanTests
     }
 
     [Test]
+    public void StreamingEvaluatorSelectsAreNeverDescribedAsCompiled()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1), (2);");
+
+        ReadPlan(connection, "EXPLAIN QUERY PLAN SELECT value FROM t;")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+    }
+
+    [Test]
+    public void StreamingCallbackProjectionKeepsItsFailureAtTheLaterRead()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1), (2);");
+        var calls = 0;
+        connection.RegisterScalarFunction(
+            "fail_on_two",
+            1,
+            values =>
+            {
+                calls++;
+                return values[0].AsInteger() == 2
+                    ? throw new EmbeddedSqlException("later row")
+                    : values[0];
+            });
+
+        ReadPlan(connection, "EXPLAIN QUERY PLAN SELECT fail_on_two(value) FROM t;")
+            .Rows[0][3].Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
+        calls.Should().Be(0);
+
+        using var statement = connection.Prepare("SELECT fail_on_two(value) FROM t;");
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(1));
+        Assert.Throws<EmbeddedSqlException>(() => statement.Step())!
+            .Message.Should().Be("later row");
+        calls.Should().Be(2);
+    }
+
+    [Test]
     public void RejectsStatementsWithoutAQueryPlanInsteadOfExecutingThem()
     {
         using var connection = new EmbeddedDatabase().Connect();
