@@ -1,4 +1,5 @@
 using Turso.Core.Execution;
+using Turso.Core.Storage;
 
 namespace Turso.Core.Compilation;
 
@@ -20,6 +21,7 @@ internal sealed class SelectStatementCompiler
     private readonly Func<Expression, SqlValue> _fold;
     private readonly Func<TableSource, ScanTarget?> _resolveScanTarget;
     private readonly Func<Expression, ScanTarget, VdbeRowPredicate?> _compilePredicate;
+    private readonly Func<Expression, ScanTarget, bool> _canEmitNativePredicate;
     private readonly Func<Expression, ScanTarget, VdbeRowIdPredicate?> _compileRowIdPredicate;
     private readonly Func<SelectStatement, ScanTarget, VdbeRowEquality?> _compileDistinctEquality;
     private readonly Func<FunctionExpression, VdbeScalarFunction?> _compileScalarFunction;
@@ -32,6 +34,7 @@ internal sealed class SelectStatementCompiler
         Func<Expression, SqlValue> fold,
         Func<TableSource, ScanTarget?> resolveScanTarget,
         Func<Expression, ScanTarget, VdbeRowPredicate?> compilePredicate,
+        Func<Expression, ScanTarget, bool> canEmitNativePredicate,
         Func<Expression, ScanTarget, VdbeRowIdPredicate?> compileRowIdPredicate,
         Func<SelectStatement, ScanTarget, VdbeRowEquality?> compileDistinctEquality,
         Func<FunctionExpression, VdbeScalarFunction?> compileScalarFunction,
@@ -43,6 +46,7 @@ internal sealed class SelectStatementCompiler
         ArgumentNullException.ThrowIfNull(fold);
         ArgumentNullException.ThrowIfNull(resolveScanTarget);
         ArgumentNullException.ThrowIfNull(compilePredicate);
+        ArgumentNullException.ThrowIfNull(canEmitNativePredicate);
         ArgumentNullException.ThrowIfNull(compileRowIdPredicate);
         ArgumentNullException.ThrowIfNull(compileDistinctEquality);
         ArgumentNullException.ThrowIfNull(compileScalarFunction);
@@ -53,6 +57,7 @@ internal sealed class SelectStatementCompiler
         _fold = fold;
         _resolveScanTarget = resolveScanTarget;
         _compilePredicate = compilePredicate;
+        _canEmitNativePredicate = canEmitNativePredicate;
         _compileRowIdPredicate = compileRowIdPredicate;
         _compileDistinctEquality = compileDistinctEquality;
         _compileScalarFunction = compileScalarFunction;
@@ -88,7 +93,7 @@ internal sealed class SelectStatementCompiler
 
         var outputCount = statement.Projections.Count;
         var body = new List<VdbeInstruction>();
-        var emitter = CreateEmitter(target: null, cursor: null, outputCount, body);
+        var emitter = CreateEmitter(target: null, cursor: null, outputCount, body, programCounterBase: 0);
         for (var index = 0; index < outputCount; index++)
         {
             if (!emitter.TryEmit(statement.Projections[index].Expression, new Register(index)))
@@ -138,18 +143,44 @@ internal sealed class SelectStatementCompiler
 
         VdbeRowPredicate? predicate = null;
         VdbeRowIdPredicate? rowIdPredicate = null;
+        Register? predicateRegister = null;
+        var predicateInstructionCount = 0;
+        var cursor = new Cursor(0);
+        var body = new List<VdbeInstruction>();
+        var nativePredicateRequested = statement.Where is not null
+            && _canEmitNativePredicate(statement.Where, target);
+        const int loopStart = 2;
+        var bodyStart = loopStart + (statement.Where is null || nativePredicateRequested ? 0 : 1);
+        var emitter = CreateEmitter(
+            target,
+            cursor,
+            projections.Count,
+            body,
+            bodyStart + (nativePredicateRequested ? 1 : 0));
         if (statement.Where is not null)
         {
-            predicate = _compilePredicate(statement.Where, target);
-            if (predicate is null)
+            if (nativePredicateRequested)
+            {
+                if (!emitter.CanEmitNativePredicate(statement.Where)
+                    || !emitter.TryEmitPredicate(statement.Where, out var emittedPredicate))
+                {
+                    return false;
+                }
+
+                predicateRegister = emittedPredicate;
+                predicateInstructionCount = body.Count;
+            }
+            else
+            {
+                predicate = _compilePredicate(statement.Where, target);
+            }
+
+            if (predicate is null && predicateRegister is null)
                 rowIdPredicate = _compileRowIdPredicate(statement.Where, target);
-            if (predicate is null && rowIdPredicate is null)
+            if (predicate is null && predicateRegister is null && rowIdPredicate is null)
                 return false;
         }
 
-        var cursor = new Cursor(0);
-        var body = new List<VdbeInstruction>();
-        var emitter = CreateEmitter(target, cursor, projections.Count, body);
         for (var index = 0; index < projections.Count; index++)
         {
             var projection = projections[index];
@@ -163,11 +194,14 @@ internal sealed class SelectStatementCompiler
             }
         }
 
-        const int loopStart = 2;
-        var filterCount = predicate is null && rowIdPredicate is null ? 0 : 1;
-        var resultRowAddr = loopStart + filterCount + body.Count;
+        var filterCount = bodyStart - loopStart;
+        var resultRowAddr = loopStart + filterCount + body.Count + (predicateRegister is null ? 0 : 1);
         var nextAddr = resultRowAddr + 1;
         var closeAddr = nextAddr + 1;
+        if (predicateRegister is { } register)
+            body.Insert(
+                predicateInstructionCount,
+                new JumpIfNotTrueInstruction(register, new ProgramCounter(nextAddr)));
         var instructions = new List<VdbeInstruction>(closeAddr + 2)
         {
             new OpenReadCursorInstruction(
@@ -221,12 +255,15 @@ internal sealed class SelectStatementCompiler
         ScanTarget? target,
         Cursor? cursor,
         int outputCount,
-        List<VdbeInstruction> instructions)
+        List<VdbeInstruction> instructions,
+        int programCounterBase)
         => new(
             target,
             cursor,
             outputCount,
             instructions,
+            programCounterBase,
+            allowControlFlow: true,
             _isConstant,
             _fold,
             _compileScalarFunction,
@@ -295,6 +332,8 @@ internal sealed class SelectStatementCompiler
         private readonly ScanTarget? _target;
         private readonly Cursor? _cursor;
         private readonly List<VdbeInstruction> _instructions;
+        private readonly int _programCounterBase;
+        private readonly bool _allowControlFlow;
         private readonly Func<Expression, bool> _isConstant;
         private readonly Func<Expression, SqlValue> _fold;
         private readonly Func<FunctionExpression, VdbeScalarFunction?> _compileScalarFunction;
@@ -304,12 +343,15 @@ internal sealed class SelectStatementCompiler
         private readonly Dictionary<int, int> _parameterSlots = [];
         private readonly List<int> _parameterIndices = [];
         private int _nextRegister;
+        private int _constantFoldingSuppression;
 
         public ExpressionEmitter(
             ScanTarget? target,
             Cursor? cursor,
             int firstScratchRegister,
             List<VdbeInstruction> instructions,
+            int programCounterBase,
+            bool allowControlFlow,
             Func<Expression, bool> isConstant,
             Func<Expression, SqlValue> fold,
             Func<FunctionExpression, VdbeScalarFunction?> compileScalarFunction,
@@ -321,6 +363,8 @@ internal sealed class SelectStatementCompiler
             _cursor = cursor;
             _nextRegister = firstScratchRegister;
             _instructions = instructions;
+            _programCounterBase = programCounterBase;
+            _allowControlFlow = allowControlFlow;
             _isConstant = isConstant;
             _fold = fold;
             _compileScalarFunction = compileScalarFunction;
@@ -333,9 +377,18 @@ internal sealed class SelectStatementCompiler
 
         public IReadOnlyList<int> ParameterIndices => _parameterIndices;
 
+        public bool CanEmitNativePredicate(Expression expression)
+            => expression is BinaryExpression binary && TryGetComparisonMetadata(binary, out _);
+
+        public bool TryEmitPredicate(Expression expression, out Register destination)
+        {
+            destination = new Register(_nextRegister++);
+            return TryEmitComparison(expression, destination);
+        }
+
         public bool TryEmit(Expression expression, Register destination)
         {
-            if (_isConstant(expression))
+            if (_constantFoldingSuppression == 0 && _isConstant(expression))
             {
                 _instructions.Add(new LoadConstantInstruction(destination, _fold(expression)));
                 return true;
@@ -389,6 +442,14 @@ internal sealed class SelectStatementCompiler
                         _instructions.Add(new NumericAffinityInstruction(operand.Start, GetAffinity(unaryArithmetic)));
                     _instructions.Add(new ArithmeticInstruction(destination, unaryArithmetic, operand));
                     return true;
+                case CastExpression cast:
+                    if (!TryEmit(cast.Expression, destination))
+                        return false;
+
+                    _instructions.Add(new CastInstruction(destination, cast.TypeName));
+                    return true;
+                case CaseExpression @case when _allowControlFlow:
+                    return TryEmitCase(@case, destination);
                 case FunctionExpression function:
                     var scalar = _compileScalarFunction(function);
                     if (scalar is null)
@@ -414,6 +475,147 @@ internal sealed class SelectStatementCompiler
             }
         }
 
+        private bool TryEmitComparison(Expression expression, Register destination)
+        {
+            if (expression is not BinaryExpression binary
+                || !TryGetComparisonMetadata(binary, out var comparison))
+            {
+                return false;
+            }
+
+            var operands = Allocate(2);
+            if (!TryEmit(binary.Left, operands.Start)
+                || !TryEmit(binary.Right, new Register(operands.Start.Index + 1)))
+            {
+                return false;
+            }
+
+            _instructions.Add(new CompareInstruction(
+                destination,
+                comparison.Operator,
+                operands.Start,
+                new Register(operands.Start.Index + 1),
+                comparison.LeftAffinity,
+                comparison.RightAffinity,
+                comparison.Collation));
+            return true;
+        }
+
+        private bool TryEmitCase(CaseExpression expression, Register destination)
+            => expression.Operand is null
+                ? TryEmitSearchedCase(expression, destination)
+                : TryEmitSimpleCase(expression, destination);
+
+        private bool TryEmitSearchedCase(CaseExpression expression, Register destination)
+        {
+            if (expression.Clauses.Count == 0)
+                return false;
+
+            var endJumps = new List<int>(expression.Clauses.Count);
+            _constantFoldingSuppression++;
+            try
+            {
+                foreach (var clause in expression.Clauses)
+                {
+                    var condition = Allocate(1).Start;
+                    if (!TryEmit(clause.When, condition))
+                        return false;
+
+                    var skipThenIndex = _instructions.Count;
+                    _instructions.Add(new JumpIfNotTrueInstruction(condition, new ProgramCounter(0)));
+                    if (!TryEmit(clause.Then, destination))
+                        return false;
+
+                    endJumps.Add(_instructions.Count);
+                    _instructions.Add(new GotoInstruction(new ProgramCounter(0)));
+                    _instructions[skipThenIndex] = new JumpIfNotTrueInstruction(
+                        condition,
+                        CurrentProgramCounter());
+                }
+
+                if (expression.Else is null)
+                    _instructions.Add(new LoadConstantInstruction(destination, SqlValue.Null));
+                else if (!TryEmit(expression.Else, destination))
+                    return false;
+
+                var end = CurrentProgramCounter();
+                foreach (var jumpIndex in endJumps)
+                    _instructions[jumpIndex] = new GotoInstruction(end);
+                return true;
+            }
+            finally
+            {
+                _constantFoldingSuppression--;
+            }
+        }
+
+        private bool TryEmitSimpleCase(CaseExpression expression, Register destination)
+        {
+            if (expression.Operand is null
+                || expression.Clauses.Count == 0
+                || !IsSimpleCaseComparisonValue(expression.Operand)
+                || expression.Clauses.Any(clause => !IsSimpleCaseComparisonValue(clause.When)))
+            {
+                return false;
+            }
+
+            var endJumps = new List<int>(expression.Clauses.Count);
+            _constantFoldingSuppression++;
+            try
+            {
+                var operand = Allocate(1).Start;
+                if (!TryEmit(expression.Operand, operand))
+                    return false;
+
+                foreach (var clause in expression.Clauses)
+                {
+                    var when = Allocate(1).Start;
+                    var condition = Allocate(1).Start;
+                    if (!TryEmit(clause.When, when))
+                        return false;
+
+                    _instructions.Add(new CompareInstruction(
+                        condition,
+                        VdbeComparisonOperator.Equal,
+                        operand,
+                        when,
+                        LeftAffinity: null,
+                        RightAffinity: null,
+                        Collation: null));
+                    var skipThenIndex = _instructions.Count;
+                    _instructions.Add(new JumpIfNotTrueInstruction(condition, new ProgramCounter(0)));
+                    if (!TryEmit(clause.Then, destination))
+                        return false;
+
+                    endJumps.Add(_instructions.Count);
+                    _instructions.Add(new GotoInstruction(new ProgramCounter(0)));
+                    _instructions[skipThenIndex] = new JumpIfNotTrueInstruction(
+                        condition,
+                        CurrentProgramCounter());
+                }
+
+                if (expression.Else is null)
+                    _instructions.Add(new LoadConstantInstruction(destination, SqlValue.Null));
+                else if (!TryEmit(expression.Else, destination))
+                    return false;
+
+                var end = CurrentProgramCounter();
+                foreach (var jumpIndex in endJumps)
+                    _instructions[jumpIndex] = new GotoInstruction(end);
+                return true;
+            }
+            finally
+            {
+                _constantFoldingSuppression--;
+            }
+        }
+
+        private static bool IsSimpleCaseComparisonValue(Expression expression)
+            => expression is LiteralExpression or ParameterExpression;
+
+        private ProgramCounter CurrentProgramCounter()
+            => new(_programCounterBase + _instructions.Count);
+
         private RegisterRange Allocate(int count)
         {
             var start = new Register(_nextRegister);
@@ -431,6 +633,86 @@ internal sealed class SelectStatementCompiler
             _parameterIndices.Add(parameterIndex);
             return slot;
         }
+
+        private bool TryGetComparisonMetadata(
+            BinaryExpression expression,
+            out VdbeComparisonMetadata metadata)
+        {
+            metadata = null!;
+            if (!TryMapComparisonOperator(expression.Operator, out var operation))
+                return false;
+
+            var collation = GetExplicitCollation(expression.Left)
+                ?? GetExplicitCollation(expression.Right)
+                ?? GetDeclaredCollation(expression.Left)
+                ?? GetDeclaredCollation(expression.Right);
+            if (!SqliteIndexRecordComparer.IsSupportedCollation(collation))
+                return false;
+
+            metadata = new VdbeComparisonMetadata(
+                operation,
+                GetDeclaredAffinity(expression.Left),
+                GetDeclaredAffinity(expression.Right),
+                collation);
+            return true;
+        }
+
+        private VdbeValueAffinity? GetDeclaredAffinity(Expression expression)
+        {
+            var column = UnwrapCollation(expression) as ColumnExpression;
+            if (column is null || _target?.ColumnDefinitions is null)
+                return null;
+
+            var index = _target.ResolveColumnIndex(column.Name);
+            if (index is null || index.Value >= _target.ColumnDefinitions.Count)
+                return null;
+
+            return _target.ColumnDefinitions[index.Value] is { StrictAny: false } definition
+                ? ToVdbeAffinity(EmbeddedTable.GetDeclaredColumnAffinity(definition))
+                : null;
+        }
+
+        private string? GetDeclaredCollation(Expression expression)
+        {
+            var column = UnwrapCollation(expression) as ColumnExpression;
+            if (column is null || _target?.ColumnDefinitions is null)
+                return null;
+
+            var index = _target.ResolveColumnIndex(column.Name);
+            return index is { } value && value < _target.ColumnDefinitions.Count
+                ? _target.ColumnDefinitions[value]?.Collation
+                : null;
+        }
+
+        private static Expression UnwrapCollation(Expression expression)
+        {
+            while (expression is CollationExpression collation)
+                expression = collation.Expression;
+            return expression;
+        }
+
+        private static string? GetExplicitCollation(Expression expression)
+        {
+            string? collation = null;
+            while (expression is CollationExpression wrapper)
+            {
+                collation ??= wrapper.Name;
+                expression = wrapper.Expression;
+            }
+
+            return collation;
+        }
+
+        private static VdbeValueAffinity ToVdbeAffinity(ColumnAffinity affinity)
+            => affinity switch
+            {
+                ColumnAffinity.Blob => VdbeValueAffinity.Blob,
+                ColumnAffinity.Text => VdbeValueAffinity.Text,
+                ColumnAffinity.Numeric => VdbeValueAffinity.Numeric,
+                ColumnAffinity.Integer => VdbeValueAffinity.Integer,
+                ColumnAffinity.Real => VdbeValueAffinity.Real,
+                _ => throw new InvalidOperationException($"Unknown column affinity {affinity}."),
+            };
 
         private static bool TryMapArithmeticOperator(BinaryOperator op, out ArithmeticOperator arithmetic)
         {
@@ -488,6 +770,42 @@ internal sealed class SelectStatementCompiler
             }
         }
 
+        private static bool TryMapComparisonOperator(
+            BinaryOperator op,
+            out VdbeComparisonOperator comparison)
+        {
+            switch (op)
+            {
+                case BinaryOperator.Is:
+                    comparison = VdbeComparisonOperator.Is;
+                    return true;
+                case BinaryOperator.IsNot:
+                    comparison = VdbeComparisonOperator.IsNot;
+                    return true;
+                case BinaryOperator.Equal:
+                    comparison = VdbeComparisonOperator.Equal;
+                    return true;
+                case BinaryOperator.NotEqual:
+                    comparison = VdbeComparisonOperator.NotEqual;
+                    return true;
+                case BinaryOperator.LessThan:
+                    comparison = VdbeComparisonOperator.LessThan;
+                    return true;
+                case BinaryOperator.LessThanOrEqual:
+                    comparison = VdbeComparisonOperator.LessThanOrEqual;
+                    return true;
+                case BinaryOperator.GreaterThan:
+                    comparison = VdbeComparisonOperator.GreaterThan;
+                    return true;
+                case BinaryOperator.GreaterThanOrEqual:
+                    comparison = VdbeComparisonOperator.GreaterThanOrEqual;
+                    return true;
+                default:
+                    comparison = default;
+                    return false;
+            }
+        }
+
         private VdbeNumericAffinity GetAffinity(ArithmeticOperator op)
         {
             return op switch
@@ -501,5 +819,11 @@ internal sealed class SelectStatementCompiler
                 _ => _numericAffinity,
             };
         }
+
+        private sealed record VdbeComparisonMetadata(
+            VdbeComparisonOperator Operator,
+            VdbeValueAffinity? LeftAffinity,
+            VdbeValueAffinity? RightAffinity,
+            string? Collation);
     }
 }

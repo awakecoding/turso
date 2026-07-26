@@ -100,6 +100,31 @@ public class SorterOpcodeExecutionTests
     }
 
     [Test]
+    public void SorterObservesCancellationRequestedByANonThrowingComparer()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var comparisonRequestedCancellation = false;
+        VdbeRowComparer comparer = (left, right) =>
+        {
+            if (!comparisonRequestedCancellation)
+            {
+                comparisonRequestedCancellation = true;
+                cancellation.Cancel();
+            }
+
+            return left[0].AsInteger().CompareTo(right[0].AsInteger());
+        };
+        var program = SingleColumnSorterProgram(comparer, 3, 1, 2);
+        using var statement = new ResumableStatement(program);
+
+        Assert.Throws<OperationCanceledException>(
+            () => statement.StepResumable(cancellation.Token));
+        statement.State.Should().Be(ResumableStatementState.Ready);
+
+        DrainRows(statement).Select(row => row[0].AsInteger()).Should().Equal(1, 2, 3);
+    }
+
+    [Test]
     public void ResetReplaysASorterProgramFromTheStart()
     {
         var program = SingleColumnSorterProgram(AscendingFirstColumn, 5, 4);

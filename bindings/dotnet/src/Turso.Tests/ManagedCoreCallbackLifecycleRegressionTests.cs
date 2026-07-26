@@ -107,6 +107,28 @@ public sealed class ManagedCoreCallbackLifecycleRegressionTests
             .SqliteErrorCode.Should().Be(1);
     }
 
+    [Test]
+    public void ManagedFacadeDefersLaterWhereCallbackFailuresUntilTheirRead()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.CreateFunction<long, long>(
+            "managed_fail_where_on_two",
+            value => value == 2
+                ? throw new InvalidOperationException("later row")
+                : 1);
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE values_table(value INTEGER);");
+        connection.ExecuteNonQuery("INSERT INTO values_table VALUES (1), (2);");
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT value FROM values_table WHERE managed_fail_where_on_two(value);";
+        using var reader = command.ExecuteReader();
+
+        reader.Read().Should().BeTrue();
+        reader.GetInt64(0).Should().Be(1);
+        Assert.Throws<SqliteException>(() => reader.Read())!
+            .SqliteErrorCode.Should().Be(1);
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static WeakReference RegisterStatefulCallbacks(SqliteConnection connection)
     {

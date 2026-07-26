@@ -13,6 +13,9 @@ public class VdbeProgramTests
         ((int)VdbeOpcode.Next).Should().Be(17);
         ((int)VdbeOpcode.AggStep).Should().Be(32);
         ((int)VdbeOpcode.Halt).Should().Be(57);
+        ((int)VdbeOpcode.Compare).Should().Be(66);
+        ((int)VdbeOpcode.JumpIfNotTrue).Should().Be(67);
+        ((int)VdbeOpcode.Cast).Should().Be(68);
 
         typeof(VdbeProgram).GetConstructor(
             [

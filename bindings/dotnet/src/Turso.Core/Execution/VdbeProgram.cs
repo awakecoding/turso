@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using Turso.Core.Storage;
 
 namespace Turso.Core.Execution;
 
@@ -222,6 +223,9 @@ public enum VdbeOpcode
     WindowBufferData = 63,
     WindowBufferNext = 64,
     CloseWindowBuffer = 65,
+    Compare = 66,
+    JumpIfNotTrue = 67,
+    Cast = 68,
 }
 
 /// <summary>
@@ -271,6 +275,27 @@ public delegate bool VdbeRowPredicate(SqlValue[] row);
 /// cursor path without appending implementation-only values to the row's declared-column tuple.
 /// </summary>
 public delegate bool VdbeRowIdPredicate(SqlValue[] row, long rowId);
+
+internal enum VdbeComparisonOperator
+{
+    Is,
+    IsNot,
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+internal enum VdbeValueAffinity
+{
+    Blob,
+    Text,
+    Numeric,
+    Integer,
+    Real,
+}
 
 /// <summary>
 /// Orders two materialized rows for a sorter. The compiler supplies the delegate so
@@ -466,6 +491,132 @@ public sealed class VdbeFunctionException : InvalidOperationException
 
     public VdbeFunctionException(string message, Exception innerException) : base(message, innerException)
     {
+    }
+}
+
+internal static class VdbeValueOperations
+{
+    public static SqlValue Compare(
+        VdbeComparisonOperator operation,
+        SqlValue left,
+        SqlValue right,
+        VdbeValueAffinity? leftAffinity,
+        VdbeValueAffinity? rightAffinity,
+        string? collation)
+    {
+        ApplyComparisonAffinities(ref left, ref right, leftAffinity, rightAffinity);
+        if (operation is VdbeComparisonOperator.Is or VdbeComparisonOperator.IsNot)
+        {
+            var equal = left.Kind == SqlValueKind.Null || right.Kind == SqlValueKind.Null
+                ? left.Kind == right.Kind
+                : CompareValues(left, right, collation) == 0;
+            return SqlValue.Integer((operation == VdbeComparisonOperator.Is) == equal ? 1 : 0);
+        }
+
+        if (left.Kind == SqlValueKind.Null || right.Kind == SqlValueKind.Null)
+            return SqlValue.Null;
+
+        var comparison = CompareValues(left, right, collation);
+        var result = operation switch
+        {
+            VdbeComparisonOperator.Equal => comparison == 0,
+            VdbeComparisonOperator.NotEqual => comparison != 0,
+            VdbeComparisonOperator.LessThan => comparison < 0,
+            VdbeComparisonOperator.LessThanOrEqual => comparison <= 0,
+            VdbeComparisonOperator.GreaterThan => comparison > 0,
+            VdbeComparisonOperator.GreaterThanOrEqual => comparison >= 0,
+            _ => throw new InvalidOperationException($"Unknown comparison operator {operation}."),
+        };
+        return SqlValue.Integer(result ? 1 : 0);
+    }
+
+    public static SqlValue Cast(SqlValue value, string typeName)
+        => EmbeddedDatabase.CastValue(value, typeName);
+
+    private static void ApplyComparisonAffinities(
+        ref SqlValue left,
+        ref SqlValue right,
+        VdbeValueAffinity? leftAffinity,
+        VdbeValueAffinity? rightAffinity)
+    {
+        if (leftAffinity is { } leftNumeric
+            && IsNumeric(leftNumeric)
+            && (rightAffinity is null || !IsNumeric(rightAffinity.Value)))
+        {
+            right = ApplyAffinity(leftNumeric, right);
+        }
+        else if (rightAffinity is { } rightNumeric
+            && IsNumeric(rightNumeric)
+            && (leftAffinity is null || !IsNumeric(leftAffinity.Value)))
+        {
+            left = ApplyAffinity(rightNumeric, left);
+        }
+        else if (leftAffinity == VdbeValueAffinity.Text && rightAffinity is null)
+        {
+            right = ApplyAffinity(VdbeValueAffinity.Text, right);
+        }
+        else if (rightAffinity == VdbeValueAffinity.Text && leftAffinity is null)
+        {
+            left = ApplyAffinity(VdbeValueAffinity.Text, left);
+        }
+    }
+
+    private static SqlValue ApplyAffinity(VdbeValueAffinity affinity, SqlValue value)
+        => EmbeddedTable.ApplyColumnAffinity(
+            affinity switch
+            {
+                VdbeValueAffinity.Blob => ColumnAffinity.Blob,
+                VdbeValueAffinity.Text => ColumnAffinity.Text,
+                VdbeValueAffinity.Numeric => ColumnAffinity.Numeric,
+                VdbeValueAffinity.Integer => ColumnAffinity.Integer,
+                VdbeValueAffinity.Real => ColumnAffinity.Real,
+                _ => throw new InvalidOperationException($"Unknown value affinity {affinity}."),
+            },
+            value);
+
+    private static bool IsNumeric(VdbeValueAffinity affinity)
+        => affinity is VdbeValueAffinity.Integer or VdbeValueAffinity.Real or VdbeValueAffinity.Numeric;
+
+    private static int CompareValues(SqlValue left, SqlValue right, string? collation)
+    {
+        if (left.Kind == SqlValueKind.Integer && right.Kind == SqlValueKind.Integer)
+            return left.AsInteger().CompareTo(right.AsInteger());
+        if (left.Kind == SqlValueKind.Integer && right.Kind == SqlValueKind.Real)
+            return CompareIntegerAndReal(left.AsInteger(), right.AsReal());
+        if (left.Kind == SqlValueKind.Real && right.Kind == SqlValueKind.Integer)
+            return -CompareIntegerAndReal(right.AsInteger(), left.AsReal());
+        if (left.Kind == SqlValueKind.Real && right.Kind == SqlValueKind.Real)
+            return left.AsReal().CompareTo(right.AsReal());
+        if (left.Kind == SqlValueKind.Text && right.Kind == SqlValueKind.Text)
+        {
+            if (collation is null || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase))
+                return string.CompareOrdinal(left.AsText(), right.AsText());
+            if (string.Equals(collation, "NOCASE", StringComparison.OrdinalIgnoreCase))
+                return SqliteIndexRecordComparer.CompareNoCaseText(left.AsText(), right.AsText());
+            if (string.Equals(collation, "RTRIM", StringComparison.OrdinalIgnoreCase))
+                return SqliteIndexRecordComparer.CompareRTrimText(left.AsText(), right.AsText());
+
+            throw new InvalidOperationException($"Unsupported compiled collation {collation}.");
+        }
+        if (left.Kind == SqlValueKind.Blob && right.Kind == SqlValueKind.Blob)
+            return left.AsBlob().Span.SequenceCompareTo(right.AsBlob().Span);
+
+        return left.Kind.CompareTo(right.Kind);
+    }
+
+    private static int CompareIntegerAndReal(long integer, double real)
+    {
+        if (real < long.MinValue)
+            return 1;
+        if (real >= -(double)long.MinValue)
+            return -1;
+
+        var truncated = (long)real;
+        var comparison = integer.CompareTo(truncated);
+        if (comparison != 0)
+            return comparison;
+
+        return real == truncated ? 0 : real > truncated ? -1 : 1;
     }
 }
 
@@ -935,6 +1086,32 @@ public sealed record ArithmeticInstruction(
 public sealed record NumericAffinityInstruction(Register Value, VdbeNumericAffinity Affinity) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.NumericAffinity;
+}
+
+/// <summary>
+/// Compares two scalar registers using SQLite NULL, affinity, and built-in
+/// collation rules. Application-defined collations remain evaluator-owned.
+/// </summary>
+internal sealed record CompareInstruction(
+    Register Destination,
+    VdbeComparisonOperator Operator,
+    Register Left,
+    Register Right,
+    VdbeValueAffinity? LeftAffinity,
+    VdbeValueAffinity? RightAffinity,
+    string? Collation) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Compare;
+}
+
+internal sealed record JumpIfNotTrueInstruction(Register Value, ProgramCounter FalseTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.JumpIfNotTrue;
+}
+
+internal sealed record CastInstruction(Register Value, string TypeName) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Cast;
 }
 
 public sealed record OpenReadCursorInstruction(Cursor Cursor, string? TableName = null, int ColumnCount = 0)
@@ -1831,6 +2008,38 @@ public sealed class VdbeProgram
                     }
 
                     break;
+                case CompareInstruction compare:
+                    ValidateRegister(compare.Destination, instructionIndex);
+                    ValidateRegister(compare.Left, instructionIndex);
+                    ValidateRegister(compare.Right, instructionIndex);
+                    if (!Enum.IsDefined(compare.Operator))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} applies an undefined comparison operator.");
+                    }
+
+                    ValidateValueAffinity(compare.LeftAffinity, instructionIndex);
+                    ValidateValueAffinity(compare.RightAffinity, instructionIndex);
+                    if (!SqliteIndexRecordComparer.IsSupportedCollation(compare.Collation))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} compares with unsupported compiled collation '{compare.Collation}'.");
+                    }
+
+                    break;
+                case JumpIfNotTrueInstruction jumpIfNotTrue:
+                    ValidateRegister(jumpIfNotTrue.Value, instructionIndex);
+                    ValidateJumpTarget(jumpIfNotTrue.FalseTarget, instructionIndex);
+                    break;
+                case CastInstruction cast:
+                    ValidateRegister(cast.Value, instructionIndex);
+                    if (string.IsNullOrWhiteSpace(cast.TypeName))
+                    {
+                        throw new VdbeProgramValidationException(
+                            $"VDBE instruction {instructionIndex} casts to an empty type name.");
+                    }
+
+                    break;
                 case OpenReadCursorInstruction open:
                     ValidateCursor(open.Cursor, instructionIndex);
                     if (openCursors[open.Cursor.Index])
@@ -2449,6 +2658,15 @@ public sealed class VdbeProgram
         {
             throw new VdbeProgramValidationException(
                 $"VDBE instruction {instructionIndex} references register {register.Index}, but the program has {RegisterCount} registers.");
+        }
+    }
+
+    private static void ValidateValueAffinity(VdbeValueAffinity? affinity, int instructionIndex)
+    {
+        if (affinity is { } value && !Enum.IsDefined(value))
+        {
+            throw new VdbeProgramValidationException(
+                $"VDBE instruction {instructionIndex} applies an undefined value affinity.");
         }
     }
 

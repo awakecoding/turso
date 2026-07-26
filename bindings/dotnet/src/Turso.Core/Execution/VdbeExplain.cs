@@ -82,6 +82,24 @@ public static class VdbeExplain
                 0,
                 numericAffinity.Affinity.Name,
                 $"r[{numericAffinity.Value.Index}]={numericAffinity.Affinity.Name}(r[{numericAffinity.Value.Index}])"),
+            CompareInstruction compare => (
+                compare.Destination.Index,
+                compare.Left.Index,
+                compare.Right.Index,
+                compare.Operator.ToString(),
+                $"r[{compare.Destination.Index}]=r[{compare.Left.Index}] {FormatComparison(compare.Operator)} r[{compare.Right.Index}]"),
+            JumpIfNotTrueInstruction jumpIfNotTrue => (
+                jumpIfNotTrue.Value.Index,
+                jumpIfNotTrue.FalseTarget.Offset,
+                0,
+                null,
+                $"goto {jumpIfNotTrue.FalseTarget.Offset} if r[{jumpIfNotTrue.Value.Index}] is not true"),
+            CastInstruction cast => (
+                cast.Value.Index,
+                0,
+                0,
+                cast.TypeName,
+                $"r[{cast.Value.Index}]=CAST(r[{cast.Value.Index}] AS {cast.TypeName})"),
             OpenReadCursorInstruction open => (
                 open.Cursor.Index,
                 0,
@@ -403,6 +421,20 @@ public static class VdbeExplain
                 $"Cannot describe unsupported opcode {instruction.Opcode}."),
         };
     }
+
+    private static string FormatComparison(VdbeComparisonOperator operation)
+        => operation switch
+        {
+            VdbeComparisonOperator.Is => "IS",
+            VdbeComparisonOperator.IsNot => "IS NOT",
+            VdbeComparisonOperator.Equal => "=",
+            VdbeComparisonOperator.NotEqual => "!=",
+            VdbeComparisonOperator.LessThan => "<",
+            VdbeComparisonOperator.LessThanOrEqual => "<=",
+            VdbeComparisonOperator.GreaterThan => ">",
+            VdbeComparisonOperator.GreaterThanOrEqual => ">=",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown comparison operator."),
+        };
 
     private static string FormatRange(RegisterRange range)
     {

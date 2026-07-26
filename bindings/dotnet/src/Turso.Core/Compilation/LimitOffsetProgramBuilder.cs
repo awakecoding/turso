@@ -210,6 +210,7 @@ public static class LimitOffsetProgramBuilder
             WindowBufferNextInstruction x => new WindowBufferNextInstruction(x.Buffer, Pc(x.LoopTarget)),
             GotoInstruction x => new GotoInstruction(Pc(x.Target)),
             JumpIfInstruction x => new JumpIfInstruction(x.Register, Pc(x.Target)),
+            JumpIfNotTrueInstruction x => new JumpIfNotTrueInstruction(x.Value, Pc(x.FalseTarget)),
             SameGroupInstruction x => new SameGroupInstruction(x.CurrentKey, x.SavedKey, x.Comparer, Pc(x.SameGroupTarget)),
             LoadConstantInstruction
                 or LoadParameterInstruction
@@ -237,6 +238,8 @@ public static class LimitOffsetProgramBuilder
                 or FunctionInstruction
                 or ArithmeticInstruction
                 or NumericAffinityInstruction
+                or CompareInstruction
+                or CastInstruction
                 or GroupKeyInstruction
                 or YieldInstruction
                 or HaltInstruction => instruction,

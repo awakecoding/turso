@@ -137,6 +137,67 @@ public class EmbeddedEngineTests
     }
 
     [Test]
+    public void StatementStreamsWhereCallbacksOneSourceRowAtATime()
+    {
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "fail_on_two",
+            1,
+            values => values[0] == SqlValue.Integer(2)
+                ? throw new InvalidOperationException("later row")
+                : SqlValue.Integer(1));
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE values_table(value INTEGER);");
+        Execute(connection, "INSERT INTO values_table VALUES (1), (2);");
+        using var statement = connection.Prepare(
+            "SELECT value FROM values_table WHERE fail_on_two(value);");
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(1));
+        Assert.Throws<InvalidOperationException>(() => statement.Step())!
+            .Message.Should().Be("later row");
+    }
+
+    [Test]
+    public void StreamedWhereHasRowsSkipsNonQualifyingSourceRows()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE values_table(value INTEGER);");
+        Execute(connection, "INSERT INTO values_table VALUES (1), (2);");
+        using var statement = connection.Prepare(
+            "SELECT value FROM values_table WHERE value > 2;");
+
+        statement.HasRows().Should().BeFalse();
+        statement.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    [Test]
+    public void StatementStreamsWhereLimitAndOffsetWithoutScanningPastLimit()
+    {
+        var observed = new List<long>();
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "observe",
+            1,
+            values =>
+            {
+                observed.Add(values[0].AsInteger());
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE values_table(value INTEGER);");
+        Execute(connection, "INSERT INTO values_table VALUES (1), (2), (3), (4), (5);");
+        using var statement = connection.Prepare(
+            "SELECT value FROM values_table WHERE observe(value) % 2 = 0 LIMIT 1 OFFSET 1;");
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(4));
+        statement.Step().Should().Be(StatementStepResult.Done);
+        observed.Should().Equal(1, 2, 3, 4);
+    }
+
+    [Test]
     public void OrderByEvaluatesScalarCallbackKeysOnceInSourceOrder()
     {
         var observed = new List<long>();

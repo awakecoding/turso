@@ -223,7 +223,7 @@ public class CompiledSelectExecutionTests
     }
 
     [Test]
-    public void ExplainDumpsScanProgramWithFilterWhenWherePresent()
+    public void ExplainDumpsScanProgramWithNativeComparisonPredicate()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -231,11 +231,13 @@ public class CompiledSelectExecutionTests
 
         var rows = ReadRows(connection, "EXPLAIN SELECT value FROM t WHERE value > 1;");
         Opcodes(rows).Should().Equal(
-            "OpenReadCursor", "Rewind", "Filter", "Column", "ResultRow", "Next", "CloseCursor", "Halt");
+            "OpenReadCursor", "Rewind", "Column", "LoadConstant", "Compare", "JumpIfNotTrue",
+            "Column", "ResultRow", "Next", "CloseCursor", "Halt");
 
-        // Filter falls through to the body when true and jumps to Next when false.
-        rows[2][2].Should().Be(SqlValue.Integer(0));
-        rows[2][3].Should().Be(SqlValue.Integer(5));
+        // The native comparison writes a three-valued result, and the branch skips NULL and false rows.
+        rows[4][5].Should().Be(SqlValue.Text("GreaterThan"));
+        rows[5][3].Should().Be(SqlValue.Integer(8));
+        rows[5][6].Should().Be(SqlValue.Text("goto 8 if r[1] is not true"));
     }
 
     [Test]
@@ -365,6 +367,190 @@ public class CompiledSelectExecutionTests
         rows.Should().Equal(SqlValue.Integer(2), SqlValue.Integer(3));
     }
 
+    [Test]
+    public void CompiledCastsPreserveSqliteConversionAndParameterResetBehavior()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        using var statement = connection.Prepare(
+            "SELECT CAST(?1 AS INTEGER), CAST(?2 AS REAL), CAST(?3 AS TEXT), CAST(?4 AS BLOB);");
+        statement.Bind(1, SqlValue.Text("42.9"));
+        statement.Bind(2, SqlValue.Text("3"));
+        statement.Bind(3, SqlValue.Integer(7));
+        statement.Bind(4, SqlValue.Text("ab"));
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        ReadCurrentRow(statement).Should().Equal(
+            SqlValue.Integer(42),
+            SqlValue.Real(3),
+            SqlValue.Text("7"),
+            SqlValue.Blob("ab"u8.ToArray()));
+        statement.Step().Should().Be(StatementStepResult.Done);
+
+        statement.Reset();
+        statement.Bind(1, SqlValue.Text("-2"));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(-2));
+
+        Execute(connection, "CREATE TABLE t(value TEXT);");
+        Execute(connection, "INSERT INTO t VALUES ('10'), ('20');");
+        Opcodes(ReadRows(connection, "EXPLAIN SELECT CAST(value AS INTEGER) FROM t;"))
+            .Should()
+            .ContainInOrder("Column", "Cast", "ResultRow");
+        ReadRows(connection, "SELECT CAST(value AS INTEGER) FROM t;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Integer(10), SqlValue.Integer(20));
+    }
+
+    [Test]
+    public void CompiledSearchedCasePreservesBranchOrderAndLazyErrors()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        using var statement = connection.Prepare(
+            "SELECT CASE WHEN ?1 THEN 'first' WHEN ?2 THEN 'second' ELSE 'last' END;");
+        statement.Bind(1, SqlValue.Integer(0));
+        statement.Bind(2, SqlValue.Integer(1));
+        DrainValues(statement).Should().Equal(SqlValue.Text("second"));
+
+        statement.Reset();
+        statement.Bind(1, SqlValue.Integer(1));
+        statement.Bind(2, SqlValue.Integer(1));
+        DrainValues(statement).Should().Equal(SqlValue.Text("first"));
+
+        using var explain = connection.Prepare(
+            "EXPLAIN SELECT CASE WHEN ?1 THEN 'first' WHEN ?2 THEN 'second' ELSE 'last' END;");
+        explain.Bind(1, SqlValue.Integer(0));
+        explain.Bind(2, SqlValue.Integer(1));
+        var explainOpcodes = new List<string>();
+        while (explain.Step() == StatementStepResult.Row)
+            explainOpcodes.Add(explain.GetValue(1).AsText());
+        explainOpcodes
+            .Should()
+            .ContainInOrder("LoadParameter", "JumpIfNotTrue", "LoadConstant", "Goto")
+            .And
+            .Contain("ResultRow");
+
+        using var lazyError = connection.Prepare(
+            "SELECT CASE WHEN ?1 THEN abs(-9223372036854775808) ELSE 7 END;");
+        lazyError.Bind(1, SqlValue.Integer(0));
+        DrainValues(lazyError).Should().Equal(SqlValue.Integer(7));
+        lazyError.Reset();
+        lazyError.Bind(1, SqlValue.Integer(1));
+        Assert.Throws<EmbeddedSqlException>(() => lazyError.Step())!
+            .Message
+            .Should()
+            .Be("integer overflow");
+
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (0), (1);");
+        ReadRows(
+                connection,
+                "SELECT CASE WHEN value THEN 'yes' ELSE 'no' END FROM t WHERE value >= 0;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Text("no"), SqlValue.Text("yes"));
+
+        using var simpleCase = connection.Prepare(
+            "SELECT CASE ?1 WHEN ?2 THEN 'match' ELSE 'miss' END;");
+        simpleCase.Bind(1, SqlValue.Integer(2));
+        simpleCase.Bind(2, SqlValue.Integer(2));
+        DrainValues(simpleCase).Should().Equal(SqlValue.Text("match"));
+        simpleCase.Reset();
+        simpleCase.Bind(1, SqlValue.Null);
+        simpleCase.Bind(2, SqlValue.Null);
+        DrainValues(simpleCase).Should().Equal(SqlValue.Text("miss"));
+
+        using var limitedCase = connection.Prepare(
+            "SELECT CASE WHEN ?1 THEN 'limited' ELSE 'miss' END LIMIT 1;");
+        limitedCase.Bind(1, SqlValue.Integer(1));
+        DrainValues(limitedCase).Should().Equal(SqlValue.Text("limited"));
+
+        using var compoundCasts = connection.Prepare(
+            "SELECT CAST(?1 AS INTEGER) UNION ALL SELECT CAST(?2 AS INTEGER);");
+        compoundCasts.Bind(1, SqlValue.Text("4"));
+        compoundCasts.Bind(2, SqlValue.Text("5"));
+        DrainValues(compoundCasts).Should().Equal(SqlValue.Integer(4), SqlValue.Integer(5));
+    }
+
+    [Test]
+    public void NativePredicatesMatchSqliteAffinityNullAndBuiltinCollationRules()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(
+            connection,
+            """
+            CREATE TABLE t(
+                i INTEGER,
+                r REAL,
+                binary_value TEXT COLLATE BINARY,
+                nocase_value TEXT COLLATE NOCASE,
+                rtrim_value TEXT COLLATE RTRIM
+            );
+            """);
+        Execute(
+            connection,
+            """
+            INSERT INTO t VALUES
+                (2, 2.5, 'Ada', 'Ada', 'Ada '),
+                (3, 3.5, 'ada', 'ada', 'Ada'),
+                (NULL, NULL, NULL, NULL, NULL);
+            """);
+
+        using var parameterized = connection.Prepare("SELECT i FROM t WHERE i = ?1;");
+        parameterized.Bind(1, SqlValue.Text("2"));
+        DrainValues(parameterized).Should().Equal(SqlValue.Integer(2));
+        parameterized.Reset();
+        parameterized.Bind(1, SqlValue.Integer(3));
+        DrainValues(parameterized).Should().Equal(SqlValue.Integer(3));
+
+        ReadRows(connection, "SELECT i FROM t WHERE r > '3';")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Integer(3));
+        ReadRows(connection, "SELECT i FROM t WHERE binary_value = 'Ada';")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Integer(2));
+        ReadRows(connection, "SELECT i FROM t WHERE nocase_value = 'ADA';")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Integer(2), SqlValue.Integer(3));
+        ReadRows(connection, "SELECT i FROM t WHERE rtrim_value = 'Ada';")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Integer(2), SqlValue.Integer(3));
+        ReadRows(connection, "SELECT i FROM t WHERE i IS NULL;")
+            .Should()
+            .ContainSingle()
+            .Which[0]
+            .Should()
+            .Be(SqlValue.Null);
+        ReadRows(connection, "SELECT i FROM t WHERE i IS NOT NULL;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Integer(2), SqlValue.Integer(3));
+        ReadRows(connection, "SELECT i FROM t WHERE i = NULL;").Should().BeEmpty();
+    }
+
+    [Test]
+    public void OverriddenBuiltinCollationKeepsPredicatesOnTheEvaluator()
+    {
+        var database = new EmbeddedDatabase();
+        database.RegisterCollation("BINARY", static (_, _) => 0);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(value TEXT COLLATE BINARY);");
+        Execute(connection, "INSERT INTO t VALUES ('first'), ('second');");
+
+        var explain = ReadRows(connection, "EXPLAIN SELECT value FROM t WHERE value = 'missing';");
+        Opcodes(explain).Should().Contain("Filter").And.NotContain("Compare");
+        ReadRows(connection, "SELECT value FROM t WHERE value = 'missing';")
+            .Should()
+            .HaveCount(2);
+    }
+
     private static IEnumerable<string> Opcodes(IEnumerable<SqlValue[]> rows)
         => rows.Select(row => row[1].AsText());
 
@@ -388,6 +574,24 @@ public class CompiledSelectExecutionTests
         }
 
         return rows;
+    }
+
+    private static List<SqlValue> DrainValues(EmbeddedStatement statement)
+    {
+        var rows = new List<SqlValue>();
+        while (statement.Step() == StatementStepResult.Row)
+            rows.Add(statement.GetValue(0));
+
+        return rows;
+    }
+
+    private static SqlValue[] ReadCurrentRow(EmbeddedStatement statement)
+    {
+        var values = new SqlValue[statement.GetColumnCount()];
+        for (var ordinal = 0; ordinal < values.Length; ordinal++)
+            values[ordinal] = statement.GetValue(ordinal);
+
+        return values;
     }
 
     private static string[] ColumnNames(EmbeddedConnection connection, string sql)

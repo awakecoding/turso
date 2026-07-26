@@ -215,6 +215,28 @@ public sealed class ResumableStatement : IDisposable
                         AdvanceInstructionPointer();
                         break;
                     }
+                case CompareInstruction compare:
+                    _registers[compare.Destination.Index] = VdbeValueOperations.Compare(
+                        compare.Operator,
+                        _registers[compare.Left.Index],
+                        _registers[compare.Right.Index],
+                        compare.LeftAffinity,
+                        compare.RightAffinity,
+                        compare.Collation);
+                    AdvanceInstructionPointer();
+                    break;
+                case JumpIfNotTrueInstruction jumpIfNotTrue:
+                    if (EmbeddedDatabase.IsTrue(_registers[jumpIfNotTrue.Value.Index]))
+                        AdvanceInstructionPointer();
+                    else
+                        _instructionPointer = jumpIfNotTrue.FalseTarget;
+                    break;
+                case CastInstruction cast:
+                    _registers[cast.Value.Index] = VdbeValueOperations.Cast(
+                        _registers[cast.Value.Index],
+                        cast.TypeName);
+                    AdvanceInstructionPointer();
+                    break;
                 case OpenReadCursorInstruction open:
                     OpenCursor(open.Cursor);
                     _cursorPositions[open.Cursor.Index] = -1;
@@ -444,7 +466,7 @@ public sealed class ResumableStatement : IDisposable
                 case SorterSortInstruction sorterSort:
                     {
                         var runtime = RequireOpenSorter(sorterSort.Sorter);
-                        if (runtime.Sort())
+                        if (runtime.Sort(cancellationToken))
                             AdvanceInstructionPointer();
                         else
                             _instructionPointer = sorterSort.EmptyTarget;
@@ -1351,11 +1373,12 @@ public sealed class ResumableStatement : IDisposable
 
         // Sorts the buffered records and positions on the first one. Returns false (and
         // leaves the sorter unpositioned) when there is nothing to drain.
-        public bool Sort()
+        public bool Sort(CancellationToken cancellationToken)
         {
-            _sorted = true;
+            cancellationToken.ThrowIfCancellationRequested();
             if (_rows.Count == 0)
             {
+                _sorted = true;
                 _position = -1;
                 return false;
             }
@@ -1370,7 +1393,9 @@ public sealed class ResumableStatement : IDisposable
             {
                 Array.Sort(order, (left, right) =>
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var comparison = _comparer(_rows[left], _rows[right]);
+                    cancellationToken.ThrowIfCancellationRequested();
                     return comparison != 0 ? comparison : left.CompareTo(right);
                 });
             }
@@ -1383,10 +1408,14 @@ public sealed class ResumableStatement : IDisposable
 
             var sorted = new List<SqlValue[]>(_rows.Count);
             foreach (var index in order)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
                 sorted.Add(_rows[index]);
+            }
 
             _rows.Clear();
             _rows.AddRange(sorted);
+            _sorted = true;
             _position = 0;
             return true;
         }

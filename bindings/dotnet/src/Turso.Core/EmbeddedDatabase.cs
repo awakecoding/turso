@@ -9493,6 +9493,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private static ExecutionResult MaterializeQueryResult(ExecutionResult result)
     {
+        if (result.Rows is StreamingProjectionRows streamingRows)
+        {
+            result = result with
+            {
+                Rows = streamingRows.Materialize(),
+            };
+        }
+
         if (!result.Rows.Any(row => row.Any(value => value.IsJson)))
             return result;
 
@@ -9520,7 +9528,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ValidateGroupByCollations(select.GroupBy);
         var canUseCompiledRoute = (!context.CancellationToken.CanBeCanceled
             || IsAggregateSelect(select))
-            && !CanStreamProjectionRows(select, context);
+            && !CanStreamProjectionRows(select, context, outerRow);
         CompiledSelect? compiled = null;
         if (canUseCompiledRoute)
         {
@@ -9694,6 +9702,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             (where, target) => IsStreamingSafeScalarScanPredicate(where, target, context)
                 ? CompileRowPredicate(where, target, parameters, context, outerRow)
                 : null,
+            (where, target) => CanEmitNativeScanPredicate(where, target, context),
             (where, target) => CompileSimpleRowIdPredicate(where, target, parameters, context, outerRow),
             (select, target) => CompileDistinctScanEquality(select, target, context),
             function => TryGetRoutableBuiltinScalarCall(function, out var routable)
@@ -9898,6 +9907,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             expression => Evaluate(expression, parameters, null, context),
             _ => target,
             (where, scan) => CompileRowPredicate(where, scan, parameters, context, outerRow),
+            (where, scan) => CanEmitNativeScanPredicate(where, scan, context),
             (where, scan) => CompileSimpleRowIdPredicate(where, scan, parameters, context, outerRow),
             (statement, scan) => CompileDistinctScanEquality(statement, scan, context),
             function => TryGetRoutableBuiltinScalarCall(function, out var routable)
@@ -10015,6 +10025,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return (IsStreamingSafeScalarScanColumn(binary.Left, target, table) && IsLiteralOrParameter(binary.Right))
             || (IsStreamingSafeScalarScanColumn(binary.Right, target, table) && IsLiteralOrParameter(binary.Left));
     }
+
+    private bool CanEmitNativeScanPredicate(
+        Expression expression,
+        ScanTarget target,
+        QueryContext context)
+        => IsStreamingSafeScalarScanPredicate(expression, target, context)
+            && !ContainsEffectiveCustomCollation(expression, context);
 
     private static bool IsStreamingSafeScalarScanColumn(
         Expression expression,
@@ -10873,6 +10890,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return false;
         }
 
+        // Bytecode set operations de-duplicate while terms emit rows; the evaluator waits
+        // for a later term to complete. Keep callback-capable result collations on the
+        // evaluator so a comparator cannot run before a later term's error.
+        if (compoundOperator != CompoundOperator.UnionAll
+            && statement.Terms.Any(term =>
+                HasObservableCompoundResultCollation(term, context)))
+        {
+            return false;
+        }
+
         // Every term must lower on its own and project the same number of result
         // columns; otherwise fall back so the evaluator produces the value or its exact error.
         if (statement.Terms.Any(ContainsLimitedCompoundTerm))
@@ -10942,6 +10969,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         compiled = new CompiledSelect(compound.Program, compound.CursorSources, parameterIndices);
         return true;
+    }
+
+    private bool HasObservableCompoundResultCollation(
+        QueryStatement term,
+        QueryContext context)
+    {
+        return term is SelectStatement select
+            && select.Projections.Any(projection =>
+                ContainsEffectiveCustomCollation(
+                    projection.Expression,
+                    EnterCollationSource(context, select.Source)));
     }
 
     private static bool IsConservativeCompoundTerm(VdbeProgram program)
@@ -11108,6 +11146,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             _ => throw new InvalidOperationException("Unfolded compound terms do not fold expressions."),
             _ => null,
             (_, _) => null,
+            (_, _) => false,
             (_, _) => null,
             (_, _) => null,
             function => TryGetRoutableBuiltinScalarCall(function, out var routable)
@@ -14801,6 +14840,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             new Cursor(1),
             projections.Count,
             instructions,
+            programCounterBase: 0,
+            allowControlFlow: false,
             IsConstantScalarExpression,
             expression => Evaluate(expression, parameters, null, context),
             function => TryGetRoutableBuiltinScalarCall(function, out var routable)
@@ -15158,6 +15199,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             // routed arithmetic projection renders byte-identically to the canonical instruction renderer.
             ArithmeticInstruction => VdbeExplain.Describe(instruction),
             NumericAffinityInstruction => VdbeExplain.Describe(instruction),
+            CompareInstruction => VdbeExplain.Describe(instruction),
+            JumpIfNotTrueInstruction => VdbeExplain.Describe(instruction),
+            CastInstruction => VdbeExplain.Describe(instruction),
             OpenJoinCursorInstruction => VdbeExplain.Describe(instruction),
             OpenReadCursorInstruction open => (
                 open.Cursor.Index,
@@ -16244,14 +16288,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ? limit
             : null;
         var indexPlan = TryPlanManagedIndexScan(statement, context);
+        var streamProjectionRows = CanStreamProjectionRows(statement, context, outerRow);
         var source = indexPlan is null
-            ? GetSourceRows(statement.Source, parameters, context, sourceLimit, outerRow)
-            : GetManagedIndexRows(indexPlan, context, outerRow);
+                ? GetSourceRows(statement.Source, parameters, context, sourceLimit, outerRow)
+                : GetManagedIndexRows(indexPlan, context, outerRow);
         var selectedRows = new List<SourceRow>();
         foreach (var row in source.Rows)
         {
             context.CancellationToken.ThrowIfCancellationRequested();
-            if (statement.Where is null || IsTrue(Evaluate(statement.Where, parameters, row, context)))
+            if (streamProjectionRows
+                || statement.Where is null
+                || IsTrue(Evaluate(statement.Where, parameters, row, context)))
                 selectedRows.Add(row);
         }
 
@@ -16447,12 +16494,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
             selectedRows = orderedRows.Select(row => row.Item).ToList();
         }
 
-        if (CanStreamProjectionRows(statement, context))
+        if (streamProjectionRows)
         {
             return new ExecutionResult(
                 columnNames,
                 new StreamingProjectionRows(
                     selectedRows,
+                    offset,
+                    limit,
+                    statement.Where is null
+                        ? null
+                        : (row, cancellationToken) => IsTrue(Evaluate(
+                            statement.Where,
+                            parameters,
+                            row,
+                            context with { CancellationToken = cancellationToken })),
                     (row, cancellationToken) => EvaluateProjectionRow(
                         statement,
                         row,
@@ -16501,21 +16557,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return Evaluate(expression, parameters, row, context);
     }
 
-    private bool CanStreamProjectionRows(SelectStatement statement, QueryContext context)
+    private bool CanStreamProjectionRows(
+        SelectStatement statement,
+        QueryContext context,
+        SourceRow? outerRow)
     {
-        if (statement.Source is not NamedTableSource named
+        if (outerRow is not null
+            || statement.Source is not NamedTableSource named
             || context.CommonTableExpressions.ContainsKey(named.Name)
             || TryGetView(context, named.Name, out _))
         {
             return false;
         }
 
-        return statement.Where is null
+        return (statement.Where is null || IsScanPredicate(statement.Where))
             && statement.GroupBy.Count == 0
             && statement.Having is null
             && statement.OrderBy.Count == 0
-            && statement.Limit is null
-            && statement.Offset is null
             && !statement.Distinct
             && !statement.Projections.Any(projection =>
                 ContainsAggregate(projection.Expression)
@@ -16940,16 +16998,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (next.Columns.Length != first.Columns.Length)
                 throw new EmbeddedSqlException("SELECTs to the left and right of a compound operator do not have the same number of result columns");
 
+            var nextRows = next.Rows.Select(row => row.ToArray()).ToArray();
             var collations = MergeCompoundCollations(
                 leftCollations,
                 GetQueryOutputCollations(statement.Terms[index], context),
                 first.Columns.Length);
             rows = statement.Operators[index - 1] switch
             {
-                CompoundOperator.Union => ApplyUnion(rows, next.Rows, collations),
-                CompoundOperator.UnionAll => [.. rows, .. next.Rows.Select(row => row.ToArray())],
-                CompoundOperator.Intersect => ApplyIntersect(rows, next.Rows, collations),
-                CompoundOperator.Except => ApplyExcept(rows, next.Rows, collations),
+                CompoundOperator.Union => ApplyUnion(rows, nextRows, collations),
+                CompoundOperator.UnionAll => [.. rows, .. nextRows],
+                CompoundOperator.Intersect => ApplyIntersect(rows, nextRows, collations),
+                CompoundOperator.Except => ApplyExcept(rows, nextRows, collations),
                 _ => throw new EmbeddedSqlException($"Unsupported compound operator {statement.Operators[index - 1]}."),
             };
             leftCollations = collations;
@@ -20473,7 +20532,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             : Evaluate(expression.Else, parameters, row, context);
     }
 
-    private static SqlValue CastValue(SqlValue value, string typeName)
+    internal static SqlValue CastValue(SqlValue value, string typeName)
     {
         if (value.Kind == SqlValueKind.Null)
             return SqlValue.Null;
@@ -31812,7 +31871,9 @@ public sealed class EmbeddedStatement : IDisposable
             || EmbeddedDatabase.TryGetReturning(_statement, out _, out _))
         {
             ExecuteIfNeeded();
-            return _result!.Rows.Count > 0;
+            return _result!.Rows is StreamingProjectionRows streamingRows
+                ? streamingRows.HasAny()
+                : _result.Rows.Count > 0;
         }
 
         return false;
@@ -31856,12 +31917,25 @@ public sealed class EmbeddedStatement : IDisposable
         ExecuteIfNeeded(cancellationToken);
 
         var nextRowIndex = _rowIndex + 1;
-        if (nextRowIndex < _result!.Rows.Count)
+        if (_result!.Rows is StreamingProjectionRows streamingRows)
         {
-            _currentRow = null;
-            _currentRow = _result.Rows is StreamingProjectionRows streamingRows
-                ? streamingRows.GetRow(nextRowIndex, cancellationToken)
-                : _result.Rows[nextRowIndex];
+            while (nextRowIndex < streamingRows.SourceCount && !streamingRows.IsComplete)
+            {
+                _currentRow = null;
+                if (streamingRows.TryGetRow(nextRowIndex, cancellationToken, out var row))
+                {
+                    _currentRow = row;
+                    _rowIndex = nextRowIndex;
+                    return StatementStepResult.Row;
+                }
+
+                _rowIndex = nextRowIndex;
+                nextRowIndex++;
+            }
+        }
+        else if (nextRowIndex < _result.Rows.Count)
+        {
+            _currentRow = _result.Rows[nextRowIndex];
             _rowIndex = nextRowIndex;
             return StatementStepResult.Row;
         }
@@ -31970,7 +32044,7 @@ public sealed class EmbeddedStatement : IDisposable
             _result = _connection.Execute(_statement, _boundValues, cancellationToken);
             if (!EmbeddedDatabase.MayMutate(_statement))
                 cancellationToken.ThrowIfCancellationRequested();
-            if (_result.Rows.Count != 0)
+            if (HasPotentialRows(_result.Rows))
             {
                 _readerLease = executionLease
                     ?? _connection.OpenStatementReaderLease();
@@ -31985,9 +32059,14 @@ public sealed class EmbeddedStatement : IDisposable
 
     private void OpenReaderLeaseIfNeeded()
     {
-        if (_result!.Rows.Count != 0 && _readerLease is null)
+        if (HasPotentialRows(_result!.Rows) && _readerLease is null)
             _readerLease = _connection.OpenStatementReaderLease();
     }
+
+    private static bool HasPotentialRows(IReadOnlyList<SqlValue[]> rows)
+        => rows is StreamingProjectionRows streamingRows
+            ? streamingRows.SourceCount != 0
+            : rows.Count != 0;
 
     private void ReleaseReaderLease()
     {
@@ -33798,25 +33877,142 @@ internal sealed record ExecutionResult(
 
 internal sealed class StreamingProjectionRows(
     IReadOnlyList<SourceRow> sourceRows,
+    long offset,
+    long? limit,
+    Func<SourceRow, CancellationToken, bool>? include,
     Func<SourceRow, CancellationToken, SqlValue[]> project) : IReadOnlyList<SqlValue[]>
 {
-    public int Count => sourceRows.Count;
+    // Step drives this list by source position so WHERE predicates can defer their
+    // callbacks until the matching source row is reached.
+    private readonly bool?[] _included = new bool?[sourceRows.Count];
+    private readonly SqlValue[]?[] _projected = new SqlValue[]?[sourceRows.Count];
+    private readonly long _offset = offset;
+    private readonly long? _limit = limit is >= 0 ? limit : null;
+    private long _skipped;
+    private long _returned;
+    private SqlValue[][]? _materialized;
 
-    public SqlValue[] this[int index] => GetRow(index, CancellationToken.None);
+    // The IReadOnlyList surface has dense result indexes, while Step uses source
+    // indexes to preserve deferred WHERE and projection evaluation.
+    public int Count => Materialize().Count;
+
+    public int SourceCount => sourceRows.Count;
+
+    public bool IsComplete { get; private set; }
+
+    public SqlValue[] this[int index] => Materialize()[index];
 
     public SqlValue[] GetRow(int index, CancellationToken cancellationToken)
     {
+        if (!TryGetRow(index, cancellationToken, out var row))
+            throw new ArgumentOutOfRangeException(nameof(index), "The source row does not satisfy the streaming predicate.");
+
+        return row;
+    }
+
+    public bool TryGetRow(int index, CancellationToken cancellationToken, out SqlValue[] row)
+    {
         cancellationToken.ThrowIfCancellationRequested();
-        return project(sourceRows[index], cancellationToken);
+        if ((uint)index >= (uint)SourceCount
+            || IsComplete
+            || !Includes(index, cancellationToken))
+        {
+            row = [];
+            return false;
+        }
+
+        if (_skipped < _offset)
+        {
+            _skipped++;
+            row = [];
+            return false;
+        }
+
+        row = Project(index, cancellationToken);
+        _returned++;
+        if (_limit is { } limit && _returned >= limit)
+            IsComplete = true;
+        return true;
+    }
+
+    public bool HasAny()
+    {
+        if (_limit == 0)
+            return false;
+
+        var skipped = 0L;
+        for (var index = 0; index < SourceCount; index++)
+        {
+            if (!Includes(index, CancellationToken.None))
+                continue;
+            if (skipped < _offset)
+            {
+                skipped++;
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
     public IEnumerator<SqlValue[]> GetEnumerator()
     {
-        for (var index = 0; index < Count; index++)
-            yield return this[index];
+        return ((IEnumerable<SqlValue[]>)Materialize()).GetEnumerator();
     }
 
     System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+
+    public IReadOnlyList<SqlValue[]> Materialize()
+    {
+        if (_materialized is not null)
+            return _materialized;
+
+        var rows = new List<SqlValue[]>();
+        var skipped = 0L;
+        for (var index = 0; index < SourceCount; index++)
+        {
+            if (!Includes(index, CancellationToken.None))
+                continue;
+            if (skipped < _offset)
+            {
+                skipped++;
+                continue;
+            }
+
+            rows.Add(Project(index, CancellationToken.None));
+            if (_limit is { } limit && rows.Count >= limit)
+                break;
+        }
+
+        _materialized = rows.ToArray();
+        return _materialized;
+    }
+
+    private bool Includes(int index, CancellationToken cancellationToken)
+    {
+        var included = _included[index];
+        if (included is not null)
+            return included.Value;
+
+        cancellationToken.ThrowIfCancellationRequested();
+        included = include?.Invoke(sourceRows[index], cancellationToken) ?? true;
+        _included[index] = included;
+        return included.Value;
+    }
+
+    private SqlValue[] Project(int index, CancellationToken cancellationToken)
+    {
+        var projected = _projected[index];
+        if (projected is not null)
+            return projected;
+
+        cancellationToken.ThrowIfCancellationRequested();
+        projected = project(sourceRows[index], cancellationToken);
+        _projected[index] = projected;
+        return projected;
+    }
 }
 
 internal sealed record CreateTableMaterialization(
