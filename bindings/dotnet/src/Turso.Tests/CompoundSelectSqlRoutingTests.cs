@@ -148,6 +148,54 @@ public class CompoundSelectSqlRoutingTests
     }
 
     [Test]
+    public void TypeofTermsRouteThroughUnionAllInSourceOrder()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+
+        Column0(ReadRows(connection, "SELECT typeof('first') UNION ALL SELECT typeof(2);"))
+            .Should().Equal(SqlValue.Text("text"), SqlValue.Text("integer"));
+
+        var opcodes = Opcodes(ReadRows(
+            connection,
+            "EXPLAIN SELECT typeof('first') UNION ALL SELECT typeof(2);")).ToList();
+        opcodes.Count(opcode => opcode == "Function").Should().Be(2);
+        opcodes.Count(opcode => opcode == "ResultRow").Should().Be(2);
+    }
+
+    [Test]
+    public void InvalidTypeofArityKeepsUnionAllOnTheEvaluator()
+    {
+        const string query = "SELECT typeof() UNION ALL SELECT typeof('later')";
+        using var connection = new EmbeddedDatabase().Connect();
+
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query))!
+            .Message.Should().Be("wrong number of arguments to function typeof()");
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
+    }
+
+    [Test]
+    public void OverriddenTypeofKeepsUnionAllOnTheEvaluator()
+    {
+        var calls = 0;
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "typeof",
+            1,
+            values =>
+            {
+                calls++;
+                return SqlValue.Text($"callback:{values[0].AsText()}");
+            });
+        using var connection = database.Connect();
+
+        Column0(ReadRows(connection, "SELECT typeof('first') UNION ALL SELECT 'second';"))
+            .Should().Equal(SqlValue.Text("callback:first"), SqlValue.Text("second"));
+        calls.Should().Be(1);
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "EXPLAIN SELECT typeof('first') UNION ALL SELECT 'second';"));
+    }
+
+    [Test]
     public void CompoundColumnNamesComeFromTheFirstTerm()
     {
         using var connection = new EmbeddedDatabase().Connect();
