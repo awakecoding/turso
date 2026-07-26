@@ -220,6 +220,229 @@ public class CompiledCompoundRecursiveDifferentialTests
             .Should().Be("MANAGED EVALUATOR FALLBACK");
     }
 
+    [Test]
+    public void RegisterPredicatesCaseCastsAndBoundedScansMatchSqliteAfterRebinding()
+    {
+        string[] setup =
+        [
+            "CREATE TABLE items(value INTEGER)",
+            "INSERT INTO items VALUES (NULL), (-1), (0), (2), (3)",
+        ];
+        const string controlFlowQuery =
+            "SELECT CASE WHEN ?1 THEN CAST(?2 AS TEXT) ELSE CAST(?3 AS TEXT) END AS result";
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var sql in setup)
+            Execute(connection, sql);
+        using var statement = connection.Prepare(controlFlowQuery);
+
+        statement.Bind(1, SqlValue.Integer(0));
+        statement.Bind(2, SqlValue.Null);
+        statement.Bind(3, SqlValue.Text("fallback"));
+        Drain(statement).Should().Equal(SqlValue.Text("fallback"));
+        AssertMatchesSqlite(
+            [],
+            controlFlowQuery,
+            SqlValue.Integer(0),
+            SqlValue.Null,
+            SqlValue.Text("fallback"));
+
+        statement.Reset();
+        statement.Bind(1, SqlValue.Integer(1));
+        statement.Bind(2, SqlValue.Integer(7));
+        statement.Bind(3, SqlValue.Null);
+        Drain(statement).Should().Equal(SqlValue.Text("7"));
+        AssertMatchesSqlite(
+            [],
+            controlFlowQuery,
+            SqlValue.Integer(1),
+            SqlValue.Integer(7),
+            SqlValue.Null);
+
+        QueryPlanDetail(
+                connection,
+                controlFlowQuery,
+                [
+                    SqlValue.Integer(1),
+                    SqlValue.Integer(7),
+                    SqlValue.Null,
+                ])
+            .Should().Be("MANAGED COMPILED VDBE");
+        ExplainOpcodes(
+                connection,
+                controlFlowQuery,
+                [
+                    SqlValue.Integer(1),
+                    SqlValue.Integer(7),
+                    SqlValue.Null,
+                ])
+            .Should()
+                .Contain("JumpIfNotTrue").And.Contain("Cast")
+            .And.Contain("ResultRow");
+
+        const string predicateQuery = "SELECT value FROM items WHERE value >= ?1";
+        AssertMatchesSqlite(setup, predicateQuery, SqlValue.Integer(0)).Rows
+            .Select(row => row[0])
+            .Should().Equal(SqlValue.Integer(0), SqlValue.Integer(2), SqlValue.Integer(3));
+        QueryPlanDetail(connection, predicateQuery, [SqlValue.Integer(0)])
+            .Should().Be("MANAGED EVALUATOR FALLBACK");
+        ExplainOpcodes(connection, predicateQuery, [SqlValue.Integer(0)])
+            .Should().Contain("Compare").And.Contain("JumpIfNotTrue");
+
+        const string boundedQuery = "SELECT value FROM items WHERE value >= ?1 LIMIT ?2 OFFSET ?3";
+        using var bounded = connection.Prepare(boundedQuery);
+        bounded.Bind(1, SqlValue.Integer(0));
+        bounded.Bind(2, SqlValue.Integer(2));
+        bounded.Bind(3, SqlValue.Integer(1));
+        Drain(bounded).Should().Equal(SqlValue.Integer(2), SqlValue.Integer(3));
+        AssertMatchesSqlite(
+            setup,
+            boundedQuery,
+            SqlValue.Integer(0),
+            SqlValue.Integer(2),
+            SqlValue.Integer(1));
+        QueryPlanDetail(
+                connection,
+                boundedQuery,
+                [SqlValue.Integer(0), SqlValue.Integer(2), SqlValue.Integer(1)])
+            .Should().Be("MANAGED EVALUATOR FALLBACK");
+        ExplainOpcodes(
+                connection,
+                boundedQuery,
+                [SqlValue.Integer(0), SqlValue.Integer(2), SqlValue.Integer(1)])
+            .Should().Contain("LimitGate").And.Contain("OffsetGate");
+    }
+
+    [Test]
+    public void EmptyAndNullPredicateScansMatchSqliteAndReportTheirActualRoutes()
+    {
+        const string predicate = "SELECT value FROM items WHERE value > ?1";
+        const string empty = "SELECT value FROM empty_items WHERE value IS NULL LIMIT 1 OFFSET 0";
+        string[] setup =
+        [
+            "CREATE TABLE items(value INTEGER)",
+            "INSERT INTO items VALUES (NULL), (1), (2)",
+            "CREATE TABLE empty_items(value INTEGER)",
+        ];
+        using var connection = new EmbeddedDatabase().Connect();
+        foreach (var sql in setup)
+            Execute(connection, sql);
+
+        AssertMatchesSqlite(setup, predicate, SqlValue.Null).Rows.Should().BeEmpty();
+        AssertMatchesSqlite(setup, empty).Rows.Should().BeEmpty();
+        QueryPlanDetail(connection, predicate, [SqlValue.Null])
+            .Should().Be("MANAGED EVALUATOR FALLBACK");
+        QueryPlanDetail(connection, empty).Should().Be("MANAGED EVALUATOR FALLBACK");
+    }
+
+    [Test]
+    public void SafeTypeofUnionAllMatchesSqliteAfterRebinding()
+    {
+        const string query = "SELECT typeof(?1) AS kind UNION ALL SELECT typeof(?2)";
+        using var connection = new EmbeddedDatabase().Connect();
+        using var statement = connection.Prepare(query);
+
+        statement.Bind(1, SqlValue.Null);
+        statement.Bind(2, SqlValue.Blob([1, 2]));
+        Drain(statement).Should().Equal(SqlValue.Text("null"), SqlValue.Text("blob"));
+        AssertMatchesSqlite([], query, SqlValue.Null, SqlValue.Blob([1, 2]));
+
+        statement.Reset();
+        statement.Bind(1, SqlValue.Integer(7));
+        statement.Bind(2, SqlValue.Real(2.5));
+        Drain(statement).Should().Equal(SqlValue.Text("integer"), SqlValue.Text("real"));
+        AssertMatchesSqlite([], query, SqlValue.Integer(7), SqlValue.Real(2.5));
+
+        QueryPlanDetail(
+                connection,
+                query,
+                [SqlValue.Integer(7), SqlValue.Real(2.5)])
+            .Should().Be("MANAGED COMPILED VDBE");
+        ExplainOpcodes(
+                connection,
+                query,
+                [SqlValue.Integer(7), SqlValue.Real(2.5)])
+            .Should().Contain("Function").And.Contain("LoadParameter");
+    }
+
+    [TestCase("tracking", false)]
+    [TestCase("NOCASE", true)]
+    public void CustomAndOverriddenCollationsMatchSqliteWhileStayingEvaluatorOwned(
+        string collation,
+        bool overridesBuiltin)
+    {
+        Func<string, string, int> comparer = overridesBuiltin
+            ? static (string _, string _) => 0
+            : static (string left, string right) =>
+                string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
+        var database = new EmbeddedDatabase();
+        database.RegisterCollation(collation, comparer);
+        using var managed = database.Connect();
+        Execute(managed, $"CREATE TABLE names(value TEXT COLLATE {collation});");
+        Execute(managed, "INSERT INTO names VALUES ('Ada'), ('ada'), ('Grace');");
+        const string query = "SELECT value FROM names WHERE value = ?1";
+        using var statement = managed.Prepare(query);
+        statement.Bind(1, SqlValue.Text("ADA"));
+        var managedRows = ReadRows(statement);
+
+        using var sqlite = new MsData.SqliteConnection("Data Source=:memory:");
+        sqlite.Open();
+        sqlite.CreateCollation(collation, (left, right) => comparer(left, right));
+        using (var setup = sqlite.CreateCommand())
+        {
+            setup.CommandText = $"CREATE TABLE names(value TEXT COLLATE {collation});"
+                + "INSERT INTO names VALUES ('Ada'), ('ada'), ('Grace');";
+            setup.ExecuteNonQuery();
+        }
+
+        using var command = sqlite.CreateCommand();
+        command.CommandText = query;
+        command.Parameters.AddWithValue("?1", "ADA");
+        using var reader = command.ExecuteReader();
+        var sqliteRows = new List<SqlValue[]>();
+        while (reader.Read())
+            sqliteRows.Add([FromClrValue(reader.GetValue(0))]);
+
+        managedRows.Should().HaveCount(sqliteRows.Count);
+        for (var index = 0; index < managedRows.Count; index++)
+            managedRows[index].Should().Equal(sqliteRows[index]);
+        QueryPlanDetail(managed, query, [SqlValue.Text("ADA")])
+            .Should().Be("MANAGED EVALUATOR FALLBACK");
+        Assert.Throws<EmbeddedSqlException>(() => ExplainOpcodes(managed, query));
+    }
+
+    [Test]
+    public void CallbackAndCancellationCandidatesReportEvaluatorFallbackWithoutEagerExecution()
+    {
+        var calls = 0;
+        var database = new EmbeddedDatabase();
+        database.RegisterScalarFunction(
+            "observe",
+            1,
+            values =>
+            {
+                calls++;
+                return values[0];
+            });
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE items(value INTEGER);");
+        Execute(connection, "INSERT INTO items VALUES (1), (2);");
+        const string callbackQuery = "SELECT value FROM items WHERE observe(value) > 0";
+        const string sorterQuery = "SELECT value FROM items ORDER BY value DESC LIMIT 1";
+        using var cancellation = new CancellationTokenSource();
+
+        QueryPlanDetail(connection, callbackQuery).Should().Be("MANAGED EVALUATOR FALLBACK");
+        calls.Should().Be(0);
+        QueryPlanDetail(connection, sorterQuery).Should().Be("MANAGED COMPILED VDBE");
+        QueryPlanDetail(connection, sorterQuery, cancellation.Token)
+            .Should().Be("MANAGED EVALUATOR FALLBACK");
+
+        cancellation.Cancel();
+        using var statement = connection.Prepare(sorterQuery);
+        Assert.Throws<OperationCanceledException>(() => statement.Step(cancellation.Token));
+        statement.Reset();
+        Drain(statement).Should().Equal(SqlValue.Integer(2));
+    }
+
     private static QueryOutput AssertMatchesSqlite(
         IReadOnlyList<string> setup,
         string query,
@@ -328,6 +551,17 @@ public class CompiledCompoundRecursiveDifferentialTests
         return ReadRows(statement).Select(row => row[1].AsText()).ToArray();
     }
 
+    private static IReadOnlyList<string> ExplainOpcodes(
+        EmbeddedConnection connection,
+        string query,
+        IReadOnlyList<SqlValue> parameters)
+    {
+        using var statement = connection.Prepare("EXPLAIN " + query);
+        for (var index = 0; index < parameters.Count; index++)
+            statement.Bind(index + 1, parameters[index]);
+        return ReadRows(statement).Select(row => row[1].AsText()).ToArray();
+    }
+
     private static string QueryPlanDetail(
         EmbeddedConnection connection,
         string query,
@@ -335,6 +569,18 @@ public class CompiledCompoundRecursiveDifferentialTests
     {
         using var statement = connection.Prepare("EXPLAIN QUERY PLAN " + query);
         statement.Step(cancellationToken).Should().Be(StatementStepResult.Row);
+        return statement.GetValue(3).AsText();
+    }
+
+    private static string QueryPlanDetail(
+        EmbeddedConnection connection,
+        string query,
+        IReadOnlyList<SqlValue> parameters)
+    {
+        using var statement = connection.Prepare("EXPLAIN QUERY PLAN " + query);
+        for (var index = 0; index < parameters.Count; index++)
+            statement.Bind(index + 1, parameters[index]);
+        statement.Step().Should().Be(StatementStepResult.Row);
         return statement.GetValue(3).AsText();
     }
 
@@ -364,6 +610,9 @@ public class CompiledCompoundRecursiveDifferentialTests
             return rows;
         }
     }
+
+    private static List<SqlValue[]> ReadRows(EmbeddedStatement statement)
+        => ReadRows(statement, default);
 
     private static void Execute(EmbeddedConnection connection, string sql)
     {
