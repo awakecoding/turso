@@ -1,0 +1,562 @@
+using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Globalization;
+using System.Text;
+using AwesomeAssertions;
+using Microsoft.Data.Sqlite;
+using Turso.Core.Storage;
+
+namespace Turso.Tests;
+
+public sealed class SqliteWalWriterCheckpointCoordinatorTests
+{
+    private const long WriteLockOffset = SqliteWalIndexCheckpointInfo.LockOffset;
+
+    [Test]
+    [NonParallelizable]
+    public void DetachedWriterPublishesDurableFramesOnlyAfterUpdatingTheWalIndex()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var sourceWal = OpenWalCopy(artifact.DatabasePath);
+        using var sourceMapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+            artifact.DatabasePath + "-shm",
+            FileOpenMode.OpenExisting,
+            readOnly: true);
+        var sourceIndex = new SqliteWalIndexSharedMemory(sourceMapping);
+        var prior = sourceIndex.ReadValidatedHeader(sourceWal);
+        var sourceFrame = sourceWal.ReadFrame(prior.Header.MaximumFrame);
+        var page = sourceFrame.PageData.ToArray();
+        page[^1] ^= 0x5A;
+
+        var written = coordinator.Commit(
+            [new SqliteWalWritePage(sourceFrame.Header.PageNumber, page)],
+            prior.Header.DatabasePageCount,
+            TimeSpan.Zero);
+
+        written.MaximumFrame.Should().Be(prior.Header.MaximumFrame + 1);
+        using var committedWal = OpenWalCopy(artifact.DatabasePath);
+        using var committedMapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+            artifact.DatabasePath + "-shm",
+            FileOpenMode.OpenExisting,
+            readOnly: true);
+        var committedIndex = new SqliteWalIndexSharedMemory(committedMapping);
+        var committed = committedIndex.ReadValidatedHeader(committedWal);
+
+        committed.Header.MaximumFrame.Should().Be(written.MaximumFrame);
+        committedWal.ReadFrame(written.MaximumFrame).Header.IsCommit.Should().BeTrue();
+        committedIndex.FindFrame(committedWal, sourceFrame.Header.PageNumber).Should().Be(written.MaximumFrame);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void PassiveCheckpointStopsAtAProcessIsolatedHeldSnapshot()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var snapshots = SqliteWalReadSnapshotCoordinator.Open(artifact.DatabasePath);
+        using var snapshot = snapshots.BeginRead(TimeSpan.Zero);
+        RunSqliteWriterWorker(artifact.DatabasePath);
+
+        var checkpoint = coordinator.Checkpoint(SqliteWalCheckpointMode.Passive, TimeSpan.Zero);
+
+        checkpoint.IsBusy.Should().BeTrue();
+        checkpoint.SafeFrame.Should().Be(snapshot.MaximumFrame);
+        checkpoint.BackfilledFrameCount.Should().Be(snapshot.MaximumFrame);
+        checkpoint.BackfillAttemptedFrameCount.Should().Be(snapshot.MaximumFrame);
+        checkpoint.MaximumFrame.Should().BeGreaterThan(snapshot.MaximumFrame);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void FullCheckpointWaitsInsteadOfCheckpointingPastAHeldSnapshot()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var snapshots = SqliteWalReadSnapshotCoordinator.Open(artifact.DatabasePath);
+        using var snapshot = snapshots.BeginRead(TimeSpan.Zero);
+        RunSqliteWriterWorker(artifact.DatabasePath);
+
+        Assert.Throws<SqliteWalByteRangeLockBusyException>(
+            () => coordinator.Checkpoint(SqliteWalCheckpointMode.Full, TimeSpan.FromMilliseconds(30)));
+
+        snapshot.IsActive.Should().BeTrue();
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void RestartAndTruncateResetOnlyAfterDurableBackfill()
+    {
+        RequireCoordinatorSupport();
+
+        using (var restartArtifact = SqliteWalArtifact.Create())
+        using (var restart = SqliteWalWriterCheckpointCoordinator.Open(restartArtifact.DatabasePath))
+        {
+            var result = restart.Checkpoint(SqliteWalCheckpointMode.Restart, TimeSpan.Zero);
+            result.ResetWal.Should().BeTrue();
+            result.BackfilledFrameCount.Should().Be(0);
+            new FileInfo(restartArtifact.DatabasePath + "-wal").Length.Should().Be(SqliteWalHeader.Size);
+
+            using var wal = OpenWalCopy(restartArtifact.DatabasePath);
+            using var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                restartArtifact.DatabasePath + "-shm",
+                FileOpenMode.OpenExisting,
+                readOnly: true);
+            var region = new SqliteWalIndexSharedMemory(mapping).ReadValidatedHeader(wal);
+            region.Header.MaximumFrame.Should().Be(0);
+            region.CheckpointInfo.BackfilledFrameCount.Should().Be(0);
+            region.CheckpointInfo.BackfillAttemptedFrameCount.Should().Be(0);
+        }
+
+        using (var truncateArtifact = SqliteWalArtifact.Create())
+        {
+            using (var truncate = SqliteWalWriterCheckpointCoordinator.Open(truncateArtifact.DatabasePath))
+            {
+                var result = truncate.Checkpoint(SqliteWalCheckpointMode.Truncate, TimeSpan.Zero);
+                result.ResetWal.Should().BeTrue();
+            }
+
+            new FileInfo(truncateArtifact.DatabasePath + "-wal").Length.Should().Be(0);
+            using var reopened = SqliteWalWriterCheckpointCoordinator.Open(truncateArtifact.DatabasePath);
+            reopened.Checkpoint(SqliteWalCheckpointMode.Passive, TimeSpan.Zero).MaximumFrame.Should().Be(0);
+            reopened.Recover(TimeSpan.Zero).LastCommittedFrameNumber.Should().Be(0);
+            new FileInfo(truncateArtifact.DatabasePath + "-wal").Length.Should().Be(0);
+        }
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void CoordinatorRebuildsCheckpointProgressBeforeAllowingAWalReset()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using (var wal = OpenWalCopy(artifact.DatabasePath))
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting))
+        {
+            var region = new SqliteWalIndexSharedMemory(mapping).ReadValidatedHeader(wal);
+            WriteUInt32Native(mapping, position: 96, region.Header.MaximumFrame);
+            WriteUInt32Native(mapping, position: 128, region.Header.MaximumFrame);
+            mapping.MemoryBarrier();
+        }
+
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var verifiedWal = OpenWalCopy(artifact.DatabasePath);
+        using var verifiedMapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+            artifact.DatabasePath + "-shm",
+            FileOpenMode.OpenExisting,
+            readOnly: true);
+        var verified = new SqliteWalIndexSharedMemory(verifiedMapping).ReadValidatedHeader(verifiedWal);
+        verified.CheckpointInfo.BackfilledFrameCount.Should().Be(0);
+        verified.CheckpointInfo.BackfillAttemptedFrameCount.Should().Be(0);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void CheckpointResetMarkerRepairsAStaleIndexOnReopen()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        byte[] staleHeader;
+        using (var wal = OpenWalCopy(artifact.DatabasePath))
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting,
+                   readOnly: true))
+        {
+            staleHeader = new SqliteWalIndexSharedMemory(mapping)
+                .ReadValidatedHeader(wal)
+                .Header
+                .ToArray();
+        }
+
+        using (var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath))
+        {
+            coordinator.Checkpoint(SqliteWalCheckpointMode.Restart, TimeSpan.Zero).ResetWal.Should().BeTrue();
+            using var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                artifact.DatabasePath + "-shm",
+                FileOpenMode.OpenExisting);
+            mapping.Write(position: 0, staleHeader);
+            mapping.Write(SqliteWalIndexHeader.Size, staleHeader);
+            mapping.MemoryBarrier();
+        }
+
+        using var reopened = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        reopened.Checkpoint(SqliteWalCheckpointMode.Passive, TimeSpan.Zero).MaximumFrame.Should().Be(0);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void CanceledCommitAndASeparateProcessWriterLeaseLeaveNoHeldWriteLock()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Assert.Throws<OperationCanceledException>(
+            () => coordinator.Commit(
+                [new SqliteWalWritePage(1, new byte[512])],
+                databasePageCount: 1,
+                TimeSpan.Zero,
+                cancellation.Token));
+
+        using (var worker = new CrossProcessWriteLockHandle(
+                   artifact.WorkDirectory,
+                   artifact.DatabasePath + "-shm"))
+        {
+            worker.Result.Should().Be("acquired");
+            Assert.Throws<SqliteWalByteRangeLockBusyException>(
+                () => coordinator.Checkpoint(SqliteWalCheckpointMode.Restart, TimeSpan.Zero));
+        }
+
+        var lockProbe = new SqliteWalByteRangeLock(artifact.DatabasePath + "-shm");
+        lockProbe.TryAcquireExclusive(WriteLockOffset, length: 1, out var released).Should().BeTrue();
+        released!.Dispose();
+    }
+
+    [TestCase("torn")]
+    [TestCase("corrupt")]
+    [NonParallelizable]
+    public void TornAndCorruptWalIndexPublicationsAreRebuiltFromTheAuthenticatedWal(string mutation)
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting))
+        {
+            var header = new byte[SqliteWalIndexHeader.Size];
+            mapping.Read(SqliteWalIndexHeader.Size, header);
+            if (mutation == "torn")
+            {
+                header[8] ^= 0x01;
+                mapping.Write(SqliteWalIndexHeader.Size, header);
+            }
+            else
+            {
+                header[40] ^= 0x01;
+                mapping.Write(SqliteWalIndexHeader.Size, header);
+                mapping.Write(position: 0, header);
+            }
+            mapping.MemoryBarrier();
+        }
+
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        coordinator.Checkpoint(SqliteWalCheckpointMode.Passive, TimeSpan.Zero).MaximumFrame.Should().BeGreaterThan(0);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void CorruptionBeforeThePublishedCommittedBoundaryIsRejectedFailClosed()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using (var stream = new FileStream(
+                   artifact.DatabasePath + "-wal",
+                   FileMode.Open,
+                   FileAccess.ReadWrite,
+                   FileShare.ReadWrite | FileShare.Delete))
+        {
+            stream.Position = SqliteWalHeader.Size + 16;
+            var checksum = stream.ReadByte();
+            checksum.Should().NotBe(-1);
+            stream.Position = SqliteWalHeader.Size + 16;
+            stream.WriteByte(unchecked((byte)(checksum ^ 0x01)));
+            stream.Flush(flushToDisk: true);
+        }
+
+        Assert.Throws<InvalidDataException>(
+            () => SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath));
+    }
+
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public void CrossProcessSqliteWriterWorker()
+    {
+        var databasePath = Environment.GetEnvironmentVariable("TURSO_WAL_WRITER_CHECKPOINT_DATABASE_PATH");
+        if (string.IsNullOrEmpty(databasePath))
+            return;
+
+        using var connection = new SqliteConnection(
+            $"Data Source={databasePath};Mode=ReadWrite;Pooling=False");
+        connection.Open();
+        Execute(connection, "PRAGMA wal_autocheckpoint=0;");
+        Execute(connection, "INSERT INTO data(value) VALUES ('writer-process');");
+    }
+
+    [Test]
+    [Category("ProcessWorker")]
+    [NonParallelizable]
+    public void CrossProcessWriteLockWorker()
+    {
+        var lockPath = Environment.GetEnvironmentVariable("TURSO_WAL_WRITER_CHECKPOINT_LOCK_PATH");
+        if (string.IsNullOrEmpty(lockPath))
+            return;
+
+        var readyPath = ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_READY_PATH");
+        var releasePath = ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_RELEASE_PATH");
+        var resultPath = ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_RESULT_PATH");
+        var locks = new SqliteWalByteRangeLock(lockPath);
+        try
+        {
+            using var lease = locks.AcquireExclusive(WriteLockOffset, length: 1, TimeSpan.Zero);
+            File.WriteAllText(resultPath, "acquired");
+            File.WriteAllText(readyPath, string.Empty);
+            WaitForFile(releasePath, TimeSpan.FromSeconds(60), "The writer-lock worker was not released.");
+        }
+        catch (SqliteWalByteRangeLockBusyException)
+        {
+            File.WriteAllText(resultPath, "busy");
+            File.WriteAllText(readyPath, string.Empty);
+        }
+    }
+
+    private static void RunSqliteWriterWorker(string databasePath)
+    {
+        var testDirectory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
+        var startInfo = new ProcessStartInfo(
+            Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+        {
+            WorkingDirectory = testDirectory.FullName,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        startInfo.ArgumentList.Add("vstest");
+        startInfo.ArgumentList.Add(Path.Combine(testDirectory.FullName, "Turso.Tests.dll"));
+        startInfo.ArgumentList.Add(
+            "--TestCaseFilter:FullyQualifiedName=Turso.Tests.SqliteWalWriterCheckpointCoordinatorTests."
+            + nameof(CrossProcessSqliteWriterWorker));
+        startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_DATABASE_PATH"] = databasePath;
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Failed to start the SQLite WAL writer worker.");
+        var output = process.StandardOutput.ReadToEnd();
+        output += process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        process.ExitCode.Should().Be(0, $"writer output:{Environment.NewLine}{output}");
+    }
+
+    private static void Execute(SqliteConnection connection, string commandText)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = commandText;
+        command.ExecuteNonQuery();
+    }
+
+    private static SqliteWalFile OpenWalCopy(string databasePath)
+    {
+        var fileSystem = new InMemoryFileSystem();
+        using (var copy = fileSystem.OpenFile("main.db-wal", FileOpenMode.CreateNew))
+            copy.Write(position: 0, ReadAllBytes(databasePath + "-wal"));
+        return SqliteWalFile.Open(fileSystem, "main.db-wal", readOnly: true);
+    }
+
+    private static byte[] ReadAllBytes(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        var bytes = new byte[checked((int)stream.Length)];
+        stream.ReadExactly(bytes);
+        return bytes;
+    }
+
+    private static void WriteUInt32Native(ISqliteWalSharedMemoryMapping mapping, long position, uint value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        if (SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian)
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
+        else
+            BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
+        mapping.Write(position, bytes);
+    }
+
+    private static string ReadWorkerValue(string name)
+        => Environment.GetEnvironmentVariable(name)
+           ?? throw new InvalidOperationException($"The WAL writer/checkpoint worker is missing '{name}'.");
+
+    private static void WaitForFile(string path, TimeSpan timeout, string failureMessage, Process? worker = null, Func<string>? output = null)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (!File.Exists(path))
+        {
+            if (worker?.HasExited == true)
+            {
+                worker.WaitForExit();
+                Assert.Fail($"{failureMessage}{Environment.NewLine}{output?.Invoke()}");
+            }
+            if (stopwatch.Elapsed >= timeout)
+            {
+                worker?.Kill(entireProcessTree: true);
+                Assert.Fail($"{failureMessage}{Environment.NewLine}{output?.Invoke()}");
+            }
+
+            Thread.Sleep(TimeSpan.FromMilliseconds(10));
+        }
+    }
+
+    private static bool SupportsCoordinator
+        => OperatingSystem.IsWindows() || (OperatingSystem.IsLinux() && Environment.Is64BitProcess);
+
+    private static void RequireCoordinatorSupport()
+    {
+        if (!SupportsCoordinator)
+        {
+            Assert.Ignore(
+                "Detached SQLite WAL writer/checkpoint coordination is supported only on Windows and 64-bit Linux.");
+        }
+    }
+
+    private sealed class SqliteWalArtifact : IDisposable
+    {
+        private SqliteWalArtifact(string workDirectory, string databasePath, SqliteConnection connection)
+        {
+            WorkDirectory = workDirectory;
+            DatabasePath = databasePath;
+            Connection = connection;
+        }
+
+        internal string WorkDirectory { get; }
+
+        internal string DatabasePath { get; }
+
+        private SqliteConnection Connection { get; }
+
+        internal static SqliteWalArtifact Create()
+        {
+            var workDirectory = Path.Combine(
+                TestContext.CurrentContext.WorkDirectory,
+                "sqlite-wal-writer-checkpoint",
+                Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(workDirectory);
+            var databasePath = Path.Combine(workDirectory, "main.db");
+            var connection = new SqliteConnection(
+                $"Data Source={databasePath};Mode=ReadWriteCreate;Pooling=False");
+            try
+            {
+                connection.Open();
+                Execute(connection, "PRAGMA page_size=512;");
+                Execute(connection, "VACUUM;");
+                Execute(connection, "PRAGMA journal_mode=WAL;");
+                Execute(connection, "PRAGMA wal_autocheckpoint=0;");
+                Execute(connection, "CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT NOT NULL);");
+                Execute(connection, "INSERT INTO data(value) VALUES ('one'), ('two'), ('three');");
+                Execute(connection, "UPDATE data SET value = 'two-updated' WHERE id = 2;");
+                Execute(connection, "CREATE INDEX data_value ON data(value);");
+                return new SqliteWalArtifact(workDirectory, databasePath, connection);
+            }
+            catch
+            {
+                connection.Dispose();
+                if (Directory.Exists(workDirectory))
+                    Directory.Delete(workDirectory, recursive: true);
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            Connection.Dispose();
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(WorkDirectory))
+                Directory.Delete(WorkDirectory, recursive: true);
+        }
+    }
+
+    private sealed class CrossProcessWriteLockHandle : IDisposable
+    {
+        private readonly Process _worker;
+        private readonly string _releasePath;
+        private readonly string _resultPath;
+        private readonly StringBuilder _output = new();
+
+        internal CrossProcessWriteLockHandle(string workDirectory, string lockPath)
+        {
+            var token = Guid.NewGuid().ToString("N");
+            var readyPath = Path.Combine(workDirectory, $"wal-write-ready-{token}");
+            _releasePath = Path.Combine(workDirectory, $"wal-write-release-{token}");
+            _resultPath = Path.Combine(workDirectory, $"wal-write-result-{token}");
+            var testDirectory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
+            var startInfo = new ProcessStartInfo(
+                Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+            {
+                WorkingDirectory = testDirectory.FullName,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            startInfo.ArgumentList.Add("vstest");
+            startInfo.ArgumentList.Add(Path.Combine(testDirectory.FullName, "Turso.Tests.dll"));
+            startInfo.ArgumentList.Add(
+                "--TestCaseFilter:FullyQualifiedName=Turso.Tests.SqliteWalWriterCheckpointCoordinatorTests."
+                + nameof(CrossProcessWriteLockWorker));
+            startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_PATH"] = lockPath;
+            startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_READY_PATH"] = readyPath;
+            startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_RELEASE_PATH"] = _releasePath;
+            startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_RESULT_PATH"] = _resultPath;
+
+            _worker = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("Failed to start the WAL writer-lock worker.");
+            _worker.OutputDataReceived += AppendOutput;
+            _worker.ErrorDataReceived += AppendOutput;
+            _worker.BeginOutputReadLine();
+            _worker.BeginErrorReadLine();
+            WaitForFile(
+                readyPath,
+                TimeSpan.FromSeconds(60),
+                "The WAL writer-lock worker did not report readiness.",
+                _worker,
+                DrainOutput);
+        }
+
+        internal string Result => File.ReadAllText(_resultPath);
+
+        public void Dispose()
+        {
+            try
+            {
+                File.WriteAllText(_releasePath, string.Empty);
+                if (!_worker.WaitForExit(TimeSpan.FromSeconds(60)))
+                {
+                    _worker.Kill(entireProcessTree: true);
+                    Assert.Fail(
+                        "The WAL writer-lock worker did not exit within 60 seconds:"
+                        + Environment.NewLine
+                        + DrainOutput());
+                }
+
+                _worker.WaitForExit();
+                _worker.ExitCode.Should().Be(0, $"worker output:{Environment.NewLine}{DrainOutput()}");
+            }
+            finally
+            {
+                _worker.Dispose();
+            }
+        }
+
+        private void AppendOutput(object sender, DataReceivedEventArgs args)
+        {
+            if (args.Data is null)
+                return;
+
+            lock (_output)
+                _output.AppendLine(args.Data);
+        }
+
+        private string DrainOutput()
+        {
+            lock (_output)
+                return _output.ToString();
+        }
+    }
+}
