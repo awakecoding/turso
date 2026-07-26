@@ -9526,9 +9526,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         context.CancellationToken.ThrowIfCancellationRequested();
         ValidateSelectIndexDirectives(select, context);
         ValidateGroupByCollations(select.GroupBy);
-        var canUseCompiledRoute = (!context.CancellationToken.CanBeCanceled
-            || IsAggregateSelect(select))
-            && !CanStreamProjectionRows(select, context, outerRow);
+        var canUseCompiledRoute = CanUseCompiledSelectRoute(select, context, outerRow);
         CompiledSelect? compiled = null;
         if (canUseCompiledRoute)
         {
@@ -9565,6 +9563,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         return ExecuteSelect(select, parameters, context, outerRow);
     }
+
+    // The evaluator streams this subset so callback failures and cancellation stay observable at the
+    // same row boundary as SQLite. Execution and EXPLAIN QUERY PLAN share this gate so the latter
+    // never reports a bytecode route that execution deliberately declines.
+    private bool CanUseCompiledSelectRoute(
+        SelectStatement select,
+        QueryContext context,
+        SourceRow? outerRow)
+        => (!context.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
+            && !CanStreamProjectionRows(select, context, outerRow);
 
     private bool IsAggregateSelect(SelectStatement select) =>
         select.GroupBy.Count > 0
@@ -15087,7 +15095,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var usesCompiledProgram = statement.Inner switch
         {
             SelectStatement select => HasExplainSafeBounds(select)
-                && (!compilationContext.CancellationToken.CanBeCanceled || IsAggregateSelect(select))
+                && CanUseCompiledSelectRoute(select, compilationContext, outerRow: null)
                 && TryCompileSelect(select, parameters, compilationContext, outerRow: null, out _),
             CompoundSelectStatement compound => !compilationContext.CancellationToken.CanBeCanceled
                 && TryCompileCompoundSelect(
