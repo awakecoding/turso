@@ -227,12 +227,24 @@ lookups against independent scans of SQLite-produced 512- and 4096-byte WAL/
 hold persistent torn and corrupt publications. Those tests characterize the
 format component only; they do not establish concurrent interoperability.
 
-**Remaining gate:** shared reader locks (`LockFileEx` and Linux OFD read locks);
-WAL-index initialization/recovery and read-mark snapshot protocol; runtime
-writer/checkpointer coordination; and differential cross-process stress while
-all of those mechanisms are attached to the pager. Until all of those are
-complete, there is no shared runtime WAL-index behavior or concurrent
-stock-SQLite interoperability.
+`SqliteWalByteRangeLock` is a detached physical lock primitive over an existing
+carrier file. Its leases express non-blocking or bounded shared and exclusive
+byte-range acquisition without creating, mapping, or interpreting `-shm`.
+Windows uses `LockFileEx`/`UnlockFileEx` with full 64-bit `OVERLAPPED` offsets;
+64-bit Linux uses `fcntl(F_OFD_SETLK)` with `F_RDLCK` or `F_WRLCK`. Each lease
+owns a dedicated carrier descriptor until it is disposed, so an unrelated
+lease cannot shorten an OFD lock lifetime. Focused worker-process tests cover
+shared-reader coexistence, exclusive and mixed-mode contention, independent
+ranges, timeout reporting, and release on disposal. This primitive is not
+connected to `SqliteWalSharedMemoryLocks`, normal `-shm` activity, the pager,
+or any read-mark, writer, or checkpoint role.
+
+**Remaining gate:** attach shared reader locks to WAL-index initialization and
+the read-mark snapshot protocol; implement runtime writer/checkpointer
+coordination; and run differential cross-process stress while all of those
+mechanisms are attached to the pager. Until all of those are complete, there
+is no shared runtime WAL-index behavior or concurrent stock-SQLite
+interoperability.
 
 ### Stage 2 — read marks and the reader protocol
 
