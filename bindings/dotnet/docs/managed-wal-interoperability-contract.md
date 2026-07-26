@@ -179,6 +179,37 @@ This requires a real shared-memory capability on `IFileSystem`
 including both header copies and their checksums, and its frame lookups agree with
 its own independent WAL scan across a corpus of SQLite-produced databases.
 
+#### Stage 1 foundation currently present
+
+`SqliteWalIndexHeader`, `SqliteWalIndexCheckpointInfo`, and
+`SqliteWalIndexHeaderRegion` validate a copied `-shm` header region without
+attaching it to a pager. They enforce SQLite's native-endian fields, the
+big-endian WAL salt bytes, both 48-byte headers and their native checksums, the
+136-byte header layout, and the committed-frame bound on backfill accounting.
+`SqliteWalIndexLayout` fixes the first- and later-block page-number/hash offsets
+for the later lookup implementation.
+
+The header-region parser requires both checksum-valid copies to be identical. A
+difference is rejected as a possibly in-progress dual-header publication, stale
+mapping, or corruption. This is intentionally stricter than the eventual live
+reader, which must use SQLite's mapped-memory barrier and retry protocol before
+selecting a stable header. A parser never exposes a candidate `mxFrame` when
+those guarantees are absent.
+
+`ISqliteWalSharedMemoryFileSystem` and `ISqliteWalSharedMemoryMapping` define
+the capability boundary for a future real mapping. No current filesystem
+implements it and no pager reads, maps, writes, or publishes a WAL-index through
+it. In particular, the `-shm` file remains a zero-length lock carrier and the
+512-byte Stage 0 main-file ownership lock remains unchanged.
+
+**Remaining gate:** a portable physical `mmap`/`MapViewOfFile` implementation;
+shared reader locks (`LockFileEx` and Linux OFD read locks); SQLite's
+barrier-aware second-header-then-first-header publication; lookup validation
+against an independent WAL scan across a SQLite-produced corpus; and
+process-isolated corruption/recovery tests. Until all of those are complete,
+there is no shared runtime WAL-index behavior or concurrent stock-SQLite
+interoperability.
+
 ### Stage 2 — read marks and the reader protocol
 
 Implement SQLite's `walTryBeginRead`: use `WAL_READ_LOCK(0)` for a database-only
