@@ -295,8 +295,11 @@ main database file, WAL, mapped index, and byte-range lock carrier. It takes
 only `WAL_WRITE_LOCK` while appending a complete transaction, flushes the WAL
 before publishing page/hash entries and the duplicate `WalIndexHdr`, and faults
 rather than reusing an artifact when a failure occurs after a commit might have
-become durable. Recovery takes `WAL_WRITE_LOCK`, `WAL_RECOVER_LOCK`, and every
-read-mark lock before truncating an uncommitted tail.
+become durable. Before appending, it requires the independently scanned valid
+and committed frame boundaries to exactly equal the published header, so it
+cannot turn an abandoned but checksum-valid tail into a later transaction.
+Recovery takes `WAL_WRITE_LOCK`, `WAL_RECOVER_LOCK`, and every read-mark lock
+before truncating such a tail.
 
 The checkpointer takes `WAL_CKPT_LOCK` independently of the pager. `PASSIVE`
 calculates `mxSafeFrame` from only the read marks it cannot exclusively lock;
@@ -308,7 +311,12 @@ WAL before copying, flush the main file before advancing `nBackfill`, and reset
 only after every read mark is exclusive. Restart first writes a durable
 checkpoint-reset WAL marker, allowing detached open to repair the stale-index
 interruption window; truncate removes that reset WAL header only after the
-zero-frame index is visible.
+zero-frame index is visible. A zero-length truncated WAL is reopened as a fresh
+empty incarnation using the main database's durable page size, never transient
+`-shm` salts or headers. Checkpoint-progress publication remains bound to the
+selected authenticated WAL incarnation and safe frame, allowing a later writer
+append without advancing past that selected boundary while rejecting an
+incarnation reset.
 `nBackfillAttempted` is published before installation; `nBackfill` is advanced
 only after the main-store flush. On open, it rebuilds all transient index
 progress and lookup state from a clean WAL that it independently authenticates

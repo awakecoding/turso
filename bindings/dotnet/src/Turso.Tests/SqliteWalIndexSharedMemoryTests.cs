@@ -27,6 +27,46 @@ public sealed class SqliteWalIndexSharedMemoryTests
         mapping.ReadBytes(SqliteWalIndexHeader.Size, SqliteWalIndexHeader.Size).Should().Equal(header.ToArray());
     }
 
+    [Test]
+    public void CheckpointProgressCanPublishItsSelectedBoundaryAfterAWriterAdvancesTheHeader()
+    {
+        using var wal = CreateWal((PageNumber: 1, DatabasePageCount: 1));
+        var selectedHeader = CreateIndexHeader(wal);
+        using var mapping = new MemorySharedMemoryMapping(SqliteWalIndexLayout.BlockSize);
+        var index = new SqliteWalIndexSharedMemory(mapping);
+        index.PublishHeader(selectedHeader, wal);
+
+        var secondFrameNumber = wal.AppendFrame(
+            pageNumber: 2,
+            pageData: new byte[wal.PageSize],
+            databaseSizeInPages: 2);
+        wal.Flush();
+        var secondFrame = wal.ReadFrame(secondFrameNumber).Header;
+        var advancedHeader = selectedHeader.WithCommittedFrames(
+            maximumFrame: checked(selectedHeader.MaximumFrame + 1),
+            databasePageCount: 2,
+            secondFrame.Checksum1,
+            secondFrame.Checksum2);
+        mapping.Write(SqliteWalIndexHeader.Size, advancedHeader.ToArray());
+        mapping.MemoryBarrier();
+
+        index.PublishBackfillAttemptedFrameCount(
+            selectedHeader,
+            attemptedFrameCount: 1,
+            wal: wal);
+        index.PublishBackfilledFrameCount(
+            selectedHeader,
+            backfilledFrameCount: 1,
+            wal: wal);
+
+        mapping.Write(position: 0, advancedHeader.ToArray());
+        mapping.MemoryBarrier();
+        var region = index.ReadValidatedHeader(wal);
+        region.Header.MaximumFrame.Should().Be(advancedHeader.MaximumFrame);
+        region.CheckpointInfo.BackfillAttemptedFrameCount.Should().Be(1);
+        region.CheckpointInfo.BackfilledFrameCount.Should().Be(1);
+    }
+
     [TestCase(512)]
     [TestCase(4_096)]
     [NonParallelizable]

@@ -106,9 +106,18 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
                 FileOpenMode.OpenExisting,
                 readOnly: true);
             var region = new SqliteWalIndexSharedMemory(mapping).ReadValidatedHeader(wal);
+            var resetTail = new byte[8];
+            mapping.Read(SqliteWalIndexHeader.Size * 2L + 32, resetTail);
             region.Header.MaximumFrame.Should().Be(0);
             region.CheckpointInfo.BackfilledFrameCount.Should().Be(0);
             region.CheckpointInfo.BackfillAttemptedFrameCount.Should().Be(0);
+            resetTail.Should().Equal(new byte[8]);
+            region.CheckpointInfo.GetReadMark(readMarkIndex: 0).Should().Be(0);
+            for (var readMarkIndex = 1; readMarkIndex < SqliteWalIndexCheckpointInfo.ReadMarkCount; readMarkIndex++)
+            {
+                region.CheckpointInfo.GetReadMark(readMarkIndex)
+                    .Should().Be(SqliteWalIndexCheckpointInfo.ReadMarkNotUsed);
+            }
         }
 
         using (var truncateArtifact = SqliteWalArtifact.Create())
@@ -125,6 +134,96 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
             reopened.Recover(TimeSpan.Zero).LastCommittedFrameNumber.Should().Be(0);
             new FileInfo(truncateArtifact.DatabasePath + "-wal").Length.Should().Be(0);
         }
+    }
+
+    [TestCase("stale")]
+    [TestCase("torn")]
+    [NonParallelizable]
+    public void ZeroLengthTruncateWalReopensDespiteStaleOrTornSharedMemory(string mutation)
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        byte[] staleHeader;
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting,
+                   readOnly: true))
+        {
+            staleHeader = new byte[SqliteWalIndexHeader.Size];
+            mapping.Read(position: 0, staleHeader);
+        }
+
+        using (var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath))
+            coordinator.Checkpoint(SqliteWalCheckpointMode.Truncate, TimeSpan.Zero).ResetWal.Should().BeTrue();
+
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting))
+        {
+            mapping.Write(position: 0, staleHeader);
+            if (mutation == "stale")
+            {
+                mapping.Write(SqliteWalIndexHeader.Size, staleHeader);
+            }
+            else
+            {
+                var tornHeader = staleHeader.ToArray();
+                tornHeader[40] ^= 0x01;
+                mapping.Write(SqliteWalIndexHeader.Size, tornHeader);
+            }
+            mapping.MemoryBarrier();
+        }
+
+        new FileInfo(artifact.DatabasePath + "-wal").Length.Should().Be(0);
+        using var reopened = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        reopened.Recover(TimeSpan.Zero).LastCommittedFrameNumber.Should().Be(0);
+        reopened.Checkpoint(SqliteWalCheckpointMode.Passive, TimeSpan.Zero).MaximumFrame.Should().Be(0);
+        new FileInfo(artifact.DatabasePath + "-wal").Length.Should().Be(0);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void CommitRefusesToPublishAValidUncommittedWalTail()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var before = OpenWalCopy(artifact.DatabasePath);
+        var beforeRecovery = before.ScanRecovery();
+        var committedFrame = before.ReadFrame(beforeRecovery.LastCommittedFrameNumber);
+
+        AppendValidUncommittedFrame(artifact.DatabasePath + "-wal", before, committedFrame);
+
+        Assert.Throws<InvalidDataException>(
+            () => coordinator.Commit(
+                [new SqliteWalWritePage(committedFrame.Header.PageNumber, committedFrame.PageData)],
+                beforeRecovery.LastCommittedDatabaseSizeInPages,
+                TimeSpan.Zero));
+
+        using (var tail = OpenWalCopy(artifact.DatabasePath))
+        {
+            var tailRecovery = tail.ScanRecovery();
+            tailRecovery.LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber + 1);
+            tailRecovery.LastCommittedFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        }
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting,
+                   readOnly: true))
+        {
+            var header = new byte[SqliteWalIndexHeader.Size];
+            mapping.Read(position: 0, header);
+            SqliteWalIndexHeader.Parse(header).MaximumFrame
+                .Should().Be(checked((uint)beforeRecovery.LastCommittedFrameNumber));
+        }
+
+        coordinator.Recover(TimeSpan.Zero).LastCommittedFrameNumber
+            .Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        coordinator.Commit(
+                [new SqliteWalWritePage(committedFrame.Header.PageNumber, committedFrame.PageData)],
+                beforeRecovery.LastCommittedDatabaseSizeInPages,
+                TimeSpan.Zero)
+            .MaximumFrame.Should().Be(checked((uint)beforeRecovery.LastCommittedFrameNumber + 1));
     }
 
     [Test]
@@ -369,6 +468,46 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
         var bytes = new byte[checked((int)stream.Length)];
         stream.ReadExactly(bytes);
         return bytes;
+    }
+
+    private static void AppendValidUncommittedFrame(
+        string walPath,
+        SqliteWalFile wal,
+        SqliteWalFrame committedFrame)
+    {
+        var page = committedFrame.PageData.ToArray();
+        page[^1] ^= 0x7B;
+        var frame = new byte[SqliteWalFrameHeader.Size + wal.PageSize];
+        var frameHeader = new SqliteWalFrameHeader(
+            committedFrame.Header.PageNumber,
+            0,
+            wal.Header.Salt1,
+            wal.Header.Salt2,
+            0,
+            0);
+        frameHeader.WriteTo(frame.AsSpan(0, SqliteWalFrameHeader.Size));
+        page.CopyTo(frame, SqliteWalFrameHeader.Size);
+        var initialChecksum = SqliteWalChecksum.Calculate(
+            frame.AsSpan(0, 8),
+            wal.Header.ChecksumByteOrder,
+            committedFrame.Header.Checksum1,
+            committedFrame.Header.Checksum2);
+        var checksum = SqliteWalChecksum.Calculate(
+            frame.AsSpan(SqliteWalFrameHeader.Size),
+            wal.Header.ChecksumByteOrder,
+            initialChecksum.First,
+            initialChecksum.Second);
+        BinaryPrimitives.WriteUInt32BigEndian(frame.AsSpan(16, sizeof(uint)), checksum.First);
+        BinaryPrimitives.WriteUInt32BigEndian(frame.AsSpan(20, sizeof(uint)), checksum.Second);
+
+        using var stream = new FileStream(
+            walPath,
+            FileMode.Open,
+            FileAccess.Write,
+            FileShare.ReadWrite | FileShare.Delete);
+        stream.Position = stream.Length;
+        stream.Write(frame);
+        stream.Flush(flushToDisk: true);
     }
 
     private static void WriteUInt32Native(ISqliteWalSharedMemoryMapping mapping, long position, uint value)
