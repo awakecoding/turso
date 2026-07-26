@@ -50,6 +50,8 @@ public sealed record SqliteCheckpointResult(
 /// Other platforms fail ownership acquisition rather than silently using only
 /// process-local locks. WAL commits become visible at their flushed commit
 /// marker; DELETE-mode main-file writes are protected by a hot rollback journal.
+/// See <c>bindings/dotnet/docs/managed-wal-interoperability-contract.md</c> for
+/// the normative ownership, busy, recovery, and cache-invalidation contract.
 /// </remarks>
 public sealed class SqlitePager : IDisposable
 {
