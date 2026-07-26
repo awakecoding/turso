@@ -9,7 +9,10 @@ namespace Turso.Core.Storage;
 /// use an OS handle with positional <see cref="RandomAccess"/> I/O, which is
 /// safe for concurrent offset-addressed reads and writes on a single handle.
 /// </summary>
-public sealed partial class PhysicalFileSystem : IFileSystem, IAtomicFileSystem
+public sealed partial class PhysicalFileSystem :
+    IFileSystem,
+    IAtomicFileSystem,
+    ISqliteWalSharedMemoryFileSystem
 {
     private const uint ReplaceFileWriteThrough = 0x00000001;
 
