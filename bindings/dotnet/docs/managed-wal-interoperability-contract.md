@@ -196,14 +196,17 @@ reader, which must use SQLite's mapped-memory barrier and retry protocol before
 selecting a stable header. A parser never exposes a candidate `mxFrame` when
 those guarantees are absent.
 
-`ISqliteWalSharedMemoryFileSystem` and `ISqliteWalSharedMemoryMapping` define
-the capability boundary for a future real mapping. No current filesystem
-implements it and no pager reads, maps, writes, or publishes a WAL-index through
-it. In particular, the `-shm` file remains a zero-length lock carrier and the
-512-byte Stage 0 main-file ownership lock remains unchanged.
+`PhysicalFileSystem` implements `ISqliteWalSharedMemoryFileSystem` with a
+file-backed `MapViewOfFile` mapping on Windows and `mmap(MAP_SHARED)` on 64-bit
+Linux. The mapping validates ranges, grows only from a writable mapping, rejects
+read-only writes, releases native resources deterministically, and supplies a
+full memory barrier for header-publication ordering. It is an optional primitive:
+no pager reads, maps, writes, or publishes a WAL-index through it. In particular,
+the `-shm` file remains a zero-length lock carrier during managed database
+operation and the 512-byte Stage 0 main-file ownership lock remains unchanged.
 
-**Remaining gate:** a portable physical `mmap`/`MapViewOfFile` implementation;
-shared reader locks (`LockFileEx` and Linux OFD read locks); SQLite's
+**Remaining gate:** shared reader locks (`LockFileEx` and Linux OFD read locks);
+SQLite's
 barrier-aware second-header-then-first-header publication; lookup validation
 against an independent WAL scan across a SQLite-produced corpus; and
 process-isolated corruption/recovery tests. Until all of those are complete,
