@@ -435,7 +435,13 @@ internal static class IndexExpressionSemantics
                     table.Columns,
                     candidate => string.Equals(candidate, name, StringComparison.OrdinalIgnoreCase));
                 if (columnIndex < 0)
+                {
+                    // A bare TRUE/FALSE keyword that matches no column is the integer literal 1/0.
+                    if (column.BooleanKeyword is not null)
+                        return;
+
                     throw new EmbeddedSqlException($"no such column: {name}");
+                }
                 if (table.ColumnDefinitions[columnIndex].Collation is { } columnCollation)
                     ValidateCollation("expression", columnCollation);
                 return;
