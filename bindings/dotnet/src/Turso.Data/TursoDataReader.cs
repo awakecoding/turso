@@ -15,6 +15,7 @@ public class TursoDataReader : DbDataReader, IConnectionOwnedReader
     private readonly IManagedStatementAdapter? _managedStatement;
     private readonly CommandBehavior _behavior;
     private readonly Action _completionCallback;
+    private string?[]? _declaredColumnTypes;
     private bool _isClosed;
     private bool _hasCurrentRow;
     private bool _completionNotified;
@@ -159,7 +160,7 @@ public class TursoDataReader : DbDataReader, IConnectionOwnedReader
         if (!_hasCurrentRow)
         {
             ValidateOrdinal(ordinal);
-            return string.Empty;
+            return StripDeclaredTypeLength(DeclaredColumnType(ordinal)) ?? string.Empty;
         }
 
         var value = ReadValue(ordinal);
@@ -193,7 +194,10 @@ public class TursoDataReader : DbDataReader, IConnectionOwnedReader
         if (!_hasCurrentRow)
         {
             ValidateOrdinal(ordinal);
-            return typeof(object);
+            var declared = DeclaredColumnType(ordinal);
+            return declared is null
+                ? typeof(object)
+                : TursoSchemaCollections.GetClrTypeFromDeclaredTypeName(declared, typeof(object));
         }
 
         var value = ReadValue(ordinal);
@@ -205,6 +209,33 @@ public class TursoDataReader : DbDataReader, IConnectionOwnedReader
             ReaderValueKind.Blob => typeof(byte[]),
             _ => typeof(object)
         };
+    }
+
+    /// <summary>
+    /// Returns the declared type of a projected column, or <c>null</c> when the statement does not
+    /// project it from a stored column. A local result set carries no declared types, so the
+    /// catalog is the only source before the first <see cref="Read"/>. <c>DbDataAdapter</c> builds
+    /// its <see cref="DataTable"/> columns from <see cref="GetFieldType"/> at that point, so
+    /// answering <c>object</c> for everything would produce an untyped dataset.
+    /// </summary>
+    private string? DeclaredColumnType(int ordinal)
+    {
+        _declaredColumnTypes ??= TursoSchemaCollections.GetDeclaredColumnTypes(
+            _connection,
+            _command.CommandText,
+            GetFieldCount(),
+            GetName);
+
+        return ordinal < _declaredColumnTypes.Length ? _declaredColumnTypes[ordinal] : null;
+    }
+
+    private static string? StripDeclaredTypeLength(string? declaredType)
+    {
+        if (declaredType is null)
+            return null;
+
+        var parenthesis = declaredType.IndexOf('(', StringComparison.Ordinal);
+        return parenthesis < 0 ? declaredType : declaredType[..parenthesis].TrimEnd();
     }
 
     public override float GetFloat(int ordinal)
@@ -288,6 +319,21 @@ public class TursoDataReader : DbDataReader, IConnectionOwnedReader
     }
 
     public override int FieldCount => GetFieldCount();
+
+    /// <summary>
+    /// Returns a schema table describing the columns of the current result set.
+    /// </summary>
+    /// <remarks>
+    /// Column metadata that a result set cannot carry (nullability, key membership, declared
+    /// type) is recovered from the catalog when the statement selects from a single table.
+    /// </remarks>
+    public override DataTable GetSchemaTable()
+        => TursoSchemaCollections.BuildReaderSchemaTable(
+            _connection,
+            _command.CommandText,
+            FieldCount,
+            GetName,
+            GetFieldType);
 
     public override object this[int ordinal] => GetValue(ordinal)!;
 

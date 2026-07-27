@@ -346,6 +346,32 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
         throw new NotSupportedException("Turso does not support changing the active database.");
     }
 
+    /// <summary>
+    /// Returns the <c>MetaDataCollections</c> schema collection.
+    /// </summary>
+    public override DataTable GetSchema()
+        => GetSchema(DbMetaDataCollectionNames.MetaDataCollections, null);
+
+    /// <summary>
+    /// Returns the requested schema collection.
+    /// </summary>
+    /// <param name="collectionName">The name of the collection to return.</param>
+    public override DataTable GetSchema(string collectionName)
+        => GetSchema(collectionName, null);
+
+    /// <summary>
+    /// Returns the requested schema collection, filtered by the supplied restrictions.
+    /// </summary>
+    /// <param name="collectionName">The name of the collection to return.</param>
+    /// <param name="restrictionValues">The restriction values for the collection.</param>
+    /// <remarks>
+    /// The catalog is read with ordinary SQL on this connection, so remote Hrana and
+    /// embedded-replica connections describe the database they are attached to instead of an
+    /// empty local catalog. A statement the target rejects surfaces that engine's error.
+    /// </remarks>
+    public override DataTable GetSchema(string collectionName, string?[]? restrictionValues)
+        => TursoSchemaCollections.GetSchema(this, collectionName, restrictionValues);
+
     internal int DefaultTimeout => _connectionOptions.DefaultTimeout;
 
     internal bool IsRemote => _remoteClient is not null;
