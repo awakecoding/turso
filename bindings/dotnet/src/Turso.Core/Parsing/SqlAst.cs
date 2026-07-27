@@ -196,9 +196,18 @@ internal sealed record UpdateStatement(
     IReadOnlyList<Projection>? Returning = null,
     IReadOnlyList<OrderByTerm>? OrderBy = null,
     Expression? Limit = null,
-    Expression? Offset = null) : ParsedStatement
+    Expression? Offset = null,
+    string? Alias = null,
+    TableSource? From = null,
+    InsertConflictAlgorithm? ConflictAlgorithm = null) : ParsedStatement
 {
     public IReadOnlyList<OrderByTerm> EffectiveOrderBy => OrderBy ?? [];
+
+    /// <summary>
+    /// The name target columns are qualified by inside SET, WHERE, and the FROM join.
+    /// An alias replaces the table name entirely, matching SQLite.
+    /// </summary>
+    public string TargetQualifier => Alias ?? ManagedSchemaName.Display(TableName);
 }
 
 internal sealed record DeleteStatement(
@@ -207,9 +216,13 @@ internal sealed record DeleteStatement(
     IReadOnlyList<Projection>? Returning = null,
     IReadOnlyList<OrderByTerm>? OrderBy = null,
     Expression? Limit = null,
-    Expression? Offset = null) : ParsedStatement
+    Expression? Offset = null,
+    string? Alias = null) : ParsedStatement
 {
     public IReadOnlyList<OrderByTerm> EffectiveOrderBy => OrderBy ?? [];
+
+    /// <summary>The name target columns are qualified by inside WHERE.</summary>
+    public string TargetQualifier => Alias ?? ManagedSchemaName.Display(TableName);
 }
 
 internal sealed record PragmaTableInfoStatement(string TableName) : ParsedStatement;
