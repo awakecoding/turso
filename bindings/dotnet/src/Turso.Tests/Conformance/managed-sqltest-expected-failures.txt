@@ -16,16 +16,12 @@ after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-with-
 after-insert-trigger-cache-spill.sqltest::before-insert-trigger-cache-spill-with-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
 after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-no-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
 after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-multi-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
-agg-functions/agg-extreme-exponent.sqltest::avg_hex_large | expected 1 row(s), got 1 row(s); row 0 expected 'real/Inf' but was 'real/0.0'
-agg-functions/agg-extreme-exponent.sqltest::sum_hex_large | expected 1 row(s), got 1 row(s); row 0 expected 'real/Inf' but was 'integer/0'
 agg-functions/avg-large-integers.sqltest::avg_large_integers_rounds_like_sqlite | expected 1 row(s), got 1 row(s); row 0 expected '0.5' but was '1.0'
 agg-functions/avg-large-integers.sqltest::avg_large_integers_ignore_nulls | expected 1 row(s), got 1 row(s); row 0 expected '0.5' but was '1.0'
 agg-functions/avg-large-integers.sqltest::avg_i64_edge_pair_positive | expected 1 row(s), got 1 row(s); row 0 expected '0.5' but was '0.0'
 agg-functions/avg-large-integers.sqltest::avg_i64_edge_pair_negative | expected 1 row(s), got 1 row(s); row 0 expected '-0.5' but was '0.0'
 agg-functions/avg-large-integers.sqltest::avg_large_integers_grouped | expected 2 row(s), got 2 row(s); row 0 expected '1/0.5' but was '1/1.0'
 agg-functions/avg-large-integers.sqltest::avg_infinite_cancellation_returns_null | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
-agg-functions/avg-text-types.sqltest::avg_partial_integer_text_rounds_like_sqlite | expected 1 row(s), got 1 row(s); row 0 expected 'real/1.0' but was 'real/0.0'
-agg-functions/avg-text-types.sqltest::avg_partial_integer_text_grouped | expected 2 row(s), got 2 row(s); row 0 expected '1/real/1.0' but was '1/real/0.0'
 agg-functions/group-concat-types.sqltest::group-concat-zero-real-and-text | expected 1 row(s), got 1 row(s); row 0 expected '0.0,zero' but was '0,zero'
 agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_integer_label | expected success but got error: no such function: JSONB_GROUP_OBJECT
 agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_real_label | expected success but got error: no such function: JSONB_GROUP_OBJECT
@@ -37,11 +33,6 @@ agg-functions/order-by-aggregate-misuse.sqltest::order-by-min-misuse | expected 
 agg-functions/order-by-aggregate-misuse.sqltest::order-by-max-misuse | expected an error but the statement succeeded
 agg-functions/order-by-aggregate-misuse.sqltest::order-by-sum-misuse | expected an error but the statement succeeded
 agg-functions/order-by-aggregate-misuse.sqltest::order-by-count-misuse | expected an error but the statement succeeded
-agg-functions/sum-blob-types.sqltest::total-blob-ascii-digit-prefix | expected 1 row(s), got 1 row(s); row 0 expected '9.0' but was '0.0'
-agg-functions/sum-blob-types.sqltest::total-blob-non-utf8-with-leading-digit | expected 1 row(s), got 1 row(s); row 0 expected '9.0' but was '0.0'
-agg-functions/sum-blob-types.sqltest::total-blob-long-non-utf8-with-leading-digit | expected 1 row(s), got 1 row(s); row 0 expected '9.0' but was '0.0'
-agg-functions/sum-blob-types.sqltest::sum-blob-non-utf8-with-leading-digit | expected 1 row(s), got 1 row(s); row 0 expected 'real/48.0' but was 'integer/0'
-agg-functions/sum-blob-types.sqltest::sum-cast-text-to-blob-returns-real | expected 1 row(s), got 1 row(s); row 0 expected 'real/60.0' but was 'integer/0'
 agg-functions/sum-inf-cancel.sqltest::sum_inf_minus_inf | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
 agg-functions/sum-inf-cancel.sqltest::avg_inf_minus_inf | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
 agg-functions/sum-inf-cancel.sqltest::total_inf_minus_inf | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
@@ -49,10 +40,6 @@ agg-functions/sum-inf-cancel.sqltest::sum_inf_cancel_with_finite_values | expect
 agg-functions/sum-large-float.sqltest::sum-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 33.
 agg-functions/sum-large-float.sqltest::total-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 35.
 agg-functions/sum-large-float.sqltest::avg-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 33.
-agg-functions/sum-text-types.sqltest::sum-partial-integer-text-returns-real | expected 1 row(s), got 1 row(s); row 0 expected 'real/7.0' but was 'integer/0'
-agg-functions/sum-text-types.sqltest::sum-non-numeric-text-returns-real | expected 1 row(s), got 1 row(s); row 0 expected 'real/0.0' but was 'integer/0'
-agg-functions/sum-text-types.sqltest::sum-mixed-pure-and-partial-text-returns-real | expected 1 row(s), got 1 row(s); row 0 expected 'real/7.0' but was 'integer/4'
-agg-functions/sum-text-types.sqltest::sum-text-default-partial-numeric | expected 1 row(s), got 1 row(s); row 0 expected 'real/12.0' but was 'integer/0'
 alter-rename-column-qualified-trigger-error.sqltest::rename-column-trigger-when-doubly-qualified-ref-error-message | error 'Expected keyword BEGIN. At SQL offset 48.' does not match pattern 'no such column: main\.t\.b'
 alter-table-quoted-trigger-target.sqltest::drop-column-with-unrelated-quoted-trigger-target | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t2 (id INTEGER PRIMARY KEY, keep_col TEXT)' but was 'CREATE TABLE "t2" ("id" INTEGER PRIMARY KEY, 
 alter-table-quoted-trigger-target.sqltest::rename-column-with-unrelated-quoted-trigger-target | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t2 (id INTEGER PRIMARY KEY, d TEXT)' but was 'CREATE TABLE "t2" ("id" INTEGER PRIMARY KEY, "d" TEX
@@ -192,10 +179,6 @@ before-update-trigger-correlated-subquery.sqltest::before-update-trigger-correla
 before-update-trigger-correlated-subquery.sqltest::before-update-trigger-uncorrelated-subquery | expected 3 row(s), got 3 row(s); row 1 expected '2/600' but was '2/1100'
 before-update-trigger-correlated-subquery.sqltest::before-update-trigger-subquery-in-where-and-set | expected success but got error: no such column: t.id
 before-update-trigger-correlated-subquery.sqltest::before-and-after-update-trigger-correlated-subquery | expected success but got error: no such column: t.id
-boolean.sqltest::boolean-not-text-float-edge | expected 1 row(s), got 1 row(s); row 0 expected '0' but was '1'
-boolean.sqltest::where-string-numeric-prefix-1 | expected 1 row(s), got 0 row(s)
-boolean.sqltest::where-string-numeric-prefix-2 | expected 1 row(s), got 0 row(s)
-boolean.sqltest::where-string-float-prefix | expected 1 row(s), got 0 row(s)
 bracket-quoting.sqltest::bracket-default-identifier | expected success but got error: default value of column is not constant: hello
 bracket-quoting.sqltest::bracket-alter-rename-column | expected success but got error: Expected keyword TO. At SQL offset 24.
 bracket-quoting.sqltest::bracket-transaction-name | expected success but got error: Expected End. At SQL offset 18.
@@ -559,15 +542,10 @@ literal.sqltest::numberic-literal-13 | expected success but got error: Expected 
 literal.sqltest::numberic-literal-14 | expected success but got error: Expected End. At SQL offset 9.
 literal.sqltest::numberic-literal-exceed-max-i64 | expected success but got error: Expected End. At SQL offset 8.
 literal.sqltest::numberic-literal-exceed-min-i64 | expected success but got error: Expected End. At SQL offset 9.
-math/memory.sqltest::add-float-text-edgecase | expected 1 row(s), got 1 row(s); row 0 expected '109.07658' but was '0'
-math/memory.sqltest::add-str-edgecase | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
-math/memory.sqltest::subtract-str-float-edgecase | expected 1 row(s), got 1 row(s); row 0 expected '-355.52342' but was '0'
-math/memory.sqltest::multiply-str-floats-edgecase | expected 1 row(s), got 1 row(s); row 0 expected '-28624.798143' but was '0'
 math/memory.sqltest::ceil-int | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
 math/memory.sqltest::ceiling-int | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
 math/memory.sqltest::floor-int | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
 math/memory.sqltest::trunc-int | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
-math/memory.sqltest::mod-int-int | expected 1 row(s), got 1 row(s); row 0 expected '1.0' but was '1'
 mvcc-begin-within-concurrent.sqltest::begin-immediate-inside-begin-concurrent-errors | error 'Expected End. At SQL offset 6.' does not match pattern 'cannot start a transaction within a transaction'
 mvcc-begin-within-concurrent.sqltest::begin-deferred-inside-begin-concurrent-errors | error 'Expected End. At SQL offset 6.' does not match pattern 'cannot start a transaction within a transaction'
 mvcc-begin-within-concurrent.sqltest::begin-concurrent-inside-begin-concurrent-errors | error 'Expected End. At SQL offset 6.' does not match pattern 'cannot start a transaction within a transaction'
@@ -796,8 +774,6 @@ subquery/memory.sqltest::subquery-correlated-in-having-grouped-scalar-null | exp
 subquery/memory.sqltest::subquery-uncorrelated-in-having-in | expected success but got error: no such column: total
 subquery/memory.sqltest::subquery-column-affinity-inheritance | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
 subquery/memory.sqltest::subquery-correlated-exists-in-select-with-aggregate-empty-table | expected success but got error: no such column: t6.id
-subquery/memory.sqltest::exists-in-ungrouped-aggregate-with-data | expected 1 row(s), got 1 row(s); row 0 expected '1/0.0' but was '1/0'
-subquery/memory.sqltest::exists-in-ungrouped-aggregate-empty-subquery-table | expected 1 row(s), got 1 row(s); row 0 expected '0/0.0' but was '0/0'
 subquery/memory.sqltest::correlated-exists-in-ungrouped-aggregate-empty-main-table | expected success but got error: no such column: t14.a
 temp_tables.sqltest::temp-table-join-can-distinguish-main-and-temp | expected success but got error: Cross-database statements are not supported by managed ATTACH; every persistent table reference must resolve to one database.
 temp_tables.sqltest::temp-store-memory-still-supports-temp-tables | expected success but got error: Unsupported PRAGMA temp_store. At SQL offset 18.

@@ -22186,27 +22186,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
             if (value.Kind == SqlValueKind.Null)
                 continue;
 
-            var numeric = ApplyNumericAffinity(value);
+            // SQLite accumulates in integers only while every value is exactly an integer
+            // (sqlite3_value_numeric_type). Anything else - a real, or text such as '12abc' that
+            // merely starts with a number - switches to floating point via sqlite3_value_double.
+            var exact = ApplyComparisonNumericAffinity(value);
             count++;
-            if (numeric.Kind == SqlValueKind.Real)
+            if (!hasReal && exact.Kind == SqlValueKind.Integer)
             {
-                if (!hasReal)
-                {
-                    realTotal = integerTotal;
-                    hasReal = true;
-                }
-
-                realTotal += numeric.AsReal();
+                integerTotal = checked(integerTotal + exact.AsInteger());
                 continue;
             }
 
-            if (hasReal)
+            if (!hasReal)
             {
-                realTotal += numeric.AsInteger();
-                continue;
+                realTotal = integerTotal;
+                hasReal = true;
             }
 
-            integerTotal = checked(integerTotal + numeric.AsInteger());
+            realTotal += exact.Kind is SqlValueKind.Integer or SqlValueKind.Real
+                ? AsReal(exact)
+                : AsReal(ApplyNumericAffinity(value));
         }
 
         if (average)
@@ -23771,7 +23770,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return SqlValue.Integer(Math.Abs(value.AsInteger()));
         }
 
-        return SqlValue.Real(Math.Abs(AsReal(value)));
+        // Text and blobs numerify rather than raising, so abs('abc') is 0.0 like SQLite.
+        return SqlValue.Real(Math.Abs(AsReal(ApplyNumericAffinity(value))));
     }
 
     private static string ToSqliteLower(string value)
@@ -26231,21 +26231,117 @@ public sealed partial class EmbeddedDatabase : IDisposable
         };
     }
 
+    /// <summary>
+    /// Numerifies a value the way SQLite's <c>sqlite3_value_double</c> does for CAST, arithmetic,
+    /// truth tests, <c>abs()</c> and <c>round()</c>: a leading numeric prefix is consumed and the
+    /// remainder is ignored, so <c>'12abc'</c> becomes 12 and a blob is read as its bytes. This is
+    /// deliberately more permissive than <see cref="ApplyComparisonNumericAffinity"/>, which
+    /// converts only a value that is entirely a well-formed number so that <c>'12abc'</c> never
+    /// compares equal to 12 and is still stored as text in a NUMERIC column. The math builtins use
+    /// that stricter rule instead and yield NULL; see <c>TryGetMathOperand</c>.
+    /// </summary>
     private static SqlValue ApplyNumericAffinity(SqlValue value)
     {
-        if (value.Kind is SqlValueKind.Integer or SqlValueKind.Real)
-            return value;
-        if (value.Kind == SqlValueKind.Text)
+        switch (value.Kind)
         {
-            var text = value.AsText().Trim();
-            if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
-                return SqlValue.Integer(integer);
-            if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var real))
-                return SqlValue.Real(real);
+            case SqlValueKind.Integer:
+            case SqlValueKind.Real:
+                return value;
+            case SqlValueKind.Text when TryParseNumericPrefix(value.AsText(), out var text):
+                return text;
+            case SqlValueKind.Blob when TryParseNumericPrefix(DecodeBlobAsLatin1(value.AsBlob().Span), out var blob):
+                return blob;
+            default:
+                return SqlValue.Integer(0);
+        }
+    }
+
+    /// <summary>
+    /// Reads blob bytes as characters for numerification. SQLite runs its text-to-number parser
+    /// straight over the blob's bytes, and that parser accepts only ASCII, so a byte-preserving
+    /// decode is equivalent while never throwing on non-UTF-8 content.
+    /// </summary>
+    private static string DecodeBlobAsLatin1(ReadOnlySpan<byte> bytes)
+        => System.Text.Encoding.Latin1.GetString(bytes);
+
+    /// <summary>
+    /// Parses the leading numeric prefix of <paramref name="text"/>, mirroring SQLite's
+    /// <c>sqlite3AtoF</c>. The result is an integer only when the prefix carries no fraction and
+    /// no exponent and fits in a 64-bit integer, so <c>'1e3xyz'</c> is the real 1000.0 while
+    /// <c>'12abc'</c> is the integer 12.
+    /// </summary>
+    private static bool TryParseNumericPrefix(ReadOnlySpan<char> text, out SqlValue value)
+    {
+        var index = 0;
+        while (index < text.Length && IsSqlSpace(text[index]))
+            index++;
+
+        var start = index;
+        if (index < text.Length && text[index] is '+' or '-')
+            index++;
+
+        var digits = 0;
+        while (index < text.Length && char.IsAsciiDigit(text[index]))
+        {
+            index++;
+            digits++;
         }
 
-        return SqlValue.Integer(0);
+        var isReal = false;
+        if (index < text.Length && text[index] == '.')
+        {
+            isReal = true;
+            index++;
+            while (index < text.Length && char.IsAsciiDigit(text[index]))
+            {
+                index++;
+                digits++;
+            }
+        }
+
+        if (digits == 0)
+        {
+            value = default;
+            return false;
+        }
+
+        // An exponent only counts when at least one digit follows it, so '1e' is 1 rather than
+        // a parse failure and '.e5' has no numeric prefix at all.
+        if (index < text.Length && text[index] is 'e' or 'E')
+        {
+            var exponent = index + 1;
+            if (exponent < text.Length && text[exponent] is '+' or '-')
+                exponent++;
+            if (exponent < text.Length && char.IsAsciiDigit(text[exponent]))
+            {
+                isReal = true;
+                index = exponent;
+                while (index < text.Length && char.IsAsciiDigit(text[index]))
+                    index++;
+            }
+        }
+
+        var number = text[start..index];
+        if (!isReal
+            && long.TryParse(number, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
+        {
+            value = SqlValue.Integer(integer);
+            return true;
+        }
+
+        // An integer prefix too large for 64 bits degrades to a real, matching SQLite.
+        if (double.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out var real))
+        {
+            value = SqlValue.Real(real);
+            return true;
+        }
+
+        value = default;
+        return false;
     }
+
+    private static bool IsSqlSpace(char character)
+        => character is ' ' or '\t' or '\n' or '\v' or '\f' or '\r';
 
     private static long RequireInteger(SqlValue value)
     {
