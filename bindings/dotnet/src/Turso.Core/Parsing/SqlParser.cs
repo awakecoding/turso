@@ -8,13 +8,16 @@ internal sealed class SqlParser
     private readonly SqlLexer _lexer;
     private readonly string _sql;
     private readonly Dictionary<string, int> _namedParameterIndices = new(StringComparer.Ordinal);
+    private readonly SqlSourceSpans? _spans;
     private int _maximumParameterIndex;
     private bool _inTriggerBody;
+    private IReadOnlyList<SqlToken>? _pendingUpdateOfTokens;
 
-    private SqlParser(string sql, SqlParameterMap parameterMap)
+    private SqlParser(string sql, SqlParameterMap parameterMap, SqlSourceSpans? spans = null)
     {
         _lexer = new SqlLexer(sql);
         _sql = sql;
+        _spans = spans;
         for (var index = 1; index <= parameterMap.Count; index++)
         {
             var name = parameterMap.GetName(index);
@@ -30,6 +33,34 @@ internal sealed class SqlParser
         parser.Consume(TokenKind.Semicolon);
         parser.Expect(TokenKind.End);
         return statement;
+    }
+
+    /// <summary>
+    /// Parses a full statement while recording the source span of every identifier that can
+    /// name a column, so <c>ALTER TABLE ... RENAME COLUMN</c> can edit the stored SQL text in
+    /// place instead of re-rendering it from the parse tree.
+    /// </summary>
+    public static ParsedStatement ParseWithSpans(string sql, out SqlSourceSpans spans)
+    {
+        spans = new SqlSourceSpans();
+        var parser = new SqlParser(sql, SqlParameterMap.Parse(sql), spans);
+        var statement = parser.ParseStatement();
+        parser.Consume(TokenKind.Semicolon);
+        parser.Expect(TokenKind.End);
+        return statement;
+    }
+
+    /// <summary>
+    /// Parses a bare expression fragment (a CHECK body, a generated-column expression, an
+    /// index key, or a partial-index predicate) with identifier spans recorded.
+    /// </summary>
+    public static Expression ParseExpressionWithSpans(string sql, out SqlSourceSpans spans)
+    {
+        spans = new SqlSourceSpans();
+        var parser = new SqlParser(sql, SqlParameterMap.Parse(sql), spans);
+        var expression = parser.ParseExpression();
+        parser.Expect(TokenKind.End);
+        return expression;
     }
 
     private ParsedStatement ParseStatement()
@@ -878,7 +909,26 @@ internal sealed class SqlParser
             {
                 var columnName = ExpectIdentifier();
                 ExpectKeyword("TO");
-                return new AlterTableRenameColumnStatement(tableName, columnName, ExpectIdentifier());
+                var newNameToken = ExpectIdentifierToken();
+                return new AlterTableRenameColumnStatement(
+                    tableName,
+                    columnName,
+                    newNameToken.Text,
+                    newNameToken.IsQuoted);
+            }
+
+            if (!CurrentIsKeyword("TO"))
+            {
+                // SQLite accepts the COLUMN keyword as optional, so `RENAME <old> TO <new>`
+                // is the same statement as `RENAME COLUMN <old> TO <new>`.
+                var columnName = ExpectIdentifier();
+                ExpectKeyword("TO");
+                var newNameToken = ExpectIdentifierToken();
+                return new AlterTableRenameColumnStatement(
+                    tableName,
+                    columnName,
+                    newNameToken.Text,
+                    newNameToken.IsQuoted);
             }
 
             ExpectKeyword("TO");
@@ -996,7 +1046,7 @@ internal sealed class SqlParser
             if (body.Count == 0)
                 throw Error("A trigger body must contain at least one statement.");
 
-            return new CreateTriggerStatement(
+            var trigger = new CreateTriggerStatement(
                 name,
                 timing,
                 triggerEvent,
@@ -1006,10 +1056,15 @@ internal sealed class SqlParser
                 body,
                 NormalizeObjectSql(),
                 ifNotExists);
+            if (_spans is not null && _pendingUpdateOfTokens is not null)
+                _spans.RecordList(trigger, _pendingUpdateOfTokens);
+
+            return trigger;
         }
         finally
         {
             _inTriggerBody = false;
+            _pendingUpdateOfTokens = null;
         }
     }
 
@@ -1022,8 +1077,12 @@ internal sealed class SqlParser
         if (ConsumeKeyword("UPDATE"))
         {
             IReadOnlyList<string>? updateOfColumns = null;
+            _pendingUpdateOfTokens = null;
             if (ConsumeKeyword("OF"))
-                updateOfColumns = ParseIdentifierList();
+            {
+                updateOfColumns = ParseIdentifierList(out var tokens);
+                _pendingUpdateOfTokens = tokens;
+            }
 
             return (TriggerEvent.Update, updateOfColumns);
         }
@@ -1096,9 +1155,10 @@ internal sealed class SqlParser
         var tableName = ParseSchemaQualifiedName();
         RejectQualifiedTriggerDmlTarget(tableName);
         string[]? columns = null;
+        IReadOnlyList<SqlToken>? columnTokens = null;
         if (Consume(TokenKind.LeftParen))
         {
-            columns = ParseIdentifierList();
+            columns = ParseIdentifierList(out columnTokens);
             Expect(TokenKind.RightParen);
         }
 
@@ -1139,7 +1199,18 @@ internal sealed class SqlParser
         }
 
         var upsert = ParseUpsert();
-        return new InsertStatement(tableName, columns, rows, source, ParseReturning(), upsert, conflictAlgorithm);
+        var insert = new InsertStatement(
+            tableName,
+            columns,
+            rows,
+            source,
+            ParseReturning(),
+            upsert,
+            conflictAlgorithm);
+        if (_spans is not null && columnTokens is not null)
+            _spans.RecordList(insert, columnTokens);
+
+        return insert;
     }
 
     private InsertConflictAlgorithm? ParseInsertConflictAlgorithm()
@@ -1248,28 +1319,31 @@ internal sealed class SqlParser
         var assignments = new List<ColumnAssignment>();
         do
         {
-            string[] columns;
+            SqlToken[] columnTokens;
             var isRowAssignment = Consume(TokenKind.LeftParen);
             if (isRowAssignment)
             {
-                columns = ParseIdentifierList();
+                ParseIdentifierList(out var tokens);
+                columnTokens = tokens.ToArray();
                 Expect(TokenKind.RightParen);
             }
             else
             {
-                columns = [ExpectIdentifier()];
+                columnTokens = [ExpectIdentifierToken()];
             }
 
             Expect(TokenKind.Equal);
             var value = ParseExpression();
-            for (var index = 0; index < columns.Length; index++)
+            for (var index = 0; index < columnTokens.Length; index++)
             {
-                assignments.Add(new ColumnAssignment(
-                    columns[index],
+                var assignment = new ColumnAssignment(
+                    columnTokens[index].Text,
                     value,
                     index,
-                    columns.Length,
-                    isRowAssignment));
+                    columnTokens.Length,
+                    isRowAssignment);
+                _spans?.RecordName(assignment, columnTokens[index]);
+                assignments.Add(assignment);
             }
         }
         while (Consume(TokenKind.Comma));
@@ -2353,11 +2427,18 @@ internal sealed class SqlParser
                 }
                 if (Consume(TokenKind.Dot))
                 {
-                    var columnName = ExpectIdentifier();
-                    return new ColumnExpression(
-                        token.Text + "." + columnName,
+                    var columnToken = ExpectIdentifierToken();
+                    var qualified = new ColumnExpression(
+                        token.Text + "." + columnToken.Text,
                         token.Text,
-                        columnName);
+                        columnToken.Text);
+                    if (_spans is not null)
+                    {
+                        _spans.RecordQualifier(qualified, token);
+                        _spans.RecordName(qualified, columnToken);
+                    }
+
+                    return qualified;
                 }
                 if (!token.IsQuoted
                     && string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
@@ -2426,7 +2507,9 @@ internal sealed class SqlParser
                     return new FunctionExpression(functionName, arguments, false, distinct, filter, window);
                 }
 
-                return new ColumnExpression(token.Text);
+                var bareColumn = new ColumnExpression(token.Text);
+                _spans?.RecordName(bareColumn, token);
+                return bareColumn;
             default:
                 throw Error("Expected an expression.");
         }
@@ -2561,12 +2644,16 @@ internal sealed class SqlParser
     }
 
     private string[] ParseIdentifierList()
-    {
-        var identifiers = new List<string> { ExpectIdentifier() };
-        while (Consume(TokenKind.Comma))
-            identifiers.Add(ExpectIdentifier());
+        => ParseIdentifierList(out _);
 
-        return identifiers.ToArray();
+    private string[] ParseIdentifierList(out IReadOnlyList<SqlToken> tokens)
+    {
+        var collected = new List<SqlToken> { ExpectIdentifierToken() };
+        while (Consume(TokenKind.Comma))
+            collected.Add(ExpectIdentifierToken());
+
+        tokens = collected;
+        return collected.Select(static token => token.Text).ToArray();
     }
 
     private EmbeddedColumn ParseColumnDefinition()
@@ -2951,6 +3038,16 @@ internal sealed class SqlParser
         var value = _lexer.Current.Text;
         _lexer.Next();
         return value;
+    }
+
+    private SqlToken ExpectIdentifierToken()
+    {
+        if (_lexer.Current.Kind != TokenKind.Identifier)
+            throw Error("Expected an identifier.");
+
+        var token = _lexer.Current;
+        _lexer.Next();
+        return token;
     }
 
     private string ParseSchemaQualifiedName()

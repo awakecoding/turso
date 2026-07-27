@@ -2004,7 +2004,7 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
-    public void TriggerDependentRenamesAreRejectedWithoutCatalogDamage()
+    public void TriggerDependentColumnRenamesRewriteBodiesAndTableRenamesStayRejected()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -2015,8 +2015,15 @@ public sealed class ManagedTriggerRowSemanticsTests
             "CREATE TRIGGER data_after AFTER INSERT ON data "
                 + "BEGIN INSERT INTO trace VALUES (NEW.id); END");
 
+        // RENAME TABLE still cannot rewrite trigger bodies, so it must keep rejecting.
         Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "ALTER TABLE data RENAME TO renamed"));
-        Assert.Throws<EmbeddedSqlException>(() => Execute(connection, "ALTER TABLE data RENAME COLUMN id TO value"));
+
+        Execute(connection, "ALTER TABLE data RENAME COLUMN id TO value");
+        ReadRows(connection, "SELECT sql FROM sqlite_schema WHERE name='data_after'").Single()[0].AsText()
+            .Should().Be(
+                "CREATE TRIGGER data_after AFTER INSERT ON data "
+                    + "BEGIN INSERT INTO trace VALUES (NEW.value); END");
+
         Execute(connection, "INSERT INTO data VALUES (1)");
         ReadRows(connection, "SELECT id FROM trace").Should().ContainSingle()
             .Which[0].Should().Be(SqlValue.Integer(1));
@@ -2332,7 +2339,7 @@ public sealed class ManagedTriggerRowSemanticsTests
     }
 
     [Test]
-    public void ColumnRenameDetectsDependenciesFromOtherTriggerTargets()
+    public void ColumnRenameRewritesDependenciesFromOtherTriggerTargets()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
@@ -2344,9 +2351,12 @@ public sealed class ManagedTriggerRowSemanticsTests
             "CREATE TRIGGER source_after AFTER INSERT ON source BEGIN "
                 + "INSERT INTO trace SELECT value FROM target; END");
 
-        Assert.Throws<EmbeddedSqlException>(
-            () => Execute(connection, "ALTER TABLE target RENAME COLUMN value TO renamed"))!
-            .Message.Should().Contain("error in trigger source_after after rename column");
+        Execute(connection, "ALTER TABLE target RENAME COLUMN value TO renamed");
+        ReadRows(connection, "SELECT sql FROM sqlite_schema WHERE name='source_after'").Single()[0].AsText()
+            .Should().Be(
+                "CREATE TRIGGER source_after AFTER INSERT ON source BEGIN "
+                    + "INSERT INTO trace SELECT renamed FROM target; END");
+
         Execute(connection, "INSERT INTO target VALUES (7)");
         Execute(connection, "INSERT INTO source VALUES (1)");
         ReadRows(connection, "SELECT value FROM trace").Should().ContainSingle()
