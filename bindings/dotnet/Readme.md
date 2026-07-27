@@ -185,6 +185,10 @@ Deliberate limits:
 - Chained `ON CONFLICT` clauses on a single `INSERT`.
 - Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Turso's
   AEGIS ciphers fail closed rather than being partially read.
+- File-backed databases on macOS and on 32-bit Linux. Managed lock leases require
+  Linux OFD locks (`F_OFD_SETLK`) or Windows `LockFileEx`, so opening any
+  on-disk database elsewhere throws `PlatformNotSupportedException`. In-memory
+  connections work on every platform.
 
 ### Testing scope
 
@@ -198,8 +202,34 @@ interruption, torn and uncommitted tails, and carrier replacement.
 The ordinary pager and commit path has no fsync-failure, disk-full, torn-write,
 or power-loss injection, and there is no fuzzing or property-based testing, so
 managed durability rests on targeted deterministic tests rather than randomized
-validation. Managed CI runs Ubuntu on `net10.0`; Windows and macOS behavior is
-validated locally and through the release gates rather than on every commit.
+validation. Managed CI runs the whole suite on Linux, Windows, and macOS against
+`net8.0`, `net9.0`, and `net10.0`, and every leg fails if it executes or passes
+fewer tests than a real run does, so a silently empty run cannot pass.
+
+**macOS is not a supported target for file-backed databases.** The managed engine
+builds its lock leases on Linux OFD locks (`F_OFD_SETLK`), which Darwin does not
+implement, so `SqliteManagedFileOwnership` throws `PlatformNotSupportedException`
+for every physical open and 236 of 3,689 tests fail on macOS. In-memory
+databases, the parser, the planner, and the conformance corpus are unaffected and
+roughly 3,250 tests still pass there. The macOS legs run the full suite and
+tolerate failures only when they carry that one documented message; any other
+macOS failure fails the leg, so the platform is covered for regressions even
+though the gap is open. Physical WAL coordination is likewise implemented for
+Windows and 64-bit Linux only, so the process-isolated WAL harness must pass on
+those legs and is required to stay discovered on macOS rather than being removed
+from the matrix.
+
+**Opening a WAL database races against other processes on Linux.**
+`SqliteWalWriterCheckpointCoordinator.Open` rebuilds the WAL index before it
+hands back a coordinator, and that rebuild takes the checkpoint, writer, and
+recovery leases with `TimeSpan.Zero`, so it never retries. If another process
+holds any of those leases at that instant the open fails outright with
+`SqliteWalByteRangeLockBusyException`, rather than waiting the way SQLite's own
+recovery path does. Five process-isolation tests hit this on the Linux CI
+runners and none on Windows, which reflects scheduling luck rather than a
+Windows-only code path, so the same race is latent on both. The Linux legs are
+left failing instead of being papered over, because the fix is a deliberate
+decision about how long `Open` may block and belongs with the WAL owner.
 
 ## Dynamic native compatibility
 

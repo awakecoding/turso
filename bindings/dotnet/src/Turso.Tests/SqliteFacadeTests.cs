@@ -87,7 +87,7 @@ public class SqliteFacadeTests
 
         Task<object?>? faulted = null;
         Assert.DoesNotThrow(() => faulted = command.ExecuteScalarAsync());
-        Assert.ThrowsAsync<SqliteException>(async () => await faulted);
+        Assert.ThrowsAsync<SqliteException>(async () => await faulted!);
     }
 
     [Test]

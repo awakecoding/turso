@@ -38,6 +38,14 @@ MANAGED_NATIVEAOT_OUTPUT ?= ./artifacts/managed-nativeaot-smoke
 MANAGED_NATIVEAOT_PACKAGES ?= $(MANAGED_PACKAGE_OUTPUT)/.nuget-packages
 MANAGED_NATIVEAOT_NUGET_CONFIG = ./samples/ManagedNativeAot/obj/managed-nativeaot.nuget.config
 MANAGED_CLOSURE_VALIDATOR = pwsh -NoLogo -NoProfile -File ./scripts/Validate-ManagedPackageClosure.ps1
+MANAGED_TEST_RUNNER = pwsh -NoLogo -NoProfile -File ./scripts/Invoke-ManagedTestSuite.ps1
+# Turso.Tests multi-targets $(TursoTargetFrameworks); pick one framework by default so a
+# local `make test-managed` stays a single run. CI drives the full framework matrix.
+MANAGED_TEST_FRAMEWORK ?= net10.0
+# A floor that a real managed run clears by a wide margin. Its job is to turn a
+# silently empty run (broken build graph, stale filter, missing runtime pack)
+# into a red job instead of a green one that asserted nothing.
+MANAGED_TEST_MINIMUM_EXECUTED ?= 2500
 
 ifeq ($(OS),Windows_NT)
 	MANAGED_NATIVEAOT_RID ?= win-x64
@@ -212,7 +220,7 @@ build-managed: restore-managed
 	dotnet build --no-restore -c Debug ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
 
 test-managed: validate-managed-package
-	dotnet test ./src/Turso.Tests/Turso.Tests.csproj
+	$(MANAGED_TEST_RUNNER) -Framework $(MANAGED_TEST_FRAMEWORK) -MinimumExecutedTests $(MANAGED_TEST_MINIMUM_EXECUTED)
 
 # Turso.slnx intentionally contains only the six shipping projects, so a
 # solution-scoped format check silently skips the test project. Verify it
@@ -306,10 +314,10 @@ build-sync-native: build-native
 test: test-managed
 
 test-native: build-native
-	dotnet test ./src/Turso.Tests/Turso.Tests.csproj
+	dotnet test --framework $(MANAGED_TEST_FRAMEWORK) ./src/Turso.Tests/Turso.Tests.csproj
 
 test-sync: build-sync-native
-	dotnet test ./src/Turso.Tests/Turso.Tests.csproj --filter "FullyQualifiedName~TursoRemoteTests"
+	dotnet test --framework $(MANAGED_TEST_FRAMEWORK) ./src/Turso.Tests/Turso.Tests.csproj --filter "FullyQualifiedName~TursoRemoteTests"
 
 benchmark: build-production
 	dotnet run -c Release --project ./src/Benchmarks/Benchmarks.csproj

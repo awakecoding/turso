@@ -12,6 +12,13 @@ namespace Turso.Tests;
 public class TursoDataSqlitePackageArtifactReleaseTests
 {
     private const string RawPackageTargetFrameworks = "net8.0;net9.0;net10.0";
+
+    // The in-process package validation loads packed lib assets into this test host, so it can
+    // only bind assemblies built for a framework the host runtime actually satisfies. The suite
+    // multi-targets, so the framework follows the host instead of being pinned to one TFM.
+    private static readonly string HostTargetFramework =
+        $"net{Environment.Version.Major}.{Environment.Version.Minor}";
+
     private const string ManagedPackageDescription =
         "Managed ADO.NET package for Turso: TursoConnection supports managed local and remote Hrana databases, while Turso.Data.Sqlite is a local-only Microsoft.Data.Sqlite-compatible facade. Native local and embedded replica modes use optional companion packages.";
     private const string NativePackageDescription =
@@ -24,6 +31,51 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         "Local-only Entity Framework Core 9.x provider for Turso.Data.Sqlite, using EF Core SQLite translation with managed or native local execution.";
     private const string NativeAotPackageDescription =
         "RID-specific static native library assets for net8.0, net9.0, and net10.0 NativeAOT desktop publishing with Turso.Data.Sqlite.";
+
+    // [NonParallelizable] only orders these tests inside a single test host. The suite
+    // multi-targets, so `dotnet test` on this project starts one host per framework and runs
+    // them concurrently, while every host drives `dotnet build`/`pack` against the same shared
+    // source projects. Those child builds write the same obj/ paths - the collision surfaces as
+    // CS2012 "being used by another process" - and can splice one host's package version into
+    // another host's assets, so the failure is not even reliably attributed to the host that
+    // caused it. Only a cross-process lock covers that; a Mutex would carry thread affinity that
+    // NUnit does not guarantee between SetUp and TearDown, so an exclusive file handle is used.
+    // CI is unaffected either way because each matrix leg pins a single framework.
+    private static readonly string BuildLockPath =
+        Path.Combine(Path.GetTempPath(), "turso-managed-package-artifact-build.lock");
+
+    private static readonly TimeSpan BuildLockTimeout = TimeSpan.FromMinutes(30);
+
+    private FileStream? _buildLock;
+
+    [SetUp]
+    public void AcquireSharedProjectBuildLock()
+    {
+        var deadline = DateTime.UtcNow + BuildLockTimeout;
+        while (true)
+        {
+            try
+            {
+                _buildLock = new FileStream(
+                    BuildLockPath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None);
+                return;
+            }
+            catch (IOException) when (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(250);
+            }
+        }
+    }
+
+    [TearDown]
+    public void ReleaseSharedProjectBuildLock()
+    {
+        _buildLock?.Dispose();
+        _buildLock = null;
+    }
 
     [Test]
     public void PackageContainsManagedDependenciesWithoutRawAndLoadsManagedConnection()
@@ -39,10 +91,10 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 "..",
                 "Turso.EntityFrameworkCore.Sqlite",
                 "Turso.EntityFrameworkCore.Sqlite.csproj");
-            BuildForPackage(projectPath, "net9.0");
-            BuildForPackage(efProjectPath, "net9.0");
-            Pack(projectPath, packageDirectory, packageVersion);
-            Pack(efProjectPath, packageDirectory, packageVersion);
+            BuildForPackage(projectPath, HostTargetFramework);
+            BuildForPackage(efProjectPath, HostTargetFramework);
+            Pack(projectPath, packageDirectory, packageVersion, HostTargetFramework);
+            Pack(efProjectPath, packageDirectory, packageVersion, HostTargetFramework);
 
             var packagePath = Path.Combine(packageDirectory, $"Turso.Data.Sqlite.{packageVersion}.nupkg");
             File.Exists(packagePath).Should().BeTrue();
@@ -55,7 +107,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
             var extractionDirectory = Path.Combine(packageDirectory, "extracted");
             ZipFile.ExtractToDirectory(packagePath, extractionDirectory);
-            var libraryDirectory = Path.Combine(extractionDirectory, "lib", "net9.0");
+            var libraryDirectory = Path.Combine(extractionDirectory, "lib", HostTargetFramework);
             using (var archive = ZipFile.OpenRead(packagePath))
             {
                 archive.Entries
@@ -99,10 +151,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             EnsureUnloaded(LoadManagedConnection(libraryDirectory));
             RunManagedPackageConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -118,10 +173,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             Pack(projectPath, packageDirectory, packageVersion);
             RunManagedReplicaOptionsConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -151,10 +209,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 NativePackageDescription);
             RunNativePackageConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -206,10 +267,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
             RunSyncPackageConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -258,10 +322,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             dependencyGroups.Should().OnlyContain(group =>
                 !group.Elements().Any(element => element.Name.LocalName == "dependency"));
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -319,10 +386,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
             RestoreNativeAotPackageConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     private static WeakReference LoadManagedConnection(string libraryDirectory)
@@ -417,6 +487,11 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 WorkingDirectory = Path.GetDirectoryName(projectPath)!,
             },
         };
+        // Matches RunDotnet: persistent MSBuild worker nodes outlive the command that spawned
+        // them, so a test harness that shells out repeatedly can inherit a wedged node from an
+        // earlier invocation. Neither variable changes what is built.
+        process.StartInfo.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        process.StartInfo.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
         process.StartInfo.ArgumentList.Add("pack");
         process.StartInfo.ArgumentList.Add(projectPath);
         process.StartInfo.ArgumentList.Add("--configuration");
@@ -432,7 +507,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         process.Start();
         var output = process.StandardOutput.ReadToEndAsync();
         var error = process.StandardError.ReadToEndAsync();
-        process.WaitForExit();
+        WaitForChildProcess(process, output, error, $"dotnet pack {projectPath}");
         Task.WaitAll(output, error);
         var result = output.Result + Environment.NewLine + error.Result;
         Assert.That(process.ExitCode, Is.EqualTo(0), result);
@@ -661,7 +736,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
               <Project Sdk="Microsoft.NET.Sdk">
                 <PropertyGroup>
                   <OutputType>Exe</OutputType>
-                  <TargetFramework>net9.0</TargetFramework>
+                  <TargetFramework>{{HostTargetFramework}}</TargetFramework>
                   <ImplicitUsings>enable</ImplicitUsings>
                 </PropertyGroup>
                 <ItemGroup>
@@ -923,9 +998,62 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         process.Start();
         var output = process.StandardOutput.ReadToEndAsync();
         var error = process.StandardError.ReadToEndAsync();
-        process.WaitForExit();
+        WaitForChildProcess(process, output, error, $"dotnet {string.Join(' ', arguments)}");
         Task.WaitAll(output, error);
         Assert.That(process.ExitCode, Is.EqualTo(0), output.Result + Environment.NewLine + error.Result);
+    }
+
+    // These helpers drive real `dotnet` child processes, and an unbounded WaitForExit turns a
+    // stuck child into a silent stall that consumes the entire CI job timeout and reports only
+    // "cancelled". Bounding the wait cannot hide a failure - it can only convert a hang into a
+    // failure that names the command and carries whatever the child managed to emit first.
+    // Kept below the CI harness's inactivity budget so the failing command is named here,
+    // with its output, instead of the whole run being aborted by the outer hang detector.
+    private static readonly TimeSpan ChildProcessTimeout = TimeSpan.FromMinutes(6);
+
+    private static void WaitForChildProcess(
+        Process process,
+        Task<string> output,
+        Task<string> error,
+        string description)
+    {
+        if (process.WaitForExit((int)ChildProcessTimeout.TotalMilliseconds))
+            return;
+
+        var partial = string.Empty;
+        try
+        {
+            process.Kill(entireProcessTree: true);
+            Task.WaitAll([output, error], TimeSpan.FromSeconds(30));
+            partial = string.Concat(
+                output.IsCompletedSuccessfully ? output.Result : string.Empty,
+                Environment.NewLine,
+                error.IsCompletedSuccessfully ? error.Result : string.Empty);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or AggregateException)
+        {
+        }
+
+        Assert.Fail(
+            $"'{description}' produced no exit within {ChildProcessTimeout.TotalMinutes} minutes and was killed. "
+            + $"Output captured before the kill:{Environment.NewLine}{partial}");
+    }
+
+    // Cleanup on the failure path must never replace the real assertion failure with a Windows
+    // sharing violation: when a test throws, a leaked handle is a symptom of that failure, not
+    // the failure itself, and masking it hides the actual defect.
+    private static void DeletePackageDirectoryWithoutMaskingFailure(string packageDirectory)
+    {
+        try
+        {
+            DeletePackageDirectory(packageDirectory);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private static void DeletePackageDirectory(string packageDirectory)
