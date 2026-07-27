@@ -8,6 +8,8 @@ namespace Turso.Tests;
 [NonParallelizable]
 public sealed class SyncReplicaRaceTests
 {
+    [SetUp]
+    public void RequireSyncCompanion() => NativeCompanionAvailability.RequireSyncSdkKit();
     [Test]
     public async Task ConcurrentSyncCallsAreSingleFlightAndRecoverAfterCancellation()
     {

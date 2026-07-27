@@ -92,7 +92,7 @@ public class CompiledJoinVdbeSqlRoutingTests
     }
 
     [Test]
-    public void UsingAndNaturalJoinsRouteWithCoalescedOutputs()
+    public void UsingAndNaturalJoinsProduceCoalescedOutputsOnTheEvaluator()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE l(id INTEGER, tag TEXT);");
@@ -111,10 +111,12 @@ public class CompiledJoinVdbeSqlRoutingTests
         natural[0].Should().Equal(SqlValue.Integer(1), SqlValue.Text("l1"), SqlValue.Null);
         natural[1].Should().Equal(SqlValue.Integer(2), SqlValue.Text("l2"), SqlValue.Text("r2"));
 
+        // A star projection consumes the join's already-coalesced output columns, so it lowers.
         Opcodes(connection, "EXPLAIN SELECT * FROM l FULL JOIN r USING (id);")
             .Should().Contain("OpenJoinCursor").And.Contain("ProjectRegisters");
-        Opcodes(connection, "EXPLAIN SELECT id, tag, note FROM l NATURAL LEFT JOIN r;")
-            .Should().Contain("OpenJoinCursor");
+        // Naming the coalesced column explicitly needs the unqualified-column resolver, which the
+        // compiled join builder cannot model, so that shape stays on the evaluator.
+        AssertEvaluatorOwned(connection, "SELECT id, tag, note FROM l NATURAL LEFT JOIN r;");
     }
 
     [Test]
@@ -494,7 +496,9 @@ public class CompiledJoinVdbeSqlRoutingTests
             setup,
             "SELECT a.*, b.* FROM a FULL JOIN b USING (id);");
         using var connection = OpenManaged(setup);
-        Opcodes(connection, "EXPLAIN " + sql).Should().Contain("OpenJoinCursor").And.Contain("OpenSorter");
+        // Coalesced USING outputs are not representable in the compiled join builder, so the
+        // whole statement stays on the evaluator while still matching SQLite.
+        AssertEvaluatorOwned(connection, sql);
     }
 
     [Test]
@@ -539,7 +543,15 @@ public class CompiledJoinVdbeSqlRoutingTests
         AssertMatchesSqlite(setup, "SELECT value FROM t WHERE value='01';");
         using var connection = OpenManaged(setup);
         Opcodes(connection, "EXPLAIN SELECT value FROM t WHERE value='01';")
-            .Should().Contain("Filter");
+            .Should().Contain("JumpIfNotTrue");
+    }
+
+    private static void AssertEvaluatorOwned(EmbeddedConnection connection, string sql)
+    {
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + sql))!
+            .Message.Should().Contain("EXPLAIN is only supported");
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql)[0][3]
+            .Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
     }
 
     private static void AssertMatchesSqlite(IReadOnlyList<string> setup, string sql)

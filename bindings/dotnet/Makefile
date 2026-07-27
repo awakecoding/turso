@@ -212,6 +212,7 @@ build-managed: restore-managed
 	dotnet build --no-restore -c Debug ./src/Turso.Serverless.Client/Turso.Serverless.Client.csproj
 
 test-managed: validate-managed-package
+	dotnet test ./src/Turso.Tests/Turso.Tests.csproj
 
 pack-managed: restore-managed validate-managed-project-closure
 	rm -rf "$(MANAGED_PACKAGE_OUTPUT)"

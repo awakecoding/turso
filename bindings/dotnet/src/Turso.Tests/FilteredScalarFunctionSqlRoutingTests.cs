@@ -7,7 +7,7 @@ namespace Turso.Tests;
 public class FilteredScalarFunctionSqlRoutingTests
 {
     [Test]
-    public void FilteredBuiltinFunctionMatchesSqliteAndRoutesThroughFilterThenFunction()
+    public void FilteredBuiltinFunctionMatchesSqliteAndGatesTheRowBeforeTheFunction()
     {
         string[] setup =
         [
@@ -25,15 +25,18 @@ public class FilteredScalarFunctionSqlRoutingTests
         foreach (var statement in setup)
             Execute(connection, statement);
 
+        // A simple column-versus-literal predicate lowers to a register-native comparison and a
+        // JumpIfNotTrue gate instead of the evaluator-callback Filter opcode.
         var opcodes = ReadRows(connection, "EXPLAIN " + query).Select(row => row[1].AsText()).ToList();
         opcodes.Should().Equal(
-            "OpenReadCursor", "Rewind", "Filter", "Column", "Column", "Function", "ResultRow", "Next",
-            "CloseCursor", "Halt");
-        opcodes.IndexOf("Filter").Should().BeLessThan(opcodes.IndexOf("Function"));
+            "OpenReadCursor", "Rewind", "Column", "LoadConstant", "Compare", "JumpIfNotTrue", "Column",
+            "Column", "Function", "ResultRow", "Next", "CloseCursor", "Halt");
+        opcodes.Should().NotContain("Filter");
+        opcodes.IndexOf("JumpIfNotTrue").Should().BeLessThan(opcodes.IndexOf("Function"));
     }
 
     [Test]
-    public void FilterRunsBeforeAFunctionErrorOnAnExcludedRow()
+    public void PredicateGateRunsBeforeAFunctionErrorOnAnExcludedRow()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(include_row INTEGER, value INTEGER);");
@@ -46,25 +49,33 @@ public class FilteredScalarFunctionSqlRoutingTests
             .Should()
             .Equal(SqlValue.Integer(5));
 
-        ReadRows(connection, "EXPLAIN SELECT abs(value) FROM t WHERE include_row = 1;")
+        var opcodes = ReadRows(connection, "EXPLAIN SELECT abs(value) FROM t WHERE include_row = 1;")
             .Select(row => row[1].AsText())
-            .Should()
-            .Contain("Filter")
-            .And
-            .Contain("Function");
+            .ToList();
+        opcodes.Should().Contain("JumpIfNotTrue").And.Contain("Function");
+        opcodes.IndexOf("JumpIfNotTrue").Should().BeLessThan(opcodes.IndexOf("Function"));
     }
 
     [Test]
-    public void ComplexFilterRetainsEvaluatorErrorOrdering()
+    public void ArityValidationPrecedesRowEvaluationLikeSqlite()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, x INTEGER, y INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1, 1, 0), (2, 2, 0);");
 
+        // SQLite resolves function arity while preparing, so the arity diagnostic wins over any
+        // row-evaluation error the WHERE clause would otherwise raise first.
         Assert.Throws<EmbeddedSqlException>(() =>
             ReadRows(
                 connection,
                 "SELECT abs(x, x) FROM t WHERE CASE WHEN id = 2 THEN abs(-9223372036854775808) ELSE 1 END;"))!
+            .Message.Should().Be("wrong number of arguments to function abs()");
+
+        // With a well-formed projection the evaluator still surfaces the WHERE clause error.
+        Assert.Throws<EmbeddedSqlException>(() =>
+            ReadRows(
+                connection,
+                "SELECT abs(x) FROM t WHERE CASE WHEN id = 2 THEN abs(-9223372036854775808) ELSE 1 END;"))!
             .Message.Should().Be("integer overflow");
     }
 

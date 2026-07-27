@@ -127,6 +127,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
     [Test]
     public void NativeCompanionPackageRoutesExplicitNativeConnections()
     {
+        NativeCompanionAvailability.RequireSdkKit();
         var packageDirectory = CreatePackageDirectory("turso-native-package-validation");
 
         try
@@ -159,6 +160,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
     [Test]
     public void SyncCompanionPackageDeclaresFacadeAndOpensDeferredReplica()
     {
+        NativeCompanionAvailability.RequireSyncSdkKit();
         var packageDirectory = CreatePackageDirectory("turso-sync-package-validation");
 
         try

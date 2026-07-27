@@ -60,7 +60,7 @@ public class ArithmeticScanSqlRoutingTests
 
         ReadRows(connection, "SELECT a + b FROM t WHERE b = 2")[0].Should().Equal(SqlValue.Integer(12));
         ReadRows(connection, "EXPLAIN SELECT a + b FROM t WHERE b = 2")
-            .Select(row => row[1].AsText()).Should().Contain("Filter");
+            .Select(row => row[1].AsText()).Should().Contain("JumpIfNotTrue");
     }
 
     [Test]

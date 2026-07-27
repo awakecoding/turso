@@ -95,6 +95,7 @@ public class TursoRemoteTests
     [Test]
     public void TestRemoteReplicaDrivesBootstrapIoAndSurfacesTransportFailure()
     {
+        NativeCompanionAvailability.RequireSyncSdkKit();
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -125,6 +126,7 @@ public class TursoRemoteTests
     [Test]
     public void TestReplicaCompanionConnectsDeferredBootstrapDatabase()
     {
+        NativeCompanionAvailability.RequireSyncSdkKit();
         using var replica = SyncReplicaDatabase.Open(
             new TursoReplicaOptions(
                 ":memory:",
@@ -141,6 +143,7 @@ public class TursoRemoteTests
     [Test]
     public async Task TestReplicaCompanionCancelsPendingSyncIo()
     {
+        NativeCompanionAvailability.RequireSyncSdkKit();
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -176,6 +179,7 @@ public class TursoRemoteTests
     [Test]
     public async Task TestRemoteReplicaOpenAsyncCancelsPendingBootstrapIo()
     {
+        NativeCompanionAvailability.RequireSyncSdkKit();
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;

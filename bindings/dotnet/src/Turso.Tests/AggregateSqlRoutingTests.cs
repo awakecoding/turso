@@ -719,10 +719,15 @@ public class AggregateSqlRoutingTests
     [Test]
     public void NestedCustomOrderCollationOnRejectedGroupsRemainsEvaluatorOwned()
     {
+        var calls = 0;
         var database = new EmbeddedDatabase();
         database.RegisterCollation(
             "boomcmp",
-            (_, _) => throw new InvalidOperationException("order collation failed"));
+            (left, right) =>
+            {
+                calls++;
+                return string.CompareOrdinal(left, right);
+            });
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE t(k INTEGER, v TEXT);");
         Execute(connection, "INSERT INTO t VALUES (1, 'x'), (2, 'y');");
@@ -730,8 +735,12 @@ public class AggregateSqlRoutingTests
             "SELECT k, count(*) FROM t GROUP BY k HAVING k = 1 " +
             "ORDER BY (group_concat(v) COLLATE boomcmp) = 'x';";
 
+        // SQLite evaluates the ORDER BY expression itself, so the COLLATE-qualified comparison
+        // inside it invokes the registered collation exactly once even for a single group.
         ReadRows(connection, query).Should().ContainSingle()
             .Which.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
+        calls.Should().Be(1);
+
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
         ReadRows(connection, "EXPLAIN QUERY PLAN " + query)[0][3]
             .Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));

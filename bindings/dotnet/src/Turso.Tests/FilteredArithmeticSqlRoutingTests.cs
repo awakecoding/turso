@@ -7,7 +7,7 @@ namespace Turso.Tests;
 public class FilteredArithmeticSqlRoutingTests
 {
     [Test]
-    public void FilteredArithmeticMatchesSqliteAndRoutesThroughFilterBeforeArithmetic()
+    public void FilteredArithmeticMatchesSqliteAndGatesTheRowBeforeArithmetic()
     {
         string[] setup =
         [
@@ -26,9 +26,11 @@ public class FilteredArithmeticSqlRoutingTests
             .Select(row => row[1].AsText())
             .ToList();
         opcodes.Should().Equal(
-            "OpenReadCursor", "Rewind", "Filter", "Column", "Column", "Column", "NumericAffinity",
-            "NumericAffinity", "Arithmetic", "Column", "ResultRow", "Next", "CloseCursor", "Halt");
-        opcodes.IndexOf("Filter").Should().BeLessThan(opcodes.IndexOf("Arithmetic"));
+            "OpenReadCursor", "Rewind", "Column", "LoadParameter", "Compare", "JumpIfNotTrue", "Column",
+            "Column", "Column", "NumericAffinity", "NumericAffinity", "Arithmetic", "Column", "ResultRow",
+            "Next", "CloseCursor", "Halt");
+        opcodes.Should().NotContain("Filter");
+        opcodes.IndexOf("JumpIfNotTrue").Should().BeLessThan(opcodes.IndexOf("Arithmetic"));
     }
 
     [Test]

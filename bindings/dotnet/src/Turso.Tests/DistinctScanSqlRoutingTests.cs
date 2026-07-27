@@ -31,7 +31,7 @@ public class DistinctScanSqlRoutingTests
     }
 
     [Test]
-    public void FilteredDirectColumnDistinctRoutesThroughFilterAndDistinctResultRow()
+    public void FilteredDirectColumnDistinctGatesTheRowBeforeDistinctResultRow()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(a, b, keep)");
@@ -46,7 +46,8 @@ public class DistinctScanSqlRoutingTests
         ReadRows(connection, "EXPLAIN SELECT DISTINCT a, b FROM t WHERE keep >= ?1", SqlValue.Integer(2))
             .Select(row => row[1].AsText())
             .Should().Equal(
-                "OpenReadCursor", "Rewind", "Filter", "Column", "Column", "DistinctResultRow", "Next", "CloseCursor", "Halt");
+                "OpenReadCursor", "Rewind", "Column", "LoadParameter", "Compare", "JumpIfNotTrue", "Column",
+                "Column", "DistinctResultRow", "Next", "CloseCursor", "Halt");
     }
 
     [Test]
@@ -84,7 +85,7 @@ public class DistinctScanSqlRoutingTests
 
         ReadRows(connection, "EXPLAIN SELECT DISTINCT value FROM t WHERE keep >= ?1", SqlValue.Integer(3))
             .Select(row => row[1].AsText())
-            .Should().Contain("Filter").And.Contain("DistinctResultRow");
+            .Should().Contain("JumpIfNotTrue").And.Contain("DistinctResultRow");
     }
 
     [Test]

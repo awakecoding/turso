@@ -346,7 +346,7 @@ public class JoinSqlRoutingTests
     }
 
     [Test]
-    public void UsingJoinRoutesWithCoalescedColumns()
+    public void UsingJoinStaysOnTheEvaluatorWithCoalescedColumns()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE l(id INTEGER, tag TEXT);");
@@ -359,12 +359,13 @@ public class JoinSqlRoutingTests
         rows.Should().ContainSingle();
         rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Text("a"), SqlValue.Text("x"));
 
-        Opcodes(ReadRows(connection, "EXPLAIN SELECT id, tag, note FROM l JOIN r USING (id);"))
-            .Should().Contain("OpenJoinCursor").And.Contain("ProjectRegisters");
+        // The compiled join builder concatenates both source rows verbatim, so it cannot represent
+        // a coalesced USING column and declines. The evaluator owns the shape instead.
+        AssertEvaluatorOwned(connection, "SELECT id, tag, note FROM l JOIN r USING (id);");
     }
 
     [Test]
-    public void NaturalJoinRoutesWithCoalescedColumns()
+    public void NaturalJoinStaysOnTheEvaluatorWithCoalescedColumns()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE l(id INTEGER, tag TEXT);");
@@ -376,8 +377,7 @@ public class JoinSqlRoutingTests
         rows.Should().ContainSingle();
         rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Text("b"), SqlValue.Text("x"));
 
-        Opcodes(ReadRows(connection, "EXPLAIN SELECT id, tag, note FROM l NATURAL JOIN r;"))
-            .Should().Contain("OpenJoinCursor");
+        AssertEvaluatorOwned(connection, "SELECT id, tag, note FROM l NATURAL JOIN r;");
     }
 
     [Test]
@@ -883,6 +883,14 @@ public class JoinSqlRoutingTests
         }
 
         return rows;
+    }
+
+    private static void AssertEvaluatorOwned(EmbeddedConnection connection, string sql)
+    {
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + sql))!
+            .Message.Should().Contain("EXPLAIN is only supported");
+        ReadRows(connection, "EXPLAIN QUERY PLAN " + sql)[0][3]
+            .Should().Be(SqlValue.Text("MANAGED EVALUATOR FALLBACK"));
     }
 
     private static IEnumerable<string> Opcodes(IEnumerable<SqlValue[]> rows)

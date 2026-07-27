@@ -741,13 +741,52 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CancellationToken cancellationToken = default,
         bool compilationEnabled = true)
     {
+        var result = ExecuteCore(
+            statement,
+            parameters,
+            lastInsertRowId,
+            foreignKeysEnabled,
+            recursiveTriggersEnabled,
+            deferForeignKeys,
+            inTransaction,
+            cancellationToken,
+            compilationEnabled);
+
+        RecordChangeCounters(statement, result);
+        return result;
+    }
+
+    /// <summary>
+    /// Mirrors sqlite3_changes()/sqlite3_total_changes(): only INSERT, UPDATE, and
+    /// DELETE update the counters, and every other statement leaves them intact.
+    /// </summary>
+    private void RecordChangeCounters(ParsedStatement statement, ExecutionResult result)
+    {
+        if (statement is not (InsertStatement or UpdateStatement or DeleteStatement))
+            return;
+
+        _changes = result.RowsAffected;
+        _totalChanges += result.RowsAffected;
+    }
+
+    private ExecutionResult ExecuteCore(
+        ParsedStatement statement,
+        SqlValue[] parameters,
+        long lastInsertRowId = 0,
+        bool foreignKeysEnabled = false,
+        bool recursiveTriggersEnabled = false,
+        bool deferForeignKeys = false,
+        bool inTransaction = false,
+        CancellationToken cancellationToken = default,
+        bool compilationEnabled = true)
+    {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
                 statement,
                 recursiveTriggersEnabled,
                 hasTriggers: true))
         {
-            return ExecuteWithRecursiveTriggerStack(() => Execute(
+            return ExecuteWithRecursiveTriggerStack(() => ExecuteCore(
                 statement,
                 parameters,
                 lastInsertRowId,
@@ -21937,6 +21976,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             "COUNT" => function.CountStar || function.Arguments.Count is 0 or 1,
             "SUM" or "TOTAL" or "AVG" or "MIN" or "MAX" => function.Arguments.Count == 1,
             "GROUP_CONCAT" => function.Arguments.Count is 1 or 2,
+            // Arity is validated during evaluation so a wrong-argument-count call reports
+            // SQLite's arity diagnostic instead of "no such function".
+            "STRING_AGG" or "JSON_GROUP_ARRAY" or "JSON_GROUP_OBJECT" => true,
             _ => false,
         };
     }
@@ -21963,6 +22005,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             "MIN" => EvaluateMinMax(function, rows, parameters, context, maximum: false),
             "MAX" => EvaluateMinMax(function, rows, parameters, context, maximum: true),
             "GROUP_CONCAT" => EvaluateGroupConcat(function, rows, parameters, context),
+            "STRING_AGG" => EvaluateStringAgg(function, rows, parameters, context),
+            "JSON_GROUP_ARRAY" => EvaluateJsonGroupArray(function, rows, parameters, context),
+            "JSON_GROUP_OBJECT" => EvaluateJsonGroupObject(function, rows, parameters, context),
             _ => throw new EmbeddedSqlException($"Unsupported aggregate function {function.Name}()."),
         };
     }
@@ -22355,6 +22400,58 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return function.Name.ToUpperInvariant() switch
         {
             "ABS" => EvaluateAbsoluteValue(arguments),
+            "CEIL" or "CEILING" => EvaluateIntegralMath(function.Name, arguments, Math.Ceiling),
+            "FLOOR" => EvaluateIntegralMath("floor", arguments, Math.Floor),
+            "TRUNC" => EvaluateIntegralMath("trunc", arguments, Math.Truncate),
+            "ROUND" => EvaluateRound(arguments),
+            "LN" => EvaluateUnaryMath("ln", arguments, Math.Log),
+            "LOG" => EvaluateLogarithm(arguments),
+            "LOG2" => EvaluateUnaryMath("log2", arguments, Math.Log2),
+            "LOG10" => EvaluateUnaryMath("log10", arguments, Math.Log10),
+            "EXP" => EvaluateUnaryMath("exp", arguments, Math.Exp),
+            "SQRT" => EvaluateUnaryMath("sqrt", arguments, Math.Sqrt),
+            "POW" or "POWER" => EvaluateBinaryMath(function.Name, arguments, Math.Pow),
+            "MOD" => EvaluateModulo(arguments),
+            "SIGN" => EvaluateSign(arguments),
+            "PI" => EvaluatePi(arguments),
+            "DEGREES" => EvaluateUnaryMath("degrees", arguments, static value => value * (180.0 / Math.PI)),
+            "RADIANS" => EvaluateUnaryMath("radians", arguments, static value => value * (Math.PI / 180.0)),
+            "SIN" => EvaluateUnaryMath("sin", arguments, Math.Sin),
+            "COS" => EvaluateUnaryMath("cos", arguments, Math.Cos),
+            "TAN" => EvaluateUnaryMath("tan", arguments, Math.Tan),
+            "ASIN" => EvaluateUnaryMath("asin", arguments, Math.Asin),
+            "ACOS" => EvaluateUnaryMath("acos", arguments, Math.Acos),
+            "ATAN" => EvaluateUnaryMath("atan", arguments, Math.Atan),
+            "ATAN2" => EvaluateBinaryMath("atan2", arguments, Math.Atan2),
+            "SINH" => EvaluateUnaryMath("sinh", arguments, Math.Sinh),
+            "COSH" => EvaluateUnaryMath("cosh", arguments, Math.Cosh),
+            "TANH" => EvaluateUnaryMath("tanh", arguments, Math.Tanh),
+            "ASINH" => EvaluateUnaryMath("asinh", arguments, Math.Asinh),
+            "ACOSH" => EvaluateUnaryMath("acosh", arguments, Math.Acosh),
+            "ATANH" => EvaluateUnaryMath("atanh", arguments, Math.Atanh),
+            "SUBSTR" or "SUBSTRING" => EvaluateSubstring(arguments),
+            "REPLACE" => EvaluateReplace(arguments),
+            "TRIM" or "BTRIM" => EvaluateTrim(arguments, "trim", trimStart: true, trimEnd: true),
+            "LTRIM" => EvaluateTrim(arguments, "ltrim", trimStart: true, trimEnd: false),
+            "RTRIM" => EvaluateTrim(arguments, "rtrim", trimStart: false, trimEnd: true),
+            "QUOTE" => EvaluateQuote(arguments),
+            "CHAR" => EvaluateChar(arguments),
+            "UNICODE" => EvaluateUnicode(arguments),
+            "UNHEX" => EvaluateUnhex(arguments),
+            "ZEROBLOB" => EvaluateZeroBlob(arguments),
+            "RANDOMBLOB" => EvaluateRandomBlob(arguments),
+            "RANDOM" => EvaluateRandom(arguments),
+            "CONCAT" => EvaluateConcat(arguments),
+            "CONCAT_WS" => EvaluateConcatWithSeparator(arguments),
+            "IIF" => EvaluateIif(arguments),
+            "LIKELY" => EvaluateProbabilityHint("likely", arguments, 1),
+            "UNLIKELY" => EvaluateProbabilityHint("unlikely", arguments, 1),
+            "LIKELIHOOD" => EvaluateProbabilityHint("likelihood", arguments, 2),
+            "SQLITE_VERSION" => EvaluateSqliteVersion(arguments),
+            "SQLITE_SOURCE_ID" => EvaluateSqliteSourceId(arguments),
+            "CHANGES" => EvaluateChanges(arguments),
+            "TOTAL_CHANGES" => EvaluateTotalChanges(arguments),
+            "TIMEDIFF" => EvaluateTimeDiff(arguments),
             "COALESCE" => EvaluateCoalesce(arguments),
             "DATE" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.Date),
             "DATETIME" => SqliteDateTime.Execute(arguments, SqliteDateTime.Func.DateTime),
@@ -22370,6 +22467,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             "JSON_INSERT" => SqliteJson.JsonInsert(arguments),
             "JSON_OBJECT" => SqliteJson.JsonObject(arguments),
             "JSON_PATCH" => SqliteJson.JsonPatch(arguments),
+            "JSON_PRETTY" => SqliteJson.JsonPretty(arguments),
             "JSON_QUOTE" => SqliteJson.JsonQuote(arguments),
             "JSON_REMOVE" => SqliteJson.JsonRemove(arguments),
             "JSON_REPLACE" => SqliteJson.JsonReplace(arguments),
@@ -24736,6 +24834,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 if (function.Arguments.Count is < 1 or > 2 || function.CountStar)
                     ThrowWrongWindowArgumentCount(function);
                 break;
+            case "STRING_AGG":
+            case "JSON_GROUP_OBJECT":
+                RequireWindowArgumentCount(function, 2);
+                break;
+            case "JSON_GROUP_ARRAY":
+                RequireWindowArgumentCount(function, 1);
+                break;
         }
 
         foreach (var argument in function.Arguments)
@@ -24768,6 +24873,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         var name = function.Name.ToUpperInvariant();
         return name is "COUNT" or "SUM" or "TOTAL" or "AVG" or "MIN" or "MAX" or "GROUP_CONCAT"
+            or "STRING_AGG" or "JSON_GROUP_ARRAY" or "JSON_GROUP_OBJECT"
             || TryGetAggregateFunction(function.Name, function.Arguments.Count, out _);
     }
 
@@ -26278,6 +26384,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
         }
 
+        /// <summary>
+        /// Resolves a date/time argument to UTC using the same parsing rules as the
+        /// date/time builtins, so callers such as timediff() stay consistent with them.
+        /// </summary>
+        internal static bool TryResolveUtc(SqlValue value, out DateTime result)
+        {
+            result = default;
+            var p = new Dt();
+            if (!InitTimeValue(p, value))
+                return false;
+
+            p.ComputeJd();
+            if (p.IsError || p.IJd < 0 || p.IJd > MaxJd)
+                return false;
+
+            result = DateTimeOffset.FromUnixTimeMilliseconds(p.IJd - UnixEpochIJd).UtcDateTime;
+            return true;
+        }
+
         internal static SqlValue Strftime(IReadOnlyList<SqlValue> args)
         {
             if (args.Count < 1)
@@ -27435,6 +27560,82 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             RequireArgumentCount("json_quote", args, 1);
             return SqlValue.JsonText(Serialize(ValueToNode(args[0])));
+        }
+
+        internal static SqlValue JsonPretty(IReadOnlyList<SqlValue> args)
+        {
+            if (args.Count is < 1 or > 2)
+                throw new EmbeddedSqlException("wrong number of arguments to function json_pretty()");
+            if (args[0].Kind == SqlValueKind.Null)
+                return SqlValue.Null;
+
+            var indent = args.Count == 2 && args[1].Kind != SqlValueKind.Null
+                ? ToSqlText(args[1])
+                : "    ";
+            var builder = new StringBuilder();
+            SerializePretty(ParseOrThrow(args[0]), builder, indent, 0);
+            return SqlValue.Text(builder.ToString());
+        }
+
+        private static void SerializePretty(JNode node, StringBuilder sb, string indent, int depth)
+        {
+            switch (node.Kind)
+            {
+                case JKind.Array:
+                    // SQLite renders an empty container inline rather than across three lines.
+                    if (node.Items!.Count == 0)
+                    {
+                        sb.Append("[]");
+                        break;
+                    }
+
+                    sb.Append('[');
+                    for (int i = 0; i < node.Items.Count; i++)
+                    {
+                        if (i > 0)
+                            sb.Append(',');
+                        sb.Append('\n');
+                        AppendIndent(sb, indent, depth + 1);
+                        SerializePretty(node.Items[i], sb, indent, depth + 1);
+                    }
+
+                    sb.Append('\n');
+                    AppendIndent(sb, indent, depth);
+                    sb.Append(']');
+                    break;
+                case JKind.Object:
+                    if (node.Members!.Count == 0)
+                    {
+                        sb.Append("{}");
+                        break;
+                    }
+
+                    sb.Append('{');
+                    for (int i = 0; i < node.Members.Count; i++)
+                    {
+                        if (i > 0)
+                            sb.Append(',');
+                        sb.Append('\n');
+                        AppendIndent(sb, indent, depth + 1);
+                        sb.Append(node.Members[i].RawKey);
+                        sb.Append(": ");
+                        SerializePretty(node.Members[i].Value, sb, indent, depth + 1);
+                    }
+
+                    sb.Append('\n');
+                    AppendIndent(sb, indent, depth);
+                    sb.Append('}');
+                    break;
+                default:
+                    Serialize(node, sb);
+                    break;
+            }
+        }
+
+        private static void AppendIndent(StringBuilder sb, string indent, int depth)
+        {
+            for (int i = 0; i < depth; i++)
+                sb.Append(indent);
         }
 
         internal static SqlValue JsonErrorPosition(IReadOnlyList<SqlValue> args)

@@ -187,8 +187,11 @@ public sealed class CompiledDmlExpressionSqlRoutingTests
         ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES ('x') RETURNING random();");
         ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES ('x') RETURNING value || '!';");
         ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES ('x') RETURNING value = 'x';");
-        ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES ('x') RETURNING CAST(value AS TEXT);");
         ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES ('x') RETURNING (SELECT value);");
+
+        // CAST is lowered rather than refused, so it must report a compiled program instead.
+        Opcodes(Explain(connection, "EXPLAIN INSERT INTO t VALUES ('x') RETURNING CAST(value AS TEXT);"))
+            .Should().Contain("Cast");
     }
 
     private static void ExplainRefused(EmbeddedConnection connection, string sql)

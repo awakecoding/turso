@@ -264,13 +264,16 @@ public class DmlReturningArithmeticSqlRoutingTests
     }
 
     [Test]
-    public void CastOperandFallsBackToEvaluator()
+    public void CastOperandRoutesThroughTheCastOpcode()
     {
         using var connection = Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
 
-        // A CAST operand is not a leaf the operand lowering accepts, so it declines.
-        ExplainRefused(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING CAST(value AS INTEGER) + 1;");
+        // CAST lowers to a typed Cast instruction, so it is a valid arithmetic operand.
+        Opcodes(ExplainBound(connection, "EXPLAIN INSERT INTO t VALUES (10) RETURNING CAST(value AS INTEGER) + 1;"))
+            .Should().ContainInOrder("Cast", "Arithmetic");
+        RoutedValue(connection, "INSERT INTO t VALUES (10) RETURNING CAST(value AS INTEGER) + 1;")
+            .Should().Be(SqlValue.Integer(11));
     }
 
     [Test]

@@ -472,12 +472,13 @@ public class CompiledSortedScanExecutionTests
             () => ReadRows(connection, "SELECT missing FROM t ORDER BY value LIMIT 0;"));
 
         // Unsupported order keys and bad bounds remain evaluator errors rather than partially
-        // compiled programs with different diagnostics.
+        // compiled programs with different diagnostics. Sort keys are materialized in source
+        // order before any comparison, so the resolution failure surfaces directly instead of
+        // being wrapped by a comparator.
         RouteUsesSorter(connection, "SELECT value FROM t ORDER BY missing LIMIT 1;").Should().BeFalse();
-        var orderError = Assert.Throws<InvalidOperationException>(
-            () => ReadRows(connection, "SELECT value FROM t ORDER BY missing LIMIT 1;"))!;
-        orderError.InnerException.Should().BeOfType<EmbeddedSqlException>()
-            .Which.Message.Should().Be("no such column: missing");
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "SELECT value FROM t ORDER BY missing LIMIT 1;"))!
+            .Message.Should().Be("no such column: missing");
 
         RouteUsesSorter(connection, "SELECT value FROM t ORDER BY value LIMIT 'x';").Should().BeFalse();
         Assert.Throws<EmbeddedSqlException>(

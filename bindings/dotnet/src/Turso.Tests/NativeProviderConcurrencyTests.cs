@@ -67,6 +67,7 @@ public sealed class NativeProviderConcurrencyTests
     [Test]
     public async Task NativeCallbackReentrancyFailsInsteadOfDeadlocking()
     {
+        NativeCompanionAvailability.RequireSdkKit();
         using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Native");
         connection.Open();
         connection.CreateFunction<long>("reenter", () =>
@@ -235,6 +236,7 @@ public sealed class NativeProviderConcurrencyTests
 
     private static TursoConnection OpenNativeConnection(string path = ":memory:")
     {
+        NativeCompanionAvailability.RequireSdkKit();
         var connection = new TursoConnection($"Data Source={path};Local Provider=Native");
         connection.Open();
         return connection;

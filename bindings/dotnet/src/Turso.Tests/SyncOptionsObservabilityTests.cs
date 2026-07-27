@@ -9,6 +9,8 @@ namespace Turso.Tests;
 [NonParallelizable]
 public sealed class SyncOptionsObservabilityTests
 {
+    [SetUp]
+    public void RequireSyncCompanion() => NativeCompanionAvailability.RequireSyncSdkKit();
     [Test]
     public void PrefixOptionsMarshalEverySupportedNativeSetting()
     {

@@ -29,12 +29,13 @@ public class QualifiedStarSqlRoutingTests
         var opcodes = Opcodes(ReadRows(connection, "EXPLAIN " + query)).ToList();
         opcodes.Should().Contain("OpenReadCursor")
             .And.Contain("Rewind")
-            .And.Contain("Filter")
+            .And.Contain("JumpIfNotTrue")
             .And.Contain("ResultRow")
             .And.Contain("Next")
             .And.Contain("CloseCursor")
             .And.Contain("Halt");
-        opcodes.Count(opcode => opcode == "Column").Should().Be(3);
+        // Three projected columns plus the one the predicate loads for its comparison.
+        opcodes.Count(opcode => opcode == "Column").Should().Be(4);
     }
 
     [Test]
