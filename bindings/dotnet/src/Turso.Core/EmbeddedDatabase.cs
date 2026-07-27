@@ -1960,7 +1960,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Dictionary<string, EmbeddedTable> tables)
     {
         if (!tables.TryGetValue(statement.TableName, out var table))
-            return new ExecutionResult(["cid", "name", "type", "notnull", "dflt_value", "pk"], [], 0);
+        {
+            return TryDescribeTableValuedFunction(statement.TableName, includeHidden: false, out var moduleRows)
+                ? new ExecutionResult(["cid", "name", "type", "notnull", "dflt_value", "pk"], moduleRows, 0)
+                : new ExecutionResult(["cid", "name", "type", "notnull", "dflt_value", "pk"], [], 0);
+        }
 
         // PRAGMA table_info excludes generated columns (they appear only in table_xinfo),
         // reports the 1-based position of each primary-key column, and treats a WITHOUT
@@ -1976,7 +1980,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
         Dictionary<string, EmbeddedTable> tables)
     {
         if (!tables.TryGetValue(statement.TableName, out var table))
-            return new ExecutionResult(["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"], [], 0);
+        {
+            return TryDescribeTableValuedFunction(statement.TableName, includeHidden: true, out var moduleRows)
+                ? new ExecutionResult(
+                    ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
+                    moduleRows,
+                    0)
+                : new ExecutionResult(["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"], [], 0);
+        }
 
         return new ExecutionResult(
             ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
@@ -1995,9 +2006,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             var primaryKeyPosition = table.PrimaryKeyPosition(index);
             var notNull = column.NotNull || (table.WithoutRowid && primaryKeyPosition > 0);
+
+            // table_info renumbers cid over the columns it reports, so hiding a generated
+            // column closes the gap it would otherwise leave; table_xinfo reports every
+            // column and therefore keeps the declaration position.
             var row = new List<SqlValue>
             {
-                SqlValue.Integer(index),
+                SqlValue.Integer(includeGeneratedColumns ? index : rows.Count),
                 SqlValue.Text(column.Name),
                 SqlValue.Text(column.DeclaredType ?? string.Empty),
                 SqlValue.Integer(notNull ? 1 : 0),
@@ -4082,10 +4097,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             case NamedTableSource named:
                 _ = GetSourceColumns(named, context);
                 return;
-            case GenerateSeriesSource series:
-                ValidateExpressionSchema(series.Start, outerRow, context, cancellationToken);
-                ValidateExpressionSchema(series.Stop, outerRow, context, cancellationToken);
-                ValidateExpressionSchema(series.Step, outerRow, context, cancellationToken);
+            case TableValuedFunctionSource function:
+                foreach (var argument in function.Arguments)
+                    ValidateExpressionSchema(argument, outerRow, context, cancellationToken);
                 return;
             case DerivedTableSource derived:
                 ValidateQuerySchema(derived.Query, context, outerRow, cancellationToken);
@@ -16299,10 +16313,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             case null:
                 return;
-            case GenerateSeriesSource series:
-                ValidateExpressionIndexDirectives(series.Start, context);
-                ValidateExpressionIndexDirectives(series.Stop, context);
-                ValidateExpressionIndexDirectives(series.Step, context);
+            case TableValuedFunctionSource function:
+                foreach (var argument in function.Arguments)
+                    ValidateExpressionIndexDirectives(argument, context);
                 return;
             case NamedTableSource named:
                 var constraints = inheritedJoinConstraints
@@ -16954,6 +16967,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? outerRow)
     {
         context.CheckInterrupt();
+        statement = BindTableValuedFunctionSources(statement, context);
         ValidateSelectIndexDirectives(statement, context);
         statement = ResolveNamedWindows(statement);
         context = EnterCollationSource(context, statement.Source);
@@ -19221,8 +19235,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 => commonTableExpression.Columns,
             NamedTableSource named when TryGetView(context, named.Name, out var view)
                 => ResolveViewColumns(view, EnterView(context, view.Name)),
+            NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
+                => GetSourceColumns(bare, context),
             NamedTableSource named => GetTable(named, context.Tables).Columns,
-            GenerateSeriesSource => ["value"],
+            TableValuedFunctionSource function
+                => [.. TableValuedFunctionRegistry.Resolve(function.Name).Schema.AllColumns],
             DerivedTableSource derived => DescribeQuery(derived.Query, context),
             JoinTableSource join => GetSourceColumns(join.Left, context)
                 .Concat(GetSourceColumns(join.Right, context))
@@ -19243,10 +19260,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 return BuildOutputColumns(named.Alias ?? named.Name, commonTableExpression.Columns);
             case NamedTableSource named when TryGetView(context, named.Name, out var view):
                 return BuildOutputColumns(named.Alias ?? view.Name, ResolveViewColumns(view, EnterView(context, view.Name)));
+            case NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare):
+                return GetOutputColumns(bare, context);
             case NamedTableSource named:
                 return BuildOutputColumns(named.Alias ?? named.Name, GetTable(named, context.Tables).Columns);
-            case GenerateSeriesSource series:
-                return BuildOutputColumns(series.Alias ?? "generate_series", ["value"]);
+            case TableValuedFunctionSource function:
+                return BuildOutputColumns(
+                    function.Alias ?? function.Name,
+                    TableValuedFunctionRegistry.Resolve(function.Name).Schema.VisibleColumns);
             case DerivedTableSource derived:
                 return BuildOutputColumns(derived.Alias, DescribeQuery(derived.Query, context));
             case JoinTableSource join:
@@ -19421,8 +19442,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         where: null),
                     context,
                     outerRow),
+            NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
+                => GetSourceRows(bare, parameters, context, maximumRows, outerRow),
             NamedTableSource named => GetNamedTableRows(named, context, maximumRows, outerRow),
-            GenerateSeriesSource series => GetSeriesRows(series, parameters, context, maximumRows, outerRow),
+            TableValuedFunctionSource function => GetTableValuedFunctionRows(
+                function,
+                parameters,
+                context,
+                maximumRows,
+                outerRow),
             DerivedTableSource derived => GetDerivedTableRows(derived, parameters, context, outerRow, maximumRows),
             JoinTableSource join => GetJoinRows(join, parameters, context, maximumRows, outerRow),
             _ => throw new EmbeddedSqlException($"Unsupported table source {source.GetType().Name}."),
@@ -19755,12 +19783,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 => BuildQualifiedColumns(named.Alias ?? named.Name, commonTableExpression.Columns),
             NamedTableSource named when TryGetView(context, named.Name, out var view)
                 => BuildQualifiedColumns(named.Alias ?? view.Name, ResolveViewColumns(view, EnterView(context, view.Name))),
+            NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
+                => GetQualifiedColumns(bare, context),
             NamedTableSource named => BuildQualifiedColumns(
                 named.Alias ?? named.Name,
                 GetTable(named, context.Tables).Columns),
-            GenerateSeriesSource series => BuildQualifiedColumns(
-                series.Alias ?? "generate_series",
-                ["value"]),
+            TableValuedFunctionSource function => BuildQualifiedColumns(
+                function.Alias ?? function.Name,
+                TableValuedFunctionRegistry.Resolve(function.Name).Schema.AllColumns),
             DerivedTableSource derived when derived.Alias is not null
                 => BuildQualifiedColumns(derived.Alias, DescribeQuery(derived.Query, context)),
             DerivedTableSource => new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
@@ -20323,57 +20353,71 @@ public sealed partial class EmbeddedDatabase : IDisposable
         };
     }
 
-    private SourceData GetSeriesRows(
-        GenerateSeriesSource source,
+    /// <summary>
+    /// Executes one table-valued function call. Argument expressions are evaluated against
+    /// the outer row so a correlated call re-runs per outer row, then the module produces the
+    /// rows. Hidden columns are materialized alongside the visible ones so predicates on the
+    /// call arguments still resolve, while <see cref="SourceRow.OutputColumns"/> exposes only
+    /// the visible columns to <c>*</c> expansion.
+    /// </summary>
+    private SourceData GetTableValuedFunctionRows(
+        TableValuedFunctionSource source,
         SqlValue[] parameters,
         QueryContext context,
         long? maximumRows,
         SourceRow? outerRow)
     {
-        var start = RequireInteger(Evaluate(source.Start, parameters, outerRow, context));
-        var stop = RequireInteger(Evaluate(source.Stop, parameters, outerRow, context));
-        var step = RequireInteger(Evaluate(source.Step, parameters, outerRow, context));
-        if (step == 0)
-            throw new EmbeddedSqlException("generate_series() step must not be zero");
-
-        var qualifier = source.Alias ?? "generate_series";
-        var qualifiedColumns = BuildQualifiedColumns(qualifier, ["value"]);
-        var outputColumns = BuildOutputColumns(qualifier, ["value"]);
-        var rows = new List<SourceRow>();
-        if (step > 0)
+        var module = TableValuedFunctionRegistry.Resolve(source.Name);
+        var schema = module.Schema;
+        var arguments = new SqlValue[schema.HiddenColumns.Count];
+        var supplied = new bool[schema.HiddenColumns.Count];
+        for (var index = 0; index < arguments.Length; index++)
         {
-            for (var current = start; current <= stop && (maximumRows is null || rows.Count < maximumRows.Value);)
+            if (index < source.Arguments.Count)
             {
-                rows.Add(new SourceRow(
-                    ["value"],
-                    [SqlValue.Integer(current)],
-                    qualifiedColumns,
-                    outerRow,
-                    outputColumns));
-                if (current > long.MaxValue - step)
-                    break;
-
-                current += step;
+                arguments[index] = Evaluate(source.Arguments[index], parameters, outerRow, context);
+                supplied[index] = true;
             }
-        }
-        else
-        {
-            for (var current = start; current >= stop && (maximumRows is null || rows.Count < maximumRows.Value);)
+            else
             {
-                rows.Add(new SourceRow(
-                    ["value"],
-                    [SqlValue.Integer(current)],
-                    qualifiedColumns,
-                    outerRow,
-                    outputColumns));
-                if (current < long.MinValue - step)
-                    break;
-
-                current += step;
+                arguments[index] = SqlValue.Null;
             }
         }
 
-        return new SourceData(["value"], rows);
+        var produced = module.Enumerate(new TableValuedFunctionCall(
+            arguments,
+            supplied,
+            source.Schema,
+            maximumRows,
+            context));
+
+        var qualifier = source.Alias ?? source.Name;
+        var columns = schema.AllColumns.ToArray();
+        var qualifiedColumns = BuildQualifiedColumns(qualifier, schema.AllColumns);
+        var outputColumns = BuildOutputColumns(qualifier, schema.VisibleColumns);
+        var rows = new List<SourceRow>(produced.Count);
+        foreach (var values in produced)
+        {
+            context.CheckInterrupt();
+            if (maximumRows is { } limit && rows.Count >= limit)
+                break;
+
+            rows.Add(new SourceRow(columns, values, qualifiedColumns, outerRow, outputColumns));
+        }
+
+        return new SourceData(columns, rows);
+    }
+
+    private static IReadOnlyList<QueryAffinityColumn> BuildTableValuedFunctionAffinities(
+        TableValuedFunctionSource source)
+    {
+        var schema = TableValuedFunctionRegistry.Resolve(source.Name).Schema;
+        var qualifier = source.Alias ?? source.Name;
+        var columns = new QueryAffinityColumn[schema.AllColumns.Count];
+        for (var index = 0; index < columns.Length; index++)
+            columns[index] = new QueryAffinityColumn(qualifier, schema.AllColumns[index], schema.AffinityAt(index));
+
+        return columns;
     }
 
     private static SqlValue GetOutputValue(SourceRow row, OutputColumn column)
@@ -20629,14 +20673,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 => QualifyAffinityColumns(
                     DescribeViewAffinities(view, EnterView(context, view.Name), commonTableExpressions),
                     named.Alias ?? view.Name),
+            NamedTableSource named when TryBindBareTableValuedFunction(named, context, out var bare)
+                => BuildTableValuedFunctionAffinities(bare),
             NamedTableSource named => GetTableAffinityColumns(named, context.Tables),
-            GenerateSeriesSource series =>
-            [
-                new QueryAffinityColumn(
-                    series.Alias ?? "generate_series",
-                    "value",
-                    ColumnAffinity.Integer),
-            ],
+            TableValuedFunctionSource function => BuildTableValuedFunctionAffinities(function),
             DerivedTableSource derived => QualifyAffinityColumns(
                 DescribeQueryAffinities(derived.Query, context, commonTableExpressions),
                 derived.Alias),
@@ -28651,7 +28691,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     // object keys, hexadecimal, comments, and raw control characters inside strings). Those are
     // deliberately rejected here as "malformed JSON" instead of returning a canonicalized value,
     // matching the task's requirement to reject unsupported input rather than guess.
-    private static class SqliteJson
+    private static partial class SqliteJson
     {
         private enum JKind
         {
@@ -32140,12 +32180,50 @@ public sealed class EmbeddedConnection : IDisposable
                 CollectSourceSchemas(join.Right, schemas, commonTableExpressions);
                 CollectExpressionSchemas(join.Condition, schemas, commonTableExpressions);
                 break;
-            case GenerateSeriesSource generateSeries:
-                CollectExpressionSchemas(generateSeries.Start, schemas, commonTableExpressions);
-                CollectExpressionSchemas(generateSeries.Stop, schemas, commonTableExpressions);
-                CollectExpressionSchemas(generateSeries.Step, schemas, commonTableExpressions);
+            case TableValuedFunctionSource function:
+                CollectTableValuedFunctionSchemas(function, schemas, commonTableExpressions);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Routes a <c>pragma_*</c> call to the schema that owns the object it names, so
+    /// <c>pragma_table_info('t')</c> reports the temp shadow when one exists, exactly as the
+    /// <c>PRAGMA table_info(t)</c> statement form does.
+    /// </summary>
+    private static void CollectTableValuedFunctionSchemas(
+        TableValuedFunctionSource function,
+        ISet<string> schemas,
+        HashSet<string> commonTableExpressions)
+    {
+        foreach (var argument in function.Arguments)
+            CollectExpressionSchemas(argument, schemas, commonTableExpressions);
+
+        if (function.Schema is { } explicitSchema)
+        {
+            schemas.Add(explicitSchema);
+            return;
+        }
+
+        if (!TableValuedFunctionRegistry.TryResolve(function.Name, out var module))
+            return;
+
+        if (module.SchemaNameArgumentIndex is { } schemaIndex
+            && schemaIndex < function.Arguments.Count
+            && function.Arguments[schemaIndex] is LiteralExpression { Value.Kind: SqlValueKind.Text } schemaLiteral)
+        {
+            schemas.Add(schemaLiteral.Value.AsText());
+            return;
+        }
+
+        if (module.SchemaObjectArgumentIndex is not { } argumentIndex
+            || argumentIndex >= function.Arguments.Count
+            || function.Arguments[argumentIndex] is not LiteralExpression { Value.Kind: SqlValueKind.Text } literal)
+        {
+            return;
+        }
+
+        schemas.Add(UnqualifiedSchemaMarker + literal.Value.AsText());
     }
 
     private static void CollectProjectionSchemas(
@@ -32458,11 +32536,11 @@ public sealed class EmbeddedConnection : IDisposable
                 Right = RewriteSourceSchema(join.Right, schema, commonTableExpressions)!,
                 Condition = RewriteNullableExpression(join.Condition, schema, commonTableExpressions),
             },
-            GenerateSeriesSource generateSeries => generateSeries with
+            TableValuedFunctionSource function => function with
             {
-                Start = RewriteExpressionSchema(generateSeries.Start, schema, commonTableExpressions),
-                Stop = RewriteExpressionSchema(generateSeries.Stop, schema, commonTableExpressions),
-                Step = RewriteExpressionSchema(generateSeries.Step, schema, commonTableExpressions),
+                Arguments = [.. function.Arguments.Select(argument =>
+                    RewriteExpressionSchema(argument, schema, commonTableExpressions))],
+                Schema = function.Schema ?? schema,
             },
             _ => throw new InvalidOperationException($"Cannot rewrite source {source.GetType().Name}."),
         };
@@ -32747,9 +32825,8 @@ public sealed class EmbeddedConnection : IDisposable
             JoinTableSource join => SourceContainsSchemaQualification(join.Left)
                 || SourceContainsSchemaQualification(join.Right)
                 || ExpressionContainsSchemaQualification(join.Condition),
-            GenerateSeriesSource generateSeries => ExpressionContainsSchemaQualification(generateSeries.Start)
-                || ExpressionContainsSchemaQualification(generateSeries.Stop)
-                || ExpressionContainsSchemaQualification(generateSeries.Step),
+            TableValuedFunctionSource function => function.Schema is not null
+                || function.Arguments.Any(ExpressionContainsSchemaQualification),
             _ => false,
         };
     }

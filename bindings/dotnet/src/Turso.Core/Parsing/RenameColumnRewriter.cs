@@ -487,13 +487,15 @@ internal static class RenameColumnRewriter
                         IsTarget: false,
                         QualifiedOnly: false));
                     break;
-                case GenerateSeriesSource series:
-                    WalkExpression(series.Start, scope.Parent);
-                    WalkExpression(series.Stop, scope.Parent);
-                    WalkExpression(series.Step, scope.Parent);
+                case TableValuedFunctionSource function:
+                    foreach (var argument in function.Arguments)
+                        WalkExpression(argument, scope.Parent);
+
                     scope.Bindings.Add(new Binding(
-                        series.Alias ?? "generate_series",
-                        ["value", "start", "stop", "step"],
+                        function.Alias ?? function.Name,
+                        TableValuedFunctionRegistry.TryResolve(function.Name, out var module)
+                            ? module.Schema.AllColumns
+                            : [],
                         IsTarget: false,
                         QualifiedOnly: false));
                     break;

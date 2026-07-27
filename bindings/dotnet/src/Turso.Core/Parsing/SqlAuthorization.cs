@@ -600,12 +600,10 @@ internal static class SqlAuthorization
                         return derived with { Query = query };
                     }
 
-                case GenerateSeriesSource series:
-                    return series with
+                case TableValuedFunctionSource function:
+                    return function with
                     {
-                        Start = Expr(series.Start),
-                        Stop = Expr(series.Stop),
-                        Step = Expr(series.Step),
+                        Arguments = [.. function.Arguments.Select(Expr)],
                     };
 
                 default:

@@ -7739,10 +7739,9 @@ internal sealed class EmbeddedFileStore : IDisposable
                 CollectTriggerReferencedTables(join.Right, tables);
                 CollectTriggerReferencedTables(join.Condition, tables);
                 break;
-            case GenerateSeriesSource series:
-                CollectTriggerReferencedTables(series.Start, tables);
-                CollectTriggerReferencedTables(series.Stop, tables);
-                CollectTriggerReferencedTables(series.Step, tables);
+            case TableValuedFunctionSource function:
+                foreach (var argument in function.Arguments)
+                    CollectTriggerReferencedTables(argument, tables);
                 break;
         }
     }
@@ -7915,10 +7914,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             null => null,
             NamedTableSource => null,
-            GenerateSeriesSource series => FirstRuntimeDependency(
-                FindRuntimeDependency(series.Start),
-                FindRuntimeDependency(series.Stop),
-                FindRuntimeDependency(series.Step)),
+            TableValuedFunctionSource function => FirstRuntimeDependency(
+                [.. function.Arguments.Select(argument => FindRuntimeDependency(argument))]),
             DerivedTableSource derived => FindRuntimeDependency(derived.Query),
             JoinTableSource join => FirstRuntimeDependency(
                 FindRuntimeDependency(join.Left),

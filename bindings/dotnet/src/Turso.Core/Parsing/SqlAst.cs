@@ -396,11 +396,22 @@ internal sealed record IndexedByDirective(string IndexName) : TableIndexDirectiv
 
 internal sealed record NotIndexedDirective : TableIndexDirective;
 
-internal sealed record GenerateSeriesSource(
-    Expression Start,
-    Expression Stop,
-    Expression Step,
-    string? Alias = null) : TableSource;
+/// <summary>
+/// A FROM-clause row source produced by calling a named module rather than by looking a
+/// table up in the catalog: <c>FROM pragma_table_info('t')</c>, <c>FROM json_each(:doc)</c>,
+/// <c>FROM generate_series(1, 10)</c>.
+/// <para>
+/// This is the only table-valued call site in the grammar. Resolution, column shape and row
+/// production all live behind <c>TableValuedFunctionRegistry</c>, so a real virtual-table
+/// module implementation attaches by registering a module rather than by extending the
+/// parser or the planner.
+/// </para>
+/// </summary>
+internal sealed record TableValuedFunctionSource(
+    string Name,
+    IReadOnlyList<Expression> Arguments,
+    string? Alias = null,
+    string? Schema = null) : TableSource;
 
 internal sealed record DerivedTableSource(QueryStatement Query, string? Alias) : TableSource;
 

@@ -98,16 +98,13 @@ alter_table.sqltest::drop-column-cross-table-trigger-unreferenced | expected 1 r
 alter_table.sqltest::drop-column-other-table-trigger-insert-col-deferred | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
 alter_table.sqltest::drop-column-owning-table-trigger-insert-col-deferred | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
 alter_table.sqltest::drop-column-owning-table-trigger-update-set-deferred | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-alter_table.sqltest::drop-column-unreferenced-with-complex-trigger | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
 alter_table.sqltest::alter-table-rename-then-rename-column-with-trigger | expected success but got error: error in trigger tr after rename table: no such table: orders
 autoincr.sqltest::autoinc-create-sequence-table | expected 3 row(s), got 2 row(s); row 0 expected '__turso_internal_seq___turso_internal_autoincrement_t1' but was 'sqlite_sequence'
 autoincr.sqltest::autoinc-alter-column-clears-sequence-row | expected success but got error: Expected ADD, DROP, or RENAME after ALTER TABLE. At SQL offset 14.
 before-update-trigger-correlated-subquery.sqltest::before-update-trigger-uncorrelated-subquery | expected 3 row(s), got 3 row(s); row 1 expected '2/600' but was '2/1100'
 bracket-quoting.sqltest::bracket-default-identifier | expected success but got error: default value of column is not constant: hello
-bracket-quoting.sqltest::bracket-alter-rename-column | expected success but got error: Expected keyword TO. At SQL offset 24.
 bracket-quoting.sqltest::bracket-transaction-name | expected success but got error: Expected End. At SQL offset 18.
 bracket-quoting.sqltest::bracket-analyze-table-name | expected success but got error: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were chang
-btree-backward-scan.sqltest::backward-scan-deep-btree | expected success but got error: Expected Comma. At SQL offset 82.
 changes.sqltest::changes-insert-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '0'
 changes.sqltest::changes-insert-in-transaction-after-commit | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '0'
 changes.sqltest::changes-delete-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '2' but was '3'
@@ -133,13 +130,6 @@ collate.sqltest::collate_subquery_preserves_column_collation | expected 2 row(s)
 collate.sqltest::collate_subquery_preserves_explicit_collation | expected 2 row(s), got 2 row(s); row 0 expected '2' but was '1'
 collate.sqltest::collate_groupby_ordinal_with_explicit_collate | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '1'
 collate.sqltest::collate_orderby_ordinal_with_collate_inside_parens | expected 1 row(s), got 1 row(s); row 0 expected 'a/b/c/Z' but was 'b/Z/c/a'
-column_name_case.sqltest::basic_case_preservation | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-column_name_case.sqltest::multiple_mixed_case_columns | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-column_name_case.sqltest::primary_key_with_mixed_case | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-column_name_case.sqltest::table_level_primary_key | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-column_name_case.sqltest::unique_constraint_with_mixed_case | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-column_name_case.sqltest::foreign_key_with_mixed_case | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-column_name_case.sqltest::quoted_identifiers | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
 composite-index-sort-elim.sqltest::group-by-eq-prefix | expected 3 row(s), got 3 row(s); row 0 expected 'art/3/2024-06-15' but was 'tech/3/2024-06-10'
 compound-select-orderby.sqltest::three-way-union-order-by | expected 11 row(s), got 11 row(s); row 0 expected '1/alpha' but was '1/apple'
 compound-select-orderby.sqltest::union-order-by-expr-no-match | error 'ORDER BY term does not match any column in the result set' does not match pattern '1st ORDER BY term does not match any column in the result set'
@@ -152,9 +142,6 @@ create_table.sqltest::create_table_multiple_column_primary_keys | expected an er
 create_table.sqltest::create_table_duplicate_primary_key_clause | expected an error but the statement succeeded
 create_table.sqltest::create_table_trailing_named_column_constraint | expected success but got error: Expected a constraint after CONSTRAINT e. At SQL offset 99.
 create_table.sqltest::create_table_trailing_named_column_constraint_primary_key_enforced | expected success but got error: Expected a constraint after CONSTRAINT d. At SQL offset 87.
-create_table_as_select.sqltest::ctas_column_names | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-create_table_as_select.sqltest::ctas_aliased_columns | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-create_table_as_select.sqltest::ctas_expression_column_names | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
 create_table_as_select.sqltest::ctas_group_by_having | expected success but got error: no such column: total
 create_table_as_select.sqltest::ctas_schema_sql | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst(id INT,name TEXT)' but was 'CREATE TABLE "dst" ("id" INT, "name" TEXT)'
 create_table_as_select.sqltest::ctas_schema_sql_expression_columns | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst("a + 1","count(*)")' but was 'CREATE TABLE "dst" ("BinaryExpression { Left = ColumnExpression 
@@ -205,13 +192,6 @@ gencol.sqltest::gencol_validate_isnull | expected success but got error: Expecte
 gencol.sqltest::gencol_validate_notnull | expected success but got error: Expected RightParen. At SQL offset 35.
 gencol.sqltest::gencol_func_substr | expected success but got error: function substr() is not allowed in a generated column
 gencol.sqltest::gencol_func_nested_upper_substr | expected success but got error: function substr() is not allowed in a generated column
-gencol.sqltest::gencol_tvf_comma_join_json_each_virtual_column | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
-gencol.sqltest::gencol_tvf_comma_join_generate_series_virtual_column | expected success but got error: Expected Comma. At SQL offset 47.
-gencol.sqltest::gencol_tvf_left_join_virtual_column | expected success but got error: Expected Comma. At SQL offset 36.
-gencol.sqltest::gencol_tvf_first_comma_join_virtual_column | expected success but got error: Expected Comma. At SQL offset 36.
-gencol.sqltest::gencol_tvf_comma_join_base_column | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
-gencol.sqltest::gencol_tvf_left_join_virtual_column_table_first | expected success but got error: Expected Comma. At SQL offset 49.
-gencol.sqltest::gencol_tvf_subquery_virtual_column | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
 gencol.sqltest::gencol_alter_add_virtual | expected 2 row(s), got 2 row(s); row 0 expected '5/10' but was '5/'
 gencol.sqltest::gencol_alter_add_virtual_explicit | expected 1 row(s), got 1 row(s); row 0 expected '3/103' but was '3/'
 gencol.sqltest::gencol_alter_add_multiple_virtual | expected 1 row(s), got 1 row(s); row 0 expected '5/10/15' but was '5//'
@@ -235,10 +215,6 @@ gencol.sqltest::gencol_rename_column_updates_expression | expected success but g
 gencol.sqltest::gencol_rename_column_other_table_unaffected | expected success but got error: Expected keyword TO. At SQL offset 22.
 gencol.sqltest::gencol_rename_column_other_table_matching_name_unaffected | expected success but got error: Expected keyword TO. At SQL offset 22.
 gencol.sqltest::rename_then_drop_keeps_renamed_column | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-gencol.sqltest::gencol_pragma_table_info_hides_virtual | expected 2 row(s), got 2 row(s); row 1 expected '1/c/TEXT/0//0' but was '2/c/TEXT/0//0'
-gencol.sqltest::gencol_large_row_count | expected success but got error: Expected Comma. At SQL offset 58.
-gencol.sqltest::gencol_large_row_update | expected success but got error: Expected Comma. At SQL offset 58.
-gencol.sqltest::gencol_large_row_delete | expected success but got error: Expected Comma. At SQL offset 58.
 gencol.sqltest::gencol_error_subquery | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
 gencol.sqltest::gencol_error_in_select | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
 gencol.sqltest::gencol_error_exists | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
@@ -273,10 +249,6 @@ gencol.sqltest::update-virtual-not-null-deferred-trigger-ignore | expected succe
 gencol.sqltest::update-virtual-not-null-transitive-deferred-trigger-ignore | expected success but got error: NOT NULL constraint failed: t.c
 gencol.sqltest::update-virtual-not-null-deferred-trigger-abort | error 'NOT NULL constraint failed: t.b' does not match pattern 'trigger rejects null'
 gencol.sqltest::update-virtual-not-null-transitive-deferred-trigger-abort | error 'NOT NULL constraint failed: t.c' does not match pattern 'trigger rejects null'
-generate_series.sqltest::generate-series-single-arg-default-stop | expected success but got error: Expected Comma. At SQL offset 59.
-generate_series.sqltest::generate-series-single-arg-via-where | expected success but got error: no such table: generate_series
-generate_series.sqltest::generate-series-two-args | expected success but got error: Expected Comma. At SQL offset 34.
-generate_series.sqltest::generate-series-explicit-negative-stop | expected success but got error: Expected Comma. At SQL offset 42.
 glob/memory.sqltest::glob-null-other-types | expected success but got error: Expected BETWEEN, IN, LIKE, GLOB, REGEXP, or MATCH after NOT. At SQL offset 59.
 glob/memory.sqltest::glob-embedded-nul-1 | expected 1 row(s), got 1 row(s); row 0 expected '0' but was '1'
 glob/memory.sqltest::glob-embedded-nul-2 | expected 1 row(s), got 1 row(s); row 0 expected '0' but was '1'
@@ -315,87 +287,18 @@ insert.sqltest::insert-explicit-rowid-with-rowidalias | expected 6 row(s), got 6
 insert.sqltest::uniq_constraint | error 'UNIQUE constraint failed: test.id' does not match pattern 'UNIQUE constraint failed: test.id \(19\)'
 insert.sqltest::insert-explicit-rowid-conflict | error 'UNIQUE constraint failed: t.rowid' does not match pattern 'UNIQUE constraint failed: t.rowid \(19\)'
 insert.sqltest::insert-integer-pk-i64-min-float-error | expected an error but the statement succeeded
-insert.sqltest::insert-or-replace-unique-index-no-corruption | expected success but got error: Expected Comma. At SQL offset 66.
-insert.sqltest::insert-or-replace-unique-index-no-corruption-2 | expected success but got error: Expected Comma. At SQL offset 68.
-insert.sqltest::insert-or-replace-data-correctness | expected success but got error: Expected Comma. At SQL offset 66.
 insert.sqltest::insert-1-3 | error 'table has a different number of columns' does not match pattern 'table test1 has 3 columns but 2 values were supplied'
 insert.sqltest::insert-1-3b | error 'table has a different number of columns' does not match pattern 'table test1 has 3 columns but 4 values were supplied'
 insert.sqltest::insert-column-count-mismatch-values | error 'table has a different number of columns' does not match pattern 'table t1 has 1 columns but 3 values were supplied'
 insert.sqltest::insert-column-count-mismatch-select | error 'table has a different number of columns' does not match pattern 'table t1 has 1 columns but 7 values were supplied'
-join/hash.sqltest::grace-inner-join-basic | expected success but got error: Expected Comma. At SQL offset 72.
-join/hash.sqltest::grace-inner-many-to-many | expected success but got error: Expected Comma. At SQL offset 155.
-join/hash.sqltest::grace-inner-many-to-many-agg | expected success but got error: Expected Comma. At SQL offset 77.
-join/hash.sqltest::grace-null-keys-inner | expected success but got error: Expected Comma. At SQL offset 185.
-join/hash.sqltest::grace-null-keys-left-join | expected success but got error: Expected Comma. At SQL offset 111.
-join/hash.sqltest::grace-null-keys-left-join-count-matched | expected success but got error: Expected Comma. At SQL offset 111.
-join/hash.sqltest::grace-mixed-int-real-join | expected success but got error: Expected Comma. At SQL offset 71.
-join/hash.sqltest::grace-mixed-int-real-spot-check | expected success but got error: Expected Comma. At SQL offset 71.
-join/hash.sqltest::grace-multi-column-key | expected success but got error: Expected Comma. At SQL offset 86.
-join/hash.sqltest::grace-multi-column-key-partial-overlap | expected success but got error: Expected Comma. At SQL offset 155.
-join/hash.sqltest::grace-left-outer-all-unmatched | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-left-outer-all-unmatched-nulls | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-left-outer-partial-match | expected success but got error: Expected Comma. At SQL offset 139.
-join/hash.sqltest::grace-left-outer-with-duplicates | expected success but got error: Expected Comma. At SQL offset 180.
-join/hash.sqltest::grace-full-outer-no-overlap | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-full-outer-complete-overlap | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-full-outer-partial-overlap | expected success but got error: Expected Comma. At SQL offset 199.
-join/hash.sqltest::grace-full-outer-null-counting | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-agg-sum | expected success but got error: Expected Comma. At SQL offset 67.
-join/hash.sqltest::grace-agg-group-by | expected success but got error: Expected Comma. At SQL offset 115.
-join/hash.sqltest::grace-agg-count-distinct | expected success but got error: Expected Comma. At SQL offset 128.
-join/hash.sqltest::grace-order-by | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-order-by-desc | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-limit-small | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-self-join | expected success but got error: Expected Comma. At SQL offset 82.
-join/hash.sqltest::grace-text-keys | expected success but got error: Expected Comma. At SQL offset 88.
-join/hash.sqltest::grace-text-keys-spot-check | expected success but got error: Expected Comma. At SQL offset 88.
-join/hash.sqltest::grace-nocase-text-keys | expected success but got error: Expected Comma. At SQL offset 72.
-join/hash.sqltest::grace-post-join-filter | expected success but got error: Expected Comma. At SQL offset 66.
-join/hash.sqltest::grace-asymmetric-small-build-large-probe | expected success but got error: Expected Comma. At SQL offset 72.
-join/hash.sqltest::grace-asymmetric-large-build-small-probe | expected success but got error: Expected Comma. At SQL offset 74.
-join/hash.sqltest::grace-empty-build | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-empty-probe | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-left-join-empty-right-large | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-full-outer-empty-right | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-full-outer-empty-left | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-three-way-join | expected success but got error: Expected Comma. At SQL offset 69.
-join/hash.sqltest::grace-distinct | expected success but got error: Expected Comma. At SQL offset 135.
-join/hash.sqltest::grace-subquery-join | expected success but got error: Expected Comma. At SQL offset 66.
-join/hash.sqltest::grace-exact-values-checksum | expected success but got error: Expected Comma. At SQL offset 66.
-join/hash.sqltest::grace-left-outer-agg-group | expected success but got error: Expected Comma. At SQL offset 72.
-join/hash.sqltest::grace-having | expected success but got error: Expected Comma. At SQL offset 67.
-join/hash.sqltest::grace-blob-keys | expected success but got error: Expected Comma. At SQL offset 103.
-join/hash.sqltest::grace-negative-keys | expected success but got error: Expected Comma. At SQL offset 75.
-join/hash.sqltest::grace-negative-keys-spot-check | expected success but got error: Expected Comma. At SQL offset 75.
-join/hash.sqltest::grace-large-payload | expected success but got error: Expected Comma. At SQL offset 130.
-join/hash.sqltest::grace-full-outer-heavy-duplicates | expected success but got error: Expected Comma. At SQL offset 137.
-join/hash.sqltest::grace-full-outer-partial-with-duplicates | expected success but got error: Expected Comma. At SQL offset 356.
-join/hash.sqltest::grace-left-outer-unmatched-build-rows | expected success but got error: Expected Comma. At SQL offset 131.
-join/hash.sqltest::grace-stress-large-result | expected success but got error: Expected Comma. At SQL offset 152.
-join/hash.sqltest::grace-coalesce-select | expected success but got error: Expected Comma. At SQL offset 62.
-join/hash.sqltest::grace-complex-on-and-where | expected success but got error: Expected Comma. At SQL offset 81.
-join/memory.sqltest::test-spill-hash-join-count | expected success but got error: Expected Comma. At SQL offset 255.
-join/memory.sqltest::test-spill-hash-join-rows | expected success but got error: Expected Comma. At SQL offset 255.
 join/memory.sqltest::correlated-subquery-hash-join-reuse | expected success but got error: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were chang
 join/memory.sqltest::full-outer-join | expected an error but the statement succeeded
 join/memory.sqltest::join-3-1 | error 'NATURAL joins may not have an ON or USING clause. At SQL offset 45.' does not match pattern 'a NATURAL join may not have an ON or USING clause'
 join/memory.sqltest::join-3-2 | error 'NATURAL joins may not have an ON or USING clause. At SQL offset 41.' does not match pattern 'a NATURAL join may not have an ON or USING clause'
-join/outer_hash_join.sqltest::left-hash-join-larger | expected success but got error: Expected Comma. At SQL offset 75.
-join/outer_hash_join.sqltest::left-hash-join-larger-null-count | expected success but got error: Expected Comma. At SQL offset 75.
-join/outer_hash_join.sqltest::right-join-larger | expected success but got error: Expected Comma. At SQL offset 74.
-join/outer_hash_join.sqltest::full-outer-join-larger | expected success but got error: Expected Comma. At SQL offset 75.
-join/outer_hash_join.sqltest::full-outer-join-larger-verify-rows | expected success but got error: Expected Comma. At SQL offset 74.
 join/outer_hash_join.sqltest::full-outer-join-using-errors | expected an error but the statement succeeded
 join/outer_hash_join.sqltest::full-outer-join-with-group-by | expected success but got error: no such column: key
-join/outer_hash_join.sqltest::left-hash-join-spill-unmatched | expected success but got error: Expected Comma. At SQL offset 78.
-join/outer_hash_join.sqltest::left-hash-join-spill-verify-order | expected success but got error: Expected Comma. At SQL offset 75.
-join/outer_hash_join.sqltest::full-outer-join-spill | expected success but got error: Expected Comma. At SQL offset 75.
-join/outer_hash_join.sqltest::multi-table-left-join-spill-with-inner | expected success but got error: Expected Comma. At SQL offset 73.
-join/outer_hash_join.sqltest::full-outer-join-many-duplicates | expected success but got error: Expected Comma. At SQL offset 64.
 join/outer_hash_join.sqltest::full-outer-join-group-by-having | expected success but got error: no such column: key
-join/outer_hash_join.sqltest::full-outer-join-count-verification | expected success but got error: Expected Comma. At SQL offset 54.
 join/outer_hash_join.sqltest::three-way-full-outer-join-errors | expected an error but the statement succeeded
-join/outer_hash_join.sqltest::full-outer-join-stress-matched-bits | expected success but got error: Expected Comma. At SQL offset 55.
 join/outer_hash_join.sqltest::left-then-full-outer-chain-errors | expected an error but the statement succeeded
 join/outer_hash_join.sqltest::right-then-full-outer-chain-errors | expected an error but the statement succeeded
 join/outer_hash_join.sqltest::left-then-right-join-chain-errors | expected an error but the statement succeeded
@@ -404,7 +307,6 @@ join/outer_hash_join.sqltest::full-outer-then-right-join-errors | expected an er
 join/outer_hash_join.sqltest::full-outer-with-not-exists-subquery | expected an error but the statement succeeded
 join/outer_hash_join.sqltest::full-outer-with-where-equijoin | expected 4 row(s), got 2 row(s); row 0 expected '1/' but was '2/2'
 joins/derived_subquery_on_predicate.sqltest::issue-7372-text-range-join-after-analyze | setup 'issue-7372-schema' failed: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were cha
-json/json_tree.sqltest::json-tree-correlated-subquery-stale-cursor | expected success but got error: Managed table-valued source 'json_tree' is not supported: no module registration, planner, or execution contract is available. A
 last_insert_rowid.sqltest::last-insert-rowid-after-insert-returning | expected 5 row(s), got 5 row(s); row 1 expected '20' but was '10'
 last_insert_rowid.sqltest::last-insert-rowid-unchanged-by-cdc-internal-inserts | expected success but got error: Unsupported PRAGMA capture_data_changes_conn. At SQL offset 33.
 literal.sqltest::numberic-literal-5 | expected success but got error: Expected End. At SQL offset 8.
@@ -437,10 +339,6 @@ on_conflict.sqltest::mvcc-upsert-set-pk-on-conflict-target-resolves | expected s
 on_conflict_constraint_def.sqltest::update-pk-rollback | error 'Managed UPDATE cannot apply schema-level ON CONFLICT ROLLBACK until the pending row-update engine supports partial publication, transaction rollback, and
 on_conflict_constraint_def.sqltest::update-rollback-terminates-transaction | error 'Managed UPDATE cannot apply schema-level ON CONFLICT ROLLBACK until the pending row-update engine supports partial publication, transaction rollback, and
 on_conflict_constraint_def.sqltest::ddl-reject-multiple-pk-columns | expected an error but the statement succeeded
-openread-cursor-reuse-stale-cache.sqltest::openread-reuse-trigger-grow-splits-leaf | setup 'grow_split_leaf' failed: Expected Comma. At SQL offset 68.
-openread-cursor-reuse-stale-cache.sqltest::openread-reuse-same-statement-writer | setup 'no_trigger_self_update' failed: Expected Comma. At SQL offset 70.
-openread-cursor-reuse-stale-cache.sqltest::openread-reuse-trigger-delete-shrinks | setup 'shrink_delete' failed: Expected Comma. At SQL offset 54.
-openread-cursor-reuse-stale-cache.sqltest::openread-reuse-index-descending | setup 'index_desc_scan' failed: Expected Comma. At SQL offset 55.
 orderby/memory.sqltest::orderby_rowid_truncation | expected success but got error: sub-select returns 2 columns - expected 1
 orderby/memory.sqltest::orderby_rowid_truncation_explicit_rowid | expected success but got error: sub-select returns 2 columns - expected 1
 orderby/memory.sqltest::order-by-plus-2 | expected 2 row(s), got 2 row(s); row 0 expected '2/9' but was '1/10'
@@ -463,27 +361,16 @@ partial_idx.sqltest::partial-index-indexed-by-count-star-without-predicate-count
 pragma-unknown-no-op.sqltest::unknown-pragma-reverse-unordered-selects | expected success but got error: Unsupported PRAGMA reverse_unordered_selects. At SQL offset 32.
 pragma-unknown-no-op.sqltest::unknown-pragma-legacy-alter-table | expected success but got error: Unsupported PRAGMA legacy_alter_table. At SQL offset 25.
 pragma/foreign_key_list.sqltest::pragma-foreign-key-list-equals-syntax | expected success but got error: Expected LeftParen. At SQL offset 23.
-pragma/foreign_key_list.sqltest::pragma-foreign-key-list-table-valued-function | expected success but got error: Managed table-valued source 'pragma_foreign_key_list' is not supported: no module registration, planner, or execution contract i
-pragma/foreign_key_list.sqltest::pragma-foreign-key-list-hidden-arg | expected success but got error: no such table: pragma_foreign_key_list
 pragma/foreign_key_list.sqltest::pragma-foreign-key-list-empty-results | expected success but got error: Expected LeftParen. At SQL offset 23.
 pragma/foreign_key_list.sqltest::pragma-foreign-key-list-attached-database | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 pragma/index_info.sqltest::pragma-index-info-equals-syntax | expected success but got error: Expected LeftParen. At SQL offset 17.
-pragma/index_info.sqltest::pragma-index-info-function-syntax | expected success but got error: Managed table-valued source 'pragma_index_info' is not supported: no module registration, planner, or execution contract is avai
 pragma/index_list.sqltest::pragma-index-list-equals-syntax | expected success but got error: Expected LeftParen. At SQL offset 17.
-pragma/index_list.sqltest::pragma-index-list-multiple-indexes | expected success but got error: Managed table-valued source 'pragma_index_list' is not supported: no module registration, planner, or execution contract is avai
-pragma/index_list.sqltest::pragma-index-list-mixed-origins | expected success but got error: Managed table-valued source 'pragma_index_list' is not supported: no module registration, planner, or execution contract is avai
-pragma/index_list.sqltest::pragma-index-list-function-syntax | expected success but got error: Managed table-valued source 'pragma_index_list' is not supported: no module registration, planner, or execution contract is avai
 pragma/index_list.sqltest::pragma-index-list-attached-database | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 pragma/index_xinfo.sqltest::pragma-index-xinfo-equals-syntax | expected success but got error: Expected LeftParen. At SQL offset 18.
-pragma/index_xinfo.sqltest::pragma-index-xinfo-function-syntax | expected success but got error: Managed table-valued source 'pragma_index_xinfo' is not supported: no module registration, planner, or execution contract is ava
 pragma/memory.sqltest::pragma-cache-size-default | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 17.
 pragma/memory.sqltest::pragma-set-cache-size | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
 pragma/memory.sqltest::pragma-cache-size | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 17.
-pragma/memory.sqltest::pragma-function-cache-size | expected success but got error: Managed table-valued source 'pragma_cache_size' is not supported: no module registration, planner, or execution contract is avai
-pragma/memory.sqltest::pragma-table-info-vtable | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
 pragma/memory.sqltest::pragma-page-count-table | expected success but got error: Managed PRAGMA page_count requires a file-backed database.
-pragma/memory.sqltest::pragma-function-argument-with-space | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-pragma/memory.sqltest::pragma-function-sql-injection | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
 pragma/memory.sqltest::pragma-max-page-count-clamping-with-data | expected success but got error: Unsupported PRAGMA max_page_count. At SQL offset 22.
 pragma/memory.sqltest::pragma-page-count-empty | expected success but got error: Managed PRAGMA page_count requires a file-backed database.
 pragma/memory.sqltest::pragma-page-count-empty-2 | expected success but got error: Managed PRAGMA page_count requires a file-backed database.
@@ -503,13 +390,8 @@ pragma/table_list.sqltest::pragma-table-list-equals-syntax | expected success bu
 pragma/table_list.sqltest::pragma-table-list-view | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
 pragma/table_list.sqltest::pragma-table-list-strict | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
 pragma/table_list.sqltest::pragma-table-list-nonexistent | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
-pragma/table_list.sqltest::pragma-table-list-all-user-tables | expected success but got error: no such table: pragma_table_list
-pragma/table_list.sqltest::pragma-table-list-includes-sqlite-schema | expected success but got error: no such table: pragma_table_list
 pragma/table_list.sqltest::pragma-table-list-includes-temp-schema | expected success but got error: no such table: pragma_table_list
 pragma/table_list.sqltest::pragma-table-list-unqualified-includes-main-and-temp-matches | expected success but got error: Managed table-valued source 'pragma_table_list' is not supported: no module registration, planner, or execution contract is avai
-pragma/table_list.sqltest::pragma-table-info-prefers-temp-shadow | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-pragma/table_list.sqltest::pragma-table-xinfo-prefers-temp-shadow | expected success but got error: Managed table-valued source 'pragma_table_xinfo' is not supported: no module registration, planner, or execution contract is ava
-pragma/table_list.sqltest::pragma-table-list-function-syntax | expected success but got error: Managed table-valued source 'pragma_table_list' is not supported: no module registration, planner, or execution contract is avai
 pragma/table_list.sqltest::pragma-table-list-attached-database | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 21.
 pragma/table_list.sqltest::pragma-table-list-explicit-main-vs-temp | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 22.
 pragma_vdbe_trace.sqltest::pragma-vdbe-trace | expected success but got error: Unsupported PRAGMA vdbe_trace. At SQL offset 18.
@@ -519,7 +401,6 @@ reindex.sqltest::reindex-view-is-noop | expected success but got error: unable t
 reindex.sqltest::reindex-expression-index-outer-collate-target | expected 2 row(s), got 2 row(s); row 0 expected '0/0/a/0/RTRIM/1' but was '0/-2//0/RTRIM/1'
 reindex.sqltest::reindex-non-ascii-identifiers-use-ascii-case-folding | error 'Unexpected SQL character 'é' at offset 16.' does not match pattern 'unable to identify the object to be reindexed'
 reindex.sqltest::reindex-unquoted-compound-keyword-target-rejected | expected an error but the statement succeeded
-returning.sqltest::insert-select-returning-where | expected success but got error: Expected Comma. At SQL offset 75.
 returning.sqltest::update-returning-target-selfread-reruns-per-row | expected 2 row(s), got 2 row(s); row 1 expected '2/2' but was '2/1'
 returning.sqltest::update-returning-target-selfread-correlated-updated-group | expected 2 row(s), got 2 row(s); row 0 expected '1/11/1' but was '1/11/0'
 returning.sqltest::update-returning-after-trigger-same-row-direct | expected 2 row(s), got 2 row(s); row 0 expected '120' but was '20'
@@ -613,11 +494,6 @@ total-changes.sqltest::total-changes-includes-fk-cascade-rows | expected 2 row(s
 transactions.sqltest::temp-and-main-table-in-immediate-tx | expected success but got error: Cross-database statements are not supported by managed ATTACH; every persistent table reference must resolve to one database.
 trigger-before-insert-affinity.sqltest::when-rowid-alias-keeps-integer-affinity | expected 1 row(s), got 0 row(s)
 trigger-before-insert-affinity.sqltest::rowid-keeps-integer-affinity | expected 1 row(s), got 0 row(s)
-trigger-virtual-table-innocuous.sqltest::json-each-in-trigger | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
-trigger-virtual-table-innocuous.sqltest::json-tree-in-trigger | expected success but got error: Managed table-valued source 'json_tree' is not supported: no module registration, planner, or execution contract is available. A
-trigger-virtual-table-innocuous.sqltest::json-each-nested-array-in-trigger | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
-trigger-virtual-table-innocuous.sqltest::json-each-with-subquery-in-trigger | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
-trigger-virtual-table-innocuous.sqltest::json-each-before-trigger | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
 trigger.sqltest::trigger-when-rowid-alias-string-literal-affinity | expected 1 row(s), got 0 row(s)
 trigger.sqltest::trigger-raise-shorthand | error 'Expected ROLLBACK, ABORT, FAIL, or IGNORE in RAISE(). At SQL offset 81.' does not match pattern 'shorthand abort'
 trigger.sqltest::trigger-raise-expr-concat | error 'Expected RightParen. At SQL offset 118.' does not match pattern 'bad: -5'
@@ -680,12 +556,10 @@ trigger_on_conflict.sqltest::trigger-upsert-new-in-where | expected success but 
 trigger_on_conflict.sqltest::trigger-upsert-new-in-where-no-update | expected success but got error: no such table: NEW
 update-from.sqltest::update-from-returning-reuses-row-cte-snapshot-after-trigger-mutation | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 88.
 update-from.sqltest::update-from-indexed-by-target-hint-is-preserved | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 9.
-update-from.sqltest::update-from-vtab-source-arguments | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 41.
 update-from.sqltest::update-from-attached-constant-where-literal-set | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 41.
 update-from.sqltest::update-from-attached-constant-where-zero | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 37.
 update-from.sqltest::update-from-attached-constant-where-one | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 37.
 update-from.sqltest::update-from-attached-constant-where-noop-set | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 37.
-update-from.sqltest::update-from-pragma-table-info-source | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 31.
 update.sqltest::update-set-expression-missing-identifier | expected an error but the statement succeeded
 update.sqltest::update-integer-pk-underflow-error | expected an error but the statement succeeded
 update_attached_db_index.sqltest::update-attached-db-rowid-change-with-unique-index | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
@@ -706,11 +580,6 @@ view-rowid.sqltest::view-rowid-select | expected an error but the statement succ
 views.sqltest::view-rejects-aggregate-order-by | error 'ORDER BY within aggregate functions is not supported by the managed engine. At SQL offset 32.' does not match pattern 'ORDER BY clause is not supported y
 views.sqltest::view-mutual-circle-detection | error 'no such table: vv' does not match pattern 'view v is circularly defined'
 views.sqltest::view-reserved-prefix-sqlite | expected an error but the statement succeeded
-virtual-table-left-join.sqltest::left-join-virtual-table-matching | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-virtual-table-left-join.sqltest::left-join-virtual-table-null | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-virtual-table-left-join.sqltest::left-join-virtual-table-on-left-matching | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-virtual-table-left-join.sqltest::left-join-virtual-table-on-left-null | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-where/memory.sqltest::where_alias_precedence_2 | expected success but got error: Expected Comma. At SQL offset 62.
 where/memory.sqltest::where_alias_precedence_3 | expected success but got error: Expected Comma. At SQL offset 62.
 window/filter-over.sqltest::filter-over-scalar-function-rejected | error 'ABS is not a supported window function' does not match pattern 'may not be used as a window function'
 window/filter-over.sqltest::filter-over-repeated-nondeterministic-call | expected success but got error: no such function: TEST_NONDET_COUNTER

@@ -2030,10 +2030,9 @@ public sealed partial class EmbeddedDatabase
             case DerivedTableSource derived:
                 ValidateTriggerQuerySources(context, derived.Query, commonTableExpressions);
                 return;
-            case GenerateSeriesSource series:
-                ValidateTriggerExpressionSources(context, series.Start, commonTableExpressions);
-                ValidateTriggerExpressionSources(context, series.Stop, commonTableExpressions);
-                ValidateTriggerExpressionSources(context, series.Step, commonTableExpressions);
+            case TableValuedFunctionSource function:
+                foreach (var argument in function.Arguments)
+                    ValidateTriggerExpressionSources(context, argument, commonTableExpressions);
                 return;
             case JoinTableSource join:
                 ValidateTriggerSourceNames(context, join.Left, commonTableExpressions);
@@ -2326,7 +2325,9 @@ public sealed partial class EmbeddedDatabase
         => source switch
         {
             null or NamedTableSource => false,
-            GenerateSeriesSource => true,
+            // A table-valued function can raise (malformed JSON, a zero series step), so a
+            // trigger body that calls one is conservatively treated as abort-capable.
+            TableValuedFunctionSource => true,
             DerivedTableSource derived => TriggerQueryCanAbort(derived.Query),
             JoinTableSource join => TriggerSourceCanAbort(join.Left)
                 || TriggerSourceCanAbort(join.Right)
@@ -2522,7 +2523,7 @@ public sealed partial class EmbeddedDatabase
         HashSet<string> visited)
         => source switch
         {
-            null or GenerateSeriesSource => false,
+            null or TableValuedFunctionSource => false,
             NamedTableSource named when context.Views?.TryGetValue(named.Name, out var view) == true
                 && visited.Add(named.Name)
                 => TriggerQueryCanAbort(view.Query)
@@ -3003,10 +3004,9 @@ public sealed partial class EmbeddedDatabase
             case null:
             case NamedTableSource:
                 return;
-            case GenerateSeriesSource series:
-                ValidateTriggerExpression(series.Start, triggerEvent, columns, hasRowid);
-                ValidateTriggerExpression(series.Stop, triggerEvent, columns, hasRowid);
-                ValidateTriggerExpression(series.Step, triggerEvent, columns, hasRowid);
+            case TableValuedFunctionSource function:
+                foreach (var argument in function.Arguments)
+                    ValidateTriggerExpression(argument, triggerEvent, columns, hasRowid);
                 return;
             case DerivedTableSource derived:
                 ValidateTriggerQuery(derived.Query, triggerEvent, columns, hasRowid);
