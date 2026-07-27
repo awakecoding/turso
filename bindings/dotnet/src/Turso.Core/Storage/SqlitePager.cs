@@ -598,7 +598,8 @@ public sealed class SqlitePager : IDisposable
                     this,
                     readerLock,
                     _committedPageCount,
-                    new Dictionary<uint, byte[]>(_walPageOverlay));
+                    new Dictionary<uint, byte[]>(_walPageOverlay),
+                    _lockGeneration);
                 _activeReadTransactions.Add(transaction);
                 return transaction;
             }
@@ -1308,6 +1309,7 @@ public sealed class SqlitePager : IDisposable
     internal byte[] ReadSnapshotPage(
         IReadOnlyDictionary<uint, byte[]> walPageOverlay,
         uint pageCount,
+        long cacheGeneration,
         uint pageNumber)
     {
         lock (_gate)
@@ -1326,13 +1328,20 @@ public sealed class SqlitePager : IDisposable
 
             try
             {
+                // The copied overlay is the snapshot authority; only a matching
+                // clean-main-store generation may be consulted after it.
+                if (_pageCache.TryGetValue(pageNumber, cacheGeneration, out var cachedPage))
+                    return [.. cachedPage];
+
                 if (pageNumber > _pageStore.PageCount)
                 {
                     throw new InvalidDataException(
                         $"Snapshot page {pageNumber} is absent from both the WAL overlay and main database file.");
                 }
 
-                return _pageStore.ReadPage(pageNumber);
+                var page = _pageStore.ReadPage(pageNumber);
+                _pageCache.Add(pageNumber, cacheGeneration, page);
+                return [.. page];
             }
             catch
             {
@@ -1873,7 +1882,7 @@ public sealed class SqlitePager : IDisposable
     {
         if (_walPageOverlay.TryGetValue(pageNumber, out var walPage))
             return walPage;
-        if (_pageCache.TryGetValue(pageNumber, out var cachedPage))
+        if (_pageCache.TryGetValue(pageNumber, _lockGeneration, out var cachedPage))
             return cachedPage;
         if (pageNumber > _pageStore.PageCount)
         {
@@ -1882,7 +1891,7 @@ public sealed class SqlitePager : IDisposable
         }
 
         var page = _pageStore.ReadPage(pageNumber);
-        _pageCache.Add(pageNumber, page);
+        _pageCache.Add(pageNumber, _lockGeneration, page);
         return page;
     }
 
@@ -1963,18 +1972,21 @@ public sealed class SqlitePagerReadTransaction : IDisposable
     private readonly object _gate = new();
     private readonly SqlitePager _pager;
     private readonly IReadOnlyDictionary<uint, byte[]> _walPageOverlay;
+    private readonly long _cacheGeneration;
     private SqlitePagerLockLease? _readerLock;
 
     internal SqlitePagerReadTransaction(
         SqlitePager pager,
         SqlitePagerLockLease readerLock,
         uint pageCount,
-        IReadOnlyDictionary<uint, byte[]> walPageOverlay)
+        IReadOnlyDictionary<uint, byte[]> walPageOverlay,
+        long cacheGeneration)
     {
         _pager = pager;
         _readerLock = readerLock;
         PageCount = pageCount;
         _walPageOverlay = walPageOverlay;
+        _cacheGeneration = cacheGeneration;
     }
 
     /// <summary>The database size captured when this snapshot began.</summary>
@@ -1998,7 +2010,7 @@ public sealed class SqlitePagerReadTransaction : IDisposable
             if (_readerLock is null)
                 throw new ObjectDisposedException(nameof(SqlitePagerReadTransaction));
 
-            return _pager.ReadSnapshotPage(_walPageOverlay, PageCount, pageNumber);
+            return _pager.ReadSnapshotPage(_walPageOverlay, PageCount, _cacheGeneration, pageNumber);
         }
     }
 

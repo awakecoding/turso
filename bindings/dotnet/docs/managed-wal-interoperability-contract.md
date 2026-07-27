@@ -127,6 +127,11 @@ Additional current behavior:
 
 - `SqlitePagerLockManager.Generation` is a monotonic counter bumped by writer and
   checkpoint leases through `PublishStorageChange`. It is purely process-local.
+- The pager's bounded clean-main-store cache tags every image with that committed
+  view generation. A mismatched lookup evicts the stale image instead of exposing
+  it. Read transactions capture their generation, consult their copied WAL overlay
+  first, and may use only a matching clean-main-store image; they never adopt an
+  image cached for a later writer or checkpoint view.
 - Because that counter cannot observe other processes, physical pagers
   (`UsesFileBackedWalLocks`) skip the generation fast path and re-validate on every
   `SynchronizeCommittedView`.
