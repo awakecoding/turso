@@ -328,14 +328,17 @@ under the full recovery lock set; this makes an unverified `nBackfill` unable
 to authorize a reset. It reads recoverable header evidence only after obtaining
 that complete lock set, so a torn publication observed while waiting cannot
 authorize a later tail truncation. Corruption that reaches before the last
-recoverable committed boundary is rejected fail-closed. Physical recovery binds
-the mapped carrier's operating-system identity to every acquired role lease and
-revalidates the carrier path before rebuilding or truncating; replacement or
-unlink evidence therefore fails recovery before it mutates the WAL or index. A
-missing `-shm` carrier is still rejected rather than recreated: without a
-pre-existing lock carrier, detached recovery cannot prove that an unlink raced a
-live client. Focused tests use SQLite-produced artifacts and separate
-reader/writer/lock-worker processes.
+recoverable committed boundary is rejected fail-closed. Physical recovery acquires every checkpoint, writer, recovery, and read-mark
+lease from a handle duplicated from the exact file that backs its mapping; it
+never reopens the `-shm` path for a destructive recovery lease. On Windows the
+recovery-only mapping denies delete sharing for its full lifetime, so the mapped
+carrier cannot be unlinked or replaced between final evidence validation and
+tail truncation. On Linux, where unlink cannot be prevented through this
+carrier, detached recovery still rebuilds a clean index but rejects every
+destructive tail repair fail-closed. A missing `-shm` carrier is still rejected
+rather than recreated: without a pre-existing lock carrier, detached recovery
+cannot prove that an unlink raced a live client. Focused tests use
+SQLite-produced artifacts and separate reader/writer/lock-worker processes.
 
 This remains unreachable from `SqlitePager`, normal managed execution, cache
 invalidation, and managed recovery. It does not relax the Stage 0 ownership

@@ -14,6 +14,27 @@ public sealed partial class PhysicalFileSystem
         string path,
         FileOpenMode mode,
         bool readOnly = false)
+        => OpenSharedMemoryCore(
+            path,
+            mode,
+            readOnly,
+            FileShare.ReadWrite | FileShare.Delete,
+            preventsCarrierReplacement: false);
+
+    internal ISqliteWalSharedMemoryMapping OpenSharedMemoryForRecovery(string path)
+        => OpenSharedMemoryCore(
+            path,
+            FileOpenMode.OpenExisting,
+            readOnly: false,
+            FileShare.ReadWrite,
+            preventsCarrierReplacement: true);
+
+    private static ISqliteWalSharedMemoryMapping OpenSharedMemoryCore(
+        string path,
+        FileOpenMode mode,
+        bool readOnly,
+        FileShare share,
+        bool preventsCarrierReplacement)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         PhysicalSqliteWalSharedMemoryMapping.ThrowIfPlatformUnsupported();
@@ -36,11 +57,14 @@ public sealed partial class PhysicalFileSystem
             path,
             fileMode,
             readOnly ? FileAccess.Read : FileAccess.ReadWrite,
-            FileShare.ReadWrite | FileShare.Delete,
+            share,
             FileOptions.None);
         try
         {
-            return new PhysicalSqliteWalSharedMemoryMapping(handle, readOnly);
+            return new PhysicalSqliteWalSharedMemoryMapping(
+                handle,
+                readOnly,
+                preventsCarrierReplacement);
         }
         catch
         {
@@ -56,7 +80,7 @@ public sealed partial class PhysicalFileSystem
 /// </summary>
 internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
     ISqliteWalSharedMemoryMapping,
-    ISqliteWalSharedMemoryCarrierIdentity
+    ISqliteWalSharedMemoryLockCarrier
 {
     private const uint PageReadOnly = 0x02;
     private const uint PageReadWrite = 0x04;
@@ -66,6 +90,7 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
     private const int ProtWrite = 0x2;
     private const int MapShared = 0x01;
     private const int MsSync = 0x04;
+    private const uint DuplicateSameAccess = 0x0000_0002;
 
     private readonly object _gate = new();
     private readonly SafeFileHandle _fileHandle;
@@ -74,11 +99,15 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
     private long _length;
     private bool _disposed;
 
-    internal PhysicalSqliteWalSharedMemoryMapping(SafeFileHandle fileHandle, bool readOnly)
+    internal PhysicalSqliteWalSharedMemoryMapping(
+        SafeFileHandle fileHandle,
+        bool readOnly,
+        bool preventsCarrierReplacement)
     {
         _fileHandle = fileHandle;
         CarrierIdentity = SqliteWalSharedMemoryCarrierIdentity.FromHandle(fileHandle);
         IsReadOnly = readOnly;
+        PreventsCarrierReplacement = preventsCarrierReplacement && OperatingSystem.IsWindows();
 
         lock (_gate)
         {
@@ -92,6 +121,48 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
 
     SqliteWalSharedMemoryCarrierIdentity ISqliteWalSharedMemoryCarrierIdentity.CarrierIdentity
         => CarrierIdentity;
+
+    internal bool PreventsCarrierReplacement { get; }
+
+    bool ISqliteWalSharedMemoryLockCarrier.PreventsCarrierReplacement
+        => PreventsCarrierReplacement;
+
+    SafeFileHandle ISqliteWalSharedMemoryLockCarrier.DuplicateLockCarrierHandle()
+    {
+        lock (_gate)
+        {
+            ThrowIfDisposed();
+            if (OperatingSystem.IsWindows())
+            {
+                var currentProcess = Native.GetCurrentProcess();
+                if (Native.DuplicateHandle(
+                        currentProcess,
+                        _fileHandle,
+                        currentProcess,
+                        out var duplicate,
+                        desiredAccess: 0,
+                        inheritHandle: false,
+                        DuplicateSameAccess) == 0)
+                {
+                    ThrowNativeIOException("DuplicateHandle", Marshal.GetLastPInvokeError());
+                }
+
+                return duplicate;
+            }
+
+            if (OperatingSystem.IsLinux() && Environment.Is64BitProcess)
+            {
+                var descriptor = Native.Dup(_fileHandle);
+                if (descriptor < 0)
+                    ThrowNativeIOException("dup", Marshal.GetLastPInvokeError());
+
+                return new SafeFileHandle(new IntPtr(descriptor), ownsHandle: true);
+            }
+
+            ThrowIfPlatformUnsupported();
+            throw new InvalidOperationException("The SQLite WAL shared-memory carrier platform selection is inconsistent.");
+        }
+    }
 
     public long Length
     {
@@ -454,6 +525,19 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
         [LibraryImport("kernel32.dll", SetLastError = true)]
         internal static partial int FlushFileBuffers(SafeFileHandle file);
 
+        [LibraryImport("kernel32.dll")]
+        internal static partial nint GetCurrentProcess();
+
+        [LibraryImport("kernel32.dll", SetLastError = true)]
+        internal static partial int DuplicateHandle(
+            nint sourceProcess,
+            SafeFileHandle sourceHandle,
+            nint targetProcess,
+            out SafeFileHandle targetHandle,
+            uint desiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+            uint options);
+
         [LibraryImport("libc", EntryPoint = "mmap", SetLastError = true)]
         internal static partial nint Mmap(
             nint address,
@@ -468,5 +552,8 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
 
         [LibraryImport("libc", EntryPoint = "msync", SetLastError = true)]
         internal static partial int Msync(nint address, nuint length, int flags);
+
+        [LibraryImport("libc", EntryPoint = "dup", SetLastError = true)]
+        internal static partial int Dup(SafeFileHandle file);
     }
 }

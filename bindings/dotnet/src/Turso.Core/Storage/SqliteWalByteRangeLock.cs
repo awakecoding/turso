@@ -126,7 +126,7 @@ public sealed partial class SqliteWalByteRangeLock
     {
         ValidateRange(offset, length);
         ValidateMode(mode);
-        return TryAcquireCore(offset, length, mode, out lease, out _);
+        return TryAcquireCore(offset, length, mode, carrier: null, out lease, out _);
     }
 
     /// <summary>
@@ -174,7 +174,7 @@ public sealed partial class SqliteWalByteRangeLock
         long length,
         SqliteWalByteRangeLockMode mode,
         TimeSpan timeout)
-        => Acquire(offset, length, mode, timeout, CancellationToken.None);
+        => AcquireCore(offset, length, mode, timeout, CancellationToken.None, carrier: null);
 
     /// <summary>
     /// Acquires a lock, retrying until it is available, the requested timeout
@@ -189,6 +189,49 @@ public sealed partial class SqliteWalByteRangeLock
         SqliteWalByteRangeLockMode mode,
         TimeSpan timeout,
         CancellationToken cancellationToken)
+        => AcquireCore(offset, length, mode, timeout, cancellationToken, carrier: null);
+
+    internal bool TryAcquireExclusive(
+        ISqliteWalSharedMemoryLockCarrier carrier,
+        long offset,
+        long length,
+        out SqliteWalByteRangeLockLease? lease)
+    {
+        ArgumentNullException.ThrowIfNull(carrier);
+        ValidateRange(offset, length);
+        return TryAcquireCore(
+            offset,
+            length,
+            SqliteWalByteRangeLockMode.Exclusive,
+            carrier,
+            out lease,
+            out _);
+    }
+
+    internal SqliteWalByteRangeLockLease AcquireExclusive(
+        ISqliteWalSharedMemoryLockCarrier carrier,
+        long offset,
+        long length,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(carrier);
+        return AcquireCore(
+            offset,
+            length,
+            SqliteWalByteRangeLockMode.Exclusive,
+            timeout,
+            cancellationToken,
+            carrier);
+    }
+
+    private SqliteWalByteRangeLockLease AcquireCore(
+        long offset,
+        long length,
+        SqliteWalByteRangeLockMode mode,
+        TimeSpan timeout,
+        CancellationToken cancellationToken,
+        ISqliteWalSharedMemoryLockCarrier? carrier)
     {
         ValidateRange(offset, length);
         ValidateMode(mode);
@@ -200,7 +243,7 @@ public sealed partial class SqliteWalByteRangeLock
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (TryAcquireCore(offset, length, mode, out var lease, out contention))
+            if (TryAcquireCore(offset, length, mode, carrier, out var lease, out contention))
             {
                 return lease
                     ?? throw new InvalidOperationException(
@@ -224,10 +267,13 @@ public sealed partial class SqliteWalByteRangeLock
         long offset,
         long length,
         SqliteWalByteRangeLockMode mode,
+        ISqliteWalSharedMemoryLockCarrier? carrier,
         out SqliteWalByteRangeLockLease? lease,
         out IOException? contention)
     {
-        var handle = OpenLeaseHandle(mode);
+        var handle = carrier is null
+            ? OpenLeaseHandle(mode)
+            : carrier.DuplicateLockCarrierHandle();
         try
         {
             if (!TryLock(handle, offset, length, mode, out contention))
