@@ -64,6 +64,12 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
     [field: ThreadStatic]
     internal static Action? AfterDetachedWalFrameAppendForTesting { get; set; }
 
+    [field: ThreadStatic]
+    internal static Action? AfterDetachedBackfillAttemptPublicationForTesting { get; set; }
+
+    [field: ThreadStatic]
+    internal static Action? AfterDetachedMainStoreBackfillForTesting { get; set; }
+
     /// <summary>
     /// Creates a coordinator over caller-owned storage, WAL, index, and lock
     /// primitives. All artifacts must describe the same SQLite database.
@@ -409,6 +415,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             {
                 _index.PublishBackfillAttemptedFrameCount(region.Header, safeFrame, _wal);
                 attemptedFrameCount = safeFrame;
+                AfterDetachedBackfillAttemptPublicationForTesting?.Invoke();
             }
 
             var backfilledFrameCount = region.CheckpointInfo.BackfilledFrameCount;
@@ -421,6 +428,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
                 // WAL recovery evidence for every copied frame is durable.
                 _wal.Flush();
                 InstallBackfill(safeFrame);
+                AfterDetachedMainStoreBackfillForTesting?.Invoke();
                 _index.PublishBackfilledFrameCount(region.Header, safeFrame, _wal);
                 backfilledFrameCount = safeFrame;
             }

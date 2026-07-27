@@ -429,6 +429,9 @@ Related existing coverage:
 - `SqlitePagerWalConcurrencyRecoverySliceTests` — ownership retry and recovery
   failure surfacing.
 - `ManagedJournalPageMigrationTests` — WAL incarnation change detection.
+- `SqliteWalProcessIsolationHarnessTests` — detached-only process worker races,
+  crash windows, fail-closed tail recovery, and post-handoff SQLite artifact
+  reopening.
 
 Tests that need an external holder of a `-shm` byte range start a worker process
 (`CrossProcessSharedMemoryLockWorkerHoldsRequestedRanges`) instead of opening a
