@@ -88,8 +88,6 @@ alter_table.sqltest::alter-table-rename-column-temp-trigger-attached-cross-table
 alter_table.sqltest::temp-trigger-attached-read-cross-table | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 alter_table.sqltest::alter-table-drop-column-temp-trigger-invalid | expected an error but the statement succeeded
 alter_table.sqltest::alter-table-drop-column-invalid-temp-trigger-missing-main-table | expected an error but the statement succeeded
-alter_table.sqltest::alter-table-drop-column-trigger-bare-owning-column-in-when-invalid | error 'error in trigger trig_when_invalid after drop column: no such column: y' does not match pattern 'error in trigger trig_when_invalid: no such column: y'
-alter_table.sqltest::alter-table-drop-column-trigger-bare-owning-column-in-update-invalid | error 'error in trigger trig_update_invalid after drop column: no such column: y' does not match pattern 'error in trigger trig_update_invalid: no such column: 
 alter_table.sqltest::alter-rename-col-schema-update-cmd-from | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 80.
 alter_table.sqltest::fail-drop-column-cross-table-trigger-update-where-expr | error 'error in trigger trg after drop column: table has no column named m' does not match pattern 'error in trigger trg after drop column: no such column: m'
 alter_table.sqltest::drop-column-cross-table-trigger-insert-col-list-deferred | expected success but got error: error in trigger trg after drop column: table has no column named m

@@ -3379,7 +3379,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 SchemaValidation = true,
             },
             context.CancellationToken,
-            "rename table");
+            "rename table",
+            catalog,
+            context with { SchemaValidation = true });
 
         if (!tables.Remove(statement.TableName))
             throw new InvalidOperationException($"Table '{statement.TableName}' disappeared during rename.");
@@ -3520,7 +3522,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 SchemaValidation = true,
             },
             context.CancellationToken,
-            "rename column");
+            "rename",
+            catalog,
+            context with
+            {
+                Views = catalog.Views,
+                Triggers = catalog.Triggers,
+                SchemaValidation = true,
+            });
 
         foreach (var entry in candidateTables)
             tables[entry.Key] = entry.Value;
@@ -3679,7 +3688,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             catalog,
             candidateContext,
             context.CancellationToken,
-            "drop column");
+            "drop column",
+            catalog,
+            context with { SchemaValidation = true });
 
         catalog.Tables[statement.TableName] = replacement;
         return new ExecutionResult([], [], 0, true);
@@ -3689,7 +3700,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SchemaCatalog catalog,
         QueryContext candidateContext,
         CancellationToken cancellationToken,
-        string operation)
+        string operation,
+        SchemaCatalog originalCatalog,
+        QueryContext originalContext)
     {
         foreach (var view in catalog.Views.Values.OrderBy(view => view.Name, StringComparer.OrdinalIgnoreCase))
         {
@@ -3701,9 +3714,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
             catch (EmbeddedSqlException exception)
             {
-                throw new EmbeddedSqlException(
-                    $"error in view {view.Name} after {operation}: {exception.Message}",
-                    exception);
+                var alreadyBroken = originalCatalog.Views.TryGetValue(view.Name, out var original)
+                    && FailsAgainstOriginalSchema(() => ValidateQuerySchema(
+                        original.Query,
+                        EnterView(originalContext, original.Name),
+                        outerRow: null,
+                        cancellationToken));
+                throw DescribeDependentSchemaFailure("view", view.Name, operation, alreadyBroken, exception);
             }
         }
 
@@ -3716,12 +3733,50 @@ public sealed partial class EmbeddedDatabase : IDisposable
             }
             catch (EmbeddedSqlException exception)
             {
-                throw new EmbeddedSqlException(
-                    $"error in trigger {trigger.Name} after {operation}: {exception.Message}",
-                    exception);
+                var alreadyBroken = originalCatalog.Triggers.TryGetValue(trigger.Name, out var original)
+                    && FailsAgainstOriginalSchema(
+                        () => ValidateTriggerSchema(original, originalContext, cancellationToken));
+                throw DescribeDependentSchemaFailure("trigger", trigger.Name, operation, alreadyBroken, exception);
             }
         }
     }
+
+    /// <summary>
+    /// Re-runs a dependent-schema check against the pre-ALTER definition and schema to find out
+    /// whether the object was already broken. Only <see cref="EmbeddedSqlException"/> is treated as
+    /// "already broken"; anything else propagates, because an unexpected failure while classifying
+    /// an error is a bug worth surfacing rather than swallowing.
+    /// </summary>
+    private static bool FailsAgainstOriginalSchema(Action validate)
+    {
+        try
+        {
+            validate();
+            return false;
+        }
+        catch (EmbeddedSqlException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// SQLite blames the ALTER only when it is actually to blame. An object that was valid before
+    /// the statement and is invalid after it reports "error in view v after drop column: ...",
+    /// while one that was already broken - because a table it referenced was dropped, or because it
+    /// never resolved in the first place - reports "error in view v: ..." with no operation.
+    /// </summary>
+    private static EmbeddedSqlException DescribeDependentSchemaFailure(
+        string kind,
+        string name,
+        string operation,
+        bool alreadyBroken,
+        EmbeddedSqlException failure)
+        => new(
+            alreadyBroken
+                ? $"error in {kind} {name}: {failure.Message}"
+                : $"error in {kind} {name} after {operation}: {failure.Message}",
+            failure);
 
     private void ValidateTriggerSchema(
         TriggerDefinition trigger,
@@ -3780,8 +3835,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
             QualifiedRowIds: triggerRowIds,
             ColumnDefinitions: triggerDefinitions,
             QualifiedColumnDefinitions: triggerQualifiedDefinitions);
-        ValidateExpressionSchema(trigger.When, triggerRow, context, cancellationToken);
-
         ValidateExpressionSchema(trigger.When, triggerRow, context, cancellationToken);
         foreach (var bodyStatement in trigger.Body)
         {
