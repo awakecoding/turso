@@ -95,13 +95,39 @@ Known divergences from SQLite:
 equivalent and are not published, because the managed engine has no per-statement
 wall-clock accounting that would make the reported numbers mean anything.
 
+### Disconnected ADO.NET
+
+`TursoDataAdapter` and `TursoCommandBuilder` support the classic `DataSet` model.
+`Fill`, `FillSchema` and `Update` round trips persist inserts, updates and deletes,
+and both `TursoConnection` and the `SqliteConnection` facade use the same adapter.
+Round trips are covered by tests on managed local connections, and on native local
+connections when the native companion is present.
+
+`GetSchema` is also shared: both connection types answer from one implementation that
+reads the catalog with ordinary SQL on the owning connection. A remote or replica
+connection therefore describes the database it is attached to, and a statement the
+target rejects surfaces that engine's own error instead of an empty table that would
+read as "no objects exist". Remote behaviour is covered against a canned Hrana server;
+it has not been validated against a live Turso Cloud instance.
+
+Deliberate limits:
+
+- `TursoCommandBuilder` generates statements for a single-table `SELECT` only, and the
+  select list must expose a key column. Joins, expressions, and multi-table selects
+  need hand-written `InsertCommand`/`UpdateCommand`/`DeleteCommand`.
+- `UpdateBatchSize` stays at 1; each changed row is a separate round trip.
+- `MissingSchemaAction.AddWithKey` does not promote a rowid-alias `INTEGER PRIMARY KEY`
+  to a `DataTable` primary key. This matches `Microsoft.Data.Sqlite`: SQLite publishes
+  no uniqueness metadata for a rowid alias, so `System.Data` declines to infer the key.
+  `TursoCommandBuilder` is unaffected because it reads `IsKey` from the schema table.
+- `GetSchema` defines `MetaDataCollections`, `ReservedWords`, `Tables`, `Columns`,
+  `Indexes` and `IndexColumns`. Any other collection name is an `ArgumentException`.
+
 ### Not implemented
 
 - Virtual-table modules and `CREATE VIRTUAL TABLE`, including FTS and R-Tree.
 - Profile callbacks (`sqlite3_profile`), and the row/close events of
   `sqlite3_trace_v2`.
-- `DbDataAdapter`/`DataSet` support. `SqliteConnection.GetSchema` is implemented;
-  `TursoConnection` inherits the throwing base implementation.
 - Raw `sqlite3*` handle interop: `SqliteConnection.Handle` returns `null`.
   `ServerVersion` reports a managed placeholder, not a real SQLite version.
 - Experimental MVCC and vector search.

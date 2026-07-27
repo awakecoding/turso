@@ -80,6 +80,14 @@ public class TursoParameter : DbParameter
     [AllowNull]
     public override string ParameterName { get; set; } = "";
 
+    /// <summary>
+    /// Gets or sets the <see cref="DataRowVersion"/> read when the parameter is filled from
+    /// a <see cref="DataRow"/>. The base implementation discards the value, which would make
+    /// <see cref="TursoCommandBuilder"/>'s optimistic-concurrency predicates compare current
+    /// instead of original values.
+    /// </summary>
+    public override DataRowVersion SourceVersion { get; set; } = DataRowVersion.Current;
+
     [AllowNull]
     public override string SourceColumn { get; set; } = "";
     public override object? Value { get; set; }

@@ -12,22 +12,33 @@ internal sealed class TursoRemoteDataReader : DbDataReader
     private readonly IReadOnlyList<RemoteStatementResult> _results;
     private readonly CommandBehavior _behavior;
     private readonly int _recordsAffected;
+    private readonly string? _commandText;
     private int _resultIndex;
     private int _rowIndex = -1;
     private bool _isClosed;
 
     public TursoRemoteDataReader(TursoCommand command, RemoteStatementResult result, CommandBehavior behavior)
-        : this(command.Connection as TursoConnection, [result], behavior)
+        : this(command.Connection as TursoConnection, [result], behavior, command.CommandText)
     {
     }
 
     public TursoRemoteDataReader(TursoConnection? connection, IReadOnlyList<RemoteStatementResult> results, CommandBehavior behavior)
+        : this(connection, results, behavior, null)
+    {
+    }
+
+    private TursoRemoteDataReader(
+        TursoConnection? connection,
+        IReadOnlyList<RemoteStatementResult> results,
+        CommandBehavior behavior,
+        string? commandText)
     {
         ArgumentNullException.ThrowIfNull(results);
 
         _connection = connection;
         _results = results;
         _behavior = behavior;
+        _commandText = commandText;
         foreach (var result in results)
             _recordsAffected = checked(_recordsAffected + (int)result.AffectedRowCount);
     }
@@ -195,6 +206,14 @@ internal sealed class TursoRemoteDataReader : DbDataReader
         : CurrentResult.Rows.Count > 0
             ? CurrentResult.Rows[0].Count
             : 0;
+
+    public override DataTable GetSchemaTable()
+        => TursoSchemaCollections.BuildReaderSchemaTable(
+            _connection,
+            _commandText,
+            FieldCount,
+            GetName,
+            GetFieldType);
 
     public override object this[int ordinal] => GetValue(ordinal);
 

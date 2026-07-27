@@ -1,3 +1,4 @@
+using System.Data;
 using System.Reflection;
 using AwesomeAssertions;
 using Turso.Data.Sqlite;
@@ -99,6 +100,54 @@ public sealed class ManagedDocumentedBoundaryTests
             .Select(candidate => candidate.Name)
             .Should()
             .Contain(member);
+    }
+
+    [Test]
+    public void OnlyTheDocumentedSchemaCollectionsAreDefined()
+    {
+        using var connection = Open();
+
+        connection.GetSchema("MetaDataCollections").Rows.Cast<DataRow>()
+            .Select(row => (string)row["CollectionName"])
+            .Should().Equal(
+                "MetaDataCollections",
+                "ReservedWords",
+                "Tables",
+                "Columns",
+                "Indexes",
+                "IndexColumns");
+
+        foreach (var undefined in new[] { "DataSourceInformation", "DataTypes", "Restrictions", "ForeignKeys", "Views" })
+        {
+            Assert.Throws<ArgumentException>(() => connection.GetSchema(undefined))!
+                .Message.Should().Be($"Unknown collection: {undefined}.");
+        }
+    }
+
+    [Test]
+    public void TheCommandBuilderRefusesSelectsItCannotRoundTrip()
+    {
+        using var connection = Open();
+
+        // Documented limit: single-table selects exposing a key column only. A join and a keyless
+        // table are the two shapes callers hit first, so both have to fail loudly at command
+        // generation rather than silently producing a statement that updates nothing.
+        using var join = new TursoDataAdapter("SELECT t.a, s.b FROM t JOIN s ON t.a = s.a", connection);
+        using var joinBuilder = new TursoCommandBuilder(join);
+        Assert.Throws<InvalidOperationException>(() => joinBuilder.GetUpdateCommand());
+
+        using var keyless = new TursoDataAdapter("SELECT a, b FROM t", connection);
+        using var keylessBuilder = new TursoCommandBuilder(keyless);
+        Assert.Throws<InvalidOperationException>(() => keylessBuilder.GetUpdateCommand());
+    }
+
+    [Test]
+    public void TheAdapterDoesNotBatchRowUpdates()
+    {
+        using var adapter = new TursoDataAdapter();
+
+        adapter.UpdateBatchSize.Should().Be(1);
+        Assert.Throws<NotSupportedException>(() => adapter.UpdateBatchSize = 10);
     }
 
     private static SqliteConnection Open()
