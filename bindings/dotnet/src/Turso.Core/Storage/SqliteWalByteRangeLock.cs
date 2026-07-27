@@ -136,10 +136,32 @@ public sealed partial class SqliteWalByteRangeLock
         => Acquire(offset, length, SqliteWalByteRangeLockMode.Shared, timeout);
 
     /// <summary>
+    /// Acquires a shared lock, retrying until it is available, the requested
+    /// timeout expires, or cancellation is requested.
+    /// </summary>
+    public SqliteWalByteRangeLockLease AcquireShared(
+        long offset,
+        long length,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+        => Acquire(offset, length, SqliteWalByteRangeLockMode.Shared, timeout, cancellationToken);
+
+    /// <summary>
     /// Acquires an exclusive lock, retrying until the requested timeout expires.
     /// </summary>
     public SqliteWalByteRangeLockLease AcquireExclusive(long offset, long length, TimeSpan timeout)
         => Acquire(offset, length, SqliteWalByteRangeLockMode.Exclusive, timeout);
+
+    /// <summary>
+    /// Acquires an exclusive lock, retrying until it is available, the requested
+    /// timeout expires, or cancellation is requested.
+    /// </summary>
+    public SqliteWalByteRangeLockLease AcquireExclusive(
+        long offset,
+        long length,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+        => Acquire(offset, length, SqliteWalByteRangeLockMode.Exclusive, timeout, cancellationToken);
 
     /// <summary>
     /// Acquires a lock, retrying until the requested timeout expires.
@@ -152,15 +174,32 @@ public sealed partial class SqliteWalByteRangeLock
         long length,
         SqliteWalByteRangeLockMode mode,
         TimeSpan timeout)
+        => Acquire(offset, length, mode, timeout, CancellationToken.None);
+
+    /// <summary>
+    /// Acquires a lock, retrying until it is available, the requested timeout
+    /// expires, or cancellation is requested.
+    /// </summary>
+    /// <exception cref="SqliteWalByteRangeLockBusyException">
+    /// The requested range remained unavailable for <paramref name="timeout"/>.
+    /// </exception>
+    public SqliteWalByteRangeLockLease Acquire(
+        long offset,
+        long length,
+        SqliteWalByteRangeLockMode mode,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
     {
         ValidateRange(offset, length);
         ValidateMode(mode);
         ValidateTimeout(timeout);
+        cancellationToken.ThrowIfCancellationRequested();
 
         var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
         IOException? contention = null;
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (TryAcquireCore(offset, length, mode, out var lease, out contention))
             {
                 return lease
@@ -168,7 +207,7 @@ public sealed partial class SqliteWalByteRangeLock
                         "SQLite WAL byte-range locking reported success without returning a lease.");
             }
 
-            if (!WaitForRetry(timeout, stopwatch))
+            if (!WaitForRetry(timeout, stopwatch, cancellationToken))
             {
                 throw new SqliteWalByteRangeLockBusyException(
                     LockFilePath,
@@ -355,11 +394,15 @@ public sealed partial class SqliteWalByteRangeLock
             throw new ArgumentOutOfRangeException(nameof(timeout), "Lock timeout must be non-negative or infinite.");
     }
 
-    private static bool WaitForRetry(TimeSpan timeout, Stopwatch? stopwatch)
+    private static bool WaitForRetry(
+        TimeSpan timeout,
+        Stopwatch? stopwatch,
+        CancellationToken cancellationToken)
     {
         if (timeout == Timeout.InfiniteTimeSpan)
         {
-            Thread.Sleep(RetryDelay);
+            cancellationToken.WaitHandle.WaitOne(RetryDelay);
+            cancellationToken.ThrowIfCancellationRequested();
             return true;
         }
 
@@ -367,7 +410,8 @@ public sealed partial class SqliteWalByteRangeLock
         if (remaining <= TimeSpan.Zero)
             return false;
 
-        Thread.Sleep(remaining < RetryDelay ? remaining : RetryDelay);
+        cancellationToken.WaitHandle.WaitOne(remaining < RetryDelay ? remaining : RetryDelay);
+        cancellationToken.ThrowIfCancellationRequested();
         return true;
     }
 

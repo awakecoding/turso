@@ -11,6 +11,7 @@ namespace Turso.Tests;
 public sealed class SqliteWalWriterCheckpointCoordinatorTests
 {
     private const long WriteLockOffset = SqliteWalIndexCheckpointInfo.LockOffset;
+    private const long RecoveryLockOffset = SqliteWalIndexCheckpointInfo.LockOffset + 2;
 
     [Test]
     [NonParallelizable]
@@ -305,9 +306,11 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
                 TimeSpan.Zero,
                 cancellation.Token));
 
-        using (var worker = new CrossProcessWriteLockHandle(
+        using (var worker = new CrossProcessLockHandle(
                    artifact.WorkDirectory,
-                   artifact.DatabasePath + "-shm"))
+                   artifact.DatabasePath + "-shm",
+                   WriteLockOffset,
+                   length: 1))
         {
             worker.Result.Should().Be("acquired");
             Assert.Throws<SqliteWalByteRangeLockBusyException>(
@@ -317,6 +320,121 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
         var lockProbe = new SqliteWalByteRangeLock(artifact.DatabasePath + "-shm");
         lockProbe.TryAcquireExclusive(WriteLockOffset, length: 1, out var released).Should().BeTrue();
         released!.Dispose();
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void RecoveryReadsTailEvidenceOnlyAfterOwningTheFullRecoveryLockSet()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var before = OpenWalCopy(artifact.DatabasePath);
+        var beforeRecovery = before.ScanRecovery();
+        var committedFrame = before.ReadFrame(beforeRecovery.LastCommittedFrameNumber);
+        AppendValidUncommittedFrame(artifact.DatabasePath + "-wal", before, committedFrame);
+
+        byte[] firstHeader;
+        byte[] secondHeader;
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting))
+        {
+            firstHeader = new byte[SqliteWalIndexHeader.Size];
+            secondHeader = new byte[SqliteWalIndexHeader.Size];
+            mapping.Read(position: 0, firstHeader);
+            mapping.Read(SqliteWalIndexHeader.Size, secondHeader);
+
+            var invalidHeader = firstHeader.ToArray();
+            invalidHeader[40] ^= 0x01;
+            mapping.Write(position: 0, invalidHeader);
+            mapping.Write(SqliteWalIndexHeader.Size, invalidHeader);
+            mapping.MemoryBarrier();
+        }
+
+        using var recoveryBlocker = new CrossProcessLockHandle(
+            artifact.WorkDirectory,
+            artifact.DatabasePath + "-shm",
+            RecoveryLockOffset,
+            length: 1);
+        var recovery = Task.Run(() => coordinator.Recover(TimeSpan.FromSeconds(5)));
+
+        using (var writerProbe = new CrossProcessLockHandle(
+                   artifact.WorkDirectory,
+                   artifact.DatabasePath + "-shm",
+                   WriteLockOffset,
+                   length: 1,
+                   holdLease: false))
+        {
+            writerProbe.Result.Should().Be("busy");
+        }
+
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting))
+        {
+            mapping.Write(position: 0, firstHeader);
+            mapping.Write(SqliteWalIndexHeader.Size, secondHeader);
+            mapping.MemoryBarrier();
+        }
+
+        recoveryBlocker.Dispose();
+        recovery.GetAwaiter().GetResult().LastCommittedFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        using var repairedWal = OpenWalCopy(artifact.DatabasePath);
+        repairedWal.ScanRecovery().LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void CanceledRecoveryReleasesRoleLocksForCrossProcessTakeover()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var before = OpenWalCopy(artifact.DatabasePath);
+        var beforeRecovery = before.ScanRecovery();
+        AppendValidUncommittedFrame(
+            artifact.DatabasePath + "-wal",
+            before,
+            before.ReadFrame(beforeRecovery.LastCommittedFrameNumber));
+
+        using var recoveryBlocker = new CrossProcessLockHandle(
+            artifact.WorkDirectory,
+            artifact.DatabasePath + "-shm",
+            RecoveryLockOffset,
+            length: 1);
+        using var cancellation = new CancellationTokenSource();
+        var recovery = Task.Run(
+            () => coordinator.Recover(Timeout.InfiniteTimeSpan, cancellation.Token));
+
+        using (var writerProbe = new CrossProcessLockHandle(
+                   artifact.WorkDirectory,
+                   artifact.DatabasePath + "-shm",
+                   WriteLockOffset,
+                   length: 1,
+                   holdLease: false))
+        {
+            writerProbe.Result.Should().Be("busy");
+        }
+
+        cancellation.Cancel();
+        SpinWait.SpinUntil(
+            () => recovery.IsCompleted,
+            TimeSpan.FromSeconds(5)).Should().BeTrue(
+            "recovery cancellation must not wait for a held lock");
+        Assert.Throws<OperationCanceledException>(() => recovery.GetAwaiter().GetResult());
+
+        recoveryBlocker.Dispose();
+        using (var takeover = new CrossProcessLockHandle(
+                   artifact.WorkDirectory,
+                   artifact.DatabasePath + "-shm",
+                   WriteLockOffset,
+                   length: 8))
+        {
+            takeover.Result.Should().Be("acquired");
+        }
+
+        coordinator.Recover(TimeSpan.Zero).LastCommittedFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
     }
 
     [TestCase("torn")]
@@ -399,16 +517,24 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
         if (string.IsNullOrEmpty(lockPath))
             return;
 
+        var offset = long.Parse(
+            ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_OFFSET"),
+            CultureInfo.InvariantCulture);
+        var length = long.Parse(
+            ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_LENGTH"),
+            CultureInfo.InvariantCulture);
+        var holdLease = bool.Parse(ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_HOLD_LEASE"));
         var readyPath = ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_READY_PATH");
         var releasePath = ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_RELEASE_PATH");
         var resultPath = ReadWorkerValue("TURSO_WAL_WRITER_CHECKPOINT_LOCK_RESULT_PATH");
         var locks = new SqliteWalByteRangeLock(lockPath);
         try
         {
-            using var lease = locks.AcquireExclusive(WriteLockOffset, length: 1, TimeSpan.Zero);
+            using var lease = locks.AcquireExclusive(offset, length, TimeSpan.Zero);
             File.WriteAllText(resultPath, "acquired");
             File.WriteAllText(readyPath, string.Empty);
-            WaitForFile(releasePath, TimeSpan.FromSeconds(60), "The writer-lock worker was not released.");
+            if (holdLease)
+                WaitForFile(releasePath, TimeSpan.FromSeconds(60), "The writer-lock worker was not released.");
         }
         catch (SqliteWalByteRangeLockBusyException)
         {
@@ -612,14 +738,22 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
         }
     }
 
-    private sealed class CrossProcessWriteLockHandle : IDisposable
+    private sealed class CrossProcessLockHandle : IDisposable
     {
         private readonly Process _worker;
         private readonly string _releasePath;
         private readonly string _resultPath;
         private readonly StringBuilder _output = new();
+        private readonly bool _holdsLease;
+        private bool _disposed;
+        private bool _released;
 
-        internal CrossProcessWriteLockHandle(string workDirectory, string lockPath)
+        internal CrossProcessLockHandle(
+            string workDirectory,
+            string lockPath,
+            long offset,
+            long length,
+            bool holdLease = true)
         {
             var token = Guid.NewGuid().ToString("N");
             var readyPath = Path.Combine(workDirectory, $"wal-write-ready-{token}");
@@ -640,9 +774,13 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
                 "--TestCaseFilter:FullyQualifiedName=Turso.Tests.SqliteWalWriterCheckpointCoordinatorTests."
                 + nameof(CrossProcessWriteLockWorker));
             startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_PATH"] = lockPath;
+            startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_OFFSET"] = offset.ToString(CultureInfo.InvariantCulture);
+            startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_LENGTH"] = length.ToString(CultureInfo.InvariantCulture);
+            startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_HOLD_LEASE"] = holdLease.ToString();
             startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_READY_PATH"] = readyPath;
             startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_RELEASE_PATH"] = _releasePath;
             startInfo.Environment["TURSO_WAL_WRITER_CHECKPOINT_LOCK_RESULT_PATH"] = _resultPath;
+            _holdsLease = holdLease;
 
             _worker = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("Failed to start the WAL writer-lock worker.");
@@ -662,9 +800,17 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
 
         public void Dispose()
         {
+            if (_disposed)
+                return;
+            _disposed = true;
+
             try
             {
-                File.WriteAllText(_releasePath, string.Empty);
+                if (_holdsLease && !_released)
+                {
+                    File.WriteAllText(_releasePath, string.Empty);
+                    _released = true;
+                }
                 if (!_worker.WaitForExit(TimeSpan.FromSeconds(60)))
                 {
                     _worker.Kill(entireProcessTree: true);
