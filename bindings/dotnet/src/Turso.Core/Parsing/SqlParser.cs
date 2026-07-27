@@ -77,11 +77,18 @@ internal sealed class SqlParser
             return ParseQuery();
         if (ConsumeKeyword("BEGIN"))
         {
-            ConsumeKeyword("DEFERRED");
-            ConsumeKeyword("IMMEDIATE");
-            ConsumeKeyword("EXCLUSIVE");
+            // SQLite's grammar admits at most one mode keyword, and the mode decides
+            // when the write lock is taken, so it cannot be discarded here.
+            var mode = TransactionMode.Deferred;
+            if (ConsumeKeyword("DEFERRED"))
+                mode = TransactionMode.Deferred;
+            else if (ConsumeKeyword("IMMEDIATE"))
+                mode = TransactionMode.Immediate;
+            else if (ConsumeKeyword("EXCLUSIVE"))
+                mode = TransactionMode.Exclusive;
+
             ConsumeKeyword("TRANSACTION");
-            return new BeginStatement();
+            return new BeginStatement(mode);
         }
         if (ConsumeKeyword("COMMIT") || ConsumeKeyword("END"))
         {

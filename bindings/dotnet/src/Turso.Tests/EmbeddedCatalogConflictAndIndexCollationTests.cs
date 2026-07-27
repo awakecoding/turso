@@ -54,8 +54,11 @@ public sealed class EmbeddedCatalogConflictAndIndexCollationTests
             using (var stale = staleDatabase.Connect())
             {
                 Execute(stale, "BEGIN;");
-                Execute(stale, "INSERT INTO entries VALUES ('stale');");
+                // The competing write has to land before the stale transaction takes
+                // its write lock at its own first write; SQLite refuses an autocommit
+                // write while another connection holds a write transaction.
                 Execute(first, "INSERT INTO entries VALUES ('first');");
+                Execute(stale, "INSERT INTO entries VALUES ('stale');");
 
                 Action staleCommit = () => Execute(stale, "COMMIT;");
                 staleCommit.Should().Throw<EmbeddedSqlException>()

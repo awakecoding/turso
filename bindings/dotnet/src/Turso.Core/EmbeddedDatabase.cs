@@ -231,9 +231,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private readonly Dictionary<BlobMutationIdentity, int> _activeBlobMutations = new();
     private readonly Dictionary<BlobMutationIdentity, long> _blobMutationGenerations = new();
     private long _nextBlobMutationGeneration;
+    private readonly EmbeddedTransactionLock _transactionLock;
 
     public EmbeddedDatabase()
     {
+        _transactionLock = new EmbeddedTransactionLock();
     }
 
     private EmbeddedDatabase(
@@ -254,6 +256,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         _tables = catalog.Tables;
         _views = catalog.Views;
         _triggers = catalog.Triggers;
+        _transactionLock = EmbeddedTransactionLockRegistry.Get(fileSystem, databasePath);
     }
 
     /// <summary>
@@ -310,6 +313,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     internal bool IsFileBacked => _fileStore is not null;
+
+    /// <summary>
+    /// The write reservation shared by every managed connection open on this
+    /// database, modeling SQLite's RESERVED and EXCLUSIVE locks.
+    /// </summary>
+    internal EmbeddedTransactionLock TransactionLock => _transactionLock;
+
+    /// <summary>
+    /// Whether an EXCLUSIVE transaction also excludes readers. SQLite only does
+    /// that under a rollback journal; in WAL mode EXCLUSIVE behaves as IMMEDIATE
+    /// because WAL readers never contend with the writer.
+    /// </summary>
+    internal bool ExclusiveTransactionsExcludeReaders => GetJournalMode() != SqliteJournalMode.Wal;
 
     internal bool IsReadOnly => _readOnly;
 
@@ -29034,6 +29050,7 @@ public sealed class EmbeddedConnection : IDisposable
     private Dictionary<EmbeddedDatabase, TransactionDatabaseState>? _transactionDatabases;
     private EmbeddedDatabase? _transactionWriteDatabase;
     private EmbeddedDatabase? _transactionMutationDatabase;
+    private readonly List<EmbeddedDatabase> _writeReservations = [];
     private bool _transactionOpenedBySavepoint;
     private readonly List<SavepointEntry> _savepoints = [];
     private long _lastInsertRowId;
@@ -29453,10 +29470,10 @@ public sealed class EmbeddedConnection : IDisposable
 
         switch (statement)
         {
-            case BeginStatement:
+            case BeginStatement begin:
                 if (_transactionDatabases is not null)
                     throw new EmbeddedSqlException("cannot start a transaction within a transaction");
-                BeginTransaction(openedBySavepoint: false);
+                BeginTransaction(openedBySavepoint: false, begin.Mode);
                 return ExecutionResult.Empty;
             case CommitStatement:
                 if (_transactionDatabases is null)
@@ -29523,6 +29540,10 @@ public sealed class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException("attempt to write a readonly database");
 
                 var routed = RouteStatement(statement);
+                // A reader-excluding EXCLUSIVE transaction on another connection blocks
+                // this statement outright, which is what SQLite's EXCLUSIVE lock does
+                // under a rollback journal.
+                routed.Database.TransactionLock.ThrowIfReadBlocked(this);
                 TransactionDatabaseState? transactionState = null;
                 EmbeddedDatabase.SchemaCatalog? statementCatalog = null;
                 HashSet<EmbeddedDatabase.ForeignKeyViolation>? deferredBefore = null;
@@ -29973,6 +29994,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         var (targetSchema, targetName) = ResolveCreateTableTarget(statement);
         var targetDatabase = ResolveSchemaDatabase(targetSchema);
+        ReserveWriteAccess(targetDatabase);
         if (CurrentCatalogContains(targetDatabase, targetName, ManagedSchemaObjectKind.Table))
         {
             if (statement.IfNotExists)
@@ -31517,18 +31539,29 @@ public sealed class EmbeddedConnection : IDisposable
         return state;
     }
 
-    private void BeginTransaction(bool openedBySavepoint)
+    private void BeginTransaction(bool openedBySavepoint, TransactionMode mode)
     {
         var databases = _attachedDatabases.Values
             .OrderBy(attachment => attachment.PathIdentity, StringComparer.OrdinalIgnoreCase)
             .Select(attachment => attachment.Database)
             .Prepend(_tempDatabase)
-            .Prepend(_database);
+            .Prepend(_database)
+            .ToArray();
+
+        // SQLite takes the write lock on every database in the transaction when the
+        // mode is IMMEDIATE or EXCLUSIVE, before anything else can fail. Acquiring
+        // first means a competing writer surfaces busy at BEGIN, which is the whole
+        // reason applications choose those modes.
+        if (mode != TransactionMode.Deferred)
+            AcquireTransactionWriteReservations(databases, mode);
+
         var states = new Dictionary<EmbeddedDatabase, TransactionDatabaseState>();
         try
         {
             foreach (var database in databases)
             {
+                if (mode == TransactionMode.Deferred)
+                    database.TransactionLock.ThrowIfReadBlocked(this);
                 var snapshot = database.CreateTransactionSnapshot();
                 states.Add(database, new TransactionDatabaseState(
                     snapshot.Catalog,
@@ -31540,6 +31573,7 @@ public sealed class EmbeddedConnection : IDisposable
         {
             foreach (var database in states.Keys)
                 database.EndTransaction();
+            ReleaseTransactionWriteReservations();
             throw;
         }
 
@@ -31548,6 +31582,55 @@ public sealed class EmbeddedConnection : IDisposable
         _transactionMutationDatabase = null;
         _transactionOpenedBySavepoint = openedBySavepoint;
         _savepoints.Clear();
+    }
+
+    /// <summary>
+    /// Takes the eager write reservation for an IMMEDIATE or EXCLUSIVE transaction
+    /// on every database it covers, releasing everything already taken when one
+    /// database is busy so a failed BEGIN leaves no lock behind.
+    /// </summary>
+    private void AcquireTransactionWriteReservations(
+        IReadOnlyList<EmbeddedDatabase> databases,
+        TransactionMode mode)
+    {
+        try
+        {
+            foreach (var database in databases)
+            {
+                if (database.IsReadOnly)
+                    continue;
+
+                var excludeReaders = mode == TransactionMode.Exclusive
+                                     && database.ExclusiveTransactionsExcludeReaders;
+                database.TransactionLock.Enter(this, excludeReaders);
+                _writeReservations.Add(database);
+            }
+        }
+        catch
+        {
+            ReleaseTransactionWriteReservations();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Takes the write reservation a DEFERRED transaction defers until its first
+    /// write, which is where SQLite reports busy for that mode.
+    /// </summary>
+    private void AcquireDeferredWriteReservation(EmbeddedDatabase database)
+    {
+        if (database.TransactionLock.IsHeldBy(this))
+            return;
+
+        database.TransactionLock.Enter(this, excludeReaders: false);
+        _writeReservations.Add(database);
+    }
+
+    private void ReleaseTransactionWriteReservations()
+    {
+        for (var index = _writeReservations.Count - 1; index >= 0; index--)
+            _writeReservations[index].TransactionLock.Exit(this);
+        _writeReservations.Clear();
     }
 
     private void EnsureTransactionMayMutate(EmbeddedDatabase database, ParsedStatement statement)
@@ -31579,8 +31662,32 @@ public sealed class EmbeddedConnection : IDisposable
         if (!EmbeddedDatabase.MayMutate(statement))
             return false;
 
+        ReserveWriteAccess(database);
         _transactionMutationDatabase = database;
         return true;
+    }
+
+    /// <summary>
+    /// Applies the transaction-mode locking rules to a write against
+    /// <paramref name="database"/>, whether it runs inside a transaction or in
+    /// autocommit.
+    /// </summary>
+    private void ReserveWriteAccess(EmbeddedDatabase database)
+    {
+        if (_transactionDatabases is not null)
+        {
+            // A DEFERRED transaction takes its write reservation here, at the first
+            // write, exactly where SQLite escalates to RESERVED. IMMEDIATE and
+            // EXCLUSIVE already hold it, so this is a no-op for them.
+            AcquireDeferredWriteReservation(database);
+        }
+        else
+        {
+            // An autocommit write is serialized with other autocommit writes by the
+            // owning database, so it takes no reservation of its own; it only has to
+            // lose to a connection that is holding one across a transaction.
+            database.TransactionLock.ThrowIfWriteBlocked(this);
+        }
     }
 
     private ExecutionResult ExecuteWithMutationReservation(
@@ -31891,6 +31998,10 @@ public sealed class EmbeddedConnection : IDisposable
         if (!database.IsFileBacked && statement.Into is null)
             return ExecutionResult.Empty;
 
+        // VACUUM rewrites the whole database, so it has to lose to a connection
+        // holding a write transaction just like any other write.
+        ReserveWriteAccess(database);
+
         int? pendingPageSize = _pendingPageSizes.TryGetValue(database, out var pendingPageSizeValue)
             ? pendingPageSizeValue
             : null;
@@ -32025,7 +32136,7 @@ public sealed class EmbeddedConnection : IDisposable
         // A SAVEPOINT issued outside an explicit BEGIN...COMMIT opens a transaction
         // that stays active until its outermost savepoint is released or rolled back.
         if (_transactionDatabases is null)
-            BeginTransaction(openedBySavepoint: true);
+            BeginTransaction(openedBySavepoint: true, TransactionMode.Deferred);
 
         _savepoints.Add(new SavepointEntry(
             name,
@@ -32105,6 +32216,7 @@ public sealed class EmbeddedConnection : IDisposable
         _transactionOpenedBySavepoint = false;
         _savepoints.Clear();
         _deferForeignKeys = false;
+        ReleaseTransactionWriteReservations();
         if (transactionDatabases is not null)
         {
             foreach (var database in transactionDatabases.Keys)
