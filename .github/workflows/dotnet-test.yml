@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - ci-matrix-evidence
+      - ci-matrix-evidence
     tags:
       - v*
   pull_request:
