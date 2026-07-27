@@ -36,6 +36,18 @@ public sealed class SqliteOverflowChainReader
         _usableSpace = header.UsableSpace;
     }
 
+    /// <summary>
+    /// Creates a reader over an incremental b-tree page-access boundary, so a
+    /// mutation in progress reads its own staged overflow pages.
+    /// </summary>
+    public SqliteOverflowChainReader(ISqliteBtreePageIo pageIo)
+    {
+        ArgumentNullException.ThrowIfNull(pageIo);
+        _readPage = pageIo.ReadPage;
+        _getPageCount = () => pageIo.PageCount;
+        _usableSpace = pageIo.UsableSpace;
+    }
+
     /// <summary>The number of payload bytes available on each overflow page.</summary>
     public int PayloadCapacity => _usableSpace - SqliteOverflowPageView.HeaderLength;
 

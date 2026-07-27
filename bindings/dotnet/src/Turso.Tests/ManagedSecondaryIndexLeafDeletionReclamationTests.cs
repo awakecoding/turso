@@ -435,13 +435,19 @@ public sealed class ManagedSecondaryIndexLeafDeletionReclamationTests
             store.ReadPage(rightPage),
             header.UsableSpace,
             header.TextEncoding);
-        middle.Cells.Should().HaveCount(2);
+        middle.Cells.Should().HaveCountGreaterThanOrEqualTo(2);
         right.Cells.Should().NotBeEmpty();
 
+        // Reduce the middle leaf to a single key: its second key is promoted as
+        // the separator that follows it and every later key moves to the right
+        // leaf, ahead of the separator that used to sit between them. Ordering
+        // is preserved, so the result is a valid tree whose middle child holds
+        // exactly one key.
         var middleRecords = Enumerable.Range(0, middle.Cells.Count).Select(middle.GetRecord).ToArray();
         var rightRecords = Enumerable.Range(0, right.Cells.Count).Select(right.GetRecord).ToList();
         var transferredToRight = root.GetRecord(1);
         rightRecords.Insert(0, transferredToRight);
+        rightRecords.InsertRange(0, middleRecords[2..]);
         var comparer = new SqliteIndexRecordComparer(header.TextEncoding);
 
         var replacementRoot = rootImage.ToArray();

@@ -1408,6 +1408,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     _fileStore.Compact();
                 else
                     _fileStore.MigratePageSize(pageSize, _tables, _views, _triggers);
+                _fileStore.AdoptCommittedTables(_tables);
                 _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath);
                 _version++;
             }
@@ -1562,7 +1563,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     catalog.Views,
                     catalog.Triggers,
                     pragmaHeader,
-                    forceFullRewrite);
+                    forceFullRewrite,
+                    previousTables: _tables);
                 PublishCatalog(catalog, committedVersion);
             }
             catch (EmbeddedPostCommitMaintenanceException)

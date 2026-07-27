@@ -25,7 +25,12 @@ public sealed class ManagedIndexedBoundedLeafFastPathInvariantTests
 
             var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
             Execute(connection, "UPDATE target SET code = 'code-001-updated' WHERE id = 1;");
-            (faults.GetOperationCount(FileSystemOperation.Write) - writesBefore).Should().Be(8);
+
+            // Three pages change - the table leaf, the target_code leaf and the
+            // header page - and each is written once as a WAL frame and once by
+            // the checkpoint. target_value is not written because the indexed
+            // column did not change.
+            (faults.GetOperationCount(FileSystemOperation.Write) - writesBefore).Should().Be(6);
 
             writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
             var duplicate = () => Execute(connection, "INSERT INTO target VALUES (99, 'code-002', 'duplicate');");
@@ -83,9 +88,13 @@ public sealed class ManagedIndexedBoundedLeafFastPathInvariantTests
         using (var connection = database.Connect())
         {
             CreateCompatibleIndexedTarget(connection);
+
+            // The mutation writes one frame per dirtied page - the table leaf,
+            // the target_code leaf and the header page - so failing the last of
+            // them aborts the transaction before it commits.
             faults.FailOnOccurrence(
                 FileSystemOperation.Write,
-                faults.GetOperationCount(FileSystemOperation.Write) + 4);
+                faults.GetOperationCount(FileSystemOperation.Write) + 3);
             Assert.Throws<IOException>(() =>
                 Execute(connection, "UPDATE target SET code = 'code-001-after' WHERE id = 1;"));
         }
@@ -184,7 +193,7 @@ public sealed class ManagedIndexedBoundedLeafFastPathInvariantTests
     }
 
     [Test]
-    public void IndexedInteriorRootFallsBackToCompleteRewriteInsteadOfPartialLeafMutation()
+    public void IndexedInteriorRootMutatesIncrementallyInsteadOfRewritingEveryPage()
     {
         var faults = new DeterministicFaultInjector();
         var fileSystem = new InMemoryFileSystem(faults);
@@ -198,9 +207,11 @@ public sealed class ManagedIndexedBoundedLeafFastPathInvariantTests
             Execute(connection, "CREATE INDEX target_value ON target(value);");
         }
 
+        uint pageCountBefore;
         using (var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true))
         {
             var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
+            pageCountBefore = pager.CommittedPageCount;
             SqliteBtreePageHeader.Parse(pager.ReadCommittedPage(
                     FindRootPage(pager, header, "index", "target_value")))
                 .PageType
@@ -213,12 +224,21 @@ public sealed class ManagedIndexedBoundedLeafFastPathInvariantTests
         {
             var writesBefore = faults.GetOperationCount(FileSystemOperation.Write);
             Execute(connection, "UPDATE target SET value = 'replacement-value' WHERE id = 1;");
-            (faults.GetOperationCount(FileSystemOperation.Write) - writesBefore).Should().BeGreaterThan(6);
+
+            // An index whose root is interior no longer forces a rewrite of
+            // every page: the cursor descends to the one index leaf that holds
+            // the old key and writes only the pages it dirties.
+            (faults.GetOperationCount(FileSystemOperation.Write) - writesBefore).Should().BeLessThanOrEqualTo(8);
         }
+
+        using (var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true))
+            pager.CommittedPageCount.Should().Be(pageCountBefore);
 
         using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
         using var reopenedConnection = reopened.Connect();
         Text(reopenedConnection, "SELECT value FROM target WHERE id = 1;").Should().Be("replacement-value");
+        Integer(reopenedConnection, "SELECT id FROM target WHERE value = 'replacement-value';").Should().Be(1);
+        Integer(reopenedConnection, "SELECT COUNT(*) FROM target;").Should().Be(96);
     }
 
     private static void CreateCompatibleIndexedTarget(EmbeddedConnection connection)
