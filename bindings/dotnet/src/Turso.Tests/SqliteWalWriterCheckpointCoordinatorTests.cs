@@ -587,6 +587,78 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
 
     [Test]
     [NonParallelizable]
+    public void FailedCommitAfterCarrierReplacementDoesNotRepairThroughTheReplacementCarrier()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        var databasePath = Path.Combine(artifact.WorkDirectory, "failed-commit-carrier-replacement.db");
+        File.Copy(artifact.DatabasePath, databasePath);
+        File.Copy(artifact.DatabasePath + "-wal", databasePath + "-wal");
+        File.Copy(artifact.DatabasePath + "-shm", databasePath + "-shm");
+
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(databasePath);
+        using var before = OpenWalCopy(databasePath);
+        var beforeRecovery = before.ScanRecovery();
+        beforeRecovery.LastCommittedDatabaseSizeInPages.Should().BeGreaterThanOrEqualTo(2);
+        var page = before.ReadFrame(beforeRecovery.LastCommittedFrameNumber).PageData;
+        var walPath = databasePath + "-wal";
+        var originalLength = new FileInfo(walPath).Length;
+        var sharedMemoryPath = databasePath + "-shm";
+        var replacementPath = sharedMemoryPath + ".failed-commit-replacement";
+        var replacementSucceeded = false;
+
+        SqliteWalWriterCheckpointCoordinator.AfterDetachedWalFrameAppendForTesting = () =>
+        {
+            File.Move(sharedMemoryPath, replacementPath);
+            File.Copy(replacementPath, sharedMemoryPath);
+            replacementSucceeded = true;
+            throw new IOException("Injected failure after the first detached WAL frame append.");
+        };
+
+        try
+        {
+            Assert.Throws<IOException>(
+                () => coordinator.Commit(
+                    [
+                        new SqliteWalWritePage(1, page),
+                        new SqliteWalWritePage(2, page),
+                    ],
+                    beforeRecovery.LastCommittedDatabaseSizeInPages,
+                    TimeSpan.Zero));
+        }
+        finally
+        {
+            SqliteWalWriterCheckpointCoordinator.AfterDetachedWalFrameAppendForTesting = null;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            replacementSucceeded.Should().BeFalse(
+                "the recovery mapping denies delete sharing for the commit writer lock's full lifetime");
+            using var repaired = OpenWalCopy(databasePath);
+            repaired.ScanRecovery().LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+            return;
+        }
+
+        replacementSucceeded.Should().BeTrue();
+        new FileInfo(walPath).Length.Should().Be(
+            originalLength + SqliteWalFrameHeader.Size + before.PageSize);
+        using (var tail = OpenWalCopy(databasePath))
+        {
+            var recovery = tail.ScanRecovery();
+            recovery.LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber + 1);
+            recovery.LastCommittedFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        }
+
+        Assert.Throws<InvalidOperationException>(
+            () => coordinator.Commit(
+                [new SqliteWalWritePage(1, page)],
+                beforeRecovery.LastCommittedDatabaseSizeInPages,
+                TimeSpan.Zero));
+    }
+
+    [Test]
+    [NonParallelizable]
     public void CanceledRecoveryReleasesRoleLocksForCrossProcessTakeover()
     {
         RequireCoordinatorSupport();
