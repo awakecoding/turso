@@ -88,11 +88,13 @@ the managed provider for write-heavy use.
 
 ### Testing scope
 
-The managed engine has its own regression suite plus a curated subset of the
-repository's `.sqltest` conformance corpus; it does not run the full corpus or
-the upstream SQLite TCL suites. Fault injection is limited to the detached WAL
-coordinator primitives, where process-isolated workers cover writer and
-checkpoint interruption, torn and uncommitted tails, and carrier replacement.
+The managed engine has its own regression suite and runs the repository's
+`sqlite-sqltests` conformance corpus in full. Cases it does not yet satisfy are
+listed in `src/Turso.Tests/Conformance/managed-sqltest-expected-failures.txt`,
+so both coverage and known gaps are visible; it does not run the upstream SQLite
+TCL suites. Fault injection is limited to the detached WAL coordinator
+primitives, where process-isolated workers cover writer and checkpoint
+interruption, torn and uncommitted tails, and carrier replacement.
 The ordinary pager and commit path has no fsync-failure, disk-full, torn-write,
 or power-loss injection, and there is no fuzzing or property-based testing, so
 managed durability rests on targeted deterministic tests rather than randomized
