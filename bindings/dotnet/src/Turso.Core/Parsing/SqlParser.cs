@@ -2072,6 +2072,14 @@ internal sealed class SqlParser
         return ParseComparison();
     }
 
+    /// <summary>
+    /// Parses the right operand of IS / IS NOT. A leading NOT negates a whole comparison in
+    /// SQLite, so <c>1 IS NOT NOT 2 = 3</c> negates <c>2 = 3</c>, while an operand without NOT
+    /// stays at the relational level so chained <c>IS</c> keeps its left associativity.
+    /// </summary>
+    private Expression ParseIsRightOperand()
+        => CurrentIsKeyword("NOT") ? ParseNot() : ParseRelational();
+
     private Expression ParseComparison()
     {
         var expression = ParseRelational();
@@ -2088,7 +2096,7 @@ internal sealed class SqlParser
                     distinct
                         ? isNot ? BinaryOperator.Is : BinaryOperator.IsNot
                         : isNot ? BinaryOperator.IsNot : BinaryOperator.Is,
-                    ParseRelational());
+                    ParseIsRightOperand());
                 continue;
             }
             var negated = ConsumeKeyword("NOT");
