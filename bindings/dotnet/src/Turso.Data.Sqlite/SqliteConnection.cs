@@ -183,6 +183,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             RegisterScalarFunctions();
             RegisterAggregateFunctions();
             RegisterCollations();
+            RegisterHooks();
             LoadPendingExtensions();
             OnStateChange(new StateChangeEventArgs(originalState, State));
         }
@@ -1221,7 +1222,8 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
     private bool HasManagedCallbacks
         => _scalarFunctions.Count != 0
            || _aggregateFunctions.Count != 0
-           || _collations.Count != 0;
+           || _collations.Count != 0
+           || HasHooks;
 
     private static string RegisterSharedMemoryFile(string path)
     {

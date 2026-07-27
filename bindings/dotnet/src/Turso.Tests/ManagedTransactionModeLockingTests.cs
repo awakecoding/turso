@@ -1,4 +1,5 @@
 using AwesomeAssertions;
+using SQLitePCL;
 using Turso.Data.Sqlite;
 using MsData = Microsoft.Data.Sqlite;
 
@@ -162,6 +163,90 @@ public class ManagedTransactionModeLockingTests
         var blocked = Capture(() => b.ExecuteNonQuery("INSERT INTO t VALUES (3);"));
         blocked.Should().NotBeNull();
         blocked!.SqliteErrorCode.Should().Be(SqliteBusy);
+    }
+
+    // A busy failure must not be mistaken for a rolled-back transaction. These pin
+    // the interaction with the rollback hook, whose firing points are: explicit
+    // ROLLBACK, a commit-hook veto, ON CONFLICT ROLLBACK, and a failed autocommit
+    // mutation - but never a failed statement inside a transaction.
+
+    [Test]
+    public void BusyBeginDoesNotFireTheRollbackHook()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        a.ExecuteNonQuery("BEGIN IMMEDIATE;");
+
+        var rollbacks = 0;
+        b.SetRollbackHook(() => rollbacks++);
+
+        Capture(() => b.ExecuteNonQuery("BEGIN IMMEDIATE;")).Should().NotBeNull();
+
+        // The losing BEGIN never opened a transaction, so there is nothing to roll back.
+        rollbacks.Should().Be(0);
+    }
+
+    [Test]
+    public void BusyAutocommitWriteDoesNotFireTheRollbackHook()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        a.ExecuteNonQuery("BEGIN IMMEDIATE;");
+
+        var rollbacks = 0;
+        b.SetRollbackHook(() => rollbacks++);
+
+        Capture(() => b.ExecuteNonQuery("INSERT INTO t VALUES (1);")).Should().NotBeNull();
+
+        // Busy is refused before the implicit transaction is opened, so unlike a
+        // failed autocommit mutation there is no implicit rollback to report.
+        rollbacks.Should().Be(0);
+    }
+
+    [Test]
+    public void BusyWriteInsideATransactionDoesNotFireTheRollbackHookUntilRollback()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        a.ExecuteNonQuery("BEGIN IMMEDIATE;");
+
+        var rollbacks = 0;
+        b.SetRollbackHook(() => rollbacks++);
+
+        b.ExecuteNonQuery("BEGIN;");
+        Capture(() => b.ExecuteNonQuery("INSERT INTO t VALUES (1);")).Should().NotBeNull();
+
+        // A failed statement inside a transaction leaves it open and reports nothing.
+        rollbacks.Should().Be(0);
+
+        b.ExecuteNonQuery("ROLLBACK;");
+        rollbacks.Should().Be(1);
+    }
+
+    [Test]
+    public void NativeSqliteAlsoLeavesTheRollbackHookSilentOnABusyAutocommitWrite()
+    {
+        using var db = new NativeFileDatabase();
+        var a = db.Connect();
+        var b = db.Connect();
+
+        NativeExec(a, "PRAGMA journal_mode=wal;");
+        NativeExec(a, "BEGIN IMMEDIATE;");
+
+        var rollbacks = 0;
+        raw.sqlite3_rollback_hook(b.Handle!, _ => rollbacks++, null);
+
+        NativeError(() => NativeExec(b, "INSERT INTO t VALUES (1);"))!
+            .SqliteErrorCode.Should().Be(SqliteBusy);
+
+        rollbacks.Should().Be(0);
+        raw.sqlite3_rollback_hook(b.Handle!, (delegate_rollback?)null, null);
     }
 
     [Test]

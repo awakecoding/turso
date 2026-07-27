@@ -43,7 +43,10 @@ public class ArithmeticSqlRoutingTests
 
         Value(connection, "SELECT ? + 1", SqlValue.Text("10")).Should().Be(SqlValue.Integer(11));
         Value(connection, "SELECT ? + 1", SqlValue.Text("not-a-number")).Should().Be(SqlValue.Integer(1));
-        Value(connection, "SELECT ? + 1", SqlValue.Blob([0x31, 0x30])).Should().Be(SqlValue.Integer(1));
+
+        // SQLite numerifies a blob from its bytes, so x'3130' reads as "10".
+        Value(connection, "SELECT ? + 1", SqlValue.Blob([0x31, 0x30])).Should().Be(SqlValue.Integer(11));
+        Value(connection, "SELECT ? + 1", SqlValue.Blob([0x61, 0x62])).Should().Be(SqlValue.Integer(1));
         Value(connection, "SELECT ? + 1", SqlValue.Null).Should().Be(SqlValue.Null);
         Value(connection, "SELECT ? / 0", SqlValue.Integer(5)).Should().Be(SqlValue.Null);
         Value(connection, "SELECT ? % 3", SqlValue.Text("10xyz")).Should().Be(SqlValue.Integer(1));

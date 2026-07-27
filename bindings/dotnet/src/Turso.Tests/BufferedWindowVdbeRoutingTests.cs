@@ -484,13 +484,15 @@ public sealed class BufferedWindowVdbeRoutingTests
     }
 
     [Test]
-    public void WindowMixedWithAPlainAggregateFallsBackAndTheEvaluatorRejectsIt()
+    public void WindowMixedWithAPlainAggregateStaysOnTheEvaluator()
     {
         const string query = "SELECT sum(value) OVER (ORDER BY id), count(*) FROM t;";
 
+        // An aggregate collapses the statement to one row and the window pass then runs over that
+        // single grouped row; this route only windows over scanned rows, so it must decline.
+        AssertMatchesSqlite(Setup, query);
+
         using var connection = OpenManaged(Setup);
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query))!
-            .Message.Should().Contain("window functions cannot be combined with aggregates or GROUP BY");
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
     }
 

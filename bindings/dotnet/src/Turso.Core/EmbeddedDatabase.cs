@@ -437,7 +437,35 @@ public sealed partial class EmbeddedDatabase : IDisposable
         InsertConflictAlgorithm? TriggerConflictAlgorithm = null,
         bool PreserveUpsertFail = false,
         StatementExecutionState? StatementState = null,
-        bool CompilationEnabled = true);
+        bool CompilationEnabled = true,
+        ManagedStatementHooks? Hooks = null)
+    {
+        /// <summary>
+        /// Row-loop checkpoint. It honors cooperative cancellation exactly as before and
+        /// additionally drives the connection's progress handler, which can interrupt the
+        /// statement. Trigger and subquery contexts are derived with <c>with</c> expressions,
+        /// so the hooks propagate to nested execution automatically.
+        /// </summary>
+        internal void CheckInterrupt()
+        {
+            CancellationToken.ThrowIfCancellationRequested();
+            Hooks?.Progress?.Step();
+        }
+
+        /// <summary>
+        /// Reports a committed row change to the connection's update hook. Mirrors SQLite:
+        /// WITHOUT ROWID tables and internal <c>sqlite_*</c> tables never notify.
+        /// </summary>
+        internal void ReportRowChange(SqliteChangeOperation operation, string tableName, EmbeddedTable table, long rowId)
+        {
+            if (Hooks?.RowChanged is not { } rowChanged || !table.HasRowid)
+                return;
+            if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            rowChanged(operation, tableName, rowId);
+        }
+    }
 
     internal sealed class StatementExecutionState(long lastInsertRowId)
     {
@@ -758,7 +786,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        ManagedStatementHooks? hooks = null)
     {
         var result = ExecuteCore(
             statement,
@@ -769,7 +798,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             deferForeignKeys,
             inTransaction,
             cancellationToken,
-            compilationEnabled);
+            compilationEnabled,
+            hooks);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -797,7 +827,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        ManagedStatementHooks? hooks = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -814,13 +845,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 deferForeignKeys,
                 inTransaction,
                 cancellationToken,
-                compilationEnabled));
+                compilationEnabled,
+                hooks));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            if (cancellationToken.CanBeCanceled && MayMutate(statement))
+            // A commit hook can veto the implicit commit of an autocommit mutation, so the
+            // statement has to run against a working clone that can be discarded. The in-memory
+            // fast path below mutates the live catalog in place and cannot be rolled back, so an
+            // installed gate forces the clone-and-publish shape here.
+            var commitGate = hooks?.CommitGate;
+            if ((cancellationToken.CanBeCanceled || commitGate is not null) && MayMutate(statement))
             {
                 var cancellableWorking = new SchemaCatalog(_tables, _views, _triggers).Clone();
                 ExecutionResult cancellableResult;
@@ -836,11 +873,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         deferForeignKeys,
                         inTransaction,
                         cancellationToken,
-                        compilationEnabled);
+                        compilationEnabled,
+                        hooks);
                 }
                 catch (EmbeddedConflictFailException)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    // ON CONFLICT FAIL keeps the rows written before the failure, so this is still
+                    // a commit and the hook still gets to veto it.
+                    if (commitGate is not null && !commitGate())
+                        throw new EmbeddedCommitVetoException();
                     if (_fileStore is null)
                         PublishCatalog(cancellableWorking);
                     else
@@ -851,6 +893,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!cancellableResult.Changed)
                     return cancellableResult;
+
+                if (commitGate is not null && !commitGate())
+                    throw new EmbeddedCommitVetoException();
 
                 if (_fileStore is null)
                 {
@@ -889,7 +934,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         deferForeignKeys,
                         inTransaction,
                         cancellationToken,
-                        compilationEnabled);
+                        compilationEnabled,
+                        hooks);
                 }
                 catch (EmbeddedConflictFailException)
                 {
@@ -924,7 +970,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     deferForeignKeys,
                     inTransaction,
                     cancellationToken,
-                    compilationEnabled);
+                    compilationEnabled,
+                    hooks);
 
             var working = new SchemaCatalog(_tables, _views, _triggers).Clone();
             ExecutionResult result;
@@ -940,7 +987,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     deferForeignKeys,
                     inTransaction,
                     cancellationToken,
-                    compilationEnabled);
+                    compilationEnabled,
+                    hooks);
             }
             catch (EmbeddedConflictFailException)
             {
@@ -975,6 +1023,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableDropColumnStatement;
+
+    /// <summary>
+    /// A read-only view over the live schema, used to resolve column ownership while an
+    /// authorizer inspects a statement. It deliberately does not clone, does not take a
+    /// transaction snapshot, and must never be mutated.
+    /// </summary>
+    internal SchemaCatalog CreateAuthorizationCatalog()
+    {
+        lock (_gate)
+            return new SchemaCatalog(_tables, _views, _triggers);
+    }
 
     internal TransactionSnapshot CreateTransactionSnapshot()
     {
@@ -1781,7 +1840,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        ManagedStatementHooks? hooks = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -1799,7 +1859,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 deferForeignKeys,
                 inTransaction,
                 cancellationToken,
-                compilationEnabled));
+                compilationEnabled,
+                hooks));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1820,7 +1881,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ForeignKeyStatement: foreignKeysEnabled ? new ForeignKeyStatementState() : null,
             CancellationToken: cancellationToken,
             StatementState: new StatementExecutionState(lastInsertRowId),
-            CompilationEnabled: compilationEnabled);
+            CompilationEnabled: compilationEnabled,
+            Hooks: hooks);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
@@ -3192,24 +3254,233 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (!tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
-        var candidateTables = new Dictionary<string, EmbeddedTable>(
-            tables,
-            StringComparer.OrdinalIgnoreCase);
-        var candidateTable = table.Clone();
-        candidateTable.RenameColumn(statement.ColumnName, statement.NewName);
-        candidateTables[statement.TableName] = candidateTable;
+        var oldName = table.Columns[table.GetColumnIndex(statement.ColumnName)];
+        var newName = statement.NewName;
+        var quoteNewName = statement.QuoteNewName;
+        var replacement = table.CreateWithRenamedColumn(
+            statement.ColumnName,
+            newName,
+            quoteNewName,
+            context.CancellationToken);
+
+        var candidateTables = new Dictionary<string, EmbeddedTable>(tables, StringComparer.OrdinalIgnoreCase)
+        {
+            [statement.TableName] = replacement,
+        };
+
+        // A foreign key in another table names the parent column by its old spelling, so the
+        // REFERENCES clause follows the rename the way SQLite rewrites it.
+        foreach (var entry in tables)
+        {
+            if (string.Equals(entry.Key, statement.TableName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (CreateWithRenamedForeignKeyParentColumn(entry.Value, table.Name, oldName, newName) is { } rewritten)
+                candidateTables[entry.Key] = rewritten;
+        }
+
+        var renameSchema = CreateRenameColumnSchema(
+            candidateTables,
+            catalog.Views,
+            table.Name,
+            table.Columns.ToArray());
+        Dictionary<string, ViewDefinition>? candidateViews = null;
+        Dictionary<string, TriggerDefinition>? candidateTriggers = null;
+        try
+        {
+            foreach (var view in catalog.Views.Values)
+            {
+                context.CheckInterrupt();
+                var rewritten = RenameColumnRewriter.RewriteSchemaObject(
+                    view.Sql,
+                    oldName,
+                    newName,
+                    quoteNewName,
+                    renameSchema);
+                if (rewritten is null)
+                    continue;
+
+                candidateViews ??= new Dictionary<string, ViewDefinition>(
+                    catalog.Views,
+                    StringComparer.OrdinalIgnoreCase);
+                var parsed = (CreateViewStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+                candidateViews[view.Name] = view with { Query = parsed.Query, Sql = parsed.Sql };
+            }
+
+            foreach (var trigger in catalog.Triggers.Values)
+            {
+                context.CheckInterrupt();
+                var rewritten = RenameColumnRewriter.RewriteSchemaObject(
+                    trigger.Sql,
+                    oldName,
+                    newName,
+                    quoteNewName,
+                    renameSchema);
+                if (rewritten is null)
+                    continue;
+
+                candidateTriggers ??= new Dictionary<string, TriggerDefinition>(
+                    catalog.Triggers,
+                    StringComparer.OrdinalIgnoreCase);
+                var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+                candidateTriggers[trigger.Name] = trigger with
+                {
+                    UpdateOfColumns = parsed.UpdateOfColumns,
+                    When = parsed.When,
+                    Body = parsed.Body,
+                    Sql = parsed.Sql,
+                };
+            }
+        }
+        catch (RenameColumnRewriteException exception)
+        {
+            throw new EmbeddedSqlException(exception.Message, exception);
+        }
+
+        var candidateCatalog = candidateViews is null && candidateTriggers is null
+            ? catalog
+            : new SchemaCatalog(
+                candidateTables,
+                candidateViews ?? catalog.Views,
+                candidateTriggers ?? catalog.Triggers);
+
         ValidateDependentSchema(
-            catalog,
+            candidateCatalog,
             context with
             {
                 Tables = candidateTables,
+                Views = candidateCatalog.Views,
+                Triggers = candidateCatalog.Triggers,
                 SchemaValidation = true,
             },
             context.CancellationToken,
             "rename column");
 
-        table.RenameColumn(statement.ColumnName, statement.NewName);
+        foreach (var entry in candidateTables)
+            tables[entry.Key] = entry.Value;
+
+        if (candidateViews is not null)
+        {
+            foreach (var entry in candidateViews)
+                catalog.Views[entry.Key] = entry.Value;
+        }
+
+        if (candidateTriggers is not null)
+        {
+            foreach (var entry in candidateTriggers)
+                catalog.Triggers[entry.Key] = entry.Value;
+        }
+
         return new ExecutionResult([], [], 0, true);
+    }
+
+    private static RenameColumnSchema CreateRenameColumnSchema(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        string renamedTable,
+        IReadOnlyList<string> renamedTableColumns)
+    {
+        return new RenameColumnSchema(ResolveColumns, IsRenameTarget);
+
+        IReadOnlyList<string>? ResolveColumns(string name)
+        {
+            var key = UnqualifiedCatalogName(name);
+            // References resolve against the pre-rename shape of the altered table so the old
+            // spelling is still recognized while the stored SQL is being edited.
+            if (string.Equals(key, renamedTable, StringComparison.OrdinalIgnoreCase))
+                return renamedTableColumns;
+            if (tables.TryGetValue(key, out var found))
+                return found.Columns;
+
+            return views.TryGetValue(key, out var view) ? view.Columns : null;
+        }
+
+        bool IsRenameTarget(string name)
+            => string.Equals(UnqualifiedCatalogName(name), renamedTable, StringComparison.OrdinalIgnoreCase);
+
+        static string UnqualifiedCatalogName(string name)
+            => ManagedSchemaName.TrySplit(name, out _, out var bare) ? bare : name;
+    }
+
+    /// <summary>
+    /// Rewrites the parent column list of every foreign key in <paramref name="table"/> that
+    /// points at the renamed column, returning <see langword="null"/> when nothing referenced it.
+    /// </summary>
+    private static EmbeddedTable? CreateWithRenamedForeignKeyParentColumn(
+        EmbeddedTable table,
+        string parentTable,
+        string oldName,
+        string newName)
+    {
+        var changed = false;
+        var columns = table.ColumnDefinitions.Select(column =>
+        {
+            var foreignKey = column.ForeignKey is null ? null : Rewrite(column.ForeignKey);
+            var additional = column.AdditionalForeignKeys is { Count: > 0 } keys
+                && keys.Any(key => Rewrite(key) is not null)
+                    ? keys.Select(key => Rewrite(key) ?? key).ToArray()
+                    : null;
+            if (foreignKey is null && additional is null)
+                return column;
+
+            changed = true;
+            return column.WithConstraints(
+                column.Checks,
+                foreignKey ?? column.ForeignKey,
+                additional ?? column.AdditionalForeignKeys);
+        }).ToArray();
+
+        var tableForeignKeys = table.TableForeignKeys.Select(key =>
+        {
+            if (Rewrite(key) is not { } replacementKey)
+                return key;
+
+            changed = true;
+            return replacementKey;
+        }).ToArray();
+
+        if (!changed)
+            return null;
+
+        var replacement = new EmbeddedTable(
+            table.Name,
+            columns,
+            table.WithoutRowid,
+            table.TableLevelPrimaryKey,
+            table.TableUniqueConstraints,
+            table.CheckConstraints,
+            table.TablePrimaryKeyConflictAlgorithm,
+            table.TablePrimaryKeyConstraintName,
+            table.TablePrimaryKeyDeclarationOrder,
+            tableForeignKeys,
+            table.Strict);
+        foreach (var row in table.Rows)
+            replacement.Rows.Add(row.ToArray());
+
+        replacement.RowIds.AddRange(table.RowIds);
+        replacement.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
+        replacement.Indexes.AddRange(table.Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
+        return replacement;
+
+        ForeignKeyDefinition? Rewrite(ForeignKeyDefinition foreignKey)
+        {
+            if (!string.Equals(foreignKey.ParentTable, parentTable, StringComparison.OrdinalIgnoreCase))
+                return null;
+            if (!foreignKey.ParentColumns.Any(column =>
+                    string.Equals(column, oldName, StringComparison.OrdinalIgnoreCase)))
+            {
+                return null;
+            }
+
+            return foreignKey with
+            {
+                ParentColumns = foreignKey.ParentColumns
+                    .Select(column => string.Equals(column, oldName, StringComparison.OrdinalIgnoreCase)
+                        ? newName
+                        : column)
+                    .ToArray(),
+            };
+        }
     }
 
     private ExecutionResult ExecuteAlterTableDropColumn(
@@ -5407,6 +5678,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     TriggerMutationKind.Update,
                     updatePlan);
                 ApplyUpsertRows(table, updatedRows, updatedRowIds);
+                updateContext.ReportRowChange(
+                    SqliteChangeOperation.Update,
+                    statement.TableName,
+                    table,
+                    updatedRowIds[conflictPosition]);
                 ValidateForeignKeysAfterUpdate(
                     updateContext,
                     statement.TableName,
@@ -6854,6 +7130,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             foreach (var rowId in insertedRowIds)
                 RecordBlobMutation(tableName, rowId);
         }
+
+        foreach (var rowId in insertedRowIds)
+            context.ReportRowChange(SqliteChangeOperation.Insert, tableName, table, rowId);
     }
 
     private void ValidateInserts(
@@ -7791,6 +8070,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 RecordBlobMutation(tableName, rowIds[position]);
             }
         }
+
+        // SQLite reports the post-update rowid, so an UPDATE that rewrites an INTEGER PRIMARY
+        // KEY notifies with the new value rather than the one the row had before.
+        foreach (var position in updatedPositions)
+            context.ReportRowChange(SqliteChangeOperation.Update, tableName, table, rowIds[position]);
     }
 
     // Foreign-key checks run against the complete post-statement image, but only inspect
@@ -8997,6 +9281,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     [deletedRow]);
                 if (table.HasRowid)
                     RecordBlobMutation(statement.TableName, selectedRowId);
+                context.ReportRowChange(
+                    SqliteChangeOperation.Delete,
+                    statement.TableName,
+                    table,
+                    selectedRowId);
                 deletedRows.Add(deletedRow);
                 deletedRowIds.Add(selectedRowId);
                 if (afterTriggers.Count > 0)
@@ -9202,6 +9491,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             foreach (var rowId in deletedRowIds)
                 RecordBlobMutation(statement.TableName, rowId);
         }
+
+        foreach (var rowId in deletedRowIds)
+            context.ReportRowChange(SqliteChangeOperation.Delete, statement.TableName, table, rowId);
         if (statement.Returning is not null)
             return returningResult!;
 
@@ -9631,7 +9923,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         return statement switch
         {
             SelectStatement select => ExecuteSelectStatement(select, parameters, context, outerRow),
@@ -9683,7 +9975,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         ValidateSelectIndexDirectives(select, context);
         ValidateGroupByCollations(select.GroupBy);
         var canUseCompiledRoute = CanUseCompiledSelectRoute(select, context, outerRow);
@@ -12216,7 +12508,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CompiledAggregateContext CreateContext() => new();
         object? CollectRow(object? stateObject, SqlValue[] values)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var state = (CompiledAggregateContext)stateObject!;
             state.Rows.Add(source.CreateSourceRow(values, outerRow));
             return state;
@@ -12233,7 +12525,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             Accumulate = CollectRow,
             Finalize = stateObject =>
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 var state = (CompiledAggregateContext)stateObject!;
                 var representative = GetRepresentative(state);
                 return aggregateMode
@@ -12932,7 +13224,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         object? CollectRow(object? stateObject, SqlValue[] values)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var state = (CompiledAggregateContext)stateObject!;
             state.Rows.Add(CreateScanSourceRow(target, values, context, outerRow));
             return state;
@@ -12951,13 +13243,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Accumulate = CollectRow,
                 Finalize = stateObject =>
                 {
-                    context.CancellationToken.ThrowIfCancellationRequested();
+                    context.CheckInterrupt();
                     var state = (CompiledAggregateContext)stateObject!;
                     var representative = GetRepresentative(state);
                     var value = aggregateMode
                         ? EvaluateAggregate(expression, state.Rows, parameters, context, representative)
                         : Evaluate(expression, parameters, representative, context);
-                    context.CancellationToken.ThrowIfCancellationRequested();
+                    context.CheckInterrupt();
                     return value;
                 },
             };
@@ -12998,12 +13290,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 .ToArray();
             VdbeGroupKeyProjector groupKeyProjector = values =>
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 var row = CreateScanSourceRow(target, values, context, outerRow);
                 var key = new SqlValue[select.GroupBy.Count];
                 for (var index = 0; index < key.Length; index++)
                 {
-                    context.CancellationToken.ThrowIfCancellationRequested();
+                    context.CheckInterrupt();
                     key[index] = Evaluate(select.GroupBy[index], parameters, row, context);
                 }
 
@@ -13020,7 +13312,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 .ToArray();
             VdbeRowComparer outputOrderComparer = (left, right) =>
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 for (var index = 0; index < resolvedOrderBy.Count; index++)
                 {
                     var term = resolvedOrderBy[index];
@@ -13434,11 +13726,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        // A window select that also carries a plain (non-window) aggregate or GROUP BY is an
-        // evaluator error ("window functions cannot be combined with aggregates or GROUP BY");
-        // decline so the evaluator raises it. ContainsAggregate is false for window calls.
-        if (select.Projections.Any(projection => ContainsAggregate(projection.Expression))
-            || select.OrderBy.Any(term => ContainsAggregate(term.Expression)))
+        // A window select that also carries a plain (non-window) aggregate or GROUP BY runs the
+        // window pass over grouped rows (ExecuteGroupedWindowSelect); this route only knows how to
+        // window over scanned rows, so decline. An aggregate nested inside a window call's own
+        // subtree - sum(count(*)) OVER () - groups the statement just the same.
+        if (select.Projections.Any(projection => ContainsAggregateAcrossWindows(projection.Expression))
+            || select.OrderBy.Any(term => ContainsAggregateAcrossWindows(term.Expression)))
         {
             return false;
         }
@@ -14945,18 +15238,32 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 var keptRows = new List<SqlValue[]>(rowCount);
                 var keptRowIds = new List<long>(rowCount);
+                var deletedRowIds = new List<long>();
                 for (var index = 0; index < table.Rows.Count; index++)
                 {
+                    var rowId = index < table.RowIds.Count ? table.RowIds[index] : index + 1;
                     if (index < deleted.Length && deleted[index])
+                    {
+                        deletedRowIds.Add(rowId);
                         continue;
+                    }
                     keptRows.Add(table.Rows[index]);
-                    keptRowIds.Add(index < table.RowIds.Count ? table.RowIds[index] : index + 1);
+                    keptRowIds.Add(rowId);
                 }
 
                 table.Rows.Clear();
                 table.Rows.AddRange(keptRows);
                 table.RowIds.Clear();
                 table.RowIds.AddRange(keptRowIds);
+                foreach (var deletedRowId in deletedRowIds)
+                {
+                    context.ReportRowChange(
+                        SqliteChangeOperation.Delete,
+                        statement.TableName,
+                        table,
+                        deletedRowId);
+                }
+
                 return (long?)null;
             },
         };
@@ -16318,7 +16625,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var entries = new List<(int Position, SqlValue[] Key)>(table.Rows.Count);
         for (var position = 0; position < table.Rows.Count; position++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var rowId = table.HasRowid ? table.RowIds[position] : (long?)null;
             if (!IndexExpressionSemantics.Qualifies(
                     plan.Index,
@@ -16419,7 +16726,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         ValidateSelectIndexDirectives(statement, context);
         statement = ResolveNamedWindows(statement);
         context = EnterCollationSource(context, statement.Source);
@@ -16439,9 +16746,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var offset = statement.Offset is null
             ? 0
             : Math.Max(0, RequireLimitInteger(Evaluate(statement.Offset, parameters, outerRow, context)));
-        var hasAggregate = statement.Projections.Any(projection => ContainsAggregate(projection.Expression))
+        // An aggregate nested inside a window call - sum(count(*)) OVER (ORDER BY count(*)) - is
+        // evaluated in the aggregate pass just like a top-level one, so it makes this an aggregate
+        // query even when nothing outside the window call aggregates.
+        var hasAggregate = statement.Projections.Any(projection =>
+                ContainsAggregateAcrossWindows(projection.Expression))
             || statement.Having is not null && ContainsAggregate(statement.Having)
-            || statement.OrderBy.Any(term => ContainsAggregate(term.Expression));
+            || statement.OrderBy.Any(term => ContainsAggregateAcrossWindows(term.Expression));
         if (statement.Having is not null && !hasAggregate && statement.GroupBy.Count == 0)
             throw new EmbeddedSqlException("HAVING clause on a non-aggregate query");
         var hasWindow = windowFunctions.Count > 0;
@@ -16451,6 +16762,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException("misuse of window function in GROUP BY clause");
         if (statement.Having is not null && ContainsWindowFunction(statement.Having))
             throw new EmbeddedSqlException("misuse of window function in HAVING clause");
+
+        // The window pass runs after aggregation, so a window call handed to an aggregate has no
+        // pass left to be evaluated in.
+        var windowInsideAggregate = statement.Projections
+                .Select(projection => FindWindowFunctionInsideAggregate(projection.Expression))
+                .FirstOrDefault(candidate => candidate is not null)
+            ?? resolvedOrderBy
+                .Select(term => FindWindowFunctionInsideAggregate(term.Expression))
+                .FirstOrDefault(candidate => candidate is not null);
+        if (windowInsideAggregate is not null)
+            throw new EmbeddedSqlException($"misuse of window function {windowInsideAggregate.Name}()");
         var sourceColumns = GetSourceColumns(statement.Source, context);
         var outputColumns = GetOutputColumns(statement.Source, context);
         var rawOutputColumns = GetRawOutputColumns(statement.Source, context);
@@ -16478,7 +16800,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var selectedRows = new List<SourceRow>();
         foreach (var row in source.Rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             if (streamProjectionRows
                 || statement.Where is null
                 || IsTrue(Evaluate(statement.Where, parameters, row, context)))
@@ -16488,8 +16810,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var columnNames = GetColumnNames(statement.Projections, outputColumns, rawOutputColumns);
         if (hasWindow)
         {
+            // SQLite aggregates first and runs the window pass over the surviving grouped rows, so
+            // a frame here sees one row per group rather than the base rows.
             if (hasAggregate || statement.GroupBy.Count > 0)
-                throw new EmbeddedSqlException("window functions cannot be combined with aggregates or GROUP BY");
+            {
+                return ExecuteGroupedWindowSelect(
+                    statement,
+                    selectedRows,
+                    windowFunctions,
+                    columnNames,
+                    resolvedOrderBy,
+                    offset,
+                    limit,
+                    parameters,
+                    context);
+            }
 
             return ExecuteWindowSelect(
                 statement,
@@ -16540,37 +16875,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     0);
             }
 
-            var groupCollations = statement.GroupBy
-                .Select(expression => GetEffectiveCollation(expression, context))
-                .ToArray();
-            VdbeGroupComparer groupEquality = (left, right) =>
-                GroupKeysEqual(left, right, groupCollations);
-            var groupHasher = BuildGroupHasher(groupCollations);
-            var groupIndexByKey = groupHasher is null
-                ? null
-                : new Dictionary<SqlValue[], int>(
-                    new GroupKeyEqualityComparer(groupEquality, groupHasher));
-            var groups = new List<(SqlValue[] Key, List<SourceRow> Rows)>();
-            foreach (var row in selectedRows)
-            {
-                context.CancellationToken.ThrowIfCancellationRequested();
-                var key = EvaluateGroupKey(statement.GroupBy, parameters, row, context);
-                var groupIndex = groupIndexByKey is not null
-                    && groupIndexByKey.TryGetValue(key, out var indexedGroup)
-                        ? indexedGroup
-                        : groupIndexByKey is null
-                            ? groups.FindIndex(group => groupEquality(group.Key, key))
-                            : -1;
-                if (groupIndex < 0)
-                {
-                    groupIndex = groups.Count;
-                    groups.Add((key, []));
-                    groupIndexByKey?.Add(key, groupIndex);
-                }
-
-                groups[groupIndex].Rows.Add(row);
-            }
-
+            var groups = BuildGroups(statement.GroupBy, selectedRows, parameters, context);
             var groupedRows = groups.Select(entry =>
             {
                 var group = entry.Rows;
@@ -18671,7 +18976,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var key = new SqlValue[groupBy.Count];
         for (var index = 0; index < key.Length; index++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             key[index] = Evaluate(groupBy[index], parameters, row, context);
         }
 
@@ -20242,7 +20547,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? row,
         QueryContext context)
     {
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         var result = expression switch
         {
             LiteralExpression literal => literal.Value,
@@ -20273,7 +20578,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             QualifiedStarExpression => throw new EmbeddedSqlException("row value misused"),
             _ => throw new EmbeddedSqlException($"Unsupported expression type {expression.GetType().Name}."),
         };
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         return result;
     }
 
@@ -20290,8 +20595,51 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ?? throw new EmbeddedSqlException($"no such column: {column.Name}");
         }
 
-        return row?.GetValue(column)
-            ?? throw new EmbeddedSqlException($"no such column: {column.Name}");
+        if (row is not null && row.TryGetValue(column, out var value))
+            return value;
+
+        // TRUE/FALSE are not reserved words: they only become the integer literals 1/0 once the
+        // name fails to resolve against the columns in scope, exactly as SQLite does.
+        if (column.BooleanKeyword is { } boolean)
+            return SqlValue.Integer(boolean ? 1 : 0);
+
+        throw new EmbeddedSqlException($"no such column: {column.Name}");
+    }
+
+    /// <summary>
+    /// Reports whether <paramref name="expression"/> is the right-hand operand of an
+    /// <c>IS [NOT] TRUE|FALSE</c> test, meaning a bare <c>TRUE</c>/<c>FALSE</c> keyword that does not
+    /// resolve to a column. SQLite turns those comparisons into a truth test rather than an
+    /// equality test, so <c>2 IS TRUE</c> is 1 while <c>2 IS 1</c> is 0.
+    /// </summary>
+    private static bool IsTruthKeyword(Expression expression, SourceRow? row, out bool expected)
+    {
+        if (UnwrapCollation(expression) is ColumnExpression { BooleanKeyword: { } keyword } column
+            && (row is null || !row.TryGetValue(column, out _)))
+        {
+            expected = keyword;
+            return true;
+        }
+
+        expected = false;
+        return false;
+    }
+
+    /// <summary>
+    /// Evaluates <c>X IS TRUE</c>, <c>X IS FALSE</c> and their negations, mirroring SQLite's
+    /// <c>OP_IsTrue</c>: the result is never NULL, and NULL counts as neither true nor false.
+    /// </summary>
+    private SqlValue EvaluateTruthTest(
+        BinaryExpression expression,
+        bool expected,
+        SqlValue[] parameters,
+        SourceRow? row,
+        QueryContext context)
+    {
+        var operand = Evaluate(expression.Left, parameters, row, context);
+        var truth = operand.Kind == SqlValueKind.Null ? !expected : IsTrue(operand);
+        var negate = expected ^ (expression.Operator == BinaryOperator.Is);
+        return SqlValue.Integer(truth ^ negate ? 1 : 0);
     }
 
     private static SqlValue EvaluateRaise(RaiseExpression expression, QueryContext context)
@@ -20401,6 +20749,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? row,
         QueryContext context)
     {
+        if (expression.Operator is BinaryOperator.Is or BinaryOperator.IsNot
+            && IsTruthKeyword(expression.Right, row, out var expectedTruth))
+        {
+            return EvaluateTruthTest(expression, expectedTruth, parameters, row, context);
+        }
+
         var leftCount = GetExpressionValueCount(expression.Left, context);
         var rightCount = GetExpressionValueCount(expression.Right, context);
         if (leftCount != rightCount)
@@ -21489,7 +21843,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? representative = null;
         foreach (var row in effectiveRows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var value = Evaluate(controllingExtremum.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -22029,7 +22383,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var filtered = new List<SourceRow>();
             foreach (var row in result)
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 if (IsTrue(Evaluate(function.Filter, parameters, row, context)))
                     filtered.Add(row);
             }
@@ -22047,7 +22401,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var deduplicated = new List<SourceRow>();
             foreach (var row in result)
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 var value = Evaluate(function.Arguments[0], parameters, row, context);
                 if (seen.Any(existing => DistinctValuesEqual(existing, value, collation)))
                     continue;
@@ -22082,7 +22436,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var count = 0L;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             if (Evaluate(function.Arguments[0], parameters, row, context).Kind != SqlValueKind.Null)
                 count++;
         }
@@ -22142,46 +22496,130 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool average)
     {
         RequireAggregateArgumentCount(function.Name.ToLowerInvariant(), function.Arguments, 1);
+
+        // SQLite's SumCtx keeps an exact 64-bit accumulator for as long as every input is an
+        // integer, and only switches to the Kahan-Babuska-Neumaier compensated double
+        // accumulator when a non-integer arrives or the integer sum overflows. avg() and total()
+        // share that accumulator, so avg(9223372036854775807, -9223372036854775806) is 0.5 and
+        // not the 0.0 that double accumulation produces.
         var integerTotal = 0L;
         var realTotal = 0d;
-        var hasReal = forceReal;
+        var realError = 0d;
+        var approximate = false;
+        var overflowed = false;
         var count = 0L;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
 
-            var numeric = ApplyNumericAffinity(value);
+            // SQLite accumulates in integers only while every value is exactly an integer
+            // (sqlite3_value_numeric_type). Anything else - a real, or text such as '12abc' that
+            // merely starts with a number - switches to floating point via sqlite3_value_double.
+            var exact = ApplyComparisonNumericAffinity(value);
             count++;
-            if (numeric.Kind == SqlValueKind.Real)
+            if (exact.Kind != SqlValueKind.Integer)
             {
-                if (!hasReal)
+                var real = exact.Kind == SqlValueKind.Real
+                    ? AsReal(exact)
+                    : AsReal(ApplyNumericAffinity(value));
+                if (!approximate)
                 {
-                    realTotal = integerTotal;
-                    hasReal = true;
+                    KahanBabuskaNeumaierInit(integerTotal, out realTotal, out realError);
+                    approximate = true;
+                }
+                else
+                {
+                    // A real input clears a previous integer overflow, exactly as sumStep does:
+                    // the running total is already inexact, so the overflow no longer matters.
+                    overflowed = false;
                 }
 
-                realTotal += numeric.AsReal();
+                KahanBabuskaNeumaierStep(real, ref realTotal, ref realError);
                 continue;
             }
 
-            if (hasReal)
+            var addend = exact.AsInteger();
+            if (!approximate)
             {
-                realTotal += numeric.AsInteger();
-                continue;
+                var candidate = unchecked(integerTotal + addend);
+                if (((integerTotal ^ candidate) & (addend ^ candidate)) >= 0)
+                {
+                    integerTotal = candidate;
+                    continue;
+                }
+
+                overflowed = true;
+                KahanBabuskaNeumaierInit(integerTotal, out realTotal, out realError);
+                approximate = true;
             }
 
-            integerTotal = checked(integerTotal + numeric.AsInteger());
+            KahanBabuskaNeumaierStepInt64(addend, ref realTotal, ref realError);
         }
 
-        if (average)
-            return count == 0 ? SqlValue.Null : SqlValue.Real(realTotal / count);
-        if (count == 0)
-            return forceReal ? SqlValue.Real(0) : SqlValue.Null;
+        var accumulated = approximate
+            ? (double.IsNaN(realError) ? realTotal : realTotal + realError)
+            : integerTotal;
 
-        return hasReal ? SqlValue.Real(realTotal) : SqlValue.Integer(integerTotal);
+        if (average)
+            return count == 0 ? SqlValue.Null : SqlValue.Real(accumulated / count);
+        if (forceReal)
+            return SqlValue.Real(count == 0 ? 0 : accumulated);
+        if (count == 0)
+            return SqlValue.Null;
+
+        // Only sum() reports the overflow. avg() and total() are documented to return a real, so
+        // sqlite3's avgFinalize and totalFinalize ignore the flag entirely.
+        if (overflowed)
+            throw new EmbeddedSqlException("integer overflow");
+
+        return approximate ? SqlValue.Real(accumulated) : SqlValue.Integer(integerTotal);
+    }
+
+    /// <summary>Seeds the compensated accumulator from an exact 64-bit running total.</summary>
+    /// <remarks>
+    /// Splitting off the low 14 bits keeps the high part exactly representable as a double, so
+    /// no precision is lost at the moment the accumulator switches modes.
+    /// </remarks>
+    private static void KahanBabuskaNeumaierInit(long value, out double sum, out double error)
+    {
+        if (value is <= -4503599627370496L or >= 4503599627370496L)
+        {
+            var low = value % 16384;
+            sum = value - low;
+            error = low;
+        }
+        else
+        {
+            sum = value;
+            error = 0d;
+        }
+    }
+
+    /// <summary>Adds one term to the Kahan-Babuska-Neumaier compensated sum.</summary>
+    private static void KahanBabuskaNeumaierStep(double term, ref double sum, ref double error)
+    {
+        var running = sum;
+        var next = running + term;
+        error += Math.Abs(running) > Math.Abs(term)
+            ? (running - next) + term
+            : (term - next) + running;
+        sum = next;
+    }
+
+    private static void KahanBabuskaNeumaierStepInt64(long value, ref double sum, ref double error)
+    {
+        if (value is <= -4503599627370496L or >= 4503599627370496L)
+        {
+            var low = value % 16384;
+            KahanBabuskaNeumaierStep(value - low, ref sum, ref error);
+            KahanBabuskaNeumaierStep(low, ref sum, ref error);
+            return;
+        }
+
+        KahanBabuskaNeumaierStep(value, ref sum, ref error);
     }
 
     private SqlValue EvaluateMinMax(
@@ -22196,7 +22634,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var result = SqlValue.Null;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -22225,7 +22663,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var hasValue = false;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -22265,7 +22703,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var accumulator = aggregate.Seed;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var arguments = function.Arguments
                 .Select(argument => Evaluate(argument, parameters, row, context))
                 .ToArray();
@@ -22294,7 +22732,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             if (!TryGetPercentileNumericValue(
                     Evaluate(function.Arguments[0], parameters, row, context),
                     out var value))
@@ -22792,12 +23230,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
             or 'f' or 'e' or 'E' or 'g' or 'G';
         var signedNumeric = verb is 'd' or 'i' or 'r' or 'f' or 'e' or 'E' or 'g' or 'G';
 
+        // SQLite resolves a "-" and "0" flag pair differently per conversion class: an integer
+        // stays zero padded (%-05d is "00042") while a real is left justified (%-010.2f is
+        // "3.14      "). A "0" on a string conversion is ignored entirely.
+        var realVerb = verb is 'f' or 'e' or 'E' or 'g' or 'G';
+        var zeroPadsNumeric = zeroPad && numeric;
+
         return new PrintfSpecifier(
             verb,
-            leftJustify && !(zeroPad && numeric),
+            leftJustify && !(zeroPadsNumeric && !realVerb),
             forceSign && signedNumeric,
             spaceSign && signedNumeric,
-            zeroPad && numeric,
+            zeroPadsNumeric && !(leftJustify && realVerb),
             alternate,
             alternate2,
             comma,
@@ -23001,7 +23445,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             Math.Abs(value),
             specifier.Precision,
             specifier.Alternate,
-            specifier.Alternate2);
+            specifier.Alternate2,
+            specifier.ZeroPad);
         if (specifier.Comma && specifier.Verb == 'f')
         {
             var decimalIndex = digits.IndexOf('.');
@@ -23185,7 +23630,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private static PrintfText ApplyPrintfNumericWidth(PrintfSpecifier specifier, string sign, string digits)
     {
-        var padding = Math.Max(0, (specifier.Width ?? 0) - sign.Length - digits.Length);
+        // An alternate-form integer prefix such as "0x" sits outside the zero padded field in
+        // SQLite, so %#04x of 255 pads the digits to four and still emits the prefix: "0x00ff".
+        var prefixIsAlternateInteger = sign is "0" or "0x" or "0X";
+        var zeroPadsDigitsOnly = specifier.ZeroPad && prefixIsAlternateInteger && !specifier.LeftJustify;
+        var occupied = zeroPadsDigitsOnly ? digits.Length : sign.Length + digits.Length;
+        var padding = Math.Max(0, (specifier.Width ?? 0) - occupied);
         if (padding == 0)
             return new PrintfText(string.Concat(sign, digits), sign.Length + digits.Length);
 
@@ -23197,10 +23647,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (specifier.ZeroPad)
         {
-            var prefixIsAlternateInteger = sign is "0" or "0x" or "0X";
-            var zeroes = new string(
-                '0',
-                prefixIsAlternateInteger ? padding + sign.Length : padding);
+            var zeroes = new string('0', padding);
             var formatted = string.Concat(sign, zeroes, digits);
             return new PrintfText(formatted, formatted.Length);
         }
@@ -23427,17 +23874,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
         double value,
         int? requestedPrecision,
         bool alternate,
-        bool alternate2)
+        bool alternate2,
+        bool zeroPad)
     {
         if (double.IsNaN(value))
             return "NaN";
         if (double.IsPositiveInfinity(value))
-            return "Inf";
+        {
+            // SQLite renders an infinity as "Inf" unless zero padding was requested, in which
+            // case zero padding a three character word would be meaningless, so it substitutes
+            // the largest value its formatter can describe: 9.0e+999.
+            if (!zeroPad)
+                return "Inf";
+            return FormatPrintfInfinitySubstitute(verb, requestedPrecision, alternate, alternate2);
+        }
 
         if (alternate2 && requestedPrecision is > 26)
             requestedPrecision = 26;
         var forceDecimalPoint = alternate || alternate2;
-        return verb switch
+        var formatted = verb switch
         {
             'f' => EnsurePrintfDecimalPoint(
                 FormatPrintfFixed(value, requestedPrecision ?? 6),
@@ -23469,6 +23924,85 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 alternate2),
             _ => throw new InvalidOperationException($"Unexpected printf real verb {verb}."),
         };
+
+        return alternate2 ? StripPrintfFractionZeros(formatted) : formatted;
+    }
+
+    /// <summary>
+    /// Applies SQLite's <c>!</c> (alternate form 2) flag to an already formatted real: trailing
+    /// fractional zeroes are removed while at least one fractional digit is retained, so
+    /// <c>%!f</c> of 3.14 is "3.14" and of 1.0 is "1.0" rather than "1".
+    /// </summary>
+    private static string StripPrintfFractionZeros(string value)
+    {
+        var exponentIndex = value.IndexOfAny(['e', 'E']);
+        var mantissa = exponentIndex < 0 ? value : value[..exponentIndex];
+        var exponent = exponentIndex < 0 ? string.Empty : value[exponentIndex..];
+        var pointIndex = mantissa.IndexOf('.');
+        if (pointIndex < 0)
+            return string.Concat(mantissa, ".0", exponent);
+
+        var end = mantissa.Length;
+        while (end > pointIndex + 2 && mantissa[end - 1] == '0')
+            end--;
+
+        return string.Concat(mantissa.AsSpan(0, end), exponent);
+    }
+
+    /// <summary>
+    /// Renders the 9.0e+999 value SQLite substitutes for an infinity when zero padding is
+    /// requested. The magnitude is beyond <see cref="double"/> range, so its digits are
+    /// synthesized rather than computed.
+    /// </summary>
+    private static string FormatPrintfInfinitySubstitute(
+        char verb,
+        int? requestedPrecision,
+        bool alternate,
+        bool alternate2)
+    {
+        const int InfinityExponent = 999;
+        var precision = requestedPrecision ?? 6;
+        var forceDecimalPoint = alternate || alternate2;
+        switch (verb)
+        {
+            case 'f':
+                {
+                    var digits = string.Concat("9", new string('0', InfinityExponent));
+                    var formatted = precision > 0
+                        ? string.Concat(digits, ".", new string('0', precision))
+                        : digits;
+                    return EnsurePrintfDecimalPoint(formatted, forceDecimalPoint, alternate2);
+                }
+
+            case 'e':
+            case 'E':
+                {
+                    var mantissa = precision > 0
+                        ? string.Concat("9.", new string('0', precision))
+                        : "9";
+                    var formatted = string.Concat(
+                        mantissa,
+                        verb == 'E' ? "E+" : "e+",
+                        InfinityExponent.ToString(CultureInfo.InvariantCulture));
+                    return EnsurePrintfDecimalPoint(formatted, forceDecimalPoint, alternate2);
+                }
+
+            default:
+                {
+                    // %g selects the exponential form because the exponent is far outside the
+                    // range where the fixed form is used, and drops trailing zeroes unless the
+                    // alternate flag asked for them.
+                    var significant = Math.Max(1, precision);
+                    var mantissa = alternate && significant > 1
+                        ? string.Concat("9.", new string('0', significant - 1))
+                        : "9";
+                    var formatted = string.Concat(
+                        mantissa,
+                        verb == 'G' ? "E+" : "e+",
+                        InfinityExponent.ToString(CultureInfo.InvariantCulture));
+                    return EnsurePrintfDecimalPoint(formatted, alternate2, alternate2);
+                }
+        }
     }
 
     private static string EnsurePrintfDecimalPoint(
@@ -23615,7 +24149,31 @@ public sealed partial class EmbeddedDatabase : IDisposable
             denominator <<= -binaryScale;
 
         var quotient = BigInteger.DivRem(numerator, denominator, out var remainder);
-        return remainder * 2 >= denominator ? quotient + 1 : quotient;
+        var rounded = remainder * 2 >= denominator ? quotient + 1 : quotient;
+        return ClampPrintfSignificantDigits(rounded);
+    }
+
+    /// <summary>
+    /// SQLite decodes a double to at most 16 significant decimal digits and zero fills the rest,
+    /// so <c>printf('%.25f', 0.1)</c> is "0.1000000000000000000000000" rather than the exact
+    /// binary expansion "0.1000000000000000055511151".
+    /// </summary>
+    private static BigInteger ClampPrintfSignificantDigits(BigInteger digits)
+    {
+        const int MaximumSignificantDigits = 16;
+        if (digits.IsZero)
+            return digits;
+
+        var length = BigInteger.Abs(digits).ToString(CultureInfo.InvariantCulture).Length;
+        if (length <= MaximumSignificantDigits)
+            return digits;
+
+        var scale = BigInteger.Pow(10, length - MaximumSignificantDigits);
+        var quotient = BigInteger.DivRem(digits, scale, out var remainder);
+        if (remainder * 2 >= scale)
+            quotient += 1;
+
+        return quotient * scale;
     }
 
     private static int GetPrintfDecimalExponent(double value)
@@ -23738,7 +24296,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return SqlValue.Integer(Math.Abs(value.AsInteger()));
         }
 
-        return SqlValue.Real(Math.Abs(AsReal(value)));
+        // Text and blobs numerify rather than raising, so abs('abc') is 0.0 like SQLite.
+        return SqlValue.Real(Math.Abs(AsReal(ApplyNumericAffinity(value))));
     }
 
     private static string ToSqliteLower(string value)
@@ -24133,12 +24692,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return value.Kind switch
         {
             SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
-            SqlValueKind.Real => value.AsReal().ToString("R", CultureInfo.InvariantCulture),
+            SqlValueKind.Real => FormatRealAsText(value.AsReal()),
             SqlValueKind.Text => value.AsText(),
             SqlValueKind.Blob => System.Text.Encoding.UTF8.GetString(value.AsBlob().Span),
             _ => throw new EmbeddedSqlException($"Cannot convert {value.Kind} to text."),
         };
     }
+
+    /// <summary>Renders a REAL the way SQLite converts a floating point value to text.</summary>
+    /// <remarks>
+    /// SQLite never renders a floating point value as a bare integer, so <c>CAST(0.0 AS TEXT)</c>
+    /// is "0.0" and not "0", and 1e20 is "1.0e+20" rather than the platform's "1E+20".
+    /// </remarks>
+    internal static string FormatRealAsText(double value) => SqliteRealText.Format(value);
 
     private static string? GetCollation(Expression expression) =>
         GetExplicitCollation(expression);
@@ -24964,29 +25530,141 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 break;
         }
 
-        foreach (var argument in function.Arguments)
-        {
-            if (ContainsWindowFunction(argument) || ContainsAggregate(argument))
-                throw new EmbeddedSqlException("window function arguments cannot contain aggregate or window functions");
-        }
-
-        if (function.Filter is not null
-            && (ContainsWindowFunction(function.Filter) || ContainsAggregate(function.Filter)))
-        {
-            throw new EmbeddedSqlException("FILTER clause cannot contain aggregate or window functions");
-        }
+        // Aggregates are legal everywhere inside a window call's own subtree: SQLite aggregates
+        // first and runs the window pass over the grouped rows, so sum(count(*)) OVER (ORDER BY
+        // count(*)) reads an already-aggregated value. A *window* call nested in that subtree has
+        // no such later pass to be evaluated in and stays a misuse, named after the inner call.
+        var nestedInInputs = function.Arguments
+                .Select(FindWindowFunction)
+                .FirstOrDefault(candidate => candidate is not null)
+            ?? FindWindowFunction(function.Filter);
+        if (nestedInInputs is not null)
+            throw new EmbeddedSqlException($"misuse of window function {nestedInInputs.Name}()");
 
         var window = function.Window!;
         ValidateWindowFrameStructure(window);
-        if (window.PartitionBy.Any(expression => ContainsWindowFunction(expression) || ContainsAggregate(expression))
-            || window.OrderBy.Any(term =>
-                ContainsWindowFunction(term.Expression) || ContainsAggregate(term.Expression))
-            || window.Frame?.Start.Offset is { } startOffset
+        var nestedInSpec = window.PartitionBy
+                .Select(FindWindowFunction)
+                .FirstOrDefault(candidate => candidate is not null)
+            ?? window.OrderBy
+                .Select(term => FindWindowFunction(term.Expression))
+                .FirstOrDefault(candidate => candidate is not null);
+        if (nestedInSpec is not null)
+            throw new EmbeddedSqlException($"misuse of window function {nestedInSpec.Name}()");
+
+        // Frame offsets have no aggregate pass of their own - they are evaluated once per
+        // statement - so anything non-constant stays rejected here.
+        if (window.Frame?.Start.Offset is { } startOffset
                 && (ContainsWindowFunction(startOffset) || ContainsAggregate(startOffset))
             || window.Frame?.End.Offset is { } endOffset
                 && (ContainsWindowFunction(endOffset) || ContainsAggregate(endOffset)))
         {
             throw new EmbeddedSqlException("misuse of window function");
+        }
+    }
+
+    // Returns the outermost window call inside <paramref name="expression"/>, or null when the
+    // expression carries none. Used to name the offending call in a misuse diagnostic exactly the
+    // way SQLite does.
+    private FunctionExpression? FindWindowFunction(Expression? expression)
+    {
+        if (expression is null)
+            return null;
+
+        var found = new List<FunctionExpression>();
+        CollectWindowFunctions(expression, found);
+        return found.Count == 0 ? null : found[0];
+    }
+
+    // True when the expression contains an aggregate call anywhere, including inside a window
+    // call's arguments, FILTER, PARTITION BY or ORDER BY. Those aggregates are evaluated in the
+    // statement's aggregate pass, so their presence makes the statement an aggregate query even
+    // when no aggregate appears outside a window call.
+    private bool ContainsAggregateAcrossWindows(Expression expression)
+    {
+        if (ContainsAggregate(expression))
+            return true;
+
+        var windowFunctions = new List<FunctionExpression>();
+        CollectWindowFunctions(expression, windowFunctions);
+        return windowFunctions.Any(WindowFunctionContainsAggregate);
+    }
+
+    private bool WindowFunctionContainsAggregate(FunctionExpression function)
+    {
+        var window = function.Window!;
+        return function.Arguments.Any(ContainsAggregate)
+            || function.Filter is not null && ContainsAggregate(function.Filter)
+            || window.PartitionBy.Any(ContainsAggregate)
+            || window.OrderBy.Any(term => ContainsAggregate(term.Expression));
+    }
+
+    // Returns the window call that a non-window aggregate takes as input, if any. SQLite has no
+    // pass in which such a call could be evaluated - the window pass runs after aggregation - so
+    // it is a misuse named after the window call.
+    private FunctionExpression? FindWindowFunctionInsideAggregate(Expression? expression)
+    {
+        switch (expression)
+        {
+            case null:
+                return null;
+            case FunctionExpression { Window: not null }:
+                return null;
+            case FunctionExpression function when IsBuiltInAggregate(function)
+                || IsManagedPercentileAggregate(function.Name)
+                || TryGetAggregateFunction(function.Name, function.Arguments.Count, out _):
+                return function.Arguments
+                        .Select(FindWindowFunction)
+                        .FirstOrDefault(candidate => candidate is not null)
+                    ?? FindWindowFunction(function.Filter)
+                    ?? function.Arguments
+                        .Select(FindWindowFunctionInsideAggregate)
+                        .FirstOrDefault(candidate => candidate is not null);
+            case FunctionExpression function:
+                return function.Arguments
+                        .Select(FindWindowFunctionInsideAggregate)
+                        .FirstOrDefault(candidate => candidate is not null)
+                    ?? FindWindowFunctionInsideAggregate(function.Filter);
+            case RowValueExpression rowValue:
+                return rowValue.Values
+                    .Select(FindWindowFunctionInsideAggregate)
+                    .FirstOrDefault(candidate => candidate is not null);
+            case UnaryExpression unary:
+                return FindWindowFunctionInsideAggregate(unary.Operand);
+            case BinaryExpression binary:
+                return FindWindowFunctionInsideAggregate(binary.Left)
+                    ?? FindWindowFunctionInsideAggregate(binary.Right);
+            case CollationExpression collation:
+                return FindWindowFunctionInsideAggregate(collation.Expression);
+            case CastExpression cast:
+                return FindWindowFunctionInsideAggregate(cast.Expression);
+            case CaseExpression @case:
+                return FindWindowFunctionInsideAggregate(@case.Operand)
+                    ?? @case.Clauses
+                        .Select(clause => FindWindowFunctionInsideAggregate(clause.When)
+                            ?? FindWindowFunctionInsideAggregate(clause.Then))
+                        .FirstOrDefault(candidate => candidate is not null)
+                    ?? FindWindowFunctionInsideAggregate(@case.Else);
+            case LikeExpression like:
+                return FindWindowFunctionInsideAggregate(like.Value)
+                    ?? FindWindowFunctionInsideAggregate(like.Pattern)
+                    ?? FindWindowFunctionInsideAggregate(like.Escape);
+            case GlobExpression glob:
+                return FindWindowFunctionInsideAggregate(glob.Value)
+                    ?? FindWindowFunctionInsideAggregate(glob.Pattern);
+            case InExpression @in:
+                return FindWindowFunctionInsideAggregate(@in.Value)
+                    ?? @in.Values
+                        .Select(FindWindowFunctionInsideAggregate)
+                        .FirstOrDefault(candidate => candidate is not null);
+            case InSubqueryExpression inSubquery:
+                return FindWindowFunctionInsideAggregate(inSubquery.Value);
+            case BetweenExpression between:
+                return FindWindowFunctionInsideAggregate(between.Value)
+                    ?? FindWindowFunctionInsideAggregate(between.Lower)
+                    ?? FindWindowFunctionInsideAggregate(between.Upper);
+            default:
+                return null;
         }
     }
 
@@ -25020,6 +25698,158 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException(
                 "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression");
         }
+    }
+
+    // Runs the window pass over the aggregate pass's output. SQLite evaluates GROUP BY (and HAVING)
+    // first and only then applies window functions to the surviving grouped rows, so a frame here
+    // spans groups rather than base rows, a window argument may read an aggregate result
+    // (sum(count(*)) OVER ...), and a group removed by HAVING is invisible to every frame.
+    // Bare columns resolve against each group's representative row exactly as in the plain grouped
+    // path, which is why every window input goes through EvaluateAggregate.
+    private ExecutionResult ExecuteGroupedWindowSelect(
+        SelectStatement statement,
+        IReadOnlyList<SourceRow> selectedRows,
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        string[] columnNames,
+        IReadOnlyList<OrderByTerm> resolvedOrderBy,
+        long offset,
+        long? limit,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var grouped = new List<(SourceRow? Representative, IReadOnlyList<SourceRow> Rows)>();
+        if (statement.GroupBy.Count == 0)
+        {
+            // An aggregate without GROUP BY collapses to exactly one row, even over no rows at all.
+            var representative = GetAggregateRepresentative(statement, selectedRows, parameters, context);
+            if (statement.Having is null
+                || IsTrue(EvaluateAggregate(statement.Having, selectedRows, parameters, context, representative)))
+            {
+                grouped.Add((representative, selectedRows));
+            }
+        }
+        else
+        {
+            foreach (var entry in BuildGroups(statement.GroupBy, selectedRows, parameters, context))
+            {
+                var representative = GetAggregateRepresentative(statement, entry.Rows, parameters, context)
+                    ?? entry.Rows[0];
+                if (statement.Having is null
+                    || IsTrue(EvaluateAggregate(
+                        statement.Having,
+                        entry.Rows,
+                        parameters,
+                        context,
+                        representative)))
+                {
+                    grouped.Add((representative, entry.Rows));
+                }
+            }
+        }
+
+        SqlValue EvaluateInGroup(int index, Expression expression) => EvaluateAggregate(
+            expression,
+            grouped[index].Rows,
+            parameters,
+            context,
+            grouped[index].Representative);
+
+        var valueRows = ComputeWindowFunctionValueRows(
+            windowFunctions,
+            grouped.Count,
+            EvaluateInGroup,
+            parameters,
+            context);
+        var windowValues = new Dictionary<FunctionExpression, SqlValue>[grouped.Count];
+        for (var index = 0; index < grouped.Count; index++)
+        {
+            var substitution = new Dictionary<FunctionExpression, SqlValue>(windowFunctions.Count);
+            for (var ordinal = 0; ordinal < windowFunctions.Count; ordinal++)
+                substitution[windowFunctions[ordinal]] = valueRows[index][ordinal];
+
+            windowValues[index] = substitution;
+        }
+
+        var results = new List<OrderByKeyed<SqlValue[]>>(grouped.Count);
+        for (var index = 0; index < grouped.Count; index++)
+        {
+            context.CheckInterrupt();
+            var substitution = windowValues[index];
+            var values = statement.Projections
+                .Select(projection => EvaluateInGroup(
+                    index,
+                    ReplaceWindowFunctions(projection.Expression, substitution)))
+                .ToArray();
+            var keys = resolvedOrderBy
+                .Select(term => EvaluateInGroup(index, ReplaceWindowFunctions(term.Expression, substitution)))
+                .ToArray();
+            results.Add(new OrderByKeyed<SqlValue[]>(values, keys, index));
+        }
+
+        if (resolvedOrderBy.Count > 0)
+        {
+            var orderCollations = resolvedOrderBy
+                .Select(term => GetEffectiveCollation(term.Expression, context))
+                .ToArray();
+            results.Sort((left, right) =>
+            {
+                var comparison = CompareOrderKeys(left.Keys, right.Keys, resolvedOrderBy, orderCollations);
+                return comparison != 0 ? comparison : left.Position.CompareTo(right.Position);
+            });
+        }
+
+        return new ExecutionResult(
+            columnNames,
+            ApplyDistinctLimit(
+                results.Select(result => result.Item),
+                statement.Distinct,
+                offset,
+                limit,
+                statement.Projections
+                    .Select(projection => GetEffectiveCollation(projection.Expression, context))
+                    .ToArray()),
+            0);
+    }
+
+    // Partitions the selected rows into GROUP BY groups, preserving first-encounter order.
+    private List<(SqlValue[] Key, List<SourceRow> Rows)> BuildGroups(
+        IReadOnlyList<Expression> groupBy,
+        IReadOnlyList<SourceRow> selectedRows,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var groupCollations = groupBy
+            .Select(expression => GetEffectiveCollation(expression, context))
+            .ToArray();
+        VdbeGroupComparer groupEquality = (left, right) =>
+            GroupKeysEqual(left, right, groupCollations);
+        var groupHasher = BuildGroupHasher(groupCollations);
+        var groupIndexByKey = groupHasher is null
+            ? null
+            : new Dictionary<SqlValue[], int>(
+                new GroupKeyEqualityComparer(groupEquality, groupHasher));
+        var groups = new List<(SqlValue[] Key, List<SourceRow> Rows)>();
+        foreach (var row in selectedRows)
+        {
+            context.CheckInterrupt();
+            var key = EvaluateGroupKey(groupBy, parameters, row, context);
+            var groupIndex = groupIndexByKey is not null
+                && groupIndexByKey.TryGetValue(key, out var indexedGroup)
+                    ? indexedGroup
+                    : groupIndexByKey is null
+                        ? groups.FindIndex(group => groupEquality(group.Key, key))
+                        : -1;
+            if (groupIndex < 0)
+            {
+                groupIndex = groups.Count;
+                groups.Add((key, []));
+                groupIndexByKey?.Add(key, groupIndex);
+            }
+
+            groups[groupIndex].Rows.Add(row);
+        }
+
+        return groups;
     }
 
     private ExecutionResult ExecuteWindowSelect(
@@ -25131,14 +25961,33 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        var values = new SqlValue[rows.Count][];
-        for (var index = 0; index < rows.Count; index++)
+        return ComputeWindowFunctionValueRows(
+            windowFunctions,
+            rows.Count,
+            (index, expression) => Evaluate(expression, parameters, rows[index], context),
+            parameters,
+            context);
+    }
+
+    // The window pass reads every one of its inputs - arguments, FILTER, PARTITION BY and window
+    // ORDER BY - through <paramref name="evaluate"/> rather than from a SourceRow directly. A plain
+    // windowed SELECT supplies the scanned row; a grouped one supplies the aggregate pass's output
+    // for the group at that index, which is what makes a frame see grouped rows instead of base rows.
+    private SqlValue[][] ComputeWindowFunctionValueRows(
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        int rowCount,
+        WindowInputEvaluator evaluate,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var values = new SqlValue[rowCount][];
+        for (var index = 0; index < rowCount; index++)
             values[index] = new SqlValue[windowFunctions.Count];
 
         if (windowFunctions.Count == 0)
             return values;
 
-        var inputs = PrepareWindowFunctionInputs(windowFunctions, rows, parameters, context);
+        var inputs = PrepareWindowFunctionInputs(windowFunctions, rowCount, evaluate, context);
         var groups = new List<List<int>>();
         foreach (var ordinal in Enumerable.Range(0, windowFunctions.Count))
         {
@@ -25156,11 +26005,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         foreach (var group in groups)
         {
             var functions = group.Select(ordinal => windowFunctions[ordinal]).ToArray();
-            var computed = ComputeWindowFunctions(functions, rows, inputs, parameters, context);
+            var computed = ComputeWindowFunctions(functions, rowCount, evaluate, inputs, parameters, context);
             for (var position = 0; position < functions.Length; position++)
             {
                 var series = computed[functions[position]];
-                for (var index = 0; index < rows.Count; index++)
+                for (var index = 0; index < rowCount; index++)
                     values[index][group[position]] = series[index];
             }
         }
@@ -25170,26 +26019,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private Dictionary<FunctionExpression, WindowFunctionInput[]> PrepareWindowFunctionInputs(
         IReadOnlyList<FunctionExpression> functions,
-        IReadOnlyList<SourceRow> rows,
-        SqlValue[] parameters,
+        int rowCount,
+        WindowInputEvaluator evaluate,
         QueryContext context)
     {
         var inputs = new Dictionary<FunctionExpression, WindowFunctionInput[]>();
         foreach (var function in functions)
-            inputs.Add(function, new WindowFunctionInput[rows.Count]);
+            inputs.Add(function, new WindowFunctionInput[rowCount]);
 
-        for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
-            var row = rows[rowIndex];
+            context.CheckInterrupt();
             foreach (var function in functions)
             {
                 var included = !IsAggregateWindowFunction(function)
                     || function.Filter is null
-                    || IsTrue(Evaluate(function.Filter, parameters, row, context));
+                    || IsTrue(evaluate(rowIndex, function.Filter));
                 var arguments = included
                     ? function.Arguments
-                        .Select(argument => Evaluate(argument, parameters, row, context))
+                        .Select(argument => evaluate(rowIndex, argument))
                         .ToArray()
                     : [];
                 inputs[function][rowIndex] = new WindowFunctionInput(included, arguments);
@@ -25293,9 +26141,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private readonly record struct WindowFrameRuntime(SqlValue? StartOffset, SqlValue? EndOffset);
 
+    private delegate SqlValue WindowInputEvaluator(int rowIndex, Expression expression);
+
     private Dictionary<FunctionExpression, SqlValue[]> ComputeWindowFunctions(
         IReadOnlyList<FunctionExpression> functions,
-        IReadOnlyList<SourceRow> rows,
+        int rowCount,
+        WindowInputEvaluator evaluate,
         IReadOnlyDictionary<FunctionExpression, WindowFunctionInput[]> inputs,
         SqlValue[] parameters,
         QueryContext context)
@@ -25303,7 +26154,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var spec = functions[0].Window!;
         var results = new Dictionary<FunctionExpression, SqlValue[]>();
         foreach (var function in functions)
-            results.Add(function, new SqlValue[rows.Count]);
+            results.Add(function, new SqlValue[rowCount]);
 
         var partitionCollations = spec.PartitionBy
             .Select(expression => GetEffectiveCollation(expression, context))
@@ -25316,13 +26167,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             : new Dictionary<SqlValue[], WindowPartition>(
                 new GroupKeyEqualityComparer(partitionEquality, partitionHasher));
         var partitions = new List<WindowPartition>();
-        var orderKeysBySource = new SqlValue[rows.Count][];
-        for (var index = 0; index < rows.Count; index++)
+        var orderKeysBySource = new SqlValue[rowCount][];
+        for (var index = 0; index < rowCount; index++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var keys = spec.PartitionBy.Count == 0
                 ? []
-                : EvaluateGroupKey(spec.PartitionBy, parameters, rows[index], context);
+                : spec.PartitionBy.Select(expression => evaluate(index, expression)).ToArray();
             WindowPartition? partition;
             if (partitionIndexByKey is not null)
             {
@@ -25342,7 +26193,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             partition.Members.Add(index);
             orderKeysBySource[index] = spec.OrderBy
-                .Select(term => Evaluate(term.Expression, parameters, rows[index], context))
+                .Select(term => evaluate(index, term.Expression))
                 .ToArray();
         }
 
@@ -25355,7 +26206,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             : default;
         foreach (var partition in partitions)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var entries = new List<WindowOrderEntry>(partition.Members.Count);
             for (var ordinal = 0; ordinal < partition.Members.Count; ordinal++)
             {
@@ -25391,7 +26242,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             for (var position = 0; position < entries.Count; position++)
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 var framePositions = needsFrame
                     ? ResolveWindowFramePositions(
                         spec,
@@ -26198,21 +27049,117 @@ public sealed partial class EmbeddedDatabase : IDisposable
         };
     }
 
+    /// <summary>
+    /// Numerifies a value the way SQLite's <c>sqlite3_value_double</c> does for CAST, arithmetic,
+    /// truth tests, <c>abs()</c> and <c>round()</c>: a leading numeric prefix is consumed and the
+    /// remainder is ignored, so <c>'12abc'</c> becomes 12 and a blob is read as its bytes. This is
+    /// deliberately more permissive than <see cref="ApplyComparisonNumericAffinity"/>, which
+    /// converts only a value that is entirely a well-formed number so that <c>'12abc'</c> never
+    /// compares equal to 12 and is still stored as text in a NUMERIC column. The math builtins use
+    /// that stricter rule instead and yield NULL; see <c>TryGetMathOperand</c>.
+    /// </summary>
     private static SqlValue ApplyNumericAffinity(SqlValue value)
     {
-        if (value.Kind is SqlValueKind.Integer or SqlValueKind.Real)
-            return value;
-        if (value.Kind == SqlValueKind.Text)
+        switch (value.Kind)
         {
-            var text = value.AsText().Trim();
-            if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
-                return SqlValue.Integer(integer);
-            if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var real))
-                return SqlValue.Real(real);
+            case SqlValueKind.Integer:
+            case SqlValueKind.Real:
+                return value;
+            case SqlValueKind.Text when TryParseNumericPrefix(value.AsText(), out var text):
+                return text;
+            case SqlValueKind.Blob when TryParseNumericPrefix(DecodeBlobAsLatin1(value.AsBlob().Span), out var blob):
+                return blob;
+            default:
+                return SqlValue.Integer(0);
+        }
+    }
+
+    /// <summary>
+    /// Reads blob bytes as characters for numerification. SQLite runs its text-to-number parser
+    /// straight over the blob's bytes, and that parser accepts only ASCII, so a byte-preserving
+    /// decode is equivalent while never throwing on non-UTF-8 content.
+    /// </summary>
+    private static string DecodeBlobAsLatin1(ReadOnlySpan<byte> bytes)
+        => System.Text.Encoding.Latin1.GetString(bytes);
+
+    /// <summary>
+    /// Parses the leading numeric prefix of <paramref name="text"/>, mirroring SQLite's
+    /// <c>sqlite3AtoF</c>. The result is an integer only when the prefix carries no fraction and
+    /// no exponent and fits in a 64-bit integer, so <c>'1e3xyz'</c> is the real 1000.0 while
+    /// <c>'12abc'</c> is the integer 12.
+    /// </summary>
+    private static bool TryParseNumericPrefix(ReadOnlySpan<char> text, out SqlValue value)
+    {
+        var index = 0;
+        while (index < text.Length && IsSqlSpace(text[index]))
+            index++;
+
+        var start = index;
+        if (index < text.Length && text[index] is '+' or '-')
+            index++;
+
+        var digits = 0;
+        while (index < text.Length && char.IsAsciiDigit(text[index]))
+        {
+            index++;
+            digits++;
         }
 
-        return SqlValue.Integer(0);
+        var isReal = false;
+        if (index < text.Length && text[index] == '.')
+        {
+            isReal = true;
+            index++;
+            while (index < text.Length && char.IsAsciiDigit(text[index]))
+            {
+                index++;
+                digits++;
+            }
+        }
+
+        if (digits == 0)
+        {
+            value = default;
+            return false;
+        }
+
+        // An exponent only counts when at least one digit follows it, so '1e' is 1 rather than
+        // a parse failure and '.e5' has no numeric prefix at all.
+        if (index < text.Length && text[index] is 'e' or 'E')
+        {
+            var exponent = index + 1;
+            if (exponent < text.Length && text[exponent] is '+' or '-')
+                exponent++;
+            if (exponent < text.Length && char.IsAsciiDigit(text[exponent]))
+            {
+                isReal = true;
+                index = exponent;
+                while (index < text.Length && char.IsAsciiDigit(text[index]))
+                    index++;
+            }
+        }
+
+        var number = text[start..index];
+        if (!isReal
+            && long.TryParse(number, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
+        {
+            value = SqlValue.Integer(integer);
+            return true;
+        }
+
+        // An integer prefix too large for 64 bits degrades to a real, matching SQLite.
+        if (double.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out var real))
+        {
+            value = SqlValue.Real(real);
+            return true;
+        }
+
+        value = default;
+        return false;
     }
+
+    private static bool IsSqlSpace(char character)
+        => character is ' ' or '\t' or '\n' or '\v' or '\f' or '\r';
 
     private static long RequireInteger(SqlValue value)
     {
@@ -29060,6 +30007,8 @@ public sealed class EmbeddedConnection : IDisposable
     private bool _recursiveTriggers;
     private bool _tempInitialized;
     private readonly Dictionary<EmbeddedDatabase, int> _pendingPageSizes = [];
+    private readonly ManagedConnectionHooks _hooks = new();
+    private bool _insideHookCallback;
     private bool _disposed;
 
     private sealed class AttachedDatabase : IDisposable
@@ -29249,9 +30198,135 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
+        ThrowIfInsideHookCallback();
         var parameterMap = SqlParameterMap.Parse(sql);
-        return new EmbeddedStatement(this, SqlParser.Parse(sql, parameterMap), parameterMap);
+        var statement = SqlParser.Parse(sql, parameterMap);
+        if (_hooks.Authorizer is not null)
+            statement = Authorize(statement);
+
+        return new EmbeddedStatement(this, statement, parameterMap, sql);
     }
+
+    /// <summary>
+    /// The callbacks registered on this connection. Mutating the returned instance takes effect
+    /// on the next prepared statement or execution, mirroring SQLite's hook registration APIs.
+    /// </summary>
+    public ManagedConnectionHooks Hooks => _hooks;
+
+    private ParsedStatement Authorize(ParsedStatement statement)
+    {
+        var authorizer = _hooks.Authorizer!;
+        var catalog = _transactionDatabases is not null
+            && _transactionDatabases.TryGetValue(_database, out var transactionState)
+            ? transactionState.Catalog
+            : _database.CreateAuthorizationCatalog();
+        var tempCatalog = _tempDatabase.CreateAuthorizationCatalog();
+        return SqlAuthorization.Apply(
+            statement,
+            catalog,
+            tempCatalog,
+            context => InvokeHook(() => authorizer(context)));
+    }
+
+    /// <summary>
+    /// Builds the per-execution hook payload for a routed statement. Returning <c>null</c> when
+    /// nothing is registered keeps the uninstrumented execution path byte-for-byte unchanged.
+    /// </summary>
+    private ManagedStatementHooks? CreateStatementHooks(EmbeddedDatabase database, bool includeCommitGate)
+    {
+        var updateHook = _hooks.UpdateHook;
+        var commitHook = includeCommitGate ? _hooks.CommitHook : null;
+        var progressHandler = _hooks.ProgressHandler;
+        var progressInterval = _hooks.ProgressInterval;
+        if (updateHook is null && commitHook is null && (progressHandler is null || progressInterval <= 0))
+            return null;
+
+        var schema = ResolveSchemaName(database);
+        return new ManagedStatementHooks
+        {
+            RowChanged = updateHook is null
+                ? null
+                : (operation, table, rowId) => InvokeHook(
+                    () => updateHook(new SqliteRowChange(operation, schema, table, rowId))),
+            CommitGate = commitHook is null ? null : () => InvokeHook(commitHook),
+            Progress = progressHandler is null || progressInterval <= 0
+                ? null
+                : new ManagedProgressCounter(progressInterval, () => InvokeHook(progressHandler)),
+        };
+    }
+
+    private string ResolveSchemaName(EmbeddedDatabase database)
+    {
+        if (ReferenceEquals(database, _tempDatabase))
+            return "temp";
+
+        foreach (var attachment in _attachedDatabases)
+        {
+            if (ReferenceEquals(attachment.Value.Database, database))
+                return attachment.Key;
+        }
+
+        return "main";
+    }
+
+    private void FireRollbackHook()
+    {
+        if (_hooks.RollbackHook is { } rollbackHook)
+            InvokeHook(rollbackHook);
+    }
+
+    internal void FireTraceHook(string sql)
+    {
+        if (_hooks.Trace is { } trace)
+            InvokeHook(() => trace(sql));
+    }
+
+    /// <summary>
+    /// Runs a user callback with reentrancy tracking. The managed engine cannot execute a
+    /// statement while a mutation is in flight, so a hook that calls back into its own
+    /// connection fails loudly instead of corrupting the working catalog.
+    /// </summary>
+    private void InvokeHook(Action callback)
+    {
+        if (_insideHookCallback)
+            ThrowHookReentry();
+
+        _insideHookCallback = true;
+        try
+        {
+            callback();
+        }
+        finally
+        {
+            _insideHookCallback = false;
+        }
+    }
+
+    private T InvokeHook<T>(Func<T> callback)
+    {
+        if (_insideHookCallback)
+            ThrowHookReentry();
+
+        _insideHookCallback = true;
+        try
+        {
+            return callback();
+        }
+        finally
+        {
+            _insideHookCallback = false;
+        }
+    }
+
+    internal void ThrowIfInsideHookCallback()
+    {
+        if (_insideHookCallback)
+            ThrowHookReentry();
+    }
+
+    private static void ThrowHookReentry()
+        => throw new EmbeddedSqlException(
+            "Managed connections do not support reentrant use of the connection from a hook callback.");
 
     public IReadOnlyList<EmbeddedStatement> PrepareScript(string sql)
     {
@@ -29273,6 +30348,13 @@ public sealed class EmbeddedConnection : IDisposable
         _recursiveTriggers = false;
         _tempInitialized = false;
         _pendingPageSizes.Clear();
+        _hooks.UpdateHook = null;
+        _hooks.CommitHook = null;
+        _hooks.RollbackHook = null;
+        _hooks.Authorizer = null;
+        _hooks.Trace = null;
+        _hooks.ProgressHandler = null;
+        _hooks.ProgressInterval = 0;
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
@@ -29448,6 +30530,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
+        ThrowIfInsideHookCallback();
         cancellationToken.ThrowIfCancellationRequested();
         if (_transactionMutationDatabase is not null && EmbeddedDatabase.MayMutate(statement))
         {
@@ -29486,6 +30569,7 @@ public sealed class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException("cannot rollback - no transaction is active");
 
                 ResetTransactionState();
+                FireRollbackHook();
                 return ExecutionResult.Empty;
             case SavepointStatement savepoint:
                 CreateSavepoint(savepoint.Name);
@@ -29564,17 +30648,32 @@ public sealed class EmbeddedConnection : IDisposable
                     {
                         if (transactionState is null)
                         {
-                            result = routed.Database.Execute(
-                                routed.Statement,
-                                parameters,
-                                _lastInsertRowId,
-                                _foreignKeys,
-                                _recursiveTriggers,
-                                _deferForeignKeys,
-                                inTransaction: false,
-                                cancellationToken,
-                                compilationEnabled: !routed.IsAttached
-                                    && !ReferenceEquals(routed.Database, _tempDatabase));
+                            try
+                            {
+                                result = routed.Database.Execute(
+                                    routed.Statement,
+                                    parameters,
+                                    _lastInsertRowId,
+                                    _foreignKeys,
+                                    _recursiveTriggers,
+                                    _deferForeignKeys,
+                                    inTransaction: false,
+                                    cancellationToken,
+                                    compilationEnabled: !routed.IsAttached
+                                        && !ReferenceEquals(routed.Database, _tempDatabase),
+                                    CreateStatementHooks(routed.Database, includeCommitGate: true));
+                            }
+                            catch (Exception failure)
+                                when (failure is not EmbeddedConflictFailException
+                                    && EmbeddedDatabase.MayMutate(routed.Statement))
+                            {
+                                // SQLite rolls back the implicit transaction wrapping a failed
+                                // autocommit mutation and notifies the rollback hook. ON CONFLICT
+                                // FAIL is excluded because the rows written before the failure are
+                                // still committed.
+                                FireRollbackHook();
+                                throw;
+                            }
                         }
                         else
                         {
@@ -29592,7 +30691,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 inTransaction: true,
                                 cancellationToken,
                                 compilationEnabled: !routed.IsAttached
-                                    && !ReferenceEquals(routed.Database, _tempDatabase));
+                                    && !ReferenceEquals(routed.Database, _tempDatabase),
+                                CreateStatementHooks(routed.Database, includeCommitGate: false));
                             if (EmbeddedDatabase.MayMutate(routed.Statement))
                                 cancellationToken.ThrowIfCancellationRequested();
                         }
@@ -29644,7 +30744,10 @@ public sealed class EmbeddedConnection : IDisposable
                     if (exception.LastInsertRowId is { } rolledBackInsertRowId)
                         _lastInsertRowId = rolledBackInsertRowId;
                     if (_transactionDatabases is not null)
+                    {
                         ResetTransactionState();
+                        FireRollbackHook();
+                    }
 
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
@@ -29709,7 +30812,10 @@ public sealed class EmbeddedConnection : IDisposable
                 catch (OperationCanceledException)
                 {
                     if (transactionState is not null && EmbeddedDatabase.MayMutate(routed.Statement))
+                    {
                         ResetTransactionState();
+                        FireRollbackHook();
+                    }
                     throw;
                 }
         }
@@ -31728,6 +32834,16 @@ public sealed class EmbeddedConnection : IDisposable
         var changed = _transactionDatabases
             .Where(pair => pair.Value.HasChanges)
             .ToArray();
+
+        // SQLite only consults the commit hook when the transaction actually has something to
+        // commit, and a veto turns the commit into a rollback.
+        if (changed.Length != 0 && _hooks.CommitHook is { } commitHook && !InvokeHook(commitHook))
+        {
+            ResetTransactionState();
+            FireRollbackHook();
+            throw new EmbeddedCommitVetoException();
+        }
+
         var persistentChanges = changed
             .Where(pair => !ReferenceEquals(pair.Key, _tempDatabase))
             .ToArray();
@@ -32259,6 +33375,7 @@ public sealed class EmbeddedStatement : IDisposable
     private readonly EmbeddedConnection _connection;
     private readonly ParsedStatement _statement;
     private readonly SqlParameterMap _parameters;
+    private readonly string _sql;
     private readonly SqlValue[] _boundValues;
     private readonly bool[] _isBound;
     private string[]? _columnNames;
@@ -32284,11 +33401,16 @@ public sealed class EmbeddedStatement : IDisposable
         Ineligible,
     }
 
-    internal EmbeddedStatement(EmbeddedConnection connection, ParsedStatement statement, SqlParameterMap parameters)
+    internal EmbeddedStatement(
+        EmbeddedConnection connection,
+        ParsedStatement statement,
+        SqlParameterMap parameters,
+        string sql = "")
     {
         _connection = connection;
         _statement = statement;
         _parameters = parameters;
+        _sql = sql;
         _boundValues = new SqlValue[parameters.Count + 1];
         _isBound = new bool[parameters.Count + 1];
     }
@@ -32478,6 +33600,9 @@ public sealed class EmbeddedStatement : IDisposable
                     ? $"Missing value for parameter {name}."
                     : $"Missing value for parameter at position {index}.");
         }
+
+        if (_sql.Length != 0)
+            _connection.FireTraceHook(_sql);
 
         // An eligible top-level VALUES reuses its cached lowering (compiled once for this statement) instead
         // of recompiling on every execution; every other statement -- and any fallback VALUES shape -- keeps
@@ -33143,6 +34268,11 @@ internal sealed class EmbeddedTable
             case CurrentTimeExpression:
                 return;
             case ColumnExpression column:
+                // A bare TRUE/FALSE keyword is the integer literal 1/0 unless a column of that
+                // name is in scope. DEFAULT expressions resolve with no columns in scope at all,
+                // so there the keyword is always the literal.
+                if (column.BooleanKeyword is not null && (!allowColumns || !IsConstraintColumn(column)))
+                    return;
                 if (!allowColumns)
                     throw new EmbeddedSqlException($"default value of column is not constant: {column.Name}");
                 if (!IsConstraintColumn(column))
@@ -34020,42 +35150,190 @@ internal sealed class EmbeddedTable
             .ToArray();
     }
 
-    public void RenameColumn(string name, string newName)
+    /// <summary>
+    /// Builds a replacement table with <paramref name="name"/> renamed to
+    /// <paramref name="newName"/>. Every stored expression the table owns — CHECK bodies,
+    /// generated-column expressions, table-level key column lists, foreign-key column lists,
+    /// index keys, and partial-index predicates — is reparsed and rewritten so no reference to
+    /// the old spelling survives and no unrelated text is disturbed.
+    /// </summary>
+    public EmbeddedTable CreateWithRenamedColumn(
+        string name,
+        string newName,
+        bool quoteNewName,
+        CancellationToken cancellationToken)
     {
-        var index = GetColumnIndex(name);
-        if (_columnIndices.ContainsKey(newName))
+        var renamedIndex = GetColumnIndex(name);
+        var oldName = Columns[renamedIndex];
+        if (!string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase)
+            && _columnIndices.ContainsKey(newName))
+        {
             throw new EmbeddedSqlException($"duplicate column name: {newName}");
-        if (HasCheckConstraints
-            || HasGeneratedColumns
-            || TableLevelPrimaryKey is not null
-            || TableUniqueConstraints.Count > 0
-            || Indexes.Any(definition =>
-                definition.IsPartial || definition.Columns.Any(column => column.IsExpression))
-            || ForeignKeys.Any(foreignKey =>
-                foreignKey.ChildColumns.Contains(name, StringComparer.OrdinalIgnoreCase)))
+        }
+
+        var previousColumns = Columns.ToArray();
+        var rewrittenColumns = new EmbeddedColumn[ColumnDefinitions.Length];
+        for (var position = 0; position < ColumnDefinitions.Length; position++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var column = ColumnDefinitions[position];
+            if (column.GenerationExpression is not null)
+            {
+                if (column.GenerationSql is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Generated column '{column.Name}' of table '{Name}' has no stored expression text.");
+                }
+
+                if (RewriteFragment(column.GenerationSql) is { } generationSql)
+                {
+                    column = column with
+                    {
+                        GenerationSql = generationSql,
+                        GenerationExpression = SqlParser.ParseExpressionWithSpans(generationSql, out _),
+                    };
+                }
+            }
+
+            if (column.CheckConstraints.Count > 0
+                || column.ForeignKey is not null
+                || column.AdditionalForeignKeys is { Count: > 0 })
+            {
+                column = column.WithConstraints(
+                    column.CheckConstraints.Count > 0 ? RewriteChecks(column.CheckConstraints) : column.Checks,
+                    column.ForeignKey is null ? null : RewriteForeignKey(column.ForeignKey),
+                    column.AdditionalForeignKeys?.Select(RewriteForeignKey).ToArray());
+            }
+
+            if (position == renamedIndex)
+                column = column with { Name = newName };
+
+            rewrittenColumns[position] = column;
+        }
+
+        EmbeddedTable replacement;
+        try
+        {
+            replacement = new EmbeddedTable(
+                Name,
+                rewrittenColumns,
+                WithoutRowid,
+                TableLevelPrimaryKey?.Select(RewriteKeyColumn).ToArray(),
+                TableUniqueConstraints
+                    .Select(constraint => constraint with
+                    {
+                        Columns = constraint.Columns.Select(RewriteKeyColumn).ToArray(),
+                    })
+                    .ToArray(),
+                RewriteChecks(CheckConstraints),
+                TablePrimaryKeyConflictAlgorithm,
+                TablePrimaryKeyConstraintName,
+                TablePrimaryKeyDeclarationOrder,
+                TableForeignKeys.Select(RewriteForeignKey).ToArray(),
+                Strict);
+        }
+        catch (EmbeddedSqlException exception)
         {
             throw new EmbeddedSqlException(
-                "ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, "
-                + "index-expression, partial-index, or foreign-key schema expressions until managed "
-                + "schema token rewriting is implemented.");
+                $"error in table {Name} after rename column: {exception.Message}",
+                exception);
         }
 
-        Columns[index] = newName;
-        ColumnDefinitions[index] = ColumnDefinitions[index] with { Name = newName };
-        _columnIndices.Remove(name);
-        _columnIndices.Add(newName, index);
-
-        for (var indexPosition = 0; indexPosition < Indexes.Count; indexPosition++)
+        foreach (var index in Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit))
         {
-            var definition = Indexes[indexPosition];
-            if (definition.Columns.All(column => column.ColumnIndex != index))
-                continue;
+            cancellationToken.ThrowIfCancellationRequested();
+            var rewritten = index with
+            {
+                Columns = index.Columns.Select(RewriteIndexColumn).ToArray(),
+            };
+            if (index.WhereSql is { } whereSql && RewriteFragment(whereSql) is { } rewrittenWhere)
+            {
+                rewritten = rewritten with
+                {
+                    WhereSql = rewrittenWhere,
+                    Where = SqlParser.ParseExpressionWithSpans(rewrittenWhere, out _),
+                };
+            }
 
-            var updatedColumns = definition.Columns
-                .Select(column => column.ColumnIndex == index ? column with { Name = newName } : column)
-                .ToArray();
-            Indexes[indexPosition] = definition with { Columns = updatedColumns };
+            try
+            {
+                IndexExpressionSemantics.ValidateDefinition(Name, replacement, rewritten);
+                IndexExpressionSemantics.ValidateRoundTrip(Name, replacement, rewritten);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                throw new EmbeddedSqlException(
+                    $"error in index {index.Name} after rename column: {exception.Message}",
+                    exception);
+            }
+
+            replacement.Indexes.Add(rewritten);
         }
+
+        if (RowIds.Count != Rows.Count)
+            throw new InvalidOperationException($"Table '{Name}' has inconsistent row identity metadata.");
+        foreach (var row in Rows)
+            replacement.Rows.Add(row.ToArray());
+
+        replacement.RowIds.AddRange(RowIds);
+        return replacement;
+
+        string? RewriteFragment(string sql)
+            => RenameColumnRewriter.RewriteTableExpression(
+                sql,
+                Name,
+                previousColumns,
+                oldName,
+                newName,
+                quoteNewName);
+
+        IReadOnlyList<CheckConstraint> RewriteChecks(IReadOnlyList<CheckConstraint> checks)
+            => checks
+                .Select(check => RewriteFragment(check.Sql) is { } sql
+                    ? check with { Sql = sql, Expression = SqlParser.ParseExpressionWithSpans(sql, out _) }
+                    : check)
+                .ToArray();
+
+        TablePrimaryKeyColumn RewriteKeyColumn(TablePrimaryKeyColumn column)
+            => string.Equals(column.Name, oldName, StringComparison.OrdinalIgnoreCase)
+                ? column with { Name = newName }
+                : column;
+
+        EmbeddedIndexColumn RewriteIndexColumn(EmbeddedIndexColumn column)
+        {
+            if (column.ExpressionSql is { } expressionSql)
+            {
+                return RewriteFragment(expressionSql) is { } rewritten
+                    ? column with
+                    {
+                        ExpressionSql = rewritten,
+                        Expression = SqlParser.ParseExpressionWithSpans(rewritten, out _),
+                    }
+                    : column;
+            }
+
+            return string.Equals(column.Name, oldName, StringComparison.OrdinalIgnoreCase)
+                ? column with { Name = newName }
+                : column;
+        }
+
+        // A self-referencing foreign key names this table's columns on both sides of the
+        // REFERENCES clause, so both lists follow the rename.
+        ForeignKeyDefinition RewriteForeignKey(ForeignKeyDefinition foreignKey)
+        {
+            var rewritten = foreignKey with { ChildColumns = RenameAll(foreignKey.ChildColumns) };
+            if (string.Equals(foreignKey.ParentTable, Name, StringComparison.OrdinalIgnoreCase))
+                rewritten = rewritten with { ParentColumns = RenameAll(foreignKey.ParentColumns) };
+
+            return rewritten;
+        }
+
+        string[] RenameAll(IReadOnlyList<string> columns)
+            => columns
+                .Select(column => string.Equals(column, oldName, StringComparison.OrdinalIgnoreCase)
+                    ? newName
+                    : column)
+                .ToArray();
     }
 
     public EmbeddedTable Clone()
@@ -34534,13 +35812,22 @@ internal sealed record SourceRow(
 
     public SqlValue GetValue(ColumnExpression column)
     {
+        if (TryGetValue(column, out var value))
+            return value;
+
+        throw new EmbeddedSqlException($"no such column: {column.Name}");
+    }
+
+    public bool TryGetValue(ColumnExpression column, out SqlValue value)
+    {
         if (column.Qualifier is null)
-            return GetValue(column.Name, allowQualifiedLookup: false);
+            return TryGetValue(column.Name, allowQualifiedLookup: false, out value);
 
         if (QualifiedColumns is not null
             && QualifiedColumns.TryGetValue(column.Name, out var qualifiedIndex))
         {
-            return Values[qualifiedIndex];
+            value = Values[qualifiedIndex];
+            return true;
         }
 
         if (QualifiedRowIds is not null
@@ -34549,13 +35836,17 @@ internal sealed record SourceRow(
             && EmbeddedTable.IsRowidAliasName(rowIdName)
             && QualifiedRowIds.TryGetValue(column.Qualifier, out var qualifiedRowId))
         {
-            return qualifiedRowId is { } rowId ? SqlValue.Integer(rowId) : SqlValue.Null;
+            value = qualifiedRowId is { } rowId ? SqlValue.Integer(rowId) : SqlValue.Null;
+            return true;
         }
 
         for (var index = 0; index < Columns.Length; index++)
         {
             if (string.Equals(Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
-                return Values[index];
+            {
+                value = Values[index];
+                return true;
+            }
         }
 
         if (RowId is { } rowid
@@ -34564,13 +35855,15 @@ internal sealed record SourceRow(
             && column.UnqualifiedName is { } bareName
             && EmbeddedTable.IsRowidAliasName(bareName))
         {
-            return SqlValue.Integer(rowid);
+            value = SqlValue.Integer(rowid);
+            return true;
         }
 
         if (Parent is not null)
-            return Parent.GetValue(column);
+            return Parent.TryGetValue(column, out value);
 
-        throw new EmbeddedSqlException($"no such column: {column.Name}");
+        value = default;
+        return false;
     }
 
     public bool TryGetQualifiedValue(ColumnExpression column, out SqlValue value)
@@ -34646,11 +35939,20 @@ internal sealed record SourceRow(
 
     private SqlValue GetValue(string name, bool allowQualifiedLookup)
     {
+        if (TryGetValue(name, allowQualifiedLookup, out var value))
+            return value;
+
+        throw new EmbeddedSqlException($"no such column: {name}");
+    }
+
+    private bool TryGetValue(string name, bool allowQualifiedLookup, out SqlValue value)
+    {
         if (allowQualifiedLookup
             && QualifiedColumns is not null
             && QualifiedColumns.TryGetValue(name, out var qualifiedIndex))
         {
-            return Values[qualifiedIndex];
+            value = Values[qualifiedIndex];
+            return true;
         }
 
         // Columns joined with USING/NATURAL are coalesced: an unqualified reference to
@@ -34666,14 +35968,14 @@ internal sealed record SourceRow(
         if (coalesced is { Length: 1 })
         {
             var output = coalesced[0];
-            var value = Values[output.Index];
+            value = Values[output.Index];
             if (value.Kind != SqlValueKind.Null)
-                return value;
+                return true;
             if (output.CoalesceIndex is { } coalesceIndex)
             {
                 value = Values[coalesceIndex];
                 if (value.Kind != SqlValueKind.Null)
-                    return value;
+                    return true;
             }
             if (output.AdditionalCoalesceIndices is not null)
             {
@@ -34681,26 +35983,34 @@ internal sealed record SourceRow(
                 {
                     value = Values[additionalIndex];
                     if (value.Kind != SqlValueKind.Null)
-                        return value;
+                        return true;
                 }
             }
 
-            return SqlValue.Null;
+            value = SqlValue.Null;
+            return true;
         }
 
         if (FindUnqualifiedColumnIndex(name) is { } index)
-            return Values[index];
+        {
+            value = Values[index];
+            return true;
+        }
 
         // rowid/_rowid_/oid resolve to the hidden rowid only after real columns are
         // consulted, so a user column that happens to be named "oid" shadows the alias,
         // exactly as SQLite does.
         if (RowId is { } rowid && EmbeddedTable.IsRowidAliasName(name))
-            return SqlValue.Integer(rowid);
+        {
+            value = SqlValue.Integer(rowid);
+            return true;
+        }
 
         if (Parent is not null)
-            return Parent.GetValue(name, allowQualifiedLookup);
+            return Parent.TryGetValue(name, allowQualifiedLookup, out value);
 
-        throw new EmbeddedSqlException($"no such column: {name}");
+        value = default;
+        return false;
     }
 
     private int? FindUnqualifiedColumnIndex(string name)

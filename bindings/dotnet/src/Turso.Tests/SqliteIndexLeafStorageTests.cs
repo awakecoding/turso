@@ -29,6 +29,26 @@ public class SqliteIndexLeafStorageTests
         Assert.Throws<InvalidDataException>(() => SqliteIndexLeafCell.Decode(cell.ToArray()[..^1], usableSpace));
     }
 
+    // SQLite has no NaN: sqlite3VdbeMemSetDouble refuses to store one and serialGet reads a stored
+    // NaN back as NULL, so a record carrying a NaN payload sorts as NULL rather than being rejected.
+    [Test]
+    public void IndexRecordsCarryingANaNPayloadDecodeAsNullLikeSqlite()
+    {
+        var payload = BitConverter.GetBytes(double.NaN);
+        if (BitConverter.IsLittleEndian)
+            Array.Reverse(payload);
+
+        // A one-column record: a header of two bytes whose only serial type is 7 (IEEE 754 double).
+        var record = new byte[] { 0x02, 0x07 }.Concat(payload).ToArray();
+
+        var decoded = SqliteRecordCodec.Decode(record, SqliteTextEncoding.Utf8);
+        decoded.Should().ContainSingle().Which.Kind.Should().Be(SqlValueKind.Null);
+
+        var comparer = new SqliteIndexRecordComparer();
+        comparer.Invoking(c => c.Validate(record)).Should().NotThrow();
+        comparer.Compare(record, Record(SqlValue.Integer(-1))).Should().BeLessThan(0);
+    }
+
     [Test]
     public void IndexRecordComparerUsesSqliteStorageClassAndBinaryOrdering()
     {
@@ -45,9 +65,6 @@ public class SqliteIndexLeafStorageTests
         comparer.Compare(
             Record(SqlValue.Integer(1), SqlValue.Text("z")),
             Record(SqlValue.Integer(2))).Should().BeLessThan(0);
-
-        Assert.Throws<InvalidDataException>(() =>
-            comparer.Validate(Record(SqlValue.Real(double.NaN))));
     }
 
     [Test]
