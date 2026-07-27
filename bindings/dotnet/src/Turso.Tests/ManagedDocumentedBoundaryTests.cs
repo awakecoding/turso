@@ -31,8 +31,6 @@ public sealed class ManagedDocumentedBoundaryTests
 
     private static readonly string[] UnsupportedStatements =
     [
-        "CREATE TEMP VIEW v AS SELECT 1",
-        "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
         "BEGIN CONCURRENT",
         "ANALYZE",
         "SELECT * FROM fts5vocab('t', 'row')",

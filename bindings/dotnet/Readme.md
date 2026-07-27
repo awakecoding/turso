@@ -181,8 +181,7 @@ Deliberate limits:
 - Raw `sqlite3*` handle interop: `SqliteConnection.Handle` returns `null`.
   `ServerVersion` reports a managed placeholder, not a real SQLite version.
 - Experimental MVCC and vector search.
-- `CREATE TEMP VIEW`/`CREATE TEMP TRIGGER`, `BEGIN CONCURRENT`, and `ANALYZE`.
-  Each is rejected during parsing.
+- `BEGIN CONCURRENT` and `ANALYZE`. Each is rejected during parsing.
 - Chained `ON CONFLICT` clauses on a single `INSERT`.
 - Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Turso's
   AEGIS ciphers fail closed rather than being partially read.
@@ -611,15 +610,15 @@ reopen, managed backup, and page-size migration.
 | Recursion | With `recursive_triggers=OFF`, only an already-active trigger program is suppressed; distinct trigger chains and FK actions continue. Recursion-enabled trigger graph cycles are rejected before callbacks or mutation because the managed evaluator cannot safely recurse to SQLite's native depth. |
 | Ordering | Statements within one body are ordered. Separate matching triggers currently run newest declaration first, including after reopen/backup/migration, but applications must treat cross-trigger order as unspecified and place dependent work in one body. |
 | ATTACH | Same-database persistent triggers on `main` or an attached database are supported. Their unqualified body references bind to that database, preserving the one-write-file transaction rule. |
-| TEMP | `CREATE TRIGGER temp.name ... ON temp.table` creates a connection-local temp-schema trigger. The `CREATE TEMP TRIGGER` keyword spelling remains rejected. |
+| TEMP | `CREATE TEMP TRIGGER`, `CREATE TEMPORARY TRIGGER`, and `CREATE TRIGGER temp.name` create a connection-local temp-schema trigger, as does an unqualified `CREATE TRIGGER` whose target resolves to a TEMP table. A TEMP trigger may watch a `main` or attached table and its body may write any schema this connection can reach; those cross-schema writes are published only when the statement that fired the trigger succeeds. TEMP triggers are invisible to other connections, never reach a persistent schema, and are destroyed with the connection. A qualified TEMP trigger name is rejected, matching SQLite. |
 | Cancellation | Cancellation rolls back the complete mutating statement; cancellation inside an explicit write transaction rolls back that transaction. Host callback side effects are not transactional. |
 | Schema maintenance | DROP COLUMN and table/column rename validate trigger targets, WHEN clauses, row images, UPSERT expressions, query bodies, and named windows against the candidate schema before mutation. VACUUM, backup, page migration, and reopen preserve persistent trigger text and declaration order. |
 
 The managed engine rejects these shapes before target-row mutation:
 
-- The `CREATE TEMP TRIGGER` keyword spelling; persistent declarations or body references
-  that cross database schemas; qualified body DML targets or schema-qualified body
-  dependencies.
+- Persistent declarations or body references that cross database schemas; qualified body
+  DML targets or schema-qualified body dependencies. A TEMP trigger is exempt: its body is
+  dispatched by the owning connection, so it may name any schema that connection can reach.
 - `BEFORE UPDATE`/`BEFORE DELETE` programs that can directly or indirectly mutate their
   own target table, whose result SQLite documents as undefined.
 - Trigger-body `INSERT ... DEFAULT VALUES`, DML `RETURNING`, UPDATE/DELETE
@@ -690,7 +689,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 
 | Surface | Supported managed contract | Rejected managed contract |
 |---|---|---|
-| TEMP catalog | `CREATE TEMP TABLE`, `CREATE TEMPORARY TABLE`, and `CREATE TABLE temp.name`; ordinary table constraints, generated columns, indexes declared as `temp.index_name`, and same-catalog foreign keys. Unqualified lookup order is `temp`, `main`, then attachments; explicit schema names remain authoritative. TEMP state is private to one physical managed connection, participates in transactions/savepoints, survives commits, and is destroyed on connection disposal or pool reset. | TEMP views and triggers, attached in-memory databases, TEMP incremental blobs, and named TEMP backup sources/destinations. Main/attached backup and reopen never include TEMP objects. |
+| TEMP catalog | `CREATE TEMP TABLE`, `CREATE TEMPORARY TABLE`, and `CREATE TABLE temp.name`; ordinary table constraints, generated columns, indexes declared as `temp.index_name`, and same-catalog foreign keys. `CREATE TEMP VIEW` and `CREATE TEMP TRIGGER` are supported and reported by `sqlite_temp_schema`/`sqlite_temp_master` with the TEMP keyword stripped from `sql`. Unqualified lookup order is `temp`, `main`, then attachments; explicit schema names remain authoritative. TEMP state is private to one physical managed connection, participates in transactions/savepoints, survives commits, and is destroyed on connection disposal or pool reset. | TEMP view bodies that reference objects outside the `temp` schema, attached in-memory databases, TEMP incremental blobs, and named TEMP backup sources/destinations. Main/attached backup and reopen never include TEMP objects. |
 | `CREATE TABLE AS SELECT` | Atomic materialization from SELECT, VALUES, compound queries, or CTEs. The destination may be `temp`, `main`, or an attachment, and its single source schema may differ from the destination. Result names use SQLite `:N` de-duplication, declared types use SQLite expression-affinity names (`INT`, `NUM`, `REAL`, `TEXT`, or empty), rowids start at 1 in result order, and empty results retain declared columns. Publication occurs only after query completion and cancellation checks. | Explicit destination column definitions, `STRICT`/`WITHOUT ROWID` CTAS options, queries reading more than one database schema, or inheritance of source constraints, generated-column status, foreign keys, indexes, or triggers. Failure/cancellation leaves no destination object. |
 | STRICT tables | `INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB`, and `ANY`; lossless affinity conversion followed by storage-class enforcement on INSERT, UPDATE, generated values, defaults, and trigger writes. `ANY` preserves the incoming storage class. STRICT metadata survives WAL/DELETE reopen, backup, and DELETE-mode page-size migration, appears in regenerated `sqlite_schema.sql`, and is reported by `PRAGMA table_list`. | Missing types, names outside the six SQLite STRICT types, or values that cannot be losslessly stored in the declared type. Errors occur before catalog/data publication. |
 | Virtual tables | None in the managed provider. Capability reporting keeps managed extension/module support disabled. | Every `CREATE VIRTUAL TABLE` form is rejected before mutation because no managed module callbacks or planner/executor contract exists. |

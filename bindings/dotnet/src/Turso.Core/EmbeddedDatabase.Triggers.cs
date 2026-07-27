@@ -103,8 +103,9 @@ public sealed partial class EmbeddedDatabase
     {
         foreach (var trigger in triggers)
         {
+            var identity = GetTriggerIdentity(trigger);
             if (!context.RecursiveTriggersEnabled
-                && context.ActiveTriggers?.Contains(trigger.Name) == true)
+                && context.ActiveTriggers?.Contains(identity) == true)
             {
                 continue;
             }
@@ -117,7 +118,7 @@ public sealed partial class EmbeddedDatabase
             var activeTriggers = context.ActiveTriggers is null
                 ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 : new HashSet<string>(context.ActiveTriggers, StringComparer.OrdinalIgnoreCase);
-            activeTriggers.Add(trigger.Name);
+            activeTriggers.Add(identity);
             var state = context.TriggerState
                 ?? throw new InvalidOperationException("Row trigger execution lost its statement state.");
             var savedLastInsertRowId = state.LiveLastInsertRowId;
@@ -140,15 +141,18 @@ public sealed partial class EmbeddedDatabase
 
                 foreach (var bodyStatement in trigger.Body)
                 {
-                    var result = bodyStatement switch
-                    {
-                        InsertStatement insert => ExecuteInsert(insert, EmptyParameters, triggerContext),
-                        UpdateStatement update => ExecuteUpdate(update, EmptyParameters, triggerContext),
-                        DeleteStatement delete => ExecuteDelete(delete, EmptyParameters, triggerContext),
-                        QueryStatement query => ExecuteQuery(query, EmptyParameters, triggerContext, outerRow: null),
-                        _ => throw new EmbeddedSqlException(
-                            $"unsupported trigger body statement {bodyStatement.GetType().Name}"),
-                    };
+                    var localStatement = LocalizeTriggerBodyStatement(context, trigger, bodyStatement);
+                    var result = localStatement is null
+                        ? context.TempTriggers!.ExecuteForeign(bodyStatement, triggerContext)
+                        : localStatement switch
+                        {
+                            InsertStatement insert => ExecuteInsert(insert, EmptyParameters, triggerContext),
+                            UpdateStatement update => ExecuteUpdate(update, EmptyParameters, triggerContext),
+                            DeleteStatement delete => ExecuteDelete(delete, EmptyParameters, triggerContext),
+                            QueryStatement query => ExecuteQuery(query, EmptyParameters, triggerContext, outerRow: null),
+                            _ => throw new EmbeddedSqlException(
+                                $"unsupported trigger body statement {bodyStatement.GetType().Name}"),
+                        };
                     state.Changed |= result.Changed;
                     if (result.LastInsertRowId is { } insertedRowId)
                         state.LiveLastInsertRowId = insertedRowId;
@@ -175,6 +179,21 @@ public sealed partial class EmbeddedDatabase
         return false;
     }
 
+    // Only a temp trigger can have a body statement that leaves the executing database, and only
+    // the owning connection can decide where such a statement belongs. Returns null when the
+    // statement is foreign, otherwise the statement with any schema qualifier that names the
+    // executing database stripped off.
+    private static ParsedStatement? LocalizeTriggerBodyStatement(
+        QueryContext context,
+        TriggerDefinition trigger,
+        ParsedStatement statement)
+    {
+        if (!trigger.Temporary || context.TempTriggers is not { } bridge)
+            return statement;
+
+        return bridge.IsForeign(statement) ? null : bridge.Localize(statement);
+    }
+
     private static IReadOnlyList<TriggerDefinition> GetRowTriggers(
         QueryContext context,
         string targetName,
@@ -182,10 +201,11 @@ public sealed partial class EmbeddedDatabase
         TriggerEvent triggerEvent,
         IReadOnlySet<string>? updatedColumns = null)
     {
-        if (context.Triggers is null || context.Triggers.Count == 0)
+        var candidates = EnumerateVisibleTriggers(context);
+        if (candidates is null)
             return [];
 
-        return context.Triggers.Values
+        return candidates
             .Where(trigger =>
                 trigger.Timing == timing
                 && trigger.Event == triggerEvent
@@ -193,10 +213,33 @@ public sealed partial class EmbeddedDatabase
                 && (trigger.UpdateOfColumns is null
                     || updatedColumns is not null
                     && trigger.UpdateOfColumns.Any(updatedColumns.Contains)))
-            .OrderByDescending(trigger => trigger.DeclarationOrder)
+            .OrderByDescending(trigger => trigger.Temporary)
+            .ThenByDescending(trigger => trigger.DeclarationOrder)
             .ThenByDescending(trigger => trigger.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
+
+    // A temp trigger watching a table in another schema is stored in the temp database but has to
+    // fire for statements executed by the database that owns the table, so the connection hands it
+    // over as an overlay instead of it appearing in the executing catalog.
+    private static IEnumerable<TriggerDefinition>? EnumerateVisibleTriggers(QueryContext context)
+    {
+        // A trigger stored here with a foreign target watches a table in another database and must
+        // never match a same-named local table.
+        var local = context.Triggers is { Count: > 0 } triggers
+            ? triggers.Values.Where(trigger => trigger.TargetSchema is null)
+            : null;
+        var overlay = context.TempTriggers is { Overlay.Count: > 0 } bridge ? bridge.Overlay : null;
+        if (overlay is null)
+            return local;
+
+        return local is null ? overlay : overlay.Concat(local);
+    }
+
+    // Temp and persistent triggers can share a name, so recursion suppression has to tell them
+    // apart or one would silently mask the other.
+    private static string GetTriggerIdentity(TriggerDefinition trigger)
+        => trigger.Temporary ? ManagedSchemaName.Create("temp", trigger.Name) : trigger.Name;
 
     private static bool HasRowTriggers(
         QueryContext context,
@@ -211,7 +254,7 @@ public sealed partial class EmbeddedDatabase
         QueryContext context,
         string targetName,
         TriggerEvent triggerEvent)
-        => context.Triggers?.Values.Any(trigger =>
+        => EnumerateVisibleTriggers(context)?.Any(trigger =>
             trigger.Event == triggerEvent
             && string.Equals(trigger.TableName, targetName, StringComparison.OrdinalIgnoreCase)) == true;
 
@@ -1859,8 +1902,11 @@ public sealed partial class EmbeddedDatabase
     {
         foreach (var trigger in triggers)
         {
-            foreach (var statement in trigger.Body)
+            foreach (var bodyStatement in trigger.Body)
             {
+                if (LocalizeTriggerBodyStatement(context, trigger, bodyStatement) is not { } statement)
+                    continue;
+
                 ValidateTriggerStatementQuerySources(context, statement);
                 switch (statement)
                 {

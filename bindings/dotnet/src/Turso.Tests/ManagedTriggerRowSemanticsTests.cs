@@ -1753,7 +1753,6 @@ public sealed class ManagedTriggerRowSemanticsTests
             "CREATE TRIGGER bad AFTER INSERT ON data BEGIN INSERT INTO trace VALUES (?); END",
             "CREATE TRIGGER bad AFTER INSERT ON data BEGIN CREATE TABLE nested(id); END",
             "CREATE TRIGGER bad AFTER INSERT ON data BEGIN PRAGMA foreign_keys; END",
-            "CREATE TEMP TRIGGER bad AFTER INSERT ON data BEGIN INSERT INTO trace VALUES (1); END",
             "CREATE TRIGGER bad AFTER INSERT ON data BEGIN "
                 + "SELECT RAISE(FAIL, 'dynamic-' || NEW.id); END",
         };
