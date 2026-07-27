@@ -127,14 +127,6 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
                 sharedMemoryPath,
                 FileOpenMode.OpenExisting);
             var index = new SqliteWalIndexSharedMemory(mapping);
-            SqliteWalIndexHeader? recoveryHeader = null;
-            try
-            {
-                recoveryHeader = index.ReadRecoverableHeader();
-            }
-            catch (InvalidDataException)
-            {
-            }
 
             mainFile = sharedFileSystem.OpenFile(canonicalPath, FileOpenMode.OpenExisting);
             var mainPageSize = ReadMainDatabasePageSize(mainFile);
@@ -154,7 +146,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             // Checkpoint progress and hash arrays are transient shared-memory
             // state. Reconstruct them before exposing a coordinator so a stale
             // nBackfill value can never authorize a destructive WAL reset.
-            coordinator.RebuildIndexFromWal(recoveryHeader);
+            coordinator.RebuildIndexFromWal();
             mainStore = null;
             return coordinator;
         }
@@ -227,7 +219,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
 
     /// <summary>
     /// Repairs only an uncommitted or invalid WAL tail while holding SQLite's
-    /// writer, recovery, and every read-mark lock.
+    /// checkpoint, writer, recovery, and every read-mark lock.
     /// </summary>
     public SqliteWalRecoveryInfo Recover(
         TimeSpan timeout,
@@ -239,16 +231,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         lock (_gate)
         {
             ThrowIfUnavailable();
-            SqliteWalIndexHeader? recoveryHeader = null;
-            try
-            {
-                recoveryHeader = _index.ReadRecoverableHeader();
-            }
-            catch (InvalidDataException)
-            {
-            }
-
-            return RecoverAndRebuild(timeout, cancellationToken, recoveryHeader);
+            return RecoverAndRebuild(timeout, cancellationToken);
         }
     }
 
@@ -706,14 +689,34 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
 
     private SqliteWalRecoveryInfo RecoverAndRebuild(
         TimeSpan timeout,
-        CancellationToken cancellationToken,
-        SqliteWalIndexHeader? recoveryHeader)
+        CancellationToken cancellationToken)
     {
-        using var checkpoint = _locks.AcquireExclusive(CheckpointLockOffset, length: 1, timeout);
-        using var writer = _locks.AcquireExclusive(WriteLockOffset, length: 1, timeout);
-        using var recovery = _locks.AcquireExclusive(RecoveryLockOffset, length: 1, timeout);
+        using var checkpoint = _locks.AcquireExclusive(
+            CheckpointLockOffset,
+            length: 1,
+            timeout,
+            cancellationToken);
+        using var writer = _locks.AcquireExclusive(
+            WriteLockOffset,
+            length: 1,
+            timeout,
+            cancellationToken);
+        using var recovery = _locks.AcquireExclusive(
+            RecoveryLockOffset,
+            length: 1,
+            timeout,
+            cancellationToken);
         using var readMarks = AcquireAllReadMarksWithoutIndex(timeout, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
+
+        SqliteWalIndexHeader? recoveryHeader = null;
+        try
+        {
+            recoveryHeader = _index.ReadRecoverableHeader();
+        }
+        catch (InvalidDataException)
+        {
+        }
 
         var scan = _wal.ScanRecovery();
         if (scan.StopReason != SqliteWalRecoveryStopReason.EndOfFile
@@ -734,8 +737,8 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         return repaired;
     }
 
-    private void RebuildIndexFromWal(SqliteWalIndexHeader? recoveryHeader)
-        => _ = RecoverAndRebuild(TimeSpan.Zero, CancellationToken.None, recoveryHeader);
+    private void RebuildIndexFromWal()
+        => _ = RecoverAndRebuild(TimeSpan.Zero, CancellationToken.None);
 
     private static int ReadMainDatabasePageSize(IFile mainFile)
     {

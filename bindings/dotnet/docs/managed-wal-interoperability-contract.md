@@ -298,8 +298,8 @@ rather than reusing an artifact when a failure occurs after a commit might have
 become durable. Before appending, it requires the independently scanned valid
 and committed frame boundaries to exactly equal the published header, so it
 cannot turn an abandoned but checksum-valid tail into a later transaction.
-Recovery takes `WAL_WRITE_LOCK`, `WAL_RECOVER_LOCK`, and every read-mark lock
-before truncating such a tail.
+Recovery takes `WAL_CKPT_LOCK`, `WAL_WRITE_LOCK`, `WAL_RECOVER_LOCK`, and every
+read-mark lock before truncating such a tail.
 
 The checkpointer takes `WAL_CKPT_LOCK` independently of the pager. `PASSIVE`
 calculates `mxSafeFrame` from only the read marks it cannot exclusively lock;
@@ -321,9 +321,14 @@ incarnation reset.
 only after the main-store flush. On open, it rebuilds all transient index
 progress and lookup state from a clean WAL that it independently authenticates
 under the full recovery lock set; this makes an unverified `nBackfill` unable
-to authorize a reset. Corruption that reaches before the last recoverable
-committed boundary is rejected fail-closed. Focused tests use SQLite-produced
-artifacts and separate reader/writer/lock-worker processes.
+to authorize a reset. It reads recoverable header evidence only after obtaining
+that complete lock set, so a torn publication observed while waiting cannot
+authorize a later tail truncation. Corruption that reaches before the last
+recoverable committed boundary is rejected fail-closed. A missing `-shm`
+carrier is still rejected rather than recreated: without a pre-existing lock
+carrier, detached recovery cannot prove that an unlink raced a live client.
+Focused tests use SQLite-produced artifacts and separate reader/writer/lock-worker
+processes.
 
 This remains unreachable from `SqlitePager`, normal managed execution, cache
 invalidation, and managed recovery. It does not relax the Stage 0 ownership
