@@ -5652,6 +5652,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
                 ValidateRowIdsUnique(statement.TableName, table, updatedRowIds, updatePlan!.AliasIndex);
                 table.ValidateRows(statement.TableName, updatedRows);
+
+                // SQLite validates the DO UPDATE result against the table's CHECK
+                // constraints exactly as it does for a plain UPDATE, after NOT NULL and
+                // before uniqueness. Without this the conflict branch could store a row
+                // that violates its own declared schema.
+                ValidateCheckConstraints(
+                    statement.TableName,
+                    table,
+                    updated,
+                    originalRowId,
+                    parameters,
+                    updateContext);
                 ValidateColumnUniqueConstraints(table, updatedRows);
                 ValidatePrimaryKey(statement.TableName, table, updatedRows);
                 ValidateUniqueIndexes(statement.TableName, table, updatedRows);
