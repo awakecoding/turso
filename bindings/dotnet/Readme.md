@@ -84,7 +84,12 @@ change managed locking behavior, matching SQLite's timing:
   the managed default for file databases, SQLite's EXCLUSIVE does not block
   readers and neither does this.
 
-There is no busy timeout, matching SQLite's default `busy_timeout=0`. Locking is
+There is no busy timeout, matching SQLite's default `busy_timeout=0`. Note that
+this diverges from `Microsoft.Data.Sqlite`, which maps `CommandTimeout` onto
+`sqlite3_busy_timeout` and therefore retries a contended `BEGIN IMMEDIATE` for up
+to `CommandTimeout` before reporting busy. The managed write reservation is
+fail-fast, so `CommandTimeout` does not delay a busy `BEGIN` — consistent with
+`PRAGMA busy_timeout` being unsupported here. Locking is
 process-local, which is sufficient because a managed physical database is already
 owned exclusively by one process. Two connections that both hold live snapshots
 still reject the loser's commit with a catalog-version conflict rather than a

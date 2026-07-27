@@ -497,6 +497,111 @@ public class ManagedTransactionModeLockingTests
         readError!.SqliteErrorCode.Should().Be(SqliteBusy);
     }
 
+    /// <summary>
+    /// <c>CommandTimeout</c> is not a busy timeout for the managed engine. Native
+    /// SQLite maps it onto <c>sqlite3_busy_timeout</c> and retries for that long,
+    /// but the managed engine documents <c>PRAGMA busy_timeout</c> as unsupported
+    /// (see <see cref="ManagedDocumentedBoundaryTests"/>) and the write
+    /// reservation is fail-fast, so a lost race is reported immediately. This
+    /// pins that divergence so it cannot change silently.
+    /// </summary>
+    [Test]
+    public void CommandTimeoutDoesNotTurnABusyBeginIntoABusyWait()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        a.ExecuteNonQuery("BEGIN IMMEDIATE;");
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var error = Capture(() => ExecuteWithTimeout(b, "BEGIN EXCLUSIVE;", timeoutSeconds: 5));
+        stopwatch.Stop();
+
+        error.Should().NotBeNull();
+        error!.SqliteErrorCode.Should().Be(SqliteBusy);
+
+        // The load-bearing assertion: it failed fast rather than burning the
+        // five second CommandTimeout waiting for a lock it will never poll for.
+        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(2));
+    }
+
+    /// <summary>
+    /// Cancelling a batch after <c>BEGIN EXCLUSIVE</c> has already taken the
+    /// reservation leaves the transaction open and the reservation held, which is
+    /// what SQLite does when a statement inside a transaction fails. The
+    /// reservation must then be released by the explicit ROLLBACK.
+    /// </summary>
+    [Test]
+    public void CancellingAfterExclusiveTookTheLockKeepsItUntilRollback()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        using (var cts = new CancellationTokenSource())
+        {
+            // Cancel from inside the batch, after BEGIN EXCLUSIVE has already
+            // taken the reservation. The engine checks cancellation between
+            // statements, so this deterministically aborts before the INSERT.
+            a.CreateFunction<long>("cancel_now", () => { cts.Cancel(); return 1L; });
+
+            using var command = a.CreateCommand();
+            command.CommandText = "BEGIN EXCLUSIVE; SELECT cancel_now(); INSERT INTO t VALUES (1);";
+            Assert.Catch<OperationCanceledException>(
+                () => command.ExecuteNonQueryAsync(cts.Token).GetAwaiter().GetResult());
+        }
+
+        // A's transaction is still open, so the reservation is still held.
+        var blocked = Capture(() => b.ExecuteNonQuery("BEGIN IMMEDIATE;"));
+        blocked.Should().NotBeNull();
+        blocked!.SqliteErrorCode.Should().Be(SqliteBusy);
+
+        // Rolling back releases it and B can proceed.
+        a.ExecuteNonQuery("ROLLBACK;");
+        Capture(() => b.ExecuteNonQuery("BEGIN IMMEDIATE;")).Should().BeNull();
+    }
+
+    /// <summary>
+    /// The other half of <see cref="CommandTimeoutDoesNotTurnABusyBeginIntoABusyWait"/>:
+    /// native SQLite really does retry for the CommandTimeout before reporting
+    /// busy, so the managed fail-fast behaviour is a measured divergence rather
+    /// than an assumed one.
+    /// </summary>
+    [Test]
+    public void NativeSqliteTreatsCommandTimeoutAsABusyWait()
+    {
+        using var db = new NativeFileDatabase();
+        var a = db.Connect();
+        var b = db.Connect();
+
+        NativeExec(a, "PRAGMA journal_mode=wal;");
+        NativeExec(a, "BEGIN IMMEDIATE;");
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        using (var command = b.CreateCommand())
+        {
+            // Deliberately no 'PRAGMA busy_timeout=0' on b: Microsoft.Data.Sqlite
+            // maps CommandTimeout onto sqlite3_busy_timeout.
+            command.CommandText = "BEGIN IMMEDIATE;";
+            command.CommandTimeout = 2;
+            var error = NativeError(() => command.ExecuteNonQuery());
+            error.Should().NotBeNull();
+            error!.SqliteErrorCode.Should().Be(SqliteBusy);
+        }
+
+        stopwatch.Stop();
+        stopwatch.Elapsed.Should().BeGreaterThan(TimeSpan.FromSeconds(1));
+    }
+
+    private static void ExecuteWithTimeout(SqliteConnection connection, string sql, int timeoutSeconds)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.CommandTimeout = timeoutSeconds;
+        command.ExecuteNonQuery();
+    }
+
     private static SqliteException? Capture(Action action)
     {
         try
