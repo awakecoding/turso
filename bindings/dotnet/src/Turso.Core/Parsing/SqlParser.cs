@@ -1297,12 +1297,6 @@ internal sealed class SqlParser
         if (ConsumeKeyword("NOTHING"))
             return new UpsertClause(target, new DoNothingUpsertAction(), targetWhere, targetWhereSql);
 
-        if (target.Count == 0)
-        {
-            throw Error(
-                "Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target.");
-        }
-
         ExpectKeyword("UPDATE");
         ExpectKeyword("SET");
         var assignments = ParseAssignments();
@@ -1320,17 +1314,19 @@ internal sealed class SqlParser
 
     private ParsedStatement ParseUpdate()
     {
-        if (CurrentIsKeyword("OR"))
-            throw Error("Managed UPDATE conflict algorithms are not supported.");
-
+        var conflictAlgorithm = ParseInsertConflictAlgorithm();
         var tableName = ParseSchemaQualifiedName();
         RejectQualifiedTriggerDmlTarget(tableName);
+        var alias = ParseDmlTargetAlias();
         RejectUnsupportedDmlTargetSuffix("UPDATE");
         ExpectKeyword("SET");
         var assignments = ParseAssignments();
 
-        if (CurrentIsKeyword("FROM"))
-            throw Error("Managed UPDATE FROM is not supported.");
+        TableSource? from = null;
+        if (ConsumeKeyword("FROM"))
+        {
+            from = ParseTableSource();
+        }
 
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
@@ -1338,7 +1334,20 @@ internal sealed class SqlParser
 
         var returning = ParseReturning();
         var (orderBy, limit, offset) = ParseLimitedDmlTail("UPDATE");
-        return new UpdateStatement(tableName, assignments, where, returning, orderBy, limit, offset);
+        if (from is not null && limit is not null)
+            throw Error("LIMIT is not supported on UPDATE ... FROM.");
+
+        return new UpdateStatement(
+            tableName,
+            assignments,
+            where,
+            returning,
+            orderBy,
+            limit,
+            offset,
+            alias,
+            from,
+            conflictAlgorithm);
     }
 
     private IReadOnlyList<ColumnAssignment> ParseAssignments()
@@ -1383,6 +1392,7 @@ internal sealed class SqlParser
         ExpectKeyword("FROM");
         var tableName = ParseSchemaQualifiedName();
         RejectQualifiedTriggerDmlTarget(tableName);
+        var alias = ParseDmlTargetAlias();
         RejectUnsupportedDmlTargetSuffix("DELETE");
         Expression? where = null;
         if (ConsumeKeyword("WHERE"))
@@ -1390,13 +1400,16 @@ internal sealed class SqlParser
 
         var returning = ParseReturning();
         var (orderBy, limit, offset) = ParseLimitedDmlTail("DELETE");
-        return new DeleteStatement(tableName, where, returning, orderBy, limit, offset);
+        return new DeleteStatement(tableName, where, returning, orderBy, limit, offset, alias);
     }
+
+    // SQLite's qualified-table-name allows an alias on UPDATE and DELETE targets. Only the
+    // explicit AS form is accepted so a bare identifier cannot silently swallow SET or WHERE.
+    private string? ParseDmlTargetAlias()
+        => ConsumeKeyword("AS") ? ExpectIdentifier() : null;
 
     private void RejectUnsupportedDmlTargetSuffix(string statementKind)
     {
-        if (CurrentIsKeyword("AS"))
-            throw Error($"Managed {statementKind} target aliases are not supported.");
         if (CurrentIsKeyword("INDEXED") || CurrentIsKeyword("NOT"))
             throw Error($"Managed {statementKind} does not support INDEXED BY or NOT INDEXED.");
     }

@@ -282,9 +282,21 @@ public sealed partial class EmbeddedDatabase
         IReadOnlySet<string> updatedColumns)
         => ExecuteRowTriggerStatement(
             context,
-            triggerContext => triggerContext.Views?.ContainsKey(statement.TableName) == true
-                ? PerformInsteadOfUpdate(statement, parameters, triggerContext, updatedColumns)
-                : PerformRowTriggeredUpdate(statement, parameters, triggerContext, updatedColumns));
+            triggerContext =>
+            {
+                // A trigger body ignores its own OR clause, so an inherited policy already present
+                // on the context wins over the one written on this statement.
+                if (statement.ConflictAlgorithm is { } conflictAlgorithm
+                    && triggerContext.ConflictAlgorithmOverride is null
+                    && !triggerContext.InsideTrigger)
+                {
+                    triggerContext = triggerContext with { ConflictAlgorithmOverride = conflictAlgorithm };
+                }
+
+                return triggerContext.Views?.ContainsKey(statement.TableName) == true
+                    ? PerformInsteadOfUpdate(statement, parameters, triggerContext, updatedColumns)
+                    : PerformRowTriggeredUpdate(statement, parameters, triggerContext, updatedColumns);
+            });
 
     private ExecutionResult ExecuteRowTriggeredDelete(
         DeleteStatement statement,
@@ -585,7 +597,7 @@ public sealed partial class EmbeddedDatabase
         var selectedPositions = statement.Limit is null
             ? null
             : SelectLimitedDmlPositions(
-                statement.TableName,
+                statement.TargetQualifier,
                 table,
                 statement.Where,
                 statement.EffectiveOrderBy,
@@ -595,20 +607,33 @@ public sealed partial class EmbeddedDatabase
                 statement.Returning,
                 parameters,
                 context);
-        var candidates = selectedPositions is null
-            ? CaptureMatchingTriggerRowIdentities(
-                table,
-                statement.TableName,
-                statement.Where,
-                parameters,
-                context)
-            : CaptureTriggerRowIdentities(table, selectedPositions);
+        IReadOnlyList<TriggerRowIdentity> candidates;
+        IReadOnlyList<SourceRow?> evaluationRows = [];
+        if (statement.From is not null)
+        {
+            var matches = MatchUpdateFromRows(statement, table, parameters, context);
+            candidates = [.. matches.Select(match => CaptureTriggerRowIdentity(table, match.Position))];
+            evaluationRows = [.. matches.Select(match => (SourceRow?)match.Row)];
+        }
+        else
+        {
+            candidates = selectedPositions is null
+                ? CaptureMatchingTriggerRowIdentities(
+                    table,
+                    statement.TargetQualifier,
+                    statement.Where,
+                    parameters,
+                    context)
+                : CaptureTriggerRowIdentities(table, selectedPositions);
+        }
         var returningRows = new List<SqlValue[]>();
         string[]? returningColumns = null;
         var rowsAffected = 0;
 
-        foreach (var identity in candidates)
+        for (var candidateIndex = 0; candidateIndex < candidates.Count; candidateIndex++)
         {
+            var identity = candidates[candidateIndex];
+            var evaluationRow = candidateIndex < evaluationRows.Count ? evaluationRows[candidateIndex] : null;
             context.CheckInterrupt();
             var position = FindTriggerRowPosition(table, identity);
             if (position < 0)
@@ -624,7 +649,8 @@ public sealed partial class EmbeddedDatabase
                 oldRowId,
                 parameters,
                 context,
-                validateCheckConstraints: false);
+                validateCheckConstraints: false,
+                evaluationRow: evaluationRow);
             var frame = new TriggerRowFrame(
                 CreateTriggerRowImage(table, original, oldRowId),
                 CreateTriggerRowImage(table, updated, newRowId));
@@ -634,25 +660,28 @@ public sealed partial class EmbeddedDatabase
             position = FindTriggerRowPosition(table, identity);
             if (position < 0)
                 continue;
+            updated = ReloadColumnsTheUpdateDoesNotAssign(table, plan, updated, table.Rows[position]);
+            var replacementAttempted = false;
             try
             {
+                ResolveNotNullReplaceDefaults(context.ConflictAlgorithmOverride, table, updated, context);
                 ValidateCheckConstraints(statement.TableName, table, updated, newRowId, parameters, context);
-                var rows = table.Rows.Select(row => row.ToArray()).ToList();
-                var rowIds = table.RowIds.Count == table.Rows.Count
-                    ? table.RowIds.ToList()
-                    : Enumerable.Range(1, table.Rows.Count).Select(index => (long)index).ToList();
-                rows[position] = updated;
-                if (table.HasRowid)
-                    rowIds[position] = newRowId;
-                CommitUpdates(
-                    context,
-                    statement.TableName,
-                    table,
-                    table.Rows,
-                    rows,
-                    rowIds,
-                    plan,
-                    [position]);
+                if (context.ConflictAlgorithmOverride == InsertConflictAlgorithm.Replace)
+                {
+                    replacementAttempted = true;
+                    CommitRowTriggeredUpdateReplacement(
+                        context,
+                        statement.TableName,
+                        table,
+                        plan,
+                        identity,
+                        updated,
+                        newRowId);
+                }
+                else
+                {
+                    CommitTriggerRowUpdate(context, statement.TableName, table, plan, position, updated, newRowId);
+                }
             }
             catch (EmbeddedSqlException exception)
                 when (exception is not EmbeddedStatementAbortException)
@@ -670,11 +699,21 @@ public sealed partial class EmbeddedDatabase
                             context.TriggerState?.LiveLastInsertRowId ?? context.LastInsertRowId);
                     case InsertConflictAlgorithm.Rollback:
                         throw new EmbeddedConflictRollbackException(exception);
+                    case InsertConflictAlgorithm.Replace
+                        when !replacementAttempted
+                            && exception.Message.StartsWith("UNIQUE constraint failed:", StringComparison.Ordinal):
+                        CommitRowTriggeredUpdateReplacement(
+                            context,
+                            statement.TableName,
+                            table,
+                            plan,
+                            identity,
+                            updated,
+                            newRowId);
+                        break;
+                    case InsertConflictAlgorithm.Replace:
                     case InsertConflictAlgorithm.Abort:
                         throw;
-                    case InsertConflictAlgorithm.Replace:
-                        throw new EmbeddedSqlException(
-                            "Managed trigger UPDATE does not support an outer OR REPLACE conflict policy.");
                     default:
                         throw new InvalidOperationException($"Unknown conflict algorithm {algorithm}.");
                 }
@@ -715,6 +754,33 @@ public sealed partial class EmbeddedDatabase
             rowsAffected > 0 || context.TriggerState!.Changed);
     }
 
+    // SQLite reloads every column an UPDATE does not assign after its BEFORE triggers have run,
+    // so a trigger that rewrote the row being updated is not silently reverted by the image that
+    // was computed before the trigger fired. Assigned columns keep the value the UPDATE produced,
+    // and the rowid alias is excluded because SQLite drives it from the pre-trigger rowid.
+    private static SqlValue[] ReloadColumnsTheUpdateDoesNotAssign(
+        EmbeddedTable table,
+        UpdatePlan plan,
+        SqlValue[] updated,
+        SqlValue[] current)
+    {
+        var assigned = plan.ColumnAssignments.Select(assignment => assignment.Index).ToHashSet();
+        var reloaded = updated.ToArray();
+        for (var index = 0; index < table.Columns.Length && index < current.Length; index++)
+        {
+            if (assigned.Contains(index)
+                || index == plan.AliasIndex
+                || table.ColumnDefinitions[index].IsGenerated)
+            {
+                continue;
+            }
+
+            reloaded[index] = current[index];
+        }
+
+        return reloaded;
+    }
+
     private ExecutionResult PerformRowTriggeredDelete(
         DeleteStatement statement,
         SqlValue[] parameters,
@@ -745,7 +811,7 @@ public sealed partial class EmbeddedDatabase
         var selectedPositions = statement.Limit is null
             ? null
             : SelectLimitedDmlPositions(
-                statement.TableName,
+                statement.TargetQualifier,
                 table,
                 statement.Where,
                 statement.EffectiveOrderBy,
@@ -758,7 +824,7 @@ public sealed partial class EmbeddedDatabase
         var candidates = selectedPositions is null
             ? CaptureMatchingTriggerRowIdentities(
                 table,
-                statement.TableName,
+                statement.TargetQualifier,
                 statement.Where,
                 parameters,
                 context)
@@ -831,8 +897,72 @@ public sealed partial class EmbeddedDatabase
     {
         table.ValidateRows(tableName, [candidate]);
         ValidatePrimaryKey(tableName, table, [candidate]);
+        DeleteRowsReplacedBy(context, tableName, table, candidate, candidateRowId, keptPosition: -1);
+        CommitInserts(context, tableName, table, [candidate], [candidateRowId]);
+    }
+
+    /// <summary>
+    /// Applies an UPDATE OR REPLACE row by first deleting the rows its new image displaces, then
+    /// rewriting the target in place. The target itself is excluded from the displaced set: with an
+    /// unchanged rowid it always reports a rowid conflict against its own position.
+    /// </summary>
+    private void CommitRowTriggeredUpdateReplacement(
+        QueryContext context,
+        string tableName,
+        EmbeddedTable table,
+        UpdatePlan plan,
+        TriggerRowIdentity identity,
+        SqlValue[] updated,
+        long newRowId)
+    {
+        var position = FindTriggerRowPosition(table, identity);
+        if (position < 0)
+            return;
+
+        table.ValidateRows(tableName, [updated]);
+        DeleteRowsReplacedBy(context, tableName, table, updated, newRowId, position);
+        position = FindTriggerRowPosition(table, identity);
+        if (position < 0)
+            return;
+
+        CommitTriggerRowUpdate(context, tableName, table, plan, position, updated, newRowId);
+    }
+
+    private void CommitTriggerRowUpdate(
+        QueryContext context,
+        string tableName,
+        EmbeddedTable table,
+        UpdatePlan plan,
+        int position,
+        SqlValue[] updated,
+        long newRowId)
+    {
+        var rows = table.Rows.Select(row => row.ToArray()).ToList();
+        var rowIds = table.RowIds.Count == table.Rows.Count
+            ? table.RowIds.ToList()
+            : Enumerable.Range(1, table.Rows.Count).Select(index => (long)index).ToList();
+        rows[position] = updated;
+        if (table.HasRowid)
+            rowIds[position] = newRowId;
+        CommitUpdates(context, tableName, table, table.Rows, rows, rowIds, plan, [position]);
+    }
+
+    /// <summary>
+    /// Removes the rows an OR REPLACE mutation displaces. <paramref name="keptPosition"/> is the
+    /// position of the row being rewritten by an UPDATE, which must survive even though it can
+    /// report a rowid conflict against itself; INSERT passes -1 because it has no such row.
+    /// </summary>
+    private void DeleteRowsReplacedBy(
+        QueryContext context,
+        string tableName,
+        EmbeddedTable table,
+        SqlValue[] candidate,
+        long candidateRowId,
+        int keptPosition)
+    {
         var conflicts = FindInsertUniqueConflicts(tableName, table, candidate, candidateRowId)
             .Select(conflict => conflict.RowPosition)
+            .Where(position => position != keptPosition)
             .Distinct()
             .Select(position => CaptureTriggerRowIdentity(table, position))
             .ToArray();
@@ -868,8 +998,6 @@ public sealed partial class EmbeddedDatabase
                 _ = FireRowTriggers(afterDelete, frame, context);
             }
         }
-
-        CommitInserts(context, tableName, table, [candidate], [candidateRowId]);
     }
 
     private void DeleteTriggerRow(
@@ -1039,7 +1167,7 @@ public sealed partial class EmbeddedDatabase
 
     private IReadOnlyList<TriggerRowIdentity> CaptureMatchingTriggerRowIdentities(
         EmbeddedTable table,
-        string tableName,
+        string qualifier,
         Expression? where,
         SqlValue[] parameters,
         QueryContext context)
@@ -1048,11 +1176,7 @@ public sealed partial class EmbeddedDatabase
         for (var position = 0; position < table.Rows.Count; position++)
         {
             var rowId = table.HasRowid ? table.RowIds[position] : position + 1;
-            var source = new SourceRow(
-                table.Columns,
-                table.Rows[position],
-                RowId: table.HasRowid ? rowId : null,
-                RowIdQualifier: tableName);
+            var source = CreateDmlTargetRow(table, qualifier, table.Rows[position], rowId);
             if (where is null || IsTrue(Evaluate(where, parameters, source, context)))
                 identities.Add(CaptureTriggerRowIdentity(table, position));
         }
@@ -1153,13 +1277,6 @@ public sealed partial class EmbeddedDatabase
                 table,
                 TriggerMutationKind.Update,
                 updatePlan);
-            if (updatePlan.RowidAssignment is not null
-                || updatePlan.ColumnAssignments.Any(
-                    assignment => assignment.Index == table.RowidAliasColumnIndex))
-            {
-                throw new EmbeddedSqlException(
-                    "Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.");
-            }
             ValidateUpsertUpdateExpressions(
                 statement.TableName,
                 updateAction.Assignments,
@@ -1371,7 +1488,7 @@ public sealed partial class EmbeddedDatabase
                 continue;
             }
 
-            var updated = BuildUpsertUpdatedRow(
+            var (updated, updatedRowId) = BuildUpsertUpdatedRow(
                 statement.TableName,
                 table,
                 updatePlan!,
@@ -1382,7 +1499,7 @@ public sealed partial class EmbeddedDatabase
                 doUpdateContext);
             var updateFrame = new TriggerRowFrame(
                 CreateTriggerRowImage(table, original, originalRowId),
-                CreateTriggerRowImage(table, updated, originalRowId));
+                CreateTriggerRowImage(table, updated, updatedRowId));
             if (FireRowTriggers(beforeUpdate, updateFrame, doUpdateContext))
                 continue;
 
@@ -1394,7 +1511,7 @@ public sealed partial class EmbeddedDatabase
                 statement.TableName,
                 table,
                 updated,
-                originalRowId,
+                updatedRowId,
                 parameters,
                 doUpdateContext);
             var updatedRows = table.Rows.Select(row => row.ToArray()).ToList();
@@ -1402,6 +1519,8 @@ public sealed partial class EmbeddedDatabase
             var updatedRowIds = table.RowIds.Count == table.Rows.Count
                 ? table.RowIds.ToList()
                 : Enumerable.Range(1, table.Rows.Count).Select(index => (long)index).ToList();
+            if (table.HasRowid && conflictPosition < updatedRowIds.Count)
+                updatedRowIds[conflictPosition] = updatedRowId;
             CommitUpdates(
                 doUpdateContext,
                 statement.TableName,
@@ -1418,7 +1537,7 @@ public sealed partial class EmbeddedDatabase
                 statement.TableName,
                 table,
                 updated,
-                originalRowId,
+                updatedRowId,
                 parameters,
                 doUpdateContext,
                 returningRows,

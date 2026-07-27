@@ -638,20 +638,69 @@ public sealed class ManagedUpsertTargetInferenceTests
     }
 
     [Test]
-    public void TargetlessDoUpdateRemainsConservativelyRejectedBeforeMutation()
+    public void DoUpdateMovesTheRowidAndLeavesNoStaleRow()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 1);");
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, u INTEGER UNIQUE);");
+        Execute(connection, "INSERT INTO t VALUES (1,'old',10);");
+        Execute(connection, "INSERT INTO t VALUES (2,'other',20);");
+
+        Execute(
+            connection,
+            "INSERT INTO t VALUES (3,'new',10) ON CONFLICT(u) DO UPDATE SET id = excluded.id, a = excluded.a;");
+
+        QueryManaged(connection, "SELECT id, a, u FROM t ORDER BY id;")
+            .Rows.Should().Equal("I:2\u001fT:other\u001fI:20", "I:3\u001fT:new\u001fI:10");
+        QueryManaged(connection, "SELECT rowid FROM t WHERE rowid = 1;").Rows.Should().BeEmpty();
+    }
+
+    [Test]
+    public void DoUpdateAssigningRowidIsSkippedWhenItsWhereClauseIsFalse()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1,10);");
+        Execute(connection, "INSERT INTO t VALUES (2,20);");
+
+        Execute(connection, "INSERT INTO t(id,a) VALUES(1,99) ON CONFLICT(id) DO UPDATE SET id=2 WHERE a < '2';");
+
+        QueryManaged(connection, "SELECT id, a FROM t ORDER BY id;")
+            .Rows.Should().Equal("I:1\u001fI:10", "I:2\u001fI:20");
+    }
+
+    [Test]
+    public void DoUpdateMovingTheRowidOntoAnExistingRowStillConflicts()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE);");
+        Execute(connection, "INSERT INTO t VALUES (1,10);");
+        Execute(connection, "INSERT INTO t VALUES (2,20);");
 
         Assert.Throws<EmbeddedSqlException>(
-                () => Execute(
-                    connection,
-                    "INSERT INTO t VALUES (1, 2) ON CONFLICT DO UPDATE SET value = excluded.value;"))!
-            .Message.Should().Contain("requires a parenthesized PRIMARY KEY or UNIQUE conflict target");
-        QueryManaged(connection, "SELECT id, value FROM t;")
-            .Rows.Should().Equal("I:1\u001fI:1");
+                () => Execute(connection, "INSERT INTO t VALUES (3,10) ON CONFLICT(u) DO UPDATE SET id = 2;"))!
+            .Message.Should().Contain("UNIQUE constraint failed: t.id");
+        QueryManaged(connection, "SELECT id, u FROM t ORDER BY id;")
+            .Rows.Should().Equal("I:1\u001fI:10", "I:2\u001fI:20");
+    }
+
+    [Test]
+    public void TargetlessDoUpdateResolvesAnyUniquenessConflict()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, code TEXT UNIQUE, value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 'one', 1);");
+
+        Execute(connection, "INSERT INTO t VALUES (1, 'one', 2) ON CONFLICT DO UPDATE SET value = excluded.value;");
+        QueryManaged(connection, "SELECT id, code, value FROM t;")
+            .Rows.Should().Equal("I:1\u001fT:one\u001fI:2");
+
+        Execute(connection, "INSERT INTO t VALUES (9, 'one', 3) ON CONFLICT DO UPDATE SET value = excluded.value;");
+        QueryManaged(connection, "SELECT id, code, value FROM t;")
+            .Rows.Should().Equal("I:1\u001fT:one\u001fI:3");
     }
 
     [Test]

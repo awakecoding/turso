@@ -154,9 +154,9 @@ Deliberate limits:
 - Raw `sqlite3*` handle interop: `SqliteConnection.Handle` returns `null`.
   `ServerVersion` reports a managed placeholder, not a real SQLite version.
 - Experimental MVCC and vector search.
-- `UPDATE ... FROM`, `UPDATE OR <algorithm>`, `UPDATE`/`DELETE` target aliases,
-  `BEGIN CONCURRENT`, `ANALYZE`, and
+- `BEGIN CONCURRENT`, `ANALYZE`, and
   `pragma_*` table-valued functions. Each is rejected during parsing.
+- Chained `ON CONFLICT` clauses on a single `INSERT`.
 - `BEGIN DEFERRED`/`IMMEDIATE`/`EXCLUSIVE` parse for compatibility, but the mode
   is discarded and does not change managed locking behavior.
 - Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Turso's
@@ -377,7 +377,7 @@ Managed `INSERT`, `UPDATE`, and `DELETE` reuse the same generic expression lower
 
 The compiled program first scans predicates and buffers all mutations, then evaluates buffered `RETURNING` rows in source and projection order, and commits only after projection succeeds. This retains predicate/assignment user-callback timing, keeps projection errors statement-atomic, and remains resumable across returned rows. Subqueries, aggregates/windows, `CASE`, `CAST`, concatenation/comparison projections, volatile or context-dependent functions, and shadowed user functions remain evaluator-owned. DML with a cancellation-capable token, foreign-key enforcement, open incremental blobs, conflict algorithms, source `INSERT`, CTE scope, or schema tables also falls back.
 
-The managed SQL contract enables SQLite's optional single-table `UPDATE`/`DELETE` `ORDER BY ... LIMIT` grammar independently of the bundled native SQLite compile options. `LIMIT ... OFFSET ...` and `LIMIT offset, count` accept bound parameters, negative limits are unbounded, and negative offsets clamp to zero. `RETURNING`, when present, precedes `ORDER BY`; ordering chooses the affected subset but does not reorder mutation or `RETURNING` output. Limited DML stays evaluator-owned so selection expressions run before source-ordered buffered mutation and statement-atomic projection; `EXPLAIN QUERY PLAN` reports `MANAGED EVALUATOR FALLBACK` for that route. UPDATE conflict algorithms, UPDATE-FROM, row-value assignments, target aliases, `INDEXED BY`/`NOT INDEXED`, `ORDER BY` without `LIMIT`, and limited DML inside trigger bodies are rejected during parsing.
+The managed SQL contract enables SQLite's optional single-table `UPDATE`/`DELETE` `ORDER BY ... LIMIT` grammar independently of the bundled native SQLite compile options. `LIMIT ... OFFSET ...` and `LIMIT offset, count` accept bound parameters, negative limits are unbounded, and negative offsets clamp to zero. `RETURNING`, when present, precedes `ORDER BY`; ordering chooses the affected subset but does not reorder mutation or `RETURNING` output. Limited DML stays evaluator-owned so selection expressions run before source-ordered buffered mutation and statement-atomic projection; `EXPLAIN QUERY PLAN` reports `MANAGED EVALUATOR FALLBACK` for that route. `UPDATE OR <algorithm>`, `UPDATE ... FROM`, and `UPDATE`/`DELETE` target aliases are supported but also evaluator-owned; combining `LIMIT` with `UPDATE ... FROM`, row-value assignments, `INDEXED BY`/`NOT INDEXED`, `ORDER BY` without `LIMIT`, and limited DML inside trigger bodies are rejected during parsing.
 
 ## Getting started
 
@@ -600,9 +600,8 @@ The managed engine rejects these shapes before target-row mutation:
 - Trigger-body `INSERT ... DEFAULT VALUES`, DML `RETURNING`, UPDATE/DELETE
   `ORDER BY`/`LIMIT`, `INDEXED BY`/`NOT INDEXED`, top-level DML CTE prefixes, bind
   parameters, DDL, transaction control, PRAGMA, ATTACH, and DETACH.
-- Explicit `UPDATE OR` syntax, schema-level UPDATE conflict algorithms on row-trigger
-  targets, and INSTEAD OF view DML combined with conflict clauses, UPSERT, limited DML,
-  or RETURNING.
+- Schema-level UPDATE conflict algorithms on row-trigger targets, and INSTEAD OF view
+  DML combined with conflict clauses, UPSERT, limited DML, or RETURNING.
 - Table/column renames with structural trigger dependencies; independent column renames
   remain supported.
 - File-backed trigger definitions that contain function calls, explicit custom

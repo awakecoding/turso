@@ -344,6 +344,67 @@ public sealed class ManagedUpsertCheckConstraintTests
         return connection;
     }
 
+    /// <summary>
+    /// A <c>DO UPDATE</c> that reassigns the INTEGER PRIMARY KEY must have its CHECK
+    /// constraints evaluated against the rowid the row is moving <em>to</em>.
+    /// </summary>
+    /// <remarks>
+    /// CHECK validation and rowid movement were introduced on separate branches and
+    /// merged without textual conflict, but the CHECK call still passed the
+    /// conflicting row's original rowid. A bare <c>rowid</c> reference in a CHECK
+    /// expression therefore saw the pre-move value and the violating row was stored.
+    /// Verified against real SQLite: the move to 500 is rejected.
+    /// </remarks>
+    [Test]
+    public void ADoUpdateThatMovesTheRowidValidatesChecksAgainstTheNewRowid()
+    {
+        var error = AssertBothEnginesAgree(
+            [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE, CHECK(rowid < 100))",
+                "INSERT INTO t VALUES(1,10)",
+            ],
+            "INSERT INTO t VALUES(5,10) ON CONFLICT(u) DO UPDATE SET id = 500",
+            "SELECT id,u FROM t");
+
+        error.Should().Be("CHECK constraint failed: rowid < 100");
+    }
+
+    /// <summary>
+    /// The same reassignment expressed through the INTEGER PRIMARY KEY's declared
+    /// column name, which reads from the row image rather than the rowid slot.
+    /// </summary>
+    [Test]
+    public void ADoUpdateThatMovesTheRowidValidatesChecksNamingThatColumn()
+    {
+        var error = AssertBothEnginesAgree(
+            [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE, CHECK(id < 100))",
+                "INSERT INTO t VALUES(1,10)",
+            ],
+            "INSERT INTO t VALUES(5,10) ON CONFLICT(u) DO UPDATE SET id = 500",
+            "SELECT id,u FROM t");
+
+        error.Should().Be("CHECK constraint failed: id < 100");
+    }
+
+    /// <summary>
+    /// The complement: a rowid move that satisfies the CHECK must still be applied,
+    /// so the stricter validation does not reject legal movement.
+    /// </summary>
+    [Test]
+    public void ADoUpdateThatMovesTheRowidWithinTheCheckRangeStillApplies()
+    {
+        var error = AssertBothEnginesAgree(
+            [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE, CHECK(rowid < 100))",
+                "INSERT INTO t VALUES(1,10)",
+            ],
+            "INSERT INTO t VALUES(5,10) ON CONFLICT(u) DO UPDATE SET id = 50",
+            "SELECT id,u,rowid FROM t");
+
+        error.Should().BeNull();
+    }
+
     private static void ExecuteFacade(Turso.Data.Sqlite.SqliteConnection connection, string sql)
     {
         using var command = connection.CreateCommand();
