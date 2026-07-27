@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using Microsoft.Win32.SafeHandles;
 
 namespace Turso.Core.Storage;
 
@@ -63,6 +64,17 @@ public interface ISqliteWalSharedMemoryMapping : IDisposable
 internal interface ISqliteWalSharedMemoryCarrierIdentity
 {
     SqliteWalSharedMemoryCarrierIdentity CarrierIdentity { get; }
+}
+
+/// <summary>
+/// Duplicates handles for the exact file that backs a physical shared-memory
+/// mapping, rather than reopening its path.
+/// </summary>
+internal interface ISqliteWalSharedMemoryLockCarrier : ISqliteWalSharedMemoryCarrierIdentity
+{
+    bool PreventsCarrierReplacement { get; }
+
+    SafeFileHandle DuplicateLockCarrierHandle();
 }
 
 /// <summary>Defines the fixed layout of SQLite's 32 KiB WAL-index blocks.</summary>
@@ -700,6 +712,9 @@ public sealed class SqliteWalIndexSharedMemory
 
     internal SqliteWalSharedMemoryCarrierIdentity? CarrierIdentity
         => (_mapping as ISqliteWalSharedMemoryCarrierIdentity)?.CarrierIdentity;
+
+    internal ISqliteWalSharedMemoryLockCarrier? LockCarrier
+        => _mapping as ISqliteWalSharedMemoryLockCarrier;
 
     /// <summary>
     /// Reads a stable dual-header snapshot and validates it against the WAL.

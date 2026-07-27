@@ -52,10 +52,14 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
     private readonly SqliteWalIndexSharedMemory _index;
     private readonly SqliteWalByteRangeLock _locks;
     private readonly SqliteWalSharedMemoryCarrierIdentity? _carrierIdentity;
+    private readonly ISqliteWalSharedMemoryLockCarrier? _recoveryCarrier;
     private readonly IDisposable? _ownedMapping;
     private readonly bool _ownsArtifacts;
     private bool _disposed;
     private Exception? _fault;
+
+    [field: ThreadStatic]
+    internal static Action? BeforeDetachedTailRepairForTesting { get; set; }
 
     /// <summary>
     /// Creates a coordinator over caller-owned storage, WAL, index, and lock
@@ -81,6 +85,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         _index = index;
         _locks = locks;
         _carrierIdentity = index.CarrierIdentity;
+        _recoveryCarrier = index.LockCarrier;
     }
 
     private SqliteWalWriterCheckpointCoordinator(
@@ -104,6 +109,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         _index = index;
         _locks = locks;
         _carrierIdentity = index.CarrierIdentity;
+        _recoveryCarrier = index.LockCarrier;
         _ownedMapping = ownedMapping;
         _ownsArtifacts = true;
     }
@@ -126,9 +132,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         ISqliteWalSharedMemoryMapping? mapping = null;
         try
         {
-            mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
-                sharedMemoryPath,
-                FileOpenMode.OpenExisting);
+            mapping = PhysicalFileSystem.Instance.OpenSharedMemoryForRecovery(sharedMemoryPath);
             var index = new SqliteWalIndexSharedMemory(mapping);
 
             mainFile = sharedFileSystem.OpenFile(canonicalPath, FileOpenMode.OpenExisting);
@@ -589,7 +593,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             {
                 for (var readMarkIndex = 0; readMarkIndex < SqliteWalIndexCheckpointInfo.ReadMarkCount; readMarkIndex++)
                 {
-                    if (!_locks.TryAcquireExclusive(
+                    if (!TryAcquireRecoveryLock(
                             FirstReadMarkLockOffset + readMarkIndex,
                             length: 1,
                             out var lease))
@@ -694,17 +698,17 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
-        using var checkpoint = _locks.AcquireExclusive(
+        using var checkpoint = AcquireRecoveryLock(
             CheckpointLockOffset,
             length: 1,
             timeout,
             cancellationToken);
-        using var writer = _locks.AcquireExclusive(
+        using var writer = AcquireRecoveryLock(
             WriteLockOffset,
             length: 1,
             timeout,
             cancellationToken);
-        using var recovery = _locks.AcquireExclusive(
+        using var recovery = AcquireRecoveryLock(
             RecoveryLockOffset,
             length: 1,
             timeout,
@@ -726,14 +730,20 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         if (scan.StopReason != SqliteWalRecoveryStopReason.EndOfFile
             || scan.LastValidFrameNumber != scan.LastCommittedFrameNumber)
         {
-            if (recoveryHeader is null
+            // This validation is the final point at which a path carrier is
+            // considered. Windows keeps that carrier unreplaceable for the rest
+            // of recovery; platforms without that guarantee reject repair below.
+            ValidateRecoveryCarrier(checkpoint, writer, recovery, readMarks);
+            BeforeDetachedTailRepairForTesting?.Invoke();
+
+            if (!CanRepairWalTail
+                || recoveryHeader is null
                 || !HasAuthenticatedTailRecoveryEvidence(recoveryHeader, scan))
             {
                 throw new InvalidDataException(
                     "SQLite WAL corruption reaches before the last independently published committed boundary.");
             }
 
-            ValidateRecoveryCarrier(checkpoint, writer, recovery, readMarks);
             scan = _wal.RecoverToLastCommittedFrame();
         }
 
@@ -745,6 +755,26 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
 
     private void RebuildIndexFromWal()
         => _ = RecoverAndRebuild(TimeSpan.Zero, CancellationToken.None);
+
+    private bool CanRepairWalTail
+        => _recoveryCarrier?.PreventsCarrierReplacement == true;
+
+    private SqliteWalByteRangeLockLease AcquireRecoveryLock(
+        long offset,
+        long length,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+        => _recoveryCarrier is null
+            ? _locks.AcquireExclusive(offset, length, timeout, cancellationToken)
+            : _locks.AcquireExclusive(_recoveryCarrier, offset, length, timeout, cancellationToken);
+
+    private bool TryAcquireRecoveryLock(
+        long offset,
+        long length,
+        out SqliteWalByteRangeLockLease? lease)
+        => _recoveryCarrier is null
+            ? _locks.TryAcquireExclusive(offset, length, out lease)
+            : _locks.TryAcquireExclusive(_recoveryCarrier, offset, length, out lease);
 
     private bool HasAuthenticatedTailRecoveryEvidence(
         SqliteWalIndexHeader recoveryHeader,

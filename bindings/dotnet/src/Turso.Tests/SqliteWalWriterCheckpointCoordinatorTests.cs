@@ -218,6 +218,12 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
                 .Should().Be(checked((uint)beforeRecovery.LastCommittedFrameNumber));
         }
 
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Throws<InvalidDataException>(() => coordinator.Recover(TimeSpan.Zero));
+            return;
+        }
+
         coordinator.Recover(TimeSpan.Zero).LastCommittedFrameNumber
             .Should().Be(beforeRecovery.LastCommittedFrameNumber);
         coordinator.Commit(
@@ -379,9 +385,21 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
         }
 
         recoveryBlocker.Dispose();
-        recovery.GetAwaiter().GetResult().LastCommittedFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        if (OperatingSystem.IsWindows())
+        {
+            recovery.GetAwaiter().GetResult().LastCommittedFrameNumber
+                .Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        }
+        else
+        {
+            Assert.Throws<InvalidDataException>(() => recovery.GetAwaiter().GetResult());
+        }
+
         using var repairedWal = OpenWalCopy(artifact.DatabasePath);
-        repairedWal.ScanRecovery().LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        repairedWal.ScanRecovery().LastValidFrameNumber.Should().Be(
+            OperatingSystem.IsWindows()
+                ? beforeRecovery.LastCommittedFrameNumber
+                : beforeRecovery.LastCommittedFrameNumber + 1);
     }
 
     [Test]
@@ -487,6 +505,14 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
         var walLength = new FileInfo(walPath).Length;
         var sharedMemoryPath = databasePath + "-shm";
         var replacedCarrierPath = sharedMemoryPath + ".replaced";
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Throws<IOException>(() => File.Move(sharedMemoryPath, replacedCarrierPath));
+            coordinator.Recover(TimeSpan.Zero).LastCommittedFrameNumber
+                .Should().Be(beforeRecovery.LastCommittedFrameNumber);
+            return;
+        }
+
         File.Move(sharedMemoryPath, replacedCarrierPath);
         File.Copy(replacedCarrierPath, sharedMemoryPath);
 
@@ -494,6 +520,69 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
         new FileInfo(walPath).Length.Should().Be(walLength);
         using var tail = OpenWalCopy(databasePath);
         tail.ScanRecovery().LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber + 1);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void RecoveryCannotRepairATailAfterAnAdversarialCarrierReplacementAttempt()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        var databasePath = Path.Combine(artifact.WorkDirectory, "late-carrier-replacement.db");
+        File.Copy(artifact.DatabasePath, databasePath);
+        File.Copy(artifact.DatabasePath + "-wal", databasePath + "-wal");
+        File.Copy(artifact.DatabasePath + "-shm", databasePath + "-shm");
+
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(databasePath);
+        using var before = OpenWalCopy(databasePath);
+        var beforeRecovery = before.ScanRecovery();
+        AppendValidUncommittedFrame(
+            databasePath + "-wal",
+            before,
+            before.ReadFrame(beforeRecovery.LastCommittedFrameNumber));
+        var walPath = databasePath + "-wal";
+        var walLength = new FileInfo(walPath).Length;
+        var sharedMemoryPath = databasePath + "-shm";
+        var replacedCarrierPath = sharedMemoryPath + ".late-replaced";
+        IOException? replacementFailure = null;
+
+        SqliteWalWriterCheckpointCoordinator.BeforeDetachedTailRepairForTesting = () =>
+        {
+            try
+            {
+                File.Move(sharedMemoryPath, replacedCarrierPath);
+                File.Copy(replacedCarrierPath, sharedMemoryPath);
+            }
+            catch (IOException exception)
+            {
+                replacementFailure = exception;
+            }
+        };
+
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                coordinator.Recover(TimeSpan.Zero).LastCommittedFrameNumber
+                    .Should().Be(beforeRecovery.LastCommittedFrameNumber);
+                replacementFailure.Should().NotBeNull(
+                    "the recovery mapping denies delete sharing until its carrier-bound recovery leases are released");
+                using var repaired = OpenWalCopy(databasePath);
+                repaired.ScanRecovery().LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+            }
+            else
+            {
+                Assert.Throws<InvalidDataException>(() => coordinator.Recover(TimeSpan.Zero));
+                replacementFailure.Should().BeNull();
+                new FileInfo(walPath).Length.Should().Be(walLength);
+                using var tail = OpenWalCopy(databasePath);
+                tail.ScanRecovery().LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber + 1);
+            }
+        }
+        finally
+        {
+            SqliteWalWriterCheckpointCoordinator.BeforeDetachedTailRepairForTesting = null;
+        }
     }
 
     [Test]
@@ -546,7 +635,14 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
             takeover.Result.Should().Be("acquired");
         }
 
-        coordinator.Recover(TimeSpan.Zero).LastCommittedFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        if (OperatingSystem.IsWindows())
+        {
+            coordinator.Recover(TimeSpan.Zero).LastCommittedFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber);
+        }
+        else
+        {
+            Assert.Throws<InvalidDataException>(() => coordinator.Recover(TimeSpan.Zero));
+        }
     }
 
     [TestCase("torn")]
