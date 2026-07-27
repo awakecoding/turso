@@ -50,6 +50,12 @@ internal sealed class EmbeddedFileStore : IDisposable
     private Dictionary<string, uint> _tableRootPages = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, uint> _indexRootPages = new(StringComparer.OrdinalIgnoreCase);
     private string _lastSchemaSignature = string.Empty;
+
+    // The exact table dictionary whose contents this store last made durable.
+    // Reference identity is the only admissible proof that a caller's "previous"
+    // catalog really is the committed one, so an incremental write can compute
+    // its page delta from memory instead of re-reading the database.
+    private IReadOnlyDictionary<string, EmbeddedTable>? _committedTables;
     private Exception? _postCommitMaintenanceFailure;
     private bool _disposed;
 
@@ -302,6 +308,7 @@ internal sealed class EmbeddedFileStore : IDisposable
         _tableRootPages = rootPages;
         _indexRootPages = indexRootPages;
         _lastSchemaSignature = ComputeSchemaSignature(schemaEntries);
+        _committedTables = tables;
         return new EmbeddedFileCatalog(tables, views, triggers);
     }
 
@@ -1173,7 +1180,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         IReadOnlyDictionary<string, ViewDefinition> views,
         IReadOnlyDictionary<string, TriggerDefinition> triggers,
         PragmaHeaderMetadata? pragmaHeader = null,
-        bool forceFullRewrite = false)
+        bool forceFullRewrite = false,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
         => PersistCore(
             tables,
             views,
@@ -1181,7 +1189,8 @@ internal sealed class EmbeddedFileStore : IDisposable
             reclaimTrailingPages: false,
             incrementSchemaCookie: false,
             pragmaHeader,
-            forceFullRewrite);
+            forceFullRewrite,
+            previousTables);
 
     internal FileCatalogVersion CommittedCatalogVersion => FileCatalogVersion.FromHeader(_header);
 
@@ -1435,7 +1444,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         bool reclaimTrailingPages,
         bool incrementSchemaCookie,
         PragmaHeaderMetadata? pragmaHeader,
-        bool forceFullRewrite)
+        bool forceFullRewrite,
+        IReadOnlyDictionary<string, EmbeddedTable>? previousTables = null)
     {
         ThrowIfDisposed();
         ThrowIfPostCommitMaintenanceFaulted();
@@ -1448,10 +1458,21 @@ internal sealed class EmbeddedFileStore : IDisposable
 
         if (!forceFullRewrite
             && !reclaimTrailingPages
-            && pragmaHeader is null
-            && TryPersistBoundedTableLeafMutation(tables, views, triggers))
+            && pragmaHeader is null)
         {
-            return CommittedCatalogVersion;
+            if (previousTables is not null
+                && ReferenceEquals(previousTables, _committedTables)
+                && TryPersistIncrementalRowMutation(tables, views, triggers, previousTables))
+            {
+                _committedTables = tables;
+                return CommittedCatalogVersion;
+            }
+
+            if (TryPersistBoundedTableLeafMutation(tables, views, triggers))
+            {
+                _committedTables = tables;
+                return CommittedCatalogVersion;
+            }
         }
 
         var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
@@ -1593,8 +1614,369 @@ internal sealed class EmbeddedFileStore : IDisposable
         _tableRootPages = rootPages;
         _indexRootPages = indexRootPages;
         _lastSchemaSignature = signature;
+        _committedTables = tables;
         return CommittedCatalogVersion;
     }
+
+    /// <summary>The number of changed rows above which a complete rewrite is preferred.</summary>
+    /// <remarks>
+    /// A bulk change touches most of the database anyway, and one rewrite packs
+    /// its pages far more densely than a long sequence of incremental splits.
+    /// </remarks>
+    private const int MaximumIncrementalChangedRows = 256;
+
+    /// <summary>
+    /// Declares that <paramref name="tables"/> is content-identical to what this
+    /// store last made durable, so later writes may compute their page delta
+    /// against it.
+    /// </summary>
+    /// <remarks>
+    /// VACUUM and page-size migration republish the durable catalog from freshly
+    /// loaded objects, which loses the reference identity the incremental writer
+    /// relies on. The caller's dictionary is adopted only after proving it holds
+    /// the same rows, so a mismatch disables incremental writes instead of
+    /// trusting an unverified baseline.
+    /// </remarks>
+    internal void AdoptCommittedTables(IReadOnlyDictionary<string, EmbeddedTable> tables)
+    {
+        ArgumentNullException.ThrowIfNull(tables);
+        var committed = _committedTables;
+        if (committed is null || committed.Count != tables.Count)
+        {
+            _committedTables = null;
+            return;
+        }
+
+        foreach (var (name, table) in tables)
+        {
+            if (!committed.TryGetValue(name, out var persisted) || !HaveSameRows(table, persisted))
+            {
+                _committedTables = null;
+                return;
+            }
+        }
+
+        _committedTables = tables;
+    }
+
+    /// <summary>
+    /// Applies the row-level difference between the committed catalog and
+    /// <paramref name="tables"/> by descending each affected b-tree and
+    /// rewriting only the pages on the search paths it touches.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the incremental write path. Its cost is proportional to the number
+    /// of changed rows and the height of the trees they live in, not to the size
+    /// of the database, so it never reads or rebuilds pages the mutation does not
+    /// reach. Every page it reads, dirties, or allocates crosses
+    /// <see cref="ISqliteBtreePageIo"/>, and only the dirtied pages become WAL
+    /// frames.
+    /// </para>
+    /// <para>
+    /// It refuses anything that would need the b-tree maintenance the incremental
+    /// writers deliberately omit — page merging, rebalancing, defragmentation,
+    /// freelist reuse — and anything whose committed contents it cannot prove it
+    /// knows. Every refusal falls through to the complete catalog rewrite, which
+    /// can always represent the mutation.
+    /// </para>
+    /// </remarks>
+    private bool TryPersistIncrementalRowMutation(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        IReadOnlyDictionary<string, TriggerDefinition> triggers,
+        IReadOnlyDictionary<string, EmbeddedTable> previousTables)
+    {
+        if (!HasCurrentSchemaShape(tables, views, triggers))
+            return false;
+
+        var currentHeader = SqliteDatabaseHeader.Parse(_pager.ReadCommittedPage(SchemaRootPage));
+        if (currentHeader.PageSize != _pageSize
+            || currentHeader.UsableSpace != _usableSpace
+            || currentHeader.VersionValidFor != currentHeader.ChangeCounter
+            || currentHeader.DatabaseSizeInPages != _pager.CommittedPageCount
+            || currentHeader.LargestRootBtreePage != 0
+            || currentHeader.IncrementalVacuumEnabled != 0)
+        {
+            return false;
+        }
+
+        // The incremental writer only appends pages, so running it while free
+        // pages exist would strand them forever. The complete rewrite reuses and
+        // compacts them, so defer to it until the freelist is empty. Reusing the
+        // freelist incrementally belongs to b-tree maintenance.
+        if (currentHeader.FirstFreelistTrunkPage != 0 || currentHeader.FreelistPageCount != 0)
+            return false;
+
+        if (!TryCollectRowDeltas(tables, previousTables, out var deltas) || deltas.Count == 0)
+            return false;
+
+        var tableNames = tables.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
+        var indexesByTable = GetIndexDefinitions(tableNames, tables, views, triggers)
+            .GroupBy(definition => definition.TableName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => (IReadOnlyList<IndexDefinition>)group.ToArray(),
+                StringComparer.OrdinalIgnoreCase);
+
+        var pageIo = new SqliteStagedBtreePageIo(
+            pageNumber => _pager.ReadCommittedPage(pageNumber),
+            _pager.CommittedPageCount,
+            _pageSize,
+            _usableSpace);
+        try
+        {
+            foreach (var delta in deltas)
+            {
+                if (!_tableRootPages.TryGetValue(delta.TableName, out var rootPage)
+                    || rootPage < 2
+                    || rootPage > _pager.CommittedPageCount)
+                {
+                    return false;
+                }
+
+                if (!ApplyIncrementalTableDelta(
+                        pageIo,
+                        delta,
+                        rootPage,
+                        indexesByTable.TryGetValue(delta.TableName, out var indexes) ? indexes : []))
+                {
+                    return false;
+                }
+            }
+        }
+        catch (SqliteBtreeMaintenanceRequiredException)
+        {
+            return false;
+        }
+
+        if (pageIo.StagedPages.Count == 0 || pageIo.StagedPages.ContainsKey(SchemaRootPage))
+            return false;
+
+        var target = pageIo.PageCount;
+        var newChangeCounter = currentHeader.ChangeCounter + 1;
+        var newHeader = currentHeader with
+        {
+            ChangeCounter = newChangeCounter,
+            VersionValidFor = newChangeCounter,
+            DatabaseSizeInPages = target,
+        };
+        var pageOne = _pager.ReadCommittedPage(SchemaRootPage);
+        newHeader.WriteTo(pageOne);
+
+        using (var transaction = _pager.BeginTransaction(target))
+        {
+            foreach (var (pageNumber, image) in pageIo.StagedPages)
+                transaction.WritePage(pageNumber, image);
+
+            // Page one publishes the new database size, so it must be the frame
+            // that makes every page this mutation allocated reachable.
+            transaction.WritePage(SchemaRootPage, pageOne);
+            transaction.Commit();
+        }
+
+        _header = newHeader;
+        CheckpointCommittedMutation(reclaimTrailingPages: false);
+        return true;
+    }
+
+    private bool ApplyIncrementalTableDelta(
+        ISqliteBtreePageIo pageIo,
+        TableRowDelta delta,
+        uint rootPage,
+        IReadOnlyList<IndexDefinition> indexes)
+    {
+        var table = delta.Table;
+        var indexPlans = new List<IncrementalIndexPlan>(indexes.Count);
+        foreach (var definition in indexes)
+        {
+            if (!_indexRootPages.TryGetValue(definition.Index.Name, out var indexRootPage)
+                || indexRootPage < 2
+                || indexRootPage > _pager.CommittedPageCount)
+            {
+                return false;
+            }
+
+            var comparer = CreateIndexComparer(table, definition.Index);
+            indexPlans.Add(new IncrementalIndexPlan(
+                definition.Index,
+                indexRootPage,
+                comparer,
+                new SqliteIncrementalIndexBtree(pageIo, comparer, _textEncoding)));
+        }
+
+        var indexDeletes = new List<(IncrementalIndexPlan Plan, byte[] Record)>();
+        var indexInserts = new List<(IncrementalIndexPlan Plan, byte[] Record)>();
+        foreach (var plan in indexPlans)
+        {
+            foreach (var change in delta.Changes)
+            {
+                var before = change.Before is null
+                    ? null
+                    : TryBuildIndexRecord(delta.PreviousTable, plan.Index, change.Before, change.RowId, plan.Comparer);
+                var after = change.After is null
+                    ? null
+                    : TryBuildIndexRecord(table, plan.Index, change.After, change.RowId, plan.Comparer);
+                if (before is not null && after is not null && before.AsSpan().SequenceEqual(after))
+                    continue;
+
+                if (before is not null)
+                    indexDeletes.Add((plan, before));
+                if (after is not null)
+                    indexInserts.Add((plan, after));
+            }
+        }
+
+        // Every removal precedes every addition so a mutation that moves a key
+        // between rows never transiently duplicates it.
+        foreach (var (plan, record) in indexDeletes)
+            plan.Tree.Delete(plan.RootPage, record);
+
+        var tableTree = new SqliteIncrementalTableBtree(pageIo);
+        foreach (var change in delta.Changes)
+        {
+            if (change.After is null)
+                tableTree.Delete(rootPage, change.RowId);
+        }
+        foreach (var change in delta.Changes)
+        {
+            if (change.Before is not null && change.After is not null)
+                tableTree.Update(rootPage, change.RowId, BuildTableRecord(table, change.After));
+        }
+        foreach (var change in delta.Changes)
+        {
+            if (change.Before is null && change.After is not null)
+                tableTree.Insert(rootPage, change.RowId, BuildTableRecord(table, change.After));
+        }
+
+        foreach (var (plan, record) in indexInserts)
+            plan.Tree.Insert(plan.RootPage, record);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Computes the per-table row difference between the committed catalog and
+    /// the catalog about to be persisted.
+    /// </summary>
+    private static bool TryCollectRowDeltas(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, EmbeddedTable> previousTables,
+        out List<TableRowDelta> deltas)
+    {
+        deltas = [];
+        if (tables.Count != previousTables.Count)
+            return false;
+
+        var changedRowBudget = MaximumIncrementalChangedRows;
+        foreach (var (name, table) in tables)
+        {
+            if (!previousTables.TryGetValue(name, out var previous))
+                return false;
+            if (HaveSameRows(table, previous))
+                continue;
+
+            // A WITHOUT ROWID table is stored as an index b-tree keyed by its
+            // primary key, which this rowid-oriented delta cannot express.
+            if (table.WithoutRowid
+                || table.Rows.Count != table.RowIds.Count
+                || previous.Rows.Count != previous.RowIds.Count)
+            {
+                return false;
+            }
+
+            var before = new Dictionary<long, SqlValue[]>(previous.Rows.Count);
+            for (var index = 0; index < previous.Rows.Count; index++)
+            {
+                if (!before.TryAdd(previous.RowIds[index], previous.Rows[index]))
+                    return false;
+            }
+
+            var changes = new List<RowChange>();
+            for (var index = 0; index < table.Rows.Count; index++)
+            {
+                var rowId = table.RowIds[index];
+                var row = table.Rows[index];
+                if (!before.Remove(rowId, out var previousRow))
+                    changes.Add(new RowChange(rowId, null, row));
+                else if (!previousRow.AsSpan().SequenceEqual(row))
+                    changes.Add(new RowChange(rowId, previousRow, row));
+
+                if (changes.Count > changedRowBudget)
+                    return false;
+            }
+
+            foreach (var (rowId, previousRow) in before)
+            {
+                changes.Add(new RowChange(rowId, previousRow, null));
+                if (changes.Count > changedRowBudget)
+                    return false;
+            }
+
+            if (changes.Count == 0)
+                return false;
+
+            changedRowBudget -= changes.Count;
+            deltas.Add(new TableRowDelta(name, table, previous, changes));
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Encodes the complete SQLite index key for one row, or returns
+    /// <see langword="null"/> when a partial index excludes it.
+    /// </summary>
+    private byte[]? TryBuildIndexRecord(
+        EmbeddedTable table,
+        EmbeddedIndex index,
+        SqlValue[] row,
+        long rowId,
+        SqliteIndexRecordComparer comparer)
+    {
+        if (row.Length != table.ColumnDefinitions.Length)
+        {
+            throw new EmbeddedSqlException(
+                $"The managed file engine cannot persist index '{index.Name}' because a row has an invalid column count.");
+        }
+
+        if (!IndexExpressionSemantics.Qualifies(
+                index,
+                table,
+                row,
+                rowId,
+                _indexExpressionEvaluator.EvaluateIndexExpression))
+        {
+            return null;
+        }
+
+        var key = IndexExpressionSemantics.ProjectKey(
+            index,
+            table,
+            row,
+            rowId,
+            _indexExpressionEvaluator.EvaluateIndexExpression);
+        var values = new SqlValue[index.Columns.Count + 1];
+        Array.Copy(key, values, key.Length);
+        values[^1] = SqlValue.Integer(rowId);
+        var record = SqliteRecordCodec.Encode(values, _textEncoding);
+        comparer.Validate(record);
+        return record;
+    }
+
+    private sealed record RowChange(long RowId, SqlValue[]? Before, SqlValue[]? After);
+
+    private sealed record TableRowDelta(
+        string TableName,
+        EmbeddedTable Table,
+        EmbeddedTable PreviousTable,
+        IReadOnlyList<RowChange> Changes);
+
+    private sealed record IncrementalIndexPlan(
+        EmbeddedIndex Index,
+        uint RootPage,
+        SqliteIndexRecordComparer Comparer,
+        SqliteIncrementalIndexBtree Tree);
 
     /// <summary>
     /// Replaces one existing ordinary-table leaf and every compatible
@@ -9183,8 +9565,6 @@ internal sealed class EmbeddedFileStore : IDisposable
 
     private IEnumerable<(long RowId, byte[] Record)> EnumerateRowCells(string name, EmbeddedTable table)
     {
-        var aliasIndex = table.RowidAliasColumnIndex;
-
         // Pair every row with its tracked rowid and emit in ascending rowid order so the
         // leaf cells are sorted, as a valid SQLite b-tree requires. This preserves the
         // exact rowids across persistence for both alias and hidden-rowid tables.
@@ -9194,26 +9574,34 @@ internal sealed class EmbeddedFileStore : IDisposable
                 Row: row))
             .OrderBy(entry => entry.RowId);
         foreach (var (rowId, row) in ordered)
+            yield return (rowId, BuildTableRecord(table, row));
+    }
+
+    /// <summary>
+    /// Encodes one rowid-table row as its SQLite record payload.
+    /// </summary>
+    private byte[] BuildTableRecord(EmbeddedTable table, IReadOnlyList<SqlValue> row)
+    {
+        var record = ProjectStoredRow(table, row);
+        var aliasIndex = table.RowidAliasColumnIndex;
+        if (aliasIndex >= 0)
         {
-            var record = ProjectStoredRow(table, row);
-            if (aliasIndex >= 0)
+            // A single-column INTEGER PRIMARY KEY is a rowid alias: store its value as
+            // the SQLite rowid and NULL in the record, exactly as SQLite does.
+            var storedAliasIndex = 0;
+            for (var columnIndex = 0; columnIndex < aliasIndex; columnIndex++)
             {
-                // A single-column INTEGER PRIMARY KEY is a rowid alias: store its value as
-                // the SQLite rowid and NULL in the record, exactly as SQLite does.
-                var storedAliasIndex = 0;
-                for (var columnIndex = 0; columnIndex < aliasIndex; columnIndex++)
+                if (!table.ColumnDefinitions[columnIndex].IsGenerated
+                    || table.ColumnDefinitions[columnIndex].GeneratedStored)
                 {
-                    if (!table.ColumnDefinitions[columnIndex].IsGenerated
-                        || table.ColumnDefinitions[columnIndex].GeneratedStored)
-                    {
-                        storedAliasIndex++;
-                    }
+                    storedAliasIndex++;
                 }
-                record[storedAliasIndex] = SqlValue.Null;
             }
 
-            yield return (rowId, SqliteRecordCodec.Encode(record, _textEncoding));
+            record[storedAliasIndex] = SqlValue.Null;
         }
+
+        return SqliteRecordCodec.Encode(record, _textEncoding);
     }
 
     private static SqlValue[] ProjectStoredRow(

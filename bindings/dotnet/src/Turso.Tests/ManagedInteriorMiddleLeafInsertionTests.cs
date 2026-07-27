@@ -92,7 +92,7 @@ public sealed class ManagedInteriorMiddleLeafInsertionTests
         }
 
         var rowCount = 5;
-        for (var rowId = 11; rowId <= 127; rowId += 2)
+        foreach (var rowId in SeedRowIds())
         {
             if (TryFindMiddleLeafInsertionTarget(fileSystem, path, rowCount, out var target))
                 return target;
@@ -104,6 +104,21 @@ public sealed class ManagedInteriorMiddleLeafInsertionTests
         }
 
         throw new InvalidOperationException("Unable to create a bounded middle table-leaf insertion topology.");
+    }
+
+    /// <summary>
+    /// Odd row ids 11..127 in two passes. The first pass only appends, which
+    /// packs pages completely; the second fills the gaps it left, so those
+    /// insertions split middle leaves and leave free space behind for the
+    /// bounded insertion under test.
+    /// </summary>
+    private static IEnumerable<int> SeedRowIds()
+    {
+        for (var rowId = 11; rowId <= 127; rowId += 4)
+            yield return rowId;
+
+        for (var rowId = 13; rowId <= 127; rowId += 4)
+            yield return rowId;
     }
 
     private static bool TryFindMiddleLeafInsertionTarget(
