@@ -96,6 +96,12 @@ public static class Resources
 
     public static string ManagedVfsNotSupported => "Vfs is not supported when Local Provider=Managed because the managed engine does not use native SQLite VFS implementations.";
 
+    public static string HooksRequireManagedProvider => "Update, commit, rollback, authorizer, trace, and progress callbacks are implemented only by the managed engine; open the connection with Local Provider=Managed.";
+
+    public static string ManagedSharedCacheHooksNotSupported => "Managed shared-memory databases do not support update, commit, rollback, authorizer, trace, or progress callbacks because the managed catalog is shared across connections.";
+
+    public static string ProgressIntervalOutOfRange => "The progress handler step interval must be greater than zero.";
+
     public static string AmbiguousColumnName(object? name, object? column1, object? column2) => $"Column name {name} is ambiguous between {column1} and {column2}.";
 
     public static string ConvertFailed(object? sourceType, object? targetType) => $"Cannot convert {sourceType} to {targetType}.";

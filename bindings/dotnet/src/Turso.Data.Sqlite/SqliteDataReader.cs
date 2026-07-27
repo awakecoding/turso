@@ -241,7 +241,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (!string.IsNullOrEmpty(declaredType))
             return declaredType;
 
-        return ReadValue(ordinal).Kind switch
+        return CurrentValueKind(ordinal) switch
         {
             ReaderValueKind.Null => "BLOB",
             ReaderValueKind.Integer => "INTEGER",
@@ -311,7 +311,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
     {
         EnsureOpen();
         ValidateOrdinal(ordinal);
-        var valueType = ReadValue(ordinal).Kind;
+        var valueType = CurrentValueKind(ordinal);
         var declaredType = GetDeclaredTypeName(ordinal);
         if (!string.IsNullOrEmpty(declaredType))
             return GetClrTypeFromSqliteType(declaredType, valueType);
@@ -886,6 +886,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             return string.Empty;
 
         var table = UnquoteIdentifier(match.Groups["table"].Value);
+        using var suspension = _command.Connection.SuspendHooks();
         using var command = _command.Connection.CreateCommand();
         command.CommandText = $"PRAGMA table_info({QuoteIdentifier(table)});";
         using var reader = command.ExecuteReader();
@@ -983,6 +984,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_command.Connection is null)
             return columns;
 
+        using var suspension = _command.Connection.SuspendHooks();
         using (var command = _command.Connection.CreateCommand())
         {
             command.CommandText = $"PRAGMA table_info({QuoteIdentifier(tableName)});";
@@ -1249,4 +1251,13 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             ? ReaderValue.FromManaged(statement.ManagedCurrentRow.GetValue(ordinal))
             : ReaderValue.FromNative(statement.GetNativeValue(ordinal));
     }
+
+    /// <summary>
+    /// Returns the value kind of the current row, or <see cref="ReaderValueKind.Empty"/> when the
+    /// reader is not positioned on a row. Type metadata has to stay readable before the first
+    /// <c>Read</c> because <see cref="System.Data.Common.DbDataAdapter"/> maps the result schema
+    /// before it fetches any rows.
+    /// </summary>
+    private ReaderValueKind CurrentValueKind(int ordinal)
+        => _hasCurrentRow ? ReadValue(ordinal).Kind : ReaderValueKind.Empty;
 }

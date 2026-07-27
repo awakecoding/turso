@@ -158,10 +158,10 @@ public sealed partial class EmbeddedDatabase
         var builder = new StringBuilder(arguments.Count);
         foreach (var argument in arguments)
         {
-            if (argument.Kind == SqlValueKind.Null)
-                continue;
-
-            var codePoint = ToSqliteInteger(argument);
+            // SQLite reads every argument with sqlite3_value_int64, which yields 0 for NULL and
+            // for text that is not a number, so char(NULL) is a NUL character and not a skipped
+            // argument.
+            var codePoint = argument.Kind == SqlValueKind.Null ? 0 : ToSqliteInteger(argument);
 
             // SQLite substitutes U+FFFD for values outside the Unicode range and
             // for surrogate code points, which cannot stand alone.
