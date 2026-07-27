@@ -41,7 +41,7 @@ alter_rename_column_partial_idx.sqltest::rename-column-expression-index-then-ren
 alter_table.sqltest::alter-table-rename-column | expected success but got error: Expected keyword TO. At SQL offset 21.
 alter_table.sqltest::alter-table-rename-column-view-star | expected 2 row(s), got 0 row(s)
 alter_table.sqltest::alter-table-rename-column-view-on-view | expected success but got error: error in view v1 after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-column-view-tablecall-branch | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
+alter_table.sqltest::alter-table-rename-column-view-tablecall-branch | expected success but got error: no such column: t.b
 alter_table.sqltest::alter-table-rename-column-view-attached-db-qualified | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'cannot reference'
 alter_table.sqltest::alter-table-rename-column-trigger-attached-db-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 alter_table.sqltest::alter-table-rename-column-view-attached-db-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
@@ -92,9 +92,9 @@ alter_table.sqltest::fail-drop-column-cross-table-trigger-update-where-expr | er
 alter_table.sqltest::drop-column-cross-table-trigger-insert-col-list-deferred | expected success but got error: error in trigger trg after drop column: table has no column named m
 alter_table.sqltest::drop-column-cross-table-trigger-set-target-deferred | expected success but got error: error in trigger trg after drop column: table has no column named m
 alter_table.sqltest::drop-column-cross-table-trigger-unreferenced | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t1 (m TEXT, d REAL)' but was 'CREATE TABLE "t1" ("m" TEXT, "d" REAL)'
-alter_table.sqltest::drop-column-other-table-trigger-insert-col-deferred | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-alter_table.sqltest::drop-column-owning-table-trigger-insert-col-deferred | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
-alter_table.sqltest::drop-column-owning-table-trigger-update-set-deferred | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
+alter_table.sqltest::drop-column-other-table-trigger-insert-col-deferred | expected success but got error: error in trigger tu after drop column: table has no column named zer
+alter_table.sqltest::drop-column-owning-table-trigger-insert-col-deferred | expected success but got error: error in trigger tu after drop column: table has no column named x
+alter_table.sqltest::drop-column-owning-table-trigger-update-set-deferred | expected success but got error: error in trigger tu after drop column: table has no column named x
 alter_table.sqltest::alter-table-rename-then-rename-column-with-trigger | expected success but got error: error in trigger tr after rename table: no such table: orders
 autoincr.sqltest::autoinc-create-sequence-table | expected 3 row(s), got 2 row(s); row 0 expected '__turso_internal_seq___turso_internal_autoincrement_t1' but was 'sqlite_sequence'
 autoincr.sqltest::autoinc-alter-column-clears-sequence-row | expected success but got error: Expected ADD, DROP, or RENAME after ALTER TABLE. At SQL offset 14.
@@ -388,7 +388,7 @@ pragma/table_list.sqltest::pragma-table-list-view | expected success but got err
 pragma/table_list.sqltest::pragma-table-list-strict | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
 pragma/table_list.sqltest::pragma-table-list-nonexistent | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
 pragma/table_list.sqltest::pragma-table-list-includes-temp-schema | expected success but got error: no such table: pragma_table_list
-pragma/table_list.sqltest::pragma-table-list-unqualified-includes-main-and-temp-matches | expected success but got error: Managed table-valued source 'pragma_table_list' is not supported: no module registration, planner, or execution contract is avai
+pragma/table_list.sqltest::pragma-table-list-unqualified-includes-main-and-temp-matches | expected 2 row(s), got 1 row(s)
 pragma/table_list.sqltest::pragma-table-list-attached-database | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 21.
 pragma/table_list.sqltest::pragma-table-list-explicit-main-vs-temp | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 22.
 pragma_vdbe_trace.sqltest::pragma-vdbe-trace | expected success but got error: Unsupported PRAGMA vdbe_trace. At SQL offset 18.
