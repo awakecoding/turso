@@ -1034,6 +1034,9 @@ public class SqliteCommand : DbCommand
 
     internal static SqliteException ToSqliteException(Exception ex, string? sql = null)
     {
+        if (ex is EmbeddedBusyException)
+            return new SqliteException(Properties.Resources.SqliteNativeError(5, ex.Message), 5);
+
         var message = ex.Message;
         foreach (var prefix in new[] { "Unable to prepare statement: Parse error: ", "Parse error: " })
         {

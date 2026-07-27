@@ -317,8 +317,10 @@ public sealed class ManagedAttachDetachRuntimeSliceTests
             using (var sibling = seed.Connect())
             {
                 Execute(connection, "BEGIN;");
-                Execute(connection, "INSERT INTO main.items VALUES (5);");
+                // The competing write has to land before this transaction takes its
+                // write lock at its own first write.
                 Execute(sibling, "INSERT INTO main.items VALUES (9);");
+                Execute(connection, "INSERT INTO main.items VALUES (5);");
                 var staleCommit = () => Execute(connection, "COMMIT;");
                 staleCommit.Should().Throw<EmbeddedSqlException>().WithMessage("database is locked");
                 Execute(connection, "ROLLBACK;");

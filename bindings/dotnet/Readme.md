@@ -69,6 +69,33 @@ measured 2-3x slower at 100-400 rows. Batch writes into explicit transactions,
 keep individual tables modest, and benchmark your own workload before adopting
 the managed provider for write-heavy use.
 
+### Transaction modes and locking
+
+`BEGIN DEFERRED` (and bare `BEGIN`), `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` all
+change managed locking behavior, matching SQLite's timing:
+
+- DEFERRED takes no lock at `BEGIN`, so a competing writer surfaces
+  `SqliteException` with `SqliteErrorCode` 5 at the transaction's first write.
+- IMMEDIATE takes the write lock at `BEGIN`, so the losing writer fails there,
+  before doing any work. `SqliteConnection.BeginTransaction` uses this for
+  non-deferred `Serializable`.
+- EXCLUSIVE takes the write lock at `BEGIN` and additionally excludes other
+  connections' reads, but only under a rollback journal. In WAL mode, which is
+  the managed default for file databases, SQLite's EXCLUSIVE does not block
+  readers and neither does this.
+
+There is no busy timeout, matching SQLite's default `busy_timeout=0`. Note that
+this diverges from `Microsoft.Data.Sqlite`, which maps `CommandTimeout` onto
+`sqlite3_busy_timeout` and therefore retries a contended `BEGIN IMMEDIATE` for up
+to `CommandTimeout` before reporting busy. The managed write reservation is
+fail-fast, so `CommandTimeout` does not delay a busy `BEGIN` — consistent with
+`PRAGMA busy_timeout` being unsupported here. Locking is
+process-local, which is sufficient because a managed physical database is already
+owned exclusively by one process. Two connections that both hold live snapshots
+still reject the loser's commit with a catalog-version conflict rather than a
+lock error, because a managed connection's catalog snapshot is fixed for its
+lifetime.
+
 ### Hooks, authorizer, tracing, and the progress handler
 
 `SqliteConnection` publishes `SetUpdateHook`, `SetCommitHook`, `SetRollbackHook`,
@@ -157,8 +184,6 @@ Deliberate limits:
 - `CREATE TEMP VIEW`/`CREATE TEMP TRIGGER`, `BEGIN CONCURRENT`, `ANALYZE`, and
   `pragma_*` table-valued functions. Each is rejected during parsing.
 - Chained `ON CONFLICT` clauses on a single `INSERT`.
-- `BEGIN DEFERRED`/`IMMEDIATE`/`EXCLUSIVE` parse for compatibility, but the mode
-  is discarded and does not change managed locking behavior.
 - Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Turso's
   AEGIS ciphers fail closed rather than being partially read.
 

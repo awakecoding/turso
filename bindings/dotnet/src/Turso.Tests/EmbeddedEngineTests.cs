@@ -2010,8 +2010,10 @@ public class EmbeddedEngineTests
         using var savepointConnection = database.Connect();
         Execute(writer, "CREATE TABLE t(value INTEGER);");
         Execute(savepointConnection, "SAVEPOINT s;");
-        Execute(savepointConnection, "INSERT INTO t VALUES (1);");
+        // The competing write has to land before the savepoint transaction takes its
+        // write lock at its own first write.
         Execute(writer, "INSERT INTO t VALUES (2);");
+        Execute(savepointConnection, "INSERT INTO t VALUES (1);");
 
         Assert.Throws<EmbeddedSqlException>(() => Execute(savepointConnection, "RELEASE s;"));
         Execute(savepointConnection, "ROLLBACK TO s;");

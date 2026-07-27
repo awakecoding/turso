@@ -136,7 +136,39 @@ Stage 0 WAL ownership boundary is not an MVCC substitute.
   (`SqlitePagerClientOwnershipException`) so callers can distinguish "another
   client owns this database" from "this role is momentarily busy".
 
-### 1.5 Cache invalidation today
+### 1.6 SQL transaction modes and the write reservation
+
+`BEGIN DEFERRED`, `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` are honored by a
+process-local write reservation (`EmbeddedTransactionLock`) layered *above* the
+pager, one per database identity: per canonical path for file databases, per
+instance for in-memory databases, which is exactly what connections sharing a
+managed in-memory database share.
+
+- DEFERRED takes the reservation at its first write, so busy surfaces there.
+- IMMEDIATE takes it at `BEGIN`, so a losing writer learns it lost before doing
+  any work. This is the whole reason applications choose the mode.
+- EXCLUSIVE takes it at `BEGIN` and additionally excludes other connections'
+  reads, but only when the database's journal mode is a rollback journal. In WAL
+  mode SQLite's EXCLUSIVE does not block readers, and neither does this.
+- Autocommit statements do not take the reservation - they are already serialized
+  by the owning database - but a write does fail busy when another connection is
+  holding one, which is what SQLite reports.
+- Contention throws `EmbeddedBusyException` ("database is locked"), surfaced as
+  `SqliteException` with `SqliteErrorCode` 5. There is no busy timeout, matching
+  SQLite's default `busy_timeout=0`.
+
+This layer does not weaken Stage 0: it adds no cross-process coordination and
+relies on the fact that a managed physical database is already owned exclusively
+by one process, so every contending connection is in-process. It is also
+independent of `SqlitePagerLockManager`, whose writer lease is taken and released
+inside a single commit and therefore cannot be held across a SQL transaction.
+
+Not covered: two connections that both have live snapshots still reject the
+loser's commit with the pre-existing catalog-version conflict rather than a lock
+error, because a managed connection's catalog snapshot is fixed for its lifetime
+and is only refreshed on pooling reset.
+
+### 1.7 Cache invalidation today
 
 - `SqlitePagerLockManager.Generation` is a monotonic counter bumped by writer and
   checkpoint leases through `PublishStorageChange`. It is purely process-local.
@@ -157,7 +189,7 @@ Stage 0 WAL ownership boundary is not an MVCC substitute.
 - Any of these failures transitions the pager to `SqlitePagerState.Faulted`. The
   pager never silently re-reads a database that changed underneath it.
 
-### 1.6 Recovery and handoff today
+### 1.8 Recovery and handoff today
 
 - **Writable open** holds the write byte and the recovery byte, recovers a hot
   rollback journal, scans the WAL, truncates it to the last committed frame, and

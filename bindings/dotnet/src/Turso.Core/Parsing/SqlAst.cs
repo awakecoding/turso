@@ -358,7 +358,20 @@ internal sealed record CommonTableExpression(
     QueryStatement Query,
     CteMaterializationHint MaterializationHint);
 
-internal sealed record BeginStatement : ParsedStatement;
+/// <summary>The locking behavior requested by <c>BEGIN</c>.</summary>
+internal enum TransactionMode
+{
+    /// <summary>Take the write lock lazily, at the first write.</summary>
+    Deferred,
+
+    /// <summary>Take the write lock at <c>BEGIN</c>.</summary>
+    Immediate,
+
+    /// <summary>Take the exclusive lock at <c>BEGIN</c>.</summary>
+    Exclusive,
+}
+
+internal sealed record BeginStatement(TransactionMode Mode = TransactionMode.Deferred) : ParsedStatement;
 
 internal sealed record CommitStatement : ParsedStatement;
 
