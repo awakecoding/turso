@@ -55,7 +55,8 @@ internal sealed record CreateViewStatement(
     IReadOnlyList<string>? Columns,
     QueryStatement Query,
     string Sql,
-    bool IfNotExists) : ParsedStatement;
+    bool IfNotExists,
+    bool Temporary = false) : ParsedStatement;
 
 internal sealed record DropViewStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -82,7 +83,11 @@ internal sealed record CreateTriggerStatement(
     Expression? When,
     IReadOnlyList<ParsedStatement> Body,
     string Sql,
-    bool IfNotExists) : ParsedStatement;
+    bool IfNotExists,
+    bool Temporary = false,
+    // Set when the trigger lives in a different schema than the table it watches, which
+    // SQLite only allows for temp triggers. The owning connection validates the target.
+    string? TargetSchema = null) : ParsedStatement;
 
 internal sealed record DropTriggerStatement(string Name, bool IfExists) : ParsedStatement;
 
@@ -101,7 +106,13 @@ internal sealed record TriggerDefinition(
     Expression? When,
     IReadOnlyList<ParsedStatement> Body,
     string Sql,
-    long DeclarationOrder);
+    long DeclarationOrder,
+    // Non-null when the watched table lives in a different schema than the trigger. Only a
+    // temp trigger can do this, and its body statements are routed by the owning connection.
+    string? TargetSchema = null,
+    // True when the trigger lives in the temp schema, which makes it connection private and
+    // lets its body reach objects in other schemas.
+    bool Temporary = false);
 
 // A parser-only separator retains whether a dot was SQL syntax rather than part of a
 // quoted identifier. Catalog object names remain ordinary strings after connection routing.

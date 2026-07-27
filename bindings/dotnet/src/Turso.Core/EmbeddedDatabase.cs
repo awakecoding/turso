@@ -421,7 +421,37 @@ public sealed partial class EmbeddedDatabase : IDisposable
         InsertConflictAlgorithm? TriggerConflictAlgorithm = null,
         bool PreserveUpsertFail = false,
         StatementExecutionState? StatementState = null,
-        bool CompilationEnabled = true);
+        bool CompilationEnabled = true,
+        TempTriggerBridge? TempTriggers = null);
+
+    /// <summary>
+    /// Connection-owned hook that lets connection-private temp triggers take part in a statement
+    /// executed by another database. Temp objects live in a separate in-memory database so they
+    /// stay invisible to other connections and never reach the persistent schema, which means a
+    /// temp trigger watching a main table has to be handed to the main database at execution time,
+    /// and a body statement that targets a different schema has to be routed back out.
+    /// </summary>
+    internal sealed class TempTriggerBridge(
+        IReadOnlyList<TriggerDefinition> overlay,
+        Func<ParsedStatement, bool> isForeign,
+        Func<ParsedStatement, ParsedStatement> localize,
+        Func<ParsedStatement, QueryContext, ExecutionResult> executeForeign)
+    {
+        /// <summary>Temp triggers whose watched table lives in the executing database.</summary>
+        public IReadOnlyList<TriggerDefinition> Overlay { get; } = overlay;
+
+        /// <summary>True when a temp trigger body statement targets a different database.</summary>
+        public bool IsForeign(ParsedStatement statement) => isForeign(statement);
+
+        /// <summary>
+        /// Strips the schema qualifier from a body statement that does belong to the executing
+        /// database, because a temp trigger body may name its own schema explicitly.
+        /// </summary>
+        public ParsedStatement Localize(ParsedStatement statement) => localize(statement);
+
+        public ExecutionResult ExecuteForeign(ParsedStatement statement, QueryContext context)
+            => executeForeign(statement, context);
+    }
 
     internal sealed class StatementExecutionState(long lastInsertRowId)
     {
@@ -742,7 +772,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        TempTriggerBridge? tempTriggers = null)
     {
         var result = ExecuteCore(
             statement,
@@ -753,7 +784,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             deferForeignKeys,
             inTransaction,
             cancellationToken,
-            compilationEnabled);
+            compilationEnabled,
+            tempTriggers);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -781,7 +813,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        TempTriggerBridge? tempTriggers = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -798,7 +831,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 deferForeignKeys,
                 inTransaction,
                 cancellationToken,
-                compilationEnabled));
+                compilationEnabled,
+                tempTriggers));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -820,7 +854,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         deferForeignKeys,
                         inTransaction,
                         cancellationToken,
-                        compilationEnabled);
+                        compilationEnabled,
+                        tempTriggers);
                 }
                 catch (EmbeddedConflictFailException)
                 {
@@ -873,7 +908,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         deferForeignKeys,
                         inTransaction,
                         cancellationToken,
-                        compilationEnabled);
+                        compilationEnabled,
+                        tempTriggers);
                 }
                 catch (EmbeddedConflictFailException)
                 {
@@ -908,7 +944,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     deferForeignKeys,
                     inTransaction,
                     cancellationToken,
-                    compilationEnabled);
+                    compilationEnabled,
+                    tempTriggers);
 
             var working = new SchemaCatalog(_tables, _views, _triggers).Clone();
             ExecutionResult result;
@@ -924,7 +961,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     deferForeignKeys,
                     inTransaction,
                     cancellationToken,
-                    compilationEnabled);
+                    compilationEnabled,
+                    tempTriggers);
             }
             catch (EmbeddedConflictFailException)
             {
@@ -940,6 +978,131 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             return result;
         }
+    }
+
+    /// <summary>
+    /// Executes one statement from a temp trigger body that targets this database while another
+    /// database is running the statement that fired the trigger. The outer context supplies the
+    /// OLD/NEW row and the recursion guard so the body behaves exactly like a local trigger body.
+    /// </summary>
+    internal ExecutionResult ExecuteTriggerBodyStatement(
+        ParsedStatement statement,
+        SchemaCatalog catalog,
+        QueryContext outer)
+    {
+        lock (_gate)
+        {
+            if (_readOnly && MayMutate(statement))
+                throw new EmbeddedSqlException("attempt to write a readonly database");
+
+            var context = new QueryContext(
+                catalog.Tables,
+                new Dictionary<string, SourceData>(StringComparer.OrdinalIgnoreCase),
+                catalog.Views,
+                catalog.Triggers,
+                InsideTrigger: true,
+                LastInsertRowId: outer.LastInsertRowId,
+                ForeignKeysEnabled: outer.ForeignKeysEnabled,
+                DeferForeignKeys: outer.DeferForeignKeys,
+                InTransaction: outer.InTransaction,
+                RecursiveTriggersEnabled: outer.RecursiveTriggersEnabled,
+                ActiveTriggers: outer.ActiveTriggers,
+                TriggerDepth: outer.TriggerDepth,
+                TriggerRow: outer.TriggerRow,
+                CancellationToken: outer.CancellationToken,
+                StatementState: new StatementExecutionState(outer.LastInsertRowId),
+                CompilationEnabled: false);
+            return statement switch
+            {
+                InsertStatement insert => ExecuteDmlWithAutoIncrementState(
+                    context,
+                    scoped => ExecuteInsert(insert, EmptyParameters, scoped)),
+                UpdateStatement update => ExecuteDmlWithAutoIncrementState(
+                    context,
+                    scoped => ExecuteUpdate(update, EmptyParameters, scoped)),
+                DeleteStatement delete => ExecuteDmlWithAutoIncrementState(
+                    context,
+                    scoped => ExecuteDelete(delete, EmptyParameters, scoped)),
+                QueryStatement query => ExecuteQuery(query, EmptyParameters, context, outerRow: null),
+                _ => throw new EmbeddedSqlException(
+                    $"unsupported trigger body statement {statement.GetType().Name}"),
+            };
+        }
+    }
+
+    /// <summary>The live catalog dictionaries, for connection-owned temp schema bookkeeping.</summary>
+    internal SchemaCatalog LiveCatalog
+    {
+        get
+        {
+            lock (_gate)
+                return new SchemaCatalog(_tables, _views, _triggers);
+        }
+    }
+
+    /// <summary>
+    /// Publishes the working catalog a temp trigger body mutated. The connection only calls this
+    /// once the statement that fired the trigger succeeded, so a failed statement discards the
+    /// working copy exactly like a failed local statement does.
+    /// </summary>
+    internal void PublishTriggerBodyCatalog(SchemaCatalog catalog, bool forceFullRewrite)
+    {
+        lock (_gate)
+        {
+            _inMemoryPragmaHeader = _inMemoryPragmaHeader with
+            {
+                SchemaVersion = unchecked(_inMemoryPragmaHeader.SchemaVersion + 1),
+            };
+            if (_fileStore is null)
+                PublishCatalog(catalog);
+            else
+                PersistFileCatalog(catalog, forceFullRewrite: forceFullRewrite);
+        }
+    }
+
+    internal bool HasTriggers
+    {
+        get
+        {
+            lock (_gate)
+                return _triggers.Count > 0;
+        }
+    }
+
+    internal IReadOnlyList<TriggerDefinition> SnapshotTriggers()
+    {
+        lock (_gate)
+            return _triggers.Values.ToArray();
+    }
+
+    internal void MarkSchemaMutated()
+    {
+        lock (_gate)
+        {
+            _inMemoryPragmaHeader = _inMemoryPragmaHeader with
+            {
+                SchemaVersion = unchecked(_inMemoryPragmaHeader.SchemaVersion + 1),
+            };
+            _version++;
+        }
+    }
+
+    // A temp trigger that watches a table in another schema is dropped with that table, matching
+    // SQLite, but the trigger lives in the temp catalog so the connection has to prune it there.
+    internal static bool RemoveForeignTargetTriggers(
+        SchemaCatalog catalog,
+        string targetSchema,
+        string tableName)
+    {
+        var orphaned = catalog.Triggers
+            .Where(entry => entry.Value.TargetSchema is { } schema
+                && schema.Equals(targetSchema, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(entry.Value.TableName, tableName, StringComparison.OrdinalIgnoreCase))
+            .Select(entry => entry.Key)
+            .ToArray();
+        foreach (var trigger in orphaned)
+            catalog.Triggers.Remove(trigger);
+        return orphaned.Length != 0;
     }
 
     internal static bool MayMutate(ParsedStatement statement) => statement is
@@ -1765,7 +1928,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        TempTriggerBridge? tempTriggers = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -1783,7 +1947,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 deferForeignKeys,
                 inTransaction,
                 cancellationToken,
-                compilationEnabled));
+                compilationEnabled,
+                tempTriggers));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1804,7 +1969,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ForeignKeyStatement: foreignKeysEnabled ? new ForeignKeyStatementState() : null,
             CancellationToken: cancellationToken,
             StatementState: new StatementExecutionState(lastInsertRowId),
-            CompilationEnabled: compilationEnabled);
+            CompilationEnabled: compilationEnabled,
+            TempTriggers: tempTriggers);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
@@ -2646,7 +2812,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private static void RemoveTriggersForTable(SchemaCatalog catalog, string tableName)
     {
         var orphaned = catalog.Triggers
-            .Where(entry => string.Equals(entry.Value.TableName, tableName, StringComparison.OrdinalIgnoreCase))
+            // A temp trigger that watches a table in another schema is stored here but is not
+            // orphaned by a drop in this schema; the owning connection cleans those up instead.
+            .Where(entry => entry.Value.TargetSchema is null
+                && string.Equals(entry.Value.TableName, tableName, StringComparison.OrdinalIgnoreCase))
             .Select(entry => entry.Key)
             .ToArray();
         foreach (var trigger in orphaned)
@@ -3025,21 +3194,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         var targetsTable = tables.ContainsKey(statement.TableName);
         var targetsView = catalog.Views.ContainsKey(statement.TableName);
-        if (IsSqliteSequenceTable(statement.TableName) && targetsTable)
-            throw new EmbeddedSqlException("cannot create trigger on system table");
-        if (statement.Timing == TriggerTiming.InsteadOf)
+        // A temp trigger may watch a table in another schema. That table lives in a database this
+        // instance cannot see, so the owning connection validates the target before routing here.
+        if (statement.TargetSchema is null)
         {
-            if (targetsTable)
-                throw new EmbeddedSqlException($"cannot create INSTEAD OF trigger on table: {statement.TableName}");
-            if (!targetsView)
-                throw new EmbeddedSqlException($"no such view: {statement.TableName}");
-        }
-        else
-        {
-            if (targetsView)
-                throw new EmbeddedSqlException($"cannot create {statement.Timing.ToString().ToUpperInvariant()} trigger on view: {statement.TableName}");
-            if (!targetsTable)
-                throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+            if (IsSqliteSequenceTable(statement.TableName) && targetsTable)
+                throw new EmbeddedSqlException("cannot create trigger on system table");
+            if (statement.Timing == TriggerTiming.InsteadOf)
+            {
+                if (targetsTable)
+                    throw new EmbeddedSqlException($"cannot create INSTEAD OF trigger on table: {statement.TableName}");
+                if (!targetsView)
+                    throw new EmbeddedSqlException($"no such view: {statement.TableName}");
+            }
+            else
+            {
+                if (targetsView)
+                    throw new EmbeddedSqlException($"cannot create {statement.Timing.ToString().ToUpperInvariant()} trigger on view: {statement.TableName}");
+                if (!targetsTable)
+                    throw new EmbeddedSqlException($"no such table: {statement.TableName}");
+            }
         }
 
         var declarationOrder = catalog.Triggers.Count == 0
@@ -3055,7 +3229,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             statement.When,
             statement.Body,
             statement.Sql,
-            declarationOrder);
+            declarationOrder,
+            statement.TargetSchema,
+            statement.Temporary);
         catalog.Triggers.Add(statement.Name, definition);
         return new ExecutionResult([], [], 0, true);
     }
@@ -3330,9 +3506,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         ValidateExpressionSchema(trigger.When, triggerRow, context, cancellationToken);
 
         ValidateExpressionSchema(trigger.When, triggerRow, context, cancellationToken);
-        foreach (var statement in trigger.Body)
+        foreach (var bodyStatement in trigger.Body)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (LocalizeTriggerBodyStatement(context, trigger, bodyStatement) is not { } statement)
+                continue;
+
             switch (statement)
             {
                 case InsertStatement insert:
@@ -9596,7 +9775,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 #endif
 
-    private static void RestoreTables(
+    internal static void RestoreTables(
         Dictionary<string, EmbeddedTable> target,
         Dictionary<string, EmbeddedTable> backup)
     {
@@ -29045,6 +29224,186 @@ public sealed class EmbeddedConnection : IDisposable
     private readonly Dictionary<EmbeddedDatabase, int> _pendingPageSizes = [];
     private bool _disposed;
 
+    /// <summary>
+    /// Tracks one outer statement's use of connection-private temp triggers. Temp triggers live in
+    /// a separate in-memory database, so firing one for a main-schema table means handing it to the
+    /// main database, and a body statement may target yet another schema. Those cross-schema writes
+    /// run against a working copy of the target catalog that is published only after the statement
+    /// that fired the trigger succeeds, mirroring how a local statement is rolled back on failure.
+    /// </summary>
+    private sealed class TempTriggerSession(EmbeddedConnection connection, EmbeddedDatabase executing)
+    {
+        private readonly Dictionary<ParsedStatement, RoutedStatement> _routes =
+            new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<EmbeddedDatabase, ForeignWrite> _foreignWrites = [];
+
+        private sealed class ForeignWrite(EmbeddedDatabase.SchemaCatalog catalog)
+        {
+            public EmbeddedDatabase.SchemaCatalog Catalog { get; } = catalog;
+
+            public bool Changed { get; set; }
+
+            public bool ForceFullCatalogRewrite { get; set; }
+        }
+
+        public bool IsForeign(ParsedStatement statement)
+            => !ReferenceEquals(Resolve(statement).Database, executing);
+
+        public ParsedStatement Localize(ParsedStatement statement) => Resolve(statement).Statement;
+
+        public ExecutionResult ExecuteForeign(
+            ParsedStatement statement,
+            EmbeddedDatabase.QueryContext outer)
+        {
+            var route = Resolve(statement);
+            if (!_foreignWrites.TryGetValue(route.Database, out var write))
+            {
+                var transaction = connection.GetTransactionState(route.Database);
+                write = new ForeignWrite((transaction?.Catalog ?? route.Database.LiveCatalog).Clone());
+                _foreignWrites.Add(route.Database, write);
+            }
+
+            var result = route.Database.ExecuteTriggerBodyStatement(route.Statement, write.Catalog, outer);
+            write.Changed |= result.Changed;
+            write.ForceFullCatalogRewrite |= result.ForceFullCatalogRewrite;
+            return result;
+        }
+
+        public void Commit()
+        {
+            foreach (var pair in _foreignWrites)
+            {
+                if (!pair.Value.Changed)
+                    continue;
+
+                if (connection.GetTransactionState(pair.Key) is { } transaction)
+                {
+                    transaction.Catalog = pair.Value.Catalog;
+                    transaction.HasChanges = true;
+                    transaction.ForceFullCatalogRewrite |= pair.Value.ForceFullCatalogRewrite;
+                    if (!ReferenceEquals(pair.Key, connection._tempDatabase))
+                        connection._transactionWriteDatabase = pair.Key;
+                }
+                else
+                {
+                    pair.Key.PublishTriggerBodyCatalog(
+                        pair.Value.Catalog,
+                        pair.Value.ForceFullCatalogRewrite);
+                }
+                if (ReferenceEquals(pair.Key, connection._tempDatabase))
+                    connection._tempInitialized = true;
+            }
+
+            _foreignWrites.Clear();
+        }
+
+        private RoutedStatement Resolve(ParsedStatement statement)
+        {
+            if (_routes.TryGetValue(statement, out var route))
+                return route;
+
+            route = connection.RouteStatement(statement);
+            _routes.Add(statement, route);
+            return route;
+        }
+    }
+
+    // Temp triggers that watch a table owned by the executing database have to be handed over
+    // explicitly: they are stored in the connection-private temp database so that they stay
+    // invisible to other connections and never reach the persistent schema.
+    private EmbeddedDatabase.TempTriggerBridge? CreateTempTriggerBridge(
+        EmbeddedDatabase executing,
+        out TempTriggerSession? session)
+    {
+        var transactionState = GetTransactionState(_tempDatabase);
+        var isTempDatabase = ReferenceEquals(executing, _tempDatabase);
+
+        // Statements that touch neither the temp database nor a temp trigger are the common case,
+        // so bail out before snapshotting the temp catalog.
+        if (!isTempDatabase
+            && (transactionState is { } pending ? pending.Catalog.Triggers.Count == 0 : !_tempDatabase.HasTriggers))
+        {
+            session = null;
+            return null;
+        }
+
+        var triggers = transactionState is { } state
+            ? state.Catalog.Triggers.Values.ToArray()
+            : _tempDatabase.SnapshotTriggers();
+        var overlay = triggers
+            .Where(trigger => trigger.TargetSchema is { } schema
+                && ReferenceEquals(FindSchemaDatabase(schema), executing))
+            .ToArray();
+
+        // The temp database also needs the bridge without an overlay: its own triggers may name
+        // their schema explicitly, and only the connection can resolve those names.
+        if (overlay.Length == 0 && !isTempDatabase)
+        {
+            session = null;
+            return null;
+        }
+
+        var scope = new TempTriggerSession(this, executing);
+        session = scope;
+        return new EmbeddedDatabase.TempTriggerBridge(
+            overlay,
+            scope.IsForeign,
+            scope.Localize,
+            scope.ExecuteForeign);
+    }
+
+    private EmbeddedDatabase? FindSchemaDatabase(string schema)
+    {
+        if (schema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+            return _tempDatabase;
+        if (schema.Equals("main", StringComparison.OrdinalIgnoreCase))
+            return _database;
+
+        return _attachedDatabases.TryGetValue(schema, out var attachment) ? attachment.Database : null;
+    }
+
+    private string? GetSchemaName(EmbeddedDatabase database)
+    {
+        if (ReferenceEquals(database, _tempDatabase))
+            return "temp";
+        if (ReferenceEquals(database, _database))
+            return "main";
+
+        foreach (var pair in _attachedDatabases)
+        {
+            if (ReferenceEquals(pair.Value.Database, database))
+                return pair.Key;
+        }
+
+        return null;
+    }
+
+    // SQLite drops the triggers that watch a dropped table or view, including temp triggers that
+    // reach across schemas. Those live in the temp catalog, so prune them here.
+    private void RemoveTempTriggersForDroppedObject(RoutedStatement routed)
+    {
+        var droppedName = routed.Statement switch
+        {
+            DropTableStatement drop => drop.Name,
+            DropViewStatement drop => drop.Name,
+            _ => null,
+        };
+        if (droppedName is null || GetSchemaName(routed.Database) is not { } schema)
+            return;
+        if (ReferenceEquals(routed.Database, _tempDatabase))
+            return;
+
+        if (GetTransactionState(_tempDatabase) is { } state)
+        {
+            if (EmbeddedDatabase.RemoveForeignTargetTriggers(state.Catalog, schema, droppedName))
+                state.HasChanges = true;
+            return;
+        }
+
+        if (EmbeddedDatabase.RemoveForeignTargetTriggers(_tempDatabase.LiveCatalog, schema, droppedName))
+            _tempDatabase.MarkSchemaMutated();
+    }
+
     private sealed class AttachedDatabase : IDisposable
     {
         public AttachedDatabase(
@@ -29526,6 +29885,7 @@ public sealed class EmbeddedConnection : IDisposable
                 TransactionDatabaseState? transactionState = null;
                 EmbeddedDatabase.SchemaCatalog? statementCatalog = null;
                 HashSet<EmbeddedDatabase.ForeignKeyViolation>? deferredBefore = null;
+                var tempTriggers = CreateTempTriggerBridge(routed.Database, out var tempTriggerSession);
                 try
                 {
                     ExecutionResult result;
@@ -29553,7 +29913,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 inTransaction: false,
                                 cancellationToken,
                                 compilationEnabled: !routed.IsAttached
-                                    && !ReferenceEquals(routed.Database, _tempDatabase));
+                                    && !ReferenceEquals(routed.Database, _tempDatabase),
+                                tempTriggers);
                         }
                         else
                         {
@@ -29571,7 +29932,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 inTransaction: true,
                                 cancellationToken,
                                 compilationEnabled: !routed.IsAttached
-                                    && !ReferenceEquals(routed.Database, _tempDatabase));
+                                    && !ReferenceEquals(routed.Database, _tempDatabase),
+                                tempTriggers);
                             if (EmbeddedDatabase.MayMutate(routed.Statement))
                                 cancellationToken.ThrowIfCancellationRequested();
                         }
@@ -29581,6 +29943,8 @@ public sealed class EmbeddedConnection : IDisposable
                         if (mutationReserved)
                             ReleaseTransactionMutation(routed.Database);
                     }
+                    if (result.Changed)
+                        RemoveTempTriggersForDroppedObject(routed);
                     if (transactionState is not null)
                     {
                         if (result.Changed)
@@ -29616,6 +29980,7 @@ public sealed class EmbeddedConnection : IDisposable
                     if (ReferenceEquals(routed.Database, _tempDatabase))
                         _tempInitialized = true;
 
+                    tempTriggerSession?.Commit();
                     return result;
                 }
                 catch (EmbeddedConflictRollbackException exception)
@@ -29659,6 +30024,7 @@ public sealed class EmbeddedConnection : IDisposable
                     if (ReferenceEquals(routed.Database, _tempDatabase))
                         _tempInitialized = true;
 
+                    tempTriggerSession?.Commit();
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
                 catch (EmbeddedTriggerDepthException exception)
@@ -29679,6 +30045,7 @@ public sealed class EmbeddedConnection : IDisposable
                         transactionState.HasChanges = true;
                         if (!ReferenceEquals(routed.Database, _tempDatabase))
                             _transactionWriteDatabase = routed.Database;
+                        tempTriggerSession?.Commit();
                     }
                     if (ReferenceEquals(routed.Database, _tempDatabase))
                         _tempInitialized = true;
@@ -30051,6 +30418,7 @@ public sealed class EmbeddedConnection : IDisposable
         {
             CreateTableStatement create => RouteNamedStatement(create.Name, name => create with { Name = name }),
             CreateTriggerStatement createTrigger => RouteCreateTrigger(createTrigger),
+            CreateViewStatement createView => RouteCreateView(createView),
             DropTableStatement drop => RouteExistingNamedStatement(
                 drop.Name,
                 ManagedSchemaObjectKind.Table,
@@ -30382,13 +30750,6 @@ public sealed class EmbeddedConnection : IDisposable
 
     private RoutedStatement RouteCreateTrigger(CreateTriggerStatement statement)
     {
-        if (ExpressionContainsSchemaQualification(statement.When)
-            || statement.Body.Any(ContainsSchemaQualification))
-        {
-            throw new EmbeddedSqlException(
-                "Managed persistent trigger bodies cannot reference another database schema.");
-        }
-
         var hasTriggerSchema = ManagedSchemaName.TrySplit(
             statement.Name,
             out var triggerSchema,
@@ -30397,29 +30758,91 @@ public sealed class EmbeddedConnection : IDisposable
             statement.TableName,
             out var targetSchema,
             out var targetName);
-        if (hasTriggerSchema
-            && hasTargetSchema
-            && !string.Equals(triggerSchema, targetSchema, StringComparison.OrdinalIgnoreCase))
-        {
+        var localTargetName = hasTargetSchema ? targetName : statement.TableName;
+
+        // SQLite resolves an unqualified trigger target temp-first and stores the trigger in the
+        // schema that owns that object, so a trigger on a temp table is implicitly temporary.
+        var resolvedTargetSchema = hasTargetSchema
+            ? targetSchema
+            : FindExistingObjectSchema(statement.TableName, ManagedSchemaObjectKind.Table)
+                ?? FindExistingObjectSchema(statement.TableName, ManagedSchemaObjectKind.View)
+                ?? "main";
+        var homeSchema = statement.Temporary
+            ? "temp"
+            : hasTriggerSchema
+                ? triggerSchema
+                : resolvedTargetSchema;
+        var temporary = homeSchema.Equals("temp", StringComparison.OrdinalIgnoreCase);
+        var targetIsForeign = !homeSchema.Equals(resolvedTargetSchema, StringComparison.OrdinalIgnoreCase);
+        if (targetIsForeign && !temporary)
             throw new EmbeddedSqlException("CREATE TRIGGER cannot span managed database schemas.");
+
+        // A persistent trigger body only ever runs inside its own database. A temp trigger body is
+        // dispatched by this connection, so it may name objects in other schemas.
+        if (ExpressionContainsSchemaQualification(statement.When)
+            || !temporary && statement.Body.Any(ContainsSchemaQualification))
+        {
+            throw new EmbeddedSqlException(
+                "Managed persistent trigger bodies cannot reference another database schema.");
         }
 
-        var schema = hasTriggerSchema
-            ? triggerSchema
-            : hasTargetSchema
-                ? targetSchema
-                : "main";
         return RouteSchema(
-            schema,
-            hasTargetSchema ? targetName : statement.TableName,
-            localTargetName => statement with
+            homeSchema,
+            localTargetName,
+            local => statement with
             {
                 Name = hasTriggerSchema ? triggerName : statement.Name,
-                TableName = localTargetName,
-                Sql = RemoveSchemaQualifier(
-                    statement.Sql,
-                    schema,
-                    (hasTriggerSchema ? 1 : 0) + (hasTargetSchema ? 1 : 0)),
+                TableName = local,
+                Temporary = temporary,
+                TargetSchema = targetIsForeign ? resolvedTargetSchema : null,
+                // SQLite keeps a written target qualifier in the stored definition but drops the
+                // qualifier from the trigger's own name.
+                Sql = temporary
+                    ? RemoveSchemaQualifier(statement.Sql, homeSchema, hasTriggerSchema ? 1 : 0)
+                    : RemoveSchemaQualifier(
+                        statement.Sql,
+                        homeSchema,
+                        (hasTriggerSchema ? 1 : 0) + (hasTargetSchema ? 1 : 0)),
+            });
+    }
+
+    private RoutedStatement RouteCreateView(CreateViewStatement statement)
+    {
+        var hasViewSchema = ManagedSchemaName.TrySplit(statement.Name, out var viewSchema, out var viewName);
+        var homeSchema = statement.Temporary
+            ? "temp"
+            : hasViewSchema
+                ? viewSchema
+                : "main";
+        if (!statement.Temporary
+            && !homeSchema.Equals("main", StringComparison.OrdinalIgnoreCase)
+            && ContainsSchemaQualification(statement))
+        {
+            throw new EmbeddedSqlException("This schema-qualified statement is not supported by managed ATTACH.");
+        }
+
+        // A temp view is stored in the connection-private temp database, and the managed engine
+        // evaluates a view inside the database that owns it, so a body reaching another schema has
+        // to be rejected outright instead of failing later with a confusing "no such table".
+        if (statement.Temporary)
+        {
+            var schemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            CollectQuerySchemas(statement.Query, schemas, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            if (schemas.Select(ResolveCollectedSchema)
+                .Any(schema => !schema.Equals("temp", StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new EmbeddedSqlException(
+                    "Managed temporary views can only reference objects in the temp schema.");
+            }
+        }
+
+        return RouteSchema(
+            homeSchema,
+            hasViewSchema ? viewName : statement.Name,
+            local => statement with
+            {
+                Name = local,
+                Sql = RemoveSchemaQualifier(statement.Sql, homeSchema, hasViewSchema ? 1 : 0),
             });
     }
 
@@ -30798,6 +31221,8 @@ public sealed class EmbeddedConnection : IDisposable
             case ColumnExpression:
             case StarExpression:
             case QualifiedStarExpression:
+            case CurrentTimeExpression:
+            case RaiseExpression:
                 return;
             case ScalarSubqueryExpression scalarSubquery:
                 CollectQuerySchemas(scalarSubquery.Query, schemas, commonTableExpressions);

@@ -10,6 +10,7 @@ internal sealed class SqlParser
     private readonly Dictionary<string, int> _namedParameterIndices = new(StringComparer.Ordinal);
     private int _maximumParameterIndex;
     private bool _inTriggerBody;
+    private (int Offset, int Length)? _temporaryKeywordSpan;
 
     private SqlParser(string sql, SqlParameterMap parameterMap)
     {
@@ -443,13 +444,19 @@ internal sealed class SqlParser
 
     private ParsedStatement ParseCreate()
     {
+        var temporaryKeyword = _lexer.Current;
         var temporary = ConsumeKeyword("TEMP") || ConsumeKeyword("TEMPORARY");
         if (temporary)
         {
-            if (CurrentIsKeyword("VIEW") || CurrentIsKeyword("TRIGGER"))
-                throw Error("Temporary triggers and views are not supported by the managed engine.");
+            // sqlite_temp_schema stores the definition without the TEMP keyword, so remember
+            // where it was and elide it when the object SQL is captured.
+            _temporaryKeywordSpan = (temporaryKeyword.Offset, temporaryKeyword.Text.Length);
+            if (ConsumeKeyword("VIEW"))
+                return ParseCreateView(temporary: true);
+            if (ConsumeKeyword("TRIGGER"))
+                return ParseCreateTrigger(temporary: true);
             if (!CurrentIsKeyword("TABLE"))
-                throw Error("Only temporary tables are supported by the managed engine.");
+                throw Error("Only temporary tables, views, and triggers are supported by the managed engine.");
 
             return ParseCreateTable(temporary: true);
         }
@@ -461,9 +468,9 @@ internal sealed class SqlParser
         if (ConsumeKeyword("INDEX"))
             return ParseCreateIndex(unique: false);
         if (ConsumeKeyword("VIEW"))
-            return ParseCreateView();
+            return ParseCreateView(temporary: false);
         if (ConsumeKeyword("TRIGGER"))
-            return ParseCreateTrigger();
+            return ParseCreateTrigger(temporary: false);
         if (ConsumeKeyword("VIRTUAL"))
         {
             ExpectKeyword("TABLE");
@@ -930,10 +937,17 @@ internal sealed class SqlParser
         return new DropIndexStatement(ParseSchemaQualifiedName(), ifExists);
     }
 
-    private ParsedStatement ParseCreateView()
+    private ParsedStatement ParseCreateView(bool temporary)
     {
         var ifNotExists = ParseIfNotExists();
         var name = ParseSchemaQualifiedName();
+        if (temporary
+            && ManagedSchemaName.TrySplit(name, out var viewSchema, out _)
+            && !viewSchema.Equals("temp", StringComparison.OrdinalIgnoreCase))
+        {
+            throw Error("temporary table name must be unqualified");
+        }
+
         IReadOnlyList<string>? columns = null;
         if (Consume(TokenKind.LeftParen))
         {
@@ -946,13 +960,15 @@ internal sealed class SqlParser
             throw Error("Expected a SELECT query in the view definition.");
 
         var query = ParseQuery();
-        return new CreateViewStatement(name, columns, query, NormalizeObjectSql(), ifNotExists);
+        return new CreateViewStatement(name, columns, query, NormalizeObjectSql(), ifNotExists, temporary);
     }
 
-    private ParsedStatement ParseCreateTrigger()
+    private ParsedStatement ParseCreateTrigger(bool temporary)
     {
         var ifNotExists = ParseIfNotExists();
         var name = ParseSchemaQualifiedName();
+        if (temporary && ManagedSchemaName.TrySplit(name, out _, out _))
+            throw Error("temporary trigger may not have qualified name");
 
         var timing = TriggerTiming.Before;
         if (ConsumeKeyword("BEFORE"))
@@ -1005,7 +1021,8 @@ internal sealed class SqlParser
                 when,
                 body,
                 NormalizeObjectSql(),
-                ifNotExists);
+                ifNotExists,
+                temporary);
         }
         finally
         {
@@ -1050,7 +1067,7 @@ internal sealed class SqlParser
     private ParsedStatement ParseDropView()
     {
         var ifExists = ParseIfExists();
-        return new DropViewStatement(ExpectIdentifier(), ifExists);
+        return new DropViewStatement(ParseSchemaQualifiedName(), ifExists);
     }
 
     private ParsedStatement ParseDropTrigger()
@@ -1080,9 +1097,19 @@ internal sealed class SqlParser
 
     // Views and triggers have no AST-to-SQL printer, so sqlite_master exposes the original
     // statement text with trailing terminators trimmed to match SQLite's stored schema.
+    // SQLite also drops the TEMP keyword from the definition it records in sqlite_temp_schema.
     private string NormalizeObjectSql()
     {
-        var text = _sql.Trim();
+        var text = _sql;
+        if (_temporaryKeywordSpan is { } keyword)
+        {
+            var end = keyword.Offset + keyword.Length;
+            while (end < text.Length && char.IsWhiteSpace(text[end]))
+                end++;
+            text = text.Remove(keyword.Offset, end - keyword.Offset);
+        }
+
+        text = text.Trim();
         while (text.EndsWith(';'))
             text = text[..^1].TrimEnd();
 

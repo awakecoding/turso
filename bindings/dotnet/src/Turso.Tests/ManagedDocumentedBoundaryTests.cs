@@ -34,8 +34,6 @@ public sealed class ManagedDocumentedBoundaryTests
         "UPDATE OR REPLACE t SET a = 1",
         "UPDATE t AS x SET b = 'q'",
         "DELETE FROM t AS x WHERE x.a = 99",
-        "CREATE TEMP VIEW v AS SELECT 1",
-        "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
         "BEGIN CONCURRENT",
         "ANALYZE",
         "SELECT * FROM pragma_table_info('t')",

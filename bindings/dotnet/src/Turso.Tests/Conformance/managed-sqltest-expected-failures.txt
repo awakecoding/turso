@@ -142,7 +142,6 @@ alter_table.sqltest::alter-table-rename-column-trigger-round-trip-update-of | ex
 alter_table.sqltest::alter-table-rename-column-trigger-round-trip-fires | expected success but got error: error in trigger core_ai after rename column: no such column: NEW.row_rank
 alter_table.sqltest::alter-table-rename-column-trigger-multi-hop-rename | expected success but got error: error in trigger trig1 after rename column: no such column: NEW.b
 alter_table.sqltest::alter-table-rename-column-temp-trigger-main-cross-table | expected success but got error: no such table: src_temp_main
-alter_table.sqltest::alter-table-rename-column-temp-table-trigger-main-delete-target | expected success but got error: error in trigger trig_temp_delete after rename column: no such table: main_delete_log
 alter_table.sqltest::alter-table-rename-column-temp-trigger-main-alias-cross-table | expected success but got error: no such table: src_temp_main_alias
 alter_table.sqltest::alter-table-rename-temp-table-invalid-temp-trigger-missing-main-table | error 'error in trigger trig_invalid_temp_rename after rename table: no such table: missing_main_tbl' does not match pattern 'error in trigger trig_invalid_temp
 alter_table.sqltest::alter-table-rename-table-rewrites-temp-trigger-on-temp-table | expected success but got error: no such table: rename_src_main
@@ -847,18 +846,6 @@ temp_tables.sqltest::temp-store-change-survives-rollback-before-temp-db-exists |
 temp_tables_mvcc.sqltest::pragma-temp-journal-mode-mvcc-is-ignored | expected 2 row(s), got 2 row(s); row 0 expected 'wal' but was 'memory'
 temp_tables_mvcc.sqltest::begin-concurrent-still-fails-after-temp-journal-mode-mvcc | error 'Expected End. At SQL offset 6.' does not match pattern 'Concurrent transaction mode is only supported when MVCC is enabled'
 temp_tables_mvcc.sqltest::temp-autoincrement-is-allowed-when-main-db-is-mvcc | expected 3 row(s), got 3 row(s); row 0 expected 'mvcc' but was 'wal'
-temp_trigger.sqltest::temp-trigger-insert-on-main-table | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-in-temp-schema | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-on-temp-table | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-update-on-main-table | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-delete-on-main-table | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-cross-db-body | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-drop | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-orphan-on-drop-table | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-if-not-exists | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-multiple-on-same-table | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::temp-trigger-when-clause | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
-temp_trigger.sqltest::drop-table-main-preserves-temp-trigger-on-temp-shadow | expected success but got error: Temporary triggers and views are not supported by the managed engine. At SQL offset 12.
 total-changes.sqltest::total-changes-insert-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '0'
 total-changes.sqltest::total-changes-insert-in-transaction-after-commit | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '0'
 total-changes.sqltest::total-changes-multiple-stmts-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '4' but was '2'
@@ -889,8 +876,6 @@ trigger_attach_regression.sqltest::trigger-cross-db-when-subquery-reject | error
 trigger_attach_regression.sqltest::trigger-explicit-main-qualification | expected success but got error: Managed persistent trigger bodies cannot reference another database schema.
 trigger_attach_regression.sqltest::trigger-attached-db-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 trigger_attach_regression.sqltest::drop-trigger-finds-attached-trigger-without-qualifier | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
-trigger_attach_regression.sqltest::trigger-temp-db-same-db | expected success but got error: Managed persistent trigger bodies cannot reference another database schema.
-trigger_attach_regression.sqltest::trigger-temp-db-can-reference-main | expected success but got error: Managed persistent trigger bodies cannot reference another database schema.
 trigger_attach_regression.sqltest::trigger-attached-db-cross-to-main-reject | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_aux_cross canno
 trigger_attach_regression.sqltest::trigger-cross-db-nested-subquery-in-insert | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_ins_cross canno
 trigger_attach_regression.sqltest::trigger-cross-db-update-set-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_upd_cross canno
