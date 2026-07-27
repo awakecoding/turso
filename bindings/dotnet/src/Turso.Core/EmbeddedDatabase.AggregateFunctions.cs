@@ -27,7 +27,7 @@ public sealed partial class EmbeddedDatabase
         var items = new List<SqlValue>(rows.Count);
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             items.Add(Evaluate(function.Arguments[0], parameters, row, context));
         }
 
@@ -45,7 +45,7 @@ public sealed partial class EmbeddedDatabase
         var members = new List<SqlValue>(checked(rows.Count * 2));
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var name = Evaluate(function.Arguments[0], parameters, row, context);
             var value = Evaluate(function.Arguments[1], parameters, row, context);
 

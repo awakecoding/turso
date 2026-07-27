@@ -71,20 +71,36 @@ public sealed class ManagedDocumentedBoundaryTests
     }
 
     [Test]
-    [TestCase("Authorizer")]
-    [TestCase("UpdateHook")]
-    [TestCase("CommitHook")]
-    [TestCase("RollbackHook")]
-    [TestCase("Trace")]
-    [TestCase("ProgressHandler")]
     [TestCase("CreateModule")]
-    public void NoHookOrModuleSurfaceIsPublished(string fragment)
+    public void NoModuleSurfaceIsPublished(string fragment)
     {
         typeof(SqliteConnection)
             .GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static)
             .Select(member => member.Name)
             .Should()
             .NotContain(name => name.Contains(fragment, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Update, commit and rollback hooks, the authorizer, tracing and the progress handler moved
+    /// out of the "Not implemented" list in <c>bindings/dotnet/Readme.md</c>, so this asserts the
+    /// documented direction of that scope change: the surface must stay published. Behavior lives
+    /// in <c>ManagedHookAndAuthorizerTests</c> and <c>ManagedHookSqliteDifferentialTests</c>.
+    /// </summary>
+    [Test]
+    [TestCase("SetUpdateHook")]
+    [TestCase("SetCommitHook")]
+    [TestCase("SetRollbackHook")]
+    [TestCase("SetAuthorizer")]
+    [TestCase("SetTraceHandler")]
+    [TestCase("SetProgressHandler")]
+    public void TheDocumentedHookSurfaceIsPublished(string member)
+    {
+        typeof(SqliteConnection)
+            .GetMembers(BindingFlags.Public | BindingFlags.Instance)
+            .Select(candidate => candidate.Name)
+            .Should()
+            .Contain(member);
     }
 
     private static SqliteConnection Open()

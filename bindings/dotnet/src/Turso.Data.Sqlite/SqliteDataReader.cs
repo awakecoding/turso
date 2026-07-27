@@ -886,6 +886,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             return string.Empty;
 
         var table = UnquoteIdentifier(match.Groups["table"].Value);
+        using var suspension = _command.Connection.SuspendHooks();
         using var command = _command.Connection.CreateCommand();
         command.CommandText = $"PRAGMA table_info({QuoteIdentifier(table)});";
         using var reader = command.ExecuteReader();
@@ -983,6 +984,7 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (_command.Connection is null)
             return columns;
 
+        using var suspension = _command.Connection.SuspendHooks();
         using (var command = _command.Connection.CreateCommand())
         {
             command.CommandText = $"PRAGMA table_info({QuoteIdentifier(tableName)});";

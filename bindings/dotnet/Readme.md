@@ -67,11 +67,37 @@ measured 2-3x slower at 100-400 rows. Batch writes into explicit transactions,
 keep individual tables modest, and benchmark your own workload before adopting
 the managed provider for write-heavy use.
 
+### Hooks, authorizer, tracing, and the progress handler
+
+`SqliteConnection` publishes `SetUpdateHook`, `SetCommitHook`, `SetRollbackHook`,
+`SetAuthorizer`, `SetTraceHandler`, and `SetProgressHandler`. Their semantics were
+derived from measurements of real SQLite and are re-checked against it at test
+time by `ManagedHookSqliteDifferentialTests`, so the surprising parts match:
+`INSERT OR REPLACE` does not report its implicit delete, `WITHOUT ROWID` tables
+report nothing, `sqlite_sequence` maintenance is invisible, a vetoing commit hook
+turns the commit into a rollback reported as `SQLITE_CONSTRAINT` (19), and the
+rollback hook fires for an explicit `ROLLBACK` even when nothing changed.
+
+Known divergences from SQLite:
+
+| Surface | Managed behavior |
+| --- | --- |
+| Update hook, unfiltered `DELETE FROM t` | Reports one change per row. SQLite reports none because it replaces the statement with a truncate; suppressing the notifications to imitate that would leave a change-tracking consumer silently stale. |
+| Commit hook | Not consulted for `VACUUM`, `ATTACH`/`DETACH`, `CREATE TABLE ... AS SELECT`, header pragma writes such as `PRAGMA user_version = n`, or incremental blob writes, because those bypass the statement commit path. |
+| Reentrancy | Using the connection from inside a hook throws. SQLite leaves this undefined and in practice permits it; the managed engine cannot, because a reentrant read would observe the published catalog rather than the in-flight working copy and would therefore return stale rows. |
+| Trace | Reports the prepared SQL text without expanding parameters, matching `sqlite3_trace_v2`'s `SQLITE_TRACE_STMT` rather than the legacy `sqlite3_trace`. The provider's own column-metadata probes are excluded, because native SQLite answers those through `sqlite3_column_decltype` without preparing a statement. |
+| Progress handler | Counts managed row-execution steps rather than VDBE opcodes, so the interval is not comparable to SQLite's. The interrupt semantics are: a `true` return fails the statement with `SQLITE_INTERRUPT` (9). |
+| Provider and cache scope | Callbacks require `Local Provider=Managed`, and are rejected on managed shared-memory databases for the same reason connection-local functions are: the catalog is shared across connections. |
+
+`sqlite3_profile` and `sqlite3_trace_v2`'s row and close events have no managed
+equivalent and are not published, because the managed engine has no per-statement
+wall-clock accounting that would make the reported numbers mean anything.
+
 ### Not implemented
 
-- Update, commit, and rollback hooks; the authorizer; trace and profile
-  callbacks; and the progress handler.
 - Virtual-table modules and `CREATE VIRTUAL TABLE`, including FTS and R-Tree.
+- Profile callbacks (`sqlite3_profile`), and the row/close events of
+  `sqlite3_trace_v2`.
 - `DbDataAdapter`/`DataSet` support. `SqliteConnection.GetSchema` is implemented;
   `TursoConnection` inherits the throwing base implementation.
 - Raw `sqlite3*` handle interop: `SqliteConnection.Handle` returns `null`.
