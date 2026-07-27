@@ -442,6 +442,11 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 WorkingDirectory = Path.GetDirectoryName(projectPath)!,
             },
         };
+        // Matches RunDotnet: persistent MSBuild worker nodes outlive the command that spawned
+        // them, so a test harness that shells out repeatedly can inherit a wedged node from an
+        // earlier invocation. Neither variable changes what is built.
+        process.StartInfo.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        process.StartInfo.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
         process.StartInfo.ArgumentList.Add("pack");
         process.StartInfo.ArgumentList.Add(projectPath);
         process.StartInfo.ArgumentList.Add("--configuration");
@@ -457,7 +462,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         process.Start();
         var output = process.StandardOutput.ReadToEndAsync();
         var error = process.StandardError.ReadToEndAsync();
-        process.WaitForExit();
+        WaitForChildProcess(process, output, error, $"dotnet pack {projectPath}");
         Task.WaitAll(output, error);
         var result = output.Result + Environment.NewLine + error.Result;
         Assert.That(process.ExitCode, Is.EqualTo(0), result);
@@ -948,9 +953,45 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         process.Start();
         var output = process.StandardOutput.ReadToEndAsync();
         var error = process.StandardError.ReadToEndAsync();
-        process.WaitForExit();
+        WaitForChildProcess(process, output, error, $"dotnet {string.Join(' ', arguments)}");
         Task.WaitAll(output, error);
         Assert.That(process.ExitCode, Is.EqualTo(0), output.Result + Environment.NewLine + error.Result);
+    }
+
+    // These helpers drive real `dotnet` child processes, and an unbounded WaitForExit turns a
+    // stuck child into a silent stall that consumes the entire CI job timeout and reports only
+    // "cancelled". Bounding the wait cannot hide a failure - it can only convert a hang into a
+    // failure that names the command and carries whatever the child managed to emit first.
+    // Kept below the CI harness's inactivity budget so the failing command is named here,
+    // with its output, instead of the whole run being aborted by the outer hang detector.
+    private static readonly TimeSpan ChildProcessTimeout = TimeSpan.FromMinutes(6);
+
+    private static void WaitForChildProcess(
+        Process process,
+        Task<string> output,
+        Task<string> error,
+        string description)
+    {
+        if (process.WaitForExit((int)ChildProcessTimeout.TotalMilliseconds))
+            return;
+
+        var partial = string.Empty;
+        try
+        {
+            process.Kill(entireProcessTree: true);
+            Task.WaitAll([output, error], TimeSpan.FromSeconds(30));
+            partial = string.Concat(
+                output.IsCompletedSuccessfully ? output.Result : string.Empty,
+                Environment.NewLine,
+                error.IsCompletedSuccessfully ? error.Result : string.Empty);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or AggregateException)
+        {
+        }
+
+        Assert.Fail(
+            $"'{description}' produced no exit within {ChildProcessTimeout.TotalMinutes} minutes and was killed. "
+            + $"Output captured before the kill:{Environment.NewLine}{partial}");
     }
 
     // Cleanup on the failure path must never replace the real assertion failure with a Windows
