@@ -110,7 +110,20 @@ Additional current behavior:
    readers, the single writer, and checkpoints inside the process; the shm bytes
    are a secondary boundary layered underneath it.
 
-### 1.4 Busy semantics today
+### 1.4 MVCC is unsupported
+
+The managed engine does not implement `journal_mode=mvcc`. It has no durable
+row-version lifecycle, logical-log recovery, checkpoint protocol, or
+cross-process snapshot contract for that mode. A physical-database
+`PRAGMA journal_mode=mvcc` request is therefore an unsupported journal-mode
+request: it leaves the current durable mode unchanged and never persists an
+MVCC marker. In-memory databases continue to report their fixed `memory` mode.
+
+No managed MVCC implementation is scheduled until durable version recovery and
+concurrency invariants are designed and independently tested. The existing
+Stage 0 WAL ownership boundary is not an MVCC substitute.
+
+### 1.5 Busy semantics today
 
 - Every role converts external contention into `SqlitePagerBusyException` whose
   `Operation` is the requested role and whose `Timeout` is the configured pager
