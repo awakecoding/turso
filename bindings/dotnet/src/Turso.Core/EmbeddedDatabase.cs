@@ -13418,11 +13418,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
             return false;
         }
 
-        // A window select that also carries a plain (non-window) aggregate or GROUP BY is an
-        // evaluator error ("window functions cannot be combined with aggregates or GROUP BY");
-        // decline so the evaluator raises it. ContainsAggregate is false for window calls.
-        if (select.Projections.Any(projection => ContainsAggregate(projection.Expression))
-            || select.OrderBy.Any(term => ContainsAggregate(term.Expression)))
+        // A window select that also carries a plain (non-window) aggregate or GROUP BY runs the
+        // window pass over grouped rows (ExecuteGroupedWindowSelect); this route only knows how to
+        // window over scanned rows, so decline. An aggregate nested inside a window call's own
+        // subtree - sum(count(*)) OVER () - groups the statement just the same.
+        if (select.Projections.Any(projection => ContainsAggregateAcrossWindows(projection.Expression))
+            || select.OrderBy.Any(term => ContainsAggregateAcrossWindows(term.Expression)))
         {
             return false;
         }
@@ -16423,9 +16424,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var offset = statement.Offset is null
             ? 0
             : Math.Max(0, RequireLimitInteger(Evaluate(statement.Offset, parameters, outerRow, context)));
-        var hasAggregate = statement.Projections.Any(projection => ContainsAggregate(projection.Expression))
+        // An aggregate nested inside a window call - sum(count(*)) OVER (ORDER BY count(*)) - is
+        // evaluated in the aggregate pass just like a top-level one, so it makes this an aggregate
+        // query even when nothing outside the window call aggregates.
+        var hasAggregate = statement.Projections.Any(projection =>
+                ContainsAggregateAcrossWindows(projection.Expression))
             || statement.Having is not null && ContainsAggregate(statement.Having)
-            || statement.OrderBy.Any(term => ContainsAggregate(term.Expression));
+            || statement.OrderBy.Any(term => ContainsAggregateAcrossWindows(term.Expression));
         if (statement.Having is not null && !hasAggregate && statement.GroupBy.Count == 0)
             throw new EmbeddedSqlException("HAVING clause on a non-aggregate query");
         var hasWindow = windowFunctions.Count > 0;
@@ -16435,6 +16440,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException("misuse of window function in GROUP BY clause");
         if (statement.Having is not null && ContainsWindowFunction(statement.Having))
             throw new EmbeddedSqlException("misuse of window function in HAVING clause");
+
+        // The window pass runs after aggregation, so a window call handed to an aggregate has no
+        // pass left to be evaluated in.
+        var windowInsideAggregate = statement.Projections
+                .Select(projection => FindWindowFunctionInsideAggregate(projection.Expression))
+                .FirstOrDefault(candidate => candidate is not null)
+            ?? resolvedOrderBy
+                .Select(term => FindWindowFunctionInsideAggregate(term.Expression))
+                .FirstOrDefault(candidate => candidate is not null);
+        if (windowInsideAggregate is not null)
+            throw new EmbeddedSqlException($"misuse of window function {windowInsideAggregate.Name}()");
         var sourceColumns = GetSourceColumns(statement.Source, context);
         var outputColumns = GetOutputColumns(statement.Source, context);
         var rawOutputColumns = GetRawOutputColumns(statement.Source, context);
@@ -16472,8 +16488,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var columnNames = GetColumnNames(statement.Projections, outputColumns, rawOutputColumns);
         if (hasWindow)
         {
+            // SQLite aggregates first and runs the window pass over the surviving grouped rows, so
+            // a frame here sees one row per group rather than the base rows.
             if (hasAggregate || statement.GroupBy.Count > 0)
-                throw new EmbeddedSqlException("window functions cannot be combined with aggregates or GROUP BY");
+            {
+                return ExecuteGroupedWindowSelect(
+                    statement,
+                    selectedRows,
+                    windowFunctions,
+                    columnNames,
+                    resolvedOrderBy,
+                    offset,
+                    limit,
+                    parameters,
+                    context);
+            }
 
             return ExecuteWindowSelect(
                 statement,
@@ -16524,37 +16553,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     0);
             }
 
-            var groupCollations = statement.GroupBy
-                .Select(expression => GetEffectiveCollation(expression, context))
-                .ToArray();
-            VdbeGroupComparer groupEquality = (left, right) =>
-                GroupKeysEqual(left, right, groupCollations);
-            var groupHasher = BuildGroupHasher(groupCollations);
-            var groupIndexByKey = groupHasher is null
-                ? null
-                : new Dictionary<SqlValue[], int>(
-                    new GroupKeyEqualityComparer(groupEquality, groupHasher));
-            var groups = new List<(SqlValue[] Key, List<SourceRow> Rows)>();
-            foreach (var row in selectedRows)
-            {
-                context.CancellationToken.ThrowIfCancellationRequested();
-                var key = EvaluateGroupKey(statement.GroupBy, parameters, row, context);
-                var groupIndex = groupIndexByKey is not null
-                    && groupIndexByKey.TryGetValue(key, out var indexedGroup)
-                        ? indexedGroup
-                        : groupIndexByKey is null
-                            ? groups.FindIndex(group => groupEquality(group.Key, key))
-                            : -1;
-                if (groupIndex < 0)
-                {
-                    groupIndex = groups.Count;
-                    groups.Add((key, []));
-                    groupIndexByKey?.Add(key, groupIndex);
-                }
-
-                groups[groupIndex].Rows.Add(row);
-            }
-
+            var groups = BuildGroups(statement.GroupBy, selectedRows, parameters, context);
             var groupedRows = groups.Select(entry =>
             {
                 var group = entry.Rows;
@@ -24997,29 +24996,141 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 break;
         }
 
-        foreach (var argument in function.Arguments)
-        {
-            if (ContainsWindowFunction(argument) || ContainsAggregate(argument))
-                throw new EmbeddedSqlException("window function arguments cannot contain aggregate or window functions");
-        }
-
-        if (function.Filter is not null
-            && (ContainsWindowFunction(function.Filter) || ContainsAggregate(function.Filter)))
-        {
-            throw new EmbeddedSqlException("FILTER clause cannot contain aggregate or window functions");
-        }
+        // Aggregates are legal everywhere inside a window call's own subtree: SQLite aggregates
+        // first and runs the window pass over the grouped rows, so sum(count(*)) OVER (ORDER BY
+        // count(*)) reads an already-aggregated value. A *window* call nested in that subtree has
+        // no such later pass to be evaluated in and stays a misuse, named after the inner call.
+        var nestedInInputs = function.Arguments
+                .Select(FindWindowFunction)
+                .FirstOrDefault(candidate => candidate is not null)
+            ?? FindWindowFunction(function.Filter);
+        if (nestedInInputs is not null)
+            throw new EmbeddedSqlException($"misuse of window function {nestedInInputs.Name}()");
 
         var window = function.Window!;
         ValidateWindowFrameStructure(window);
-        if (window.PartitionBy.Any(expression => ContainsWindowFunction(expression) || ContainsAggregate(expression))
-            || window.OrderBy.Any(term =>
-                ContainsWindowFunction(term.Expression) || ContainsAggregate(term.Expression))
-            || window.Frame?.Start.Offset is { } startOffset
+        var nestedInSpec = window.PartitionBy
+                .Select(FindWindowFunction)
+                .FirstOrDefault(candidate => candidate is not null)
+            ?? window.OrderBy
+                .Select(term => FindWindowFunction(term.Expression))
+                .FirstOrDefault(candidate => candidate is not null);
+        if (nestedInSpec is not null)
+            throw new EmbeddedSqlException($"misuse of window function {nestedInSpec.Name}()");
+
+        // Frame offsets have no aggregate pass of their own - they are evaluated once per
+        // statement - so anything non-constant stays rejected here.
+        if (window.Frame?.Start.Offset is { } startOffset
                 && (ContainsWindowFunction(startOffset) || ContainsAggregate(startOffset))
             || window.Frame?.End.Offset is { } endOffset
                 && (ContainsWindowFunction(endOffset) || ContainsAggregate(endOffset)))
         {
             throw new EmbeddedSqlException("misuse of window function");
+        }
+    }
+
+    // Returns the outermost window call inside <paramref name="expression"/>, or null when the
+    // expression carries none. Used to name the offending call in a misuse diagnostic exactly the
+    // way SQLite does.
+    private FunctionExpression? FindWindowFunction(Expression? expression)
+    {
+        if (expression is null)
+            return null;
+
+        var found = new List<FunctionExpression>();
+        CollectWindowFunctions(expression, found);
+        return found.Count == 0 ? null : found[0];
+    }
+
+    // True when the expression contains an aggregate call anywhere, including inside a window
+    // call's arguments, FILTER, PARTITION BY or ORDER BY. Those aggregates are evaluated in the
+    // statement's aggregate pass, so their presence makes the statement an aggregate query even
+    // when no aggregate appears outside a window call.
+    private bool ContainsAggregateAcrossWindows(Expression expression)
+    {
+        if (ContainsAggregate(expression))
+            return true;
+
+        var windowFunctions = new List<FunctionExpression>();
+        CollectWindowFunctions(expression, windowFunctions);
+        return windowFunctions.Any(WindowFunctionContainsAggregate);
+    }
+
+    private bool WindowFunctionContainsAggregate(FunctionExpression function)
+    {
+        var window = function.Window!;
+        return function.Arguments.Any(ContainsAggregate)
+            || function.Filter is not null && ContainsAggregate(function.Filter)
+            || window.PartitionBy.Any(ContainsAggregate)
+            || window.OrderBy.Any(term => ContainsAggregate(term.Expression));
+    }
+
+    // Returns the window call that a non-window aggregate takes as input, if any. SQLite has no
+    // pass in which such a call could be evaluated - the window pass runs after aggregation - so
+    // it is a misuse named after the window call.
+    private FunctionExpression? FindWindowFunctionInsideAggregate(Expression? expression)
+    {
+        switch (expression)
+        {
+            case null:
+                return null;
+            case FunctionExpression { Window: not null }:
+                return null;
+            case FunctionExpression function when IsBuiltInAggregate(function)
+                || IsManagedPercentileAggregate(function.Name)
+                || TryGetAggregateFunction(function.Name, function.Arguments.Count, out _):
+                return function.Arguments
+                        .Select(FindWindowFunction)
+                        .FirstOrDefault(candidate => candidate is not null)
+                    ?? FindWindowFunction(function.Filter)
+                    ?? function.Arguments
+                        .Select(FindWindowFunctionInsideAggregate)
+                        .FirstOrDefault(candidate => candidate is not null);
+            case FunctionExpression function:
+                return function.Arguments
+                        .Select(FindWindowFunctionInsideAggregate)
+                        .FirstOrDefault(candidate => candidate is not null)
+                    ?? FindWindowFunctionInsideAggregate(function.Filter);
+            case RowValueExpression rowValue:
+                return rowValue.Values
+                    .Select(FindWindowFunctionInsideAggregate)
+                    .FirstOrDefault(candidate => candidate is not null);
+            case UnaryExpression unary:
+                return FindWindowFunctionInsideAggregate(unary.Operand);
+            case BinaryExpression binary:
+                return FindWindowFunctionInsideAggregate(binary.Left)
+                    ?? FindWindowFunctionInsideAggregate(binary.Right);
+            case CollationExpression collation:
+                return FindWindowFunctionInsideAggregate(collation.Expression);
+            case CastExpression cast:
+                return FindWindowFunctionInsideAggregate(cast.Expression);
+            case CaseExpression @case:
+                return FindWindowFunctionInsideAggregate(@case.Operand)
+                    ?? @case.Clauses
+                        .Select(clause => FindWindowFunctionInsideAggregate(clause.When)
+                            ?? FindWindowFunctionInsideAggregate(clause.Then))
+                        .FirstOrDefault(candidate => candidate is not null)
+                    ?? FindWindowFunctionInsideAggregate(@case.Else);
+            case LikeExpression like:
+                return FindWindowFunctionInsideAggregate(like.Value)
+                    ?? FindWindowFunctionInsideAggregate(like.Pattern)
+                    ?? FindWindowFunctionInsideAggregate(like.Escape);
+            case GlobExpression glob:
+                return FindWindowFunctionInsideAggregate(glob.Value)
+                    ?? FindWindowFunctionInsideAggregate(glob.Pattern);
+            case InExpression @in:
+                return FindWindowFunctionInsideAggregate(@in.Value)
+                    ?? @in.Values
+                        .Select(FindWindowFunctionInsideAggregate)
+                        .FirstOrDefault(candidate => candidate is not null);
+            case InSubqueryExpression inSubquery:
+                return FindWindowFunctionInsideAggregate(inSubquery.Value);
+            case BetweenExpression between:
+                return FindWindowFunctionInsideAggregate(between.Value)
+                    ?? FindWindowFunctionInsideAggregate(between.Lower)
+                    ?? FindWindowFunctionInsideAggregate(between.Upper);
+            default:
+                return null;
         }
     }
 
@@ -25053,6 +25164,158 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException(
                 "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression");
         }
+    }
+
+    // Runs the window pass over the aggregate pass's output. SQLite evaluates GROUP BY (and HAVING)
+    // first and only then applies window functions to the surviving grouped rows, so a frame here
+    // spans groups rather than base rows, a window argument may read an aggregate result
+    // (sum(count(*)) OVER ...), and a group removed by HAVING is invisible to every frame.
+    // Bare columns resolve against each group's representative row exactly as in the plain grouped
+    // path, which is why every window input goes through EvaluateAggregate.
+    private ExecutionResult ExecuteGroupedWindowSelect(
+        SelectStatement statement,
+        IReadOnlyList<SourceRow> selectedRows,
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        string[] columnNames,
+        IReadOnlyList<OrderByTerm> resolvedOrderBy,
+        long offset,
+        long? limit,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var grouped = new List<(SourceRow? Representative, IReadOnlyList<SourceRow> Rows)>();
+        if (statement.GroupBy.Count == 0)
+        {
+            // An aggregate without GROUP BY collapses to exactly one row, even over no rows at all.
+            var representative = GetAggregateRepresentative(statement, selectedRows, parameters, context);
+            if (statement.Having is null
+                || IsTrue(EvaluateAggregate(statement.Having, selectedRows, parameters, context, representative)))
+            {
+                grouped.Add((representative, selectedRows));
+            }
+        }
+        else
+        {
+            foreach (var entry in BuildGroups(statement.GroupBy, selectedRows, parameters, context))
+            {
+                var representative = GetAggregateRepresentative(statement, entry.Rows, parameters, context)
+                    ?? entry.Rows[0];
+                if (statement.Having is null
+                    || IsTrue(EvaluateAggregate(
+                        statement.Having,
+                        entry.Rows,
+                        parameters,
+                        context,
+                        representative)))
+                {
+                    grouped.Add((representative, entry.Rows));
+                }
+            }
+        }
+
+        SqlValue EvaluateInGroup(int index, Expression expression) => EvaluateAggregate(
+            expression,
+            grouped[index].Rows,
+            parameters,
+            context,
+            grouped[index].Representative);
+
+        var valueRows = ComputeWindowFunctionValueRows(
+            windowFunctions,
+            grouped.Count,
+            EvaluateInGroup,
+            parameters,
+            context);
+        var windowValues = new Dictionary<FunctionExpression, SqlValue>[grouped.Count];
+        for (var index = 0; index < grouped.Count; index++)
+        {
+            var substitution = new Dictionary<FunctionExpression, SqlValue>(windowFunctions.Count);
+            for (var ordinal = 0; ordinal < windowFunctions.Count; ordinal++)
+                substitution[windowFunctions[ordinal]] = valueRows[index][ordinal];
+
+            windowValues[index] = substitution;
+        }
+
+        var results = new List<OrderByKeyed<SqlValue[]>>(grouped.Count);
+        for (var index = 0; index < grouped.Count; index++)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var substitution = windowValues[index];
+            var values = statement.Projections
+                .Select(projection => EvaluateInGroup(
+                    index,
+                    ReplaceWindowFunctions(projection.Expression, substitution)))
+                .ToArray();
+            var keys = resolvedOrderBy
+                .Select(term => EvaluateInGroup(index, ReplaceWindowFunctions(term.Expression, substitution)))
+                .ToArray();
+            results.Add(new OrderByKeyed<SqlValue[]>(values, keys, index));
+        }
+
+        if (resolvedOrderBy.Count > 0)
+        {
+            var orderCollations = resolvedOrderBy
+                .Select(term => GetEffectiveCollation(term.Expression, context))
+                .ToArray();
+            results.Sort((left, right) =>
+            {
+                var comparison = CompareOrderKeys(left.Keys, right.Keys, resolvedOrderBy, orderCollations);
+                return comparison != 0 ? comparison : left.Position.CompareTo(right.Position);
+            });
+        }
+
+        return new ExecutionResult(
+            columnNames,
+            ApplyDistinctLimit(
+                results.Select(result => result.Item),
+                statement.Distinct,
+                offset,
+                limit,
+                statement.Projections
+                    .Select(projection => GetEffectiveCollation(projection.Expression, context))
+                    .ToArray()),
+            0);
+    }
+
+    // Partitions the selected rows into GROUP BY groups, preserving first-encounter order.
+    private List<(SqlValue[] Key, List<SourceRow> Rows)> BuildGroups(
+        IReadOnlyList<Expression> groupBy,
+        IReadOnlyList<SourceRow> selectedRows,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var groupCollations = groupBy
+            .Select(expression => GetEffectiveCollation(expression, context))
+            .ToArray();
+        VdbeGroupComparer groupEquality = (left, right) =>
+            GroupKeysEqual(left, right, groupCollations);
+        var groupHasher = BuildGroupHasher(groupCollations);
+        var groupIndexByKey = groupHasher is null
+            ? null
+            : new Dictionary<SqlValue[], int>(
+                new GroupKeyEqualityComparer(groupEquality, groupHasher));
+        var groups = new List<(SqlValue[] Key, List<SourceRow> Rows)>();
+        foreach (var row in selectedRows)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var key = EvaluateGroupKey(groupBy, parameters, row, context);
+            var groupIndex = groupIndexByKey is not null
+                && groupIndexByKey.TryGetValue(key, out var indexedGroup)
+                    ? indexedGroup
+                    : groupIndexByKey is null
+                        ? groups.FindIndex(group => groupEquality(group.Key, key))
+                        : -1;
+            if (groupIndex < 0)
+            {
+                groupIndex = groups.Count;
+                groups.Add((key, []));
+                groupIndexByKey?.Add(key, groupIndex);
+            }
+
+            groups[groupIndex].Rows.Add(row);
+        }
+
+        return groups;
     }
 
     private ExecutionResult ExecuteWindowSelect(
@@ -25164,14 +25427,33 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SqlValue[] parameters,
         QueryContext context)
     {
-        var values = new SqlValue[rows.Count][];
-        for (var index = 0; index < rows.Count; index++)
+        return ComputeWindowFunctionValueRows(
+            windowFunctions,
+            rows.Count,
+            (index, expression) => Evaluate(expression, parameters, rows[index], context),
+            parameters,
+            context);
+    }
+
+    // The window pass reads every one of its inputs - arguments, FILTER, PARTITION BY and window
+    // ORDER BY - through <paramref name="evaluate"/> rather than from a SourceRow directly. A plain
+    // windowed SELECT supplies the scanned row; a grouped one supplies the aggregate pass's output
+    // for the group at that index, which is what makes a frame see grouped rows instead of base rows.
+    private SqlValue[][] ComputeWindowFunctionValueRows(
+        IReadOnlyList<FunctionExpression> windowFunctions,
+        int rowCount,
+        WindowInputEvaluator evaluate,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var values = new SqlValue[rowCount][];
+        for (var index = 0; index < rowCount; index++)
             values[index] = new SqlValue[windowFunctions.Count];
 
         if (windowFunctions.Count == 0)
             return values;
 
-        var inputs = PrepareWindowFunctionInputs(windowFunctions, rows, parameters, context);
+        var inputs = PrepareWindowFunctionInputs(windowFunctions, rowCount, evaluate, context);
         var groups = new List<List<int>>();
         foreach (var ordinal in Enumerable.Range(0, windowFunctions.Count))
         {
@@ -25189,11 +25471,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         foreach (var group in groups)
         {
             var functions = group.Select(ordinal => windowFunctions[ordinal]).ToArray();
-            var computed = ComputeWindowFunctions(functions, rows, inputs, parameters, context);
+            var computed = ComputeWindowFunctions(functions, rowCount, evaluate, inputs, parameters, context);
             for (var position = 0; position < functions.Length; position++)
             {
                 var series = computed[functions[position]];
-                for (var index = 0; index < rows.Count; index++)
+                for (var index = 0; index < rowCount; index++)
                     values[index][group[position]] = series[index];
             }
         }
@@ -25203,26 +25485,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private Dictionary<FunctionExpression, WindowFunctionInput[]> PrepareWindowFunctionInputs(
         IReadOnlyList<FunctionExpression> functions,
-        IReadOnlyList<SourceRow> rows,
-        SqlValue[] parameters,
+        int rowCount,
+        WindowInputEvaluator evaluate,
         QueryContext context)
     {
         var inputs = new Dictionary<FunctionExpression, WindowFunctionInput[]>();
         foreach (var function in functions)
-            inputs.Add(function, new WindowFunctionInput[rows.Count]);
+            inputs.Add(function, new WindowFunctionInput[rowCount]);
 
-        for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
         {
             context.CancellationToken.ThrowIfCancellationRequested();
-            var row = rows[rowIndex];
             foreach (var function in functions)
             {
                 var included = !IsAggregateWindowFunction(function)
                     || function.Filter is null
-                    || IsTrue(Evaluate(function.Filter, parameters, row, context));
+                    || IsTrue(evaluate(rowIndex, function.Filter));
                 var arguments = included
                     ? function.Arguments
-                        .Select(argument => Evaluate(argument, parameters, row, context))
+                        .Select(argument => evaluate(rowIndex, argument))
                         .ToArray()
                     : [];
                 inputs[function][rowIndex] = new WindowFunctionInput(included, arguments);
@@ -25326,9 +25607,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private readonly record struct WindowFrameRuntime(SqlValue? StartOffset, SqlValue? EndOffset);
 
+    private delegate SqlValue WindowInputEvaluator(int rowIndex, Expression expression);
+
     private Dictionary<FunctionExpression, SqlValue[]> ComputeWindowFunctions(
         IReadOnlyList<FunctionExpression> functions,
-        IReadOnlyList<SourceRow> rows,
+        int rowCount,
+        WindowInputEvaluator evaluate,
         IReadOnlyDictionary<FunctionExpression, WindowFunctionInput[]> inputs,
         SqlValue[] parameters,
         QueryContext context)
@@ -25336,7 +25620,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var spec = functions[0].Window!;
         var results = new Dictionary<FunctionExpression, SqlValue[]>();
         foreach (var function in functions)
-            results.Add(function, new SqlValue[rows.Count]);
+            results.Add(function, new SqlValue[rowCount]);
 
         var partitionCollations = spec.PartitionBy
             .Select(expression => GetEffectiveCollation(expression, context))
@@ -25349,13 +25633,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
             : new Dictionary<SqlValue[], WindowPartition>(
                 new GroupKeyEqualityComparer(partitionEquality, partitionHasher));
         var partitions = new List<WindowPartition>();
-        var orderKeysBySource = new SqlValue[rows.Count][];
-        for (var index = 0; index < rows.Count; index++)
+        var orderKeysBySource = new SqlValue[rowCount][];
+        for (var index = 0; index < rowCount; index++)
         {
             context.CancellationToken.ThrowIfCancellationRequested();
             var keys = spec.PartitionBy.Count == 0
                 ? []
-                : EvaluateGroupKey(spec.PartitionBy, parameters, rows[index], context);
+                : spec.PartitionBy.Select(expression => evaluate(index, expression)).ToArray();
             WindowPartition? partition;
             if (partitionIndexByKey is not null)
             {
@@ -25375,7 +25659,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             partition.Members.Add(index);
             orderKeysBySource[index] = spec.OrderBy
-                .Select(term => Evaluate(term.Expression, parameters, rows[index], context))
+                .Select(term => evaluate(index, term.Expression))
                 .ToArray();
         }
 

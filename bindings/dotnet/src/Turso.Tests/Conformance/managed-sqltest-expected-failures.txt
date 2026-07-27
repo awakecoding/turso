@@ -408,7 +408,6 @@ groupby/constant-expr.sqltest::group-by-order-by-constant-float | expected succe
 groupby/constant-expr.sqltest::group-by-order-by-constant-string | expected success but got error: Unsupported expression type StarExpression.
 groupby/constant-expr.sqltest::group-by-order-by-null | expected success but got error: Unsupported expression type StarExpression.
 groupby/constant-expr.sqltest::group-by-view-constant-order-by | expected success but got error: Unsupported expression type StarExpression.
-groupby/constant-expr.sqltest::group-by-window-constant-order-by | expected success but got error: window functions cannot be combined with aggregates or GROUP BY
 groupby/memory.sqltest::having_or | expected success but got error: no such column: cnt
 groupby/memory.sqltest::group_by_nonconflicting_alias | expected success but got error: no such column: c
 groupby/memory.sqltest::group_by_column_having_alias | expected success but got error: no such column: total
@@ -1089,27 +1088,16 @@ virtual-table-left-join.sqltest::left-join-virtual-table-on-left-matching | expe
 virtual-table-left-join.sqltest::left-join-virtual-table-on-left-null | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
 where/memory.sqltest::where_alias_precedence_2 | expected success but got error: Expected Comma. At SQL offset 62.
 where/memory.sqltest::where_alias_precedence_3 | expected success but got error: Expected Comma. At SQL offset 62.
-window/filter-over.sqltest::filter-over-grouped-result | expected success but got error: window function arguments cannot contain aggregate or window functions
-window/filter-over.sqltest::filter-over-grouped-filter-aggregate-predicate | expected success but got error: window function arguments cannot contain aggregate or window functions
-window/filter-over.sqltest::filter-over-nested-window-in-filter-rejected | error 'FILTER clause cannot contain aggregate or window functions' does not match pattern 'misuse of window function'
 window/filter-over.sqltest::filter-over-scalar-function-rejected | error 'ABS is not a supported window function' does not match pattern 'may not be used as a window function'
 window/filter-over.sqltest::filter-over-repeated-nondeterministic-call | expected success but got error: no such function: TEST_NONDET_COUNTER
 window/filter-over.sqltest::filter-over-mixed-deterministic-and-nondeterministic-dedup | expected success but got error: no such function: TEST_NONDET_COUNTER
-window/group-by-order-by-partition.sqltest::window-group-by-order-by-partition-basic | expected success but got error: window functions cannot be combined with aggregates or GROUP BY
-window/group-by-order-by-partition.sqltest::window-group-by-partition-sum-desc | expected success but got error: window functions cannot be combined with aggregates or GROUP BY
-window/group-by-order-by-partition.sqltest::window-group-by-partition-max | expected success but got error: window functions cannot be combined with aggregates or GROUP BY
-window/group-by-order-by-partition.sqltest::window-group-by-partition-with-aggregate | expected success but got error: window functions cannot be combined with aggregates or GROUP BY
-window/group-by-order-by-partition.sqltest::window-group-by-partition-nulls | expected success but got error: window functions cannot be combined with aggregates or GROUP BY
-window/group-by-order-by-partition.sqltest::window-group-by-partition-empty-table | expected success but got error: window functions cannot be combined with aggregates or GROUP BY
-window/group-by-order-by-partition.sqltest::window-group-by-partition-desc-outer-order | expected success but got error: window functions cannot be combined with aggregates or GROUP BY
 window/memory.sqltest::window-collate-partition-by | expected 3 row(s), got 3 row(s); row 1 expected 'apple/2' but was 'banana/1'
 window/memory.sqltest::window-collate-order-by | expected 3 row(s), got 3 row(s); row 0 expected 'Apple/2' but was 'Apple/1'
 window/memory.sqltest::window-row-number-nulls-in-order-by | expected 5 row(s), got 5 row(s); row 1 expected '3//2' but was '2/10/3'
 window/memory.sqltest::window-row-number-nulls-in-partition-by | expected 5 row(s), got 5 row(s); row 0 expected '5//1' but was '1/x/1'
-window/memory.sqltest::window-row-number-over-group-by | expected success but got error: misuse of window function
 window/memory.sqltest::window-row-number-in-check-constraint | error 'aggregate and window functions are prohibited in CHECK constraints' does not match pattern 'misuse of window function ROW_NUMBER()'
 window/memory.sqltest::named-window-rank-dense-rank | expected an error but the statement succeeded
 window/memory.sqltest::named-window-ntile | expected an error but the statement succeeded
 window/memory.sqltest::named-window-lag-lead | expected an error but the statement succeeded
-window/memory.sqltest::named-window-with-group-by | error 'misuse of window function' does not match pattern 'no such function: rank'
+window/memory.sqltest::named-window-with-group-by | expected an error but the statement succeeded
 window/multi-window-ordering.sqltest::empty-over-first-then-ordered-then-partitioned | expected 5 row(s), got 5 row(s); row 0 expected 'c/50/1/1/1' but was 'a/10/1/5/1'

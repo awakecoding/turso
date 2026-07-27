@@ -48,6 +48,7 @@ it implements. What it does not share is the engine architecture:
 | `EXPLAIN` | Emits managed instruction names, not SQLite opcodes, and errors for evaluator-owned statements instead of fabricating a program. `EXPLAIN QUERY PLAN` reports the managed execution boundary (`MANAGED COMPILED VDBE`, `MANAGED EVALUATOR FALLBACK`, or a real `SCAN`/`SEARCH ... USING INDEX` row) rather than SQLite optimizer internals. |
 | Storage | Table rows are materialized in managed memory rather than paged incrementally from a B-tree, so a database must fit in the process heap. There is no page defragmentation, freelist reclamation on the bounded write path, interior-page split/merge balancing, `auto_vacuum`, or pointer-map support. Use `VACUUM` to compact. |
 | Working set | Nothing spills to disk. Sorters, joins, `DISTINCT`, and CTE materialization are in-memory, so result-set size is bounded by available memory. |
+| Result order | `GROUP BY` emits groups in first-encounter order rather than SQLite's sorted-by-key order. A grouped query without `ORDER BY` - including one whose window pass runs over those grouped rows, such as `row_number() OVER ()` - may therefore return a different order than SQLite. Add an `ORDER BY` when the order matters. |
 | Async | Local managed async methods move blocking work to the thread pool rather than performing non-blocking I/O. Treat them as cancellation-aware wrappers, not as a scalability mechanism. |
 
 ### Write throughput
@@ -80,7 +81,6 @@ the managed provider for write-heavy use.
 - `UPDATE ... FROM`, `UPDATE OR <algorithm>`, `UPDATE`/`DELETE` target aliases,
   `CREATE TEMP VIEW`/`CREATE TEMP TRIGGER`, `BEGIN CONCURRENT`, `ANALYZE`, and
   `pragma_*` table-valued functions. Each is rejected during parsing.
-- Window functions combined with `GROUP BY` or ordinary aggregates.
 - `BEGIN DEFERRED`/`IMMEDIATE`/`EXCLUSIVE` parse for compatibility, but the mode
   is discarded and does not change managed locking behavior.
 - Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Turso's
