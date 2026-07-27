@@ -354,6 +354,13 @@ public sealed class ExtendedDmlGrammarSqlRoutingTests
             ("DELETE FROM t INDEXED BY t_value WHERE id = 1;", "INDEXED BY"),
             ("UPDATE t SET value = 20 ORDER BY id;", "ORDER BY without LIMIT"),
             ("DELETE FROM t ORDER BY id;", "ORDER BY without LIMIT"),
+
+            // Introduced alongside UPDATE ... FROM: the limited-DML route buffers a
+            // source-ordered subset, which has no defined meaning once the row set
+            // comes from a join, so the combination is refused rather than guessed.
+            (
+                "UPDATE t SET value = source.value FROM source WHERE source.id = t.id LIMIT 1;",
+                "LIMIT is not supported on UPDATE ... FROM"),
         };
 
         foreach (var (sql, message) in cases)
@@ -389,6 +396,55 @@ public sealed class ExtendedDmlGrammarSqlRoutingTests
 
         ExecuteManaged(connection, "DELETE FROM t AS target WHERE target.id = 1;");
         Scalar(connection, "SELECT count(*) FROM t;").Should().Be(0);
+    }
+
+    /// <summary>
+    /// Pins the routing boundary the extended UPDATE forms sit on.
+    /// </summary>
+    /// <remarks>
+    /// <c>UPDATE OR</c>, <c>UPDATE ... FROM</c> and target aliases are all
+    /// evaluator-owned: the conflict algorithms need the trigger-style backup and
+    /// restore of whole tables, and the joined and aliased forms need qualified
+    /// source rows that the compiled cursor program does not build. The Readme
+    /// documents that; this asserts it, so the boundary is a declared contract
+    /// rather than a silent performance cliff, and so that a later branch teaching
+    /// the compiled path these shapes is told to update both.
+    /// </remarks>
+    [Test]
+    public void ExtendedUpdateFormsReportTheEvaluatorBoundaryInQueryPlans()
+    {
+        using var connection = Connect(
+            """
+            CREATE TABLE t(id INTEGER, value INTEGER);
+            CREATE TABLE source(id INTEGER, value INTEGER);
+            """);
+
+        string[] evaluatorOwned =
+        [
+            "UPDATE OR IGNORE t SET value = 20;",
+            "UPDATE OR REPLACE t SET value = 20;",
+            "UPDATE t AS target SET value = target.value + 1;",
+            "UPDATE t SET value = source.value FROM source WHERE source.id = t.id;",
+            "DELETE FROM t AS target WHERE target.id = 1;",
+        ];
+
+        foreach (var statement in evaluatorOwned)
+        {
+            ReadManagedRows(connection, "EXPLAIN QUERY PLAN " + statement)
+                .Should().ContainSingle()
+                .Which[3].Should().Be(
+                    SqlValue.Text("MANAGED EVALUATOR FALLBACK"),
+                    "'{0}' is evaluator-owned",
+                    statement);
+        }
+
+        // The plain forms these were derived from must keep their compiled routing,
+        // so the fallback is scoped to the extended grammar rather than regressing
+        // ordinary UPDATE and DELETE.
+        Opcodes(ReadManagedRows(connection, "EXPLAIN UPDATE t SET value = value + 1;"))
+            .Should().Contain("Update");
+        Opcodes(ReadManagedRows(connection, "EXPLAIN DELETE FROM t WHERE id = 1;"))
+            .Should().Contain("Delete");
     }
 
     [Test]
