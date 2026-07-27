@@ -1374,13 +1374,37 @@ public sealed class SqlitePager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Whether an unchanged lock generation is insufficient proof that this
+    /// pager's committed view is current.
+    /// </summary>
+    /// <remarks>
+    /// A physical database holds SQLite's complete main-file lock-byte range
+    /// exclusively for the lifetime of every pager in this process, so no
+    /// ordinary SQLite client and no other managed process can change durable
+    /// storage. Every in-process commit, checkpoint, and recovery publishes a
+    /// new lock generation, so an unchanged generation proves the committed
+    /// view still matches durable storage. A file-backed lock coordinator
+    /// without that ownership carrier has no such proof and must rescan.
+    /// </remarks>
+    private bool RequiresSharedStorageRescan
+        => _lockManager.UsesFileBackedWalLocks && _clientOwnership is null;
+
+    /// <summary>
+    /// The number of times this pager rebuilt its committed view from durable
+    /// storage. Reads that reuse an unchanged view do not increment it.
+    /// </summary>
+    internal long CommittedViewRescanCount { get; private set; }
+
     private void SynchronizeCommittedView()
     {
         try
         {
             var generation = _lockManager.Generation;
-            if (_lockGeneration == generation && !_lockManager.UsesFileBackedWalLocks)
+            if (_lockGeneration == generation && !RequiresSharedStorageRescan)
                 return;
+
+            CommittedViewRescanCount++;
             if (SqliteRollbackJournal.IsHot(_fileSystem, _journalPath))
             {
                 throw new InvalidDataException(
