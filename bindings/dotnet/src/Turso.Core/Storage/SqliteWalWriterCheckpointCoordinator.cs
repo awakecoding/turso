@@ -51,6 +51,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
     private readonly SqliteWalFile _wal;
     private readonly SqliteWalIndexSharedMemory _index;
     private readonly SqliteWalByteRangeLock _locks;
+    private readonly SqliteWalSharedMemoryCarrierIdentity? _carrierIdentity;
     private readonly IDisposable? _ownedMapping;
     private readonly bool _ownsArtifacts;
     private bool _disposed;
@@ -79,6 +80,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         _wal = wal;
         _index = index;
         _locks = locks;
+        _carrierIdentity = index.CarrierIdentity;
     }
 
     private SqliteWalWriterCheckpointCoordinator(
@@ -101,6 +103,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         _wal = wal;
         _index = index;
         _locks = locks;
+        _carrierIdentity = index.CarrierIdentity;
         _ownedMapping = ownedMapping;
         _ownsArtifacts = true;
     }
@@ -708,6 +711,7 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             cancellationToken);
         using var readMarks = AcquireAllReadMarksWithoutIndex(timeout, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
+        ValidateRecoveryCarrier(checkpoint, writer, recovery, readMarks);
 
         SqliteWalIndexHeader? recoveryHeader = null;
         try
@@ -723,22 +727,72 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             || scan.LastValidFrameNumber != scan.LastCommittedFrameNumber)
         {
             if (recoveryHeader is null
-                || recoveryHeader.MaximumFrame != scan.LastCommittedFrameNumber)
+                || !HasAuthenticatedTailRecoveryEvidence(recoveryHeader, scan))
             {
                 throw new InvalidDataException(
                     "SQLite WAL corruption reaches before the last independently published committed boundary.");
             }
 
+            ValidateRecoveryCarrier(checkpoint, writer, recovery, readMarks);
             scan = _wal.RecoverToLastCommittedFrame();
         }
 
         var repaired = scan;
+        ValidateRecoveryCarrier(checkpoint, writer, recovery, readMarks);
         _index.RebuildFromWal(_wal, _mainStore.PageCount);
         return repaired;
     }
 
     private void RebuildIndexFromWal()
         => _ = RecoverAndRebuild(TimeSpan.Zero, CancellationToken.None);
+
+    private bool HasAuthenticatedTailRecoveryEvidence(
+        SqliteWalIndexHeader recoveryHeader,
+        SqliteWalRecoveryInfo scan)
+    {
+        var walHeader = _wal.Header;
+        if (recoveryHeader.PageSize != walHeader.PageSize
+            || recoveryHeader.WalChecksumByteOrder != walHeader.ChecksumByteOrder
+            || recoveryHeader.Salt1 != walHeader.Salt1
+            || recoveryHeader.Salt2 != walHeader.Salt2
+            || recoveryHeader.MaximumFrame != scan.LastCommittedFrameNumber)
+        {
+            return false;
+        }
+
+        if (recoveryHeader.MaximumFrame == 0)
+            return true;
+
+        if (scan.LastCommittedDatabaseSizeInPages != recoveryHeader.DatabasePageCount)
+            return false;
+
+        var committedFrame = _wal.ReadFrame(recoveryHeader.MaximumFrame).Header;
+        return committedFrame.IsCommit
+            && committedFrame.DatabaseSizeInPages == recoveryHeader.DatabasePageCount
+            && committedFrame.Checksum1 == recoveryHeader.FrameChecksum1
+            && committedFrame.Checksum2 == recoveryHeader.FrameChecksum2;
+    }
+
+    private void ValidateRecoveryCarrier(
+        SqliteWalByteRangeLockLease checkpoint,
+        SqliteWalByteRangeLockLease writer,
+        SqliteWalByteRangeLockLease recovery,
+        ReadMarkLeaseSet readMarks)
+    {
+        if (_carrierIdentity is not { } carrierIdentity)
+            return;
+
+        if (checkpoint.CarrierIdentity != carrierIdentity
+            || writer.CarrierIdentity != carrierIdentity
+            || recovery.CarrierIdentity != carrierIdentity
+            || SqliteWalSharedMemoryCarrierIdentity.FromPath(_locks.LockFilePath) != carrierIdentity)
+        {
+            throw new InvalidDataException(
+                "SQLite WAL shared-memory carrier changed between mapping and recovery locking.");
+        }
+
+        readMarks.ValidateCarrierIdentity(carrierIdentity);
+    }
 
     private static int ReadMainDatabasePageSize(IFile mainFile)
     {
@@ -903,6 +957,17 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         internal uint SafeFrame { get; }
 
         internal bool AllExclusive => _leases?.Count == SqliteWalIndexCheckpointInfo.ReadMarkCount;
+
+        internal void ValidateCarrierIdentity(SqliteWalSharedMemoryCarrierIdentity carrierIdentity)
+        {
+            var leases = _leases
+                ?? throw new ObjectDisposedException(nameof(ReadMarkLeaseSet));
+            if (leases.Any(lease => lease.CarrierIdentity != carrierIdentity))
+            {
+                throw new InvalidDataException(
+                    "SQLite WAL read-mark leases do not share the mapped shared-memory carrier.");
+            }
+        }
 
         public void Dispose()
         {

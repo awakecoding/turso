@@ -386,6 +386,118 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
 
     [Test]
     [NonParallelizable]
+    public void RecoveryRejectsDivergentZeroAndCommittedHeadersBeforeTruncatingACorruptWal()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var wal = OpenWalCopy(artifact.DatabasePath);
+        using var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+            artifact.DatabasePath + "-shm",
+            FileOpenMode.OpenExisting);
+        var index = new SqliteWalIndexSharedMemory(mapping);
+        var committedHeader = index.ReadValidatedHeader(wal).Header;
+        var zeroHeader = committedHeader.WithRestartedWal(committedHeader.DatabasePageCount);
+        mapping.Write(position: 0, zeroHeader.ToArray());
+        mapping.Write(SqliteWalIndexHeader.Size, committedHeader.ToArray());
+        mapping.MemoryBarrier();
+
+        var walPath = artifact.DatabasePath + "-wal";
+        var originalLength = new FileInfo(walPath).Length;
+        using (var stream = new FileStream(
+                   walPath,
+                   FileMode.Open,
+                   FileAccess.ReadWrite,
+                   FileShare.ReadWrite | FileShare.Delete))
+        {
+            stream.Position = SqliteWalHeader.Size + 16;
+            var checksum = stream.ReadByte();
+            checksum.Should().NotBe(-1);
+            stream.Position = SqliteWalHeader.Size + 16;
+            stream.WriteByte(unchecked((byte)(checksum ^ 0x01)));
+            stream.Flush(flushToDisk: true);
+        }
+
+        Assert.Throws<InvalidDataException>(() => coordinator.Recover(TimeSpan.Zero));
+        new FileInfo(walPath).Length.Should().Be(originalLength);
+        using var corruptWal = OpenWalCopy(artifact.DatabasePath);
+        var recovery = corruptWal.ScanRecovery();
+        recovery.LastCommittedFrameNumber.Should().Be(0);
+        recovery.StopReason.Should().Be(SqliteWalRecoveryStopReason.InvalidFrame);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void RecoveryRequiresAuthenticatedDatabaseSizeAndFrameChecksumsBeforeTruncatingATail()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(artifact.DatabasePath);
+        using var before = OpenWalCopy(artifact.DatabasePath);
+        var beforeRecovery = before.ScanRecovery();
+        AppendValidUncommittedFrame(
+            artifact.DatabasePath + "-wal",
+            before,
+            before.ReadFrame(beforeRecovery.LastCommittedFrameNumber));
+        var walLength = new FileInfo(artifact.DatabasePath + "-wal").Length;
+
+        using (var mapping = ((ISqliteWalSharedMemoryFileSystem)PhysicalFileSystem.Instance).OpenSharedMemory(
+                   artifact.DatabasePath + "-shm",
+                   FileOpenMode.OpenExisting))
+        {
+            var index = new SqliteWalIndexSharedMemory(mapping);
+            var publishedHeader = index.ReadValidatedHeader(before).Header;
+            var mismatchedHeaderBytes = publishedHeader.ToArray();
+            WriteUInt32Native(
+                mismatchedHeaderBytes,
+                position: 20,
+                checked(publishedHeader.DatabasePageCount + 1));
+            RewriteIndexHeaderChecksum(mismatchedHeaderBytes);
+            var mismatchedHeader = SqliteWalIndexHeader.Parse(mismatchedHeaderBytes);
+            mapping.Write(position: 0, mismatchedHeader.ToArray());
+            mapping.Write(SqliteWalIndexHeader.Size, mismatchedHeader.ToArray());
+            mapping.MemoryBarrier();
+        }
+
+        Assert.Throws<InvalidDataException>(() => coordinator.Recover(TimeSpan.Zero));
+        new FileInfo(artifact.DatabasePath + "-wal").Length.Should().Be(walLength);
+        using var tail = OpenWalCopy(artifact.DatabasePath);
+        tail.ScanRecovery().LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber + 1);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void RecoveryRejectsSharedMemoryCarrierReplacementBeforeTailTruncation()
+    {
+        RequireCoordinatorSupport();
+        using var artifact = SqliteWalArtifact.Create();
+        var databasePath = Path.Combine(artifact.WorkDirectory, "carrier-replacement.db");
+        File.Copy(artifact.DatabasePath, databasePath);
+        File.Copy(artifact.DatabasePath + "-wal", databasePath + "-wal");
+        File.Copy(artifact.DatabasePath + "-shm", databasePath + "-shm");
+
+        using var coordinator = SqliteWalWriterCheckpointCoordinator.Open(databasePath);
+        using var before = OpenWalCopy(databasePath);
+        var beforeRecovery = before.ScanRecovery();
+        AppendValidUncommittedFrame(
+            databasePath + "-wal",
+            before,
+            before.ReadFrame(beforeRecovery.LastCommittedFrameNumber));
+        var walPath = databasePath + "-wal";
+        var walLength = new FileInfo(walPath).Length;
+        var sharedMemoryPath = databasePath + "-shm";
+        var replacedCarrierPath = sharedMemoryPath + ".replaced";
+        File.Move(sharedMemoryPath, replacedCarrierPath);
+        File.Copy(replacedCarrierPath, sharedMemoryPath);
+
+        Assert.Throws<InvalidDataException>(() => coordinator.Recover(TimeSpan.Zero));
+        new FileInfo(walPath).Length.Should().Be(walLength);
+        using var tail = OpenWalCopy(databasePath);
+        tail.ScanRecovery().LastValidFrameNumber.Should().Be(beforeRecovery.LastCommittedFrameNumber + 1);
+    }
+
+    [Test]
+    [NonParallelizable]
     public void CanceledRecoveryReleasesRoleLocksForCrossProcessTakeover()
     {
         RequireCoordinatorSupport();
@@ -639,11 +751,26 @@ public sealed class SqliteWalWriterCheckpointCoordinatorTests
     private static void WriteUInt32Native(ISqliteWalSharedMemoryMapping mapping, long position, uint value)
     {
         Span<byte> bytes = stackalloc byte[sizeof(uint)];
-        if (SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian)
-            BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
-        else
-            BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
+        WriteUInt32Native(bytes, position: 0, value);
         mapping.Write(position, bytes);
+    }
+
+    private static void WriteUInt32Native(Span<byte> destination, int position, uint value)
+    {
+        if (SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian)
+            BinaryPrimitives.WriteUInt32LittleEndian(destination.Slice(position, sizeof(uint)), value);
+        else
+            BinaryPrimitives.WriteUInt32BigEndian(destination.Slice(position, sizeof(uint)), value);
+    }
+
+    private static void RewriteIndexHeaderChecksum(byte[] header)
+    {
+        var checksumByteOrder = SqliteWalIndexHeader.NativeByteOrder == SqliteWalIndexByteOrder.LittleEndian
+            ? SqliteWalChecksumByteOrder.LittleEndian
+            : SqliteWalChecksumByteOrder.BigEndian;
+        var checksum = SqliteWalChecksum.Calculate(header.AsSpan(0, 40), checksumByteOrder);
+        WriteUInt32Native(header, position: 40, checksum.First);
+        WriteUInt32Native(header, position: 44, checksum.Second);
     }
 
     private static string ReadWorkerValue(string name)

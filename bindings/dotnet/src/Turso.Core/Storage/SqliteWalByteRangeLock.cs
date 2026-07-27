@@ -527,6 +527,7 @@ public sealed class SqliteWalByteRangeLockLease : IDisposable
         SqliteWalByteRangeLockMode mode)
     {
         _handle = handle;
+        CarrierIdentity = SqliteWalSharedMemoryCarrierIdentity.FromHandle(handle);
         _offset = offset;
         _length = length;
         Mode = mode;
@@ -543,6 +544,8 @@ public sealed class SqliteWalByteRangeLockLease : IDisposable
 
     /// <summary>Whether this lease still owns its operating-system lock.</summary>
     public bool IsActive => Volatile.Read(ref _handle) is not null;
+
+    internal SqliteWalSharedMemoryCarrierIdentity CarrierIdentity { get; }
 
     /// <inheritdoc />
     public void Dispose()
@@ -561,5 +564,109 @@ public sealed class SqliteWalByteRangeLockLease : IDisposable
             // explicit native unlock itself reports an error.
             handle.Dispose();
         }
+    }
+}
+
+/// <summary>Identifies one physical shared-memory carrier across independently opened handles.</summary>
+internal readonly partial record struct SqliteWalSharedMemoryCarrierIdentity(ulong Device, ulong File)
+{
+    internal static SqliteWalSharedMemoryCarrierIdentity FromPath(string path)
+    {
+        using var handle = System.IO.File.OpenHandle(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            FileOptions.None);
+        return FromHandle(handle);
+    }
+
+    internal static SqliteWalSharedMemoryCarrierIdentity FromHandle(SafeFileHandle handle)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
+
+        if (OperatingSystem.IsWindows())
+        {
+            if (!Native.GetFileInformationByHandle(handle, out var information))
+                ThrowNativeIOException("GetFileInformationByHandle", Marshal.GetLastPInvokeError());
+
+            return new SqliteWalSharedMemoryCarrierIdentity(
+                information.VolumeSerialNumber,
+                ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow);
+        }
+
+        if (OperatingSystem.IsLinux() && Environment.Is64BitProcess)
+        {
+            if (Native.Fstat(handle, out var information) != 0)
+                ThrowNativeIOException("fstat", Marshal.GetLastPInvokeError());
+
+            return new SqliteWalSharedMemoryCarrierIdentity(information.Device, information.Inode);
+        }
+
+        throw new PlatformNotSupportedException(
+            "SQLite WAL shared-memory carrier identity is supported only on Windows and 64-bit Linux.");
+    }
+
+    private static void ThrowNativeIOException(string operation, int error)
+        => throw new IOException(
+            $"{operation} failed with native error {error}: {new Win32Exception(error).Message}.",
+            new Win32Exception(error));
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowsFileInformation
+    {
+        internal uint FileAttributes;
+        internal uint CreationTimeLow;
+        internal uint CreationTimeHigh;
+        internal uint LastAccessTimeLow;
+        internal uint LastAccessTimeHigh;
+        internal uint LastWriteTimeLow;
+        internal uint LastWriteTimeHigh;
+        internal uint VolumeSerialNumber;
+        internal uint FileSizeHigh;
+        internal uint FileSizeLow;
+        internal uint NumberOfLinks;
+        internal uint FileIndexHigh;
+        internal uint FileIndexLow;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Size = 144)]
+    private struct LinuxFileStatus
+    {
+        internal ulong Device;
+        internal ulong Inode;
+        private ulong _linkCount;
+        private uint _mode;
+        private uint _userId;
+        private uint _groupId;
+        private int _padding;
+        private ulong _deviceType;
+        private long _size;
+        private long _blockSize;
+        private long _blockCount;
+        private long _accessSeconds;
+        private long _accessNanoseconds;
+        private long _modificationSeconds;
+        private long _modificationNanoseconds;
+        private long _changeSeconds;
+        private long _changeNanoseconds;
+        private long _reserved1;
+        private long _reserved2;
+        private long _reserved3;
+    }
+
+    private static partial class Native
+    {
+        [LibraryImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static partial bool GetFileInformationByHandle(
+            SafeFileHandle file,
+            out WindowsFileInformation information);
+
+        [LibraryImport("libc", EntryPoint = "fstat", SetLastError = true)]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        internal static partial int Fstat(
+            SafeFileHandle fileDescriptor,
+            out LinuxFileStatus information);
     }
 }

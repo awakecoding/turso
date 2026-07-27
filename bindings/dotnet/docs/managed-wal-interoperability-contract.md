@@ -299,7 +299,11 @@ become durable. Before appending, it requires the independently scanned valid
 and committed frame boundaries to exactly equal the published header, so it
 cannot turn an abandoned but checksum-valid tail into a later transaction.
 Recovery takes `WAL_CKPT_LOCK`, `WAL_WRITE_LOCK`, `WAL_RECOVER_LOCK`, and every
-read-mark lock before truncating such a tail.
+read-mark lock before truncating such a tail. It rejects differing checksum-valid
+header copies rather than selecting a zero-frame copy, and authorizes a
+destructive tail repair only when the selected header matches the WAL's page
+size, checksum byte order, salts, committed frame, database size, and final
+frame checksum.
 
 The checkpointer takes `WAL_CKPT_LOCK` independently of the pager. `PASSIVE`
 calculates `mxSafeFrame` from only the read marks it cannot exclusively lock;
@@ -324,11 +328,14 @@ under the full recovery lock set; this makes an unverified `nBackfill` unable
 to authorize a reset. It reads recoverable header evidence only after obtaining
 that complete lock set, so a torn publication observed while waiting cannot
 authorize a later tail truncation. Corruption that reaches before the last
-recoverable committed boundary is rejected fail-closed. A missing `-shm`
-carrier is still rejected rather than recreated: without a pre-existing lock
-carrier, detached recovery cannot prove that an unlink raced a live client.
-Focused tests use SQLite-produced artifacts and separate reader/writer/lock-worker
-processes.
+recoverable committed boundary is rejected fail-closed. Physical recovery binds
+the mapped carrier's operating-system identity to every acquired role lease and
+revalidates the carrier path before rebuilding or truncating; replacement or
+unlink evidence therefore fails recovery before it mutates the WAL or index. A
+missing `-shm` carrier is still rejected rather than recreated: without a
+pre-existing lock carrier, detached recovery cannot prove that an unlink raced a
+live client. Focused tests use SQLite-produced artifacts and separate
+reader/writer/lock-worker processes.
 
 This remains unreachable from `SqlitePager`, normal managed execution, cache
 invalidation, and managed recovery. It does not relax the Stage 0 ownership
