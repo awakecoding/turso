@@ -1233,13 +1233,6 @@ public sealed partial class EmbeddedDatabase
                 table,
                 TriggerMutationKind.Update,
                 updatePlan);
-            if (updatePlan.RowidAssignment is not null
-                || updatePlan.ColumnAssignments.Any(
-                    assignment => assignment.Index == table.RowidAliasColumnIndex))
-            {
-                throw new EmbeddedSqlException(
-                    "Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.");
-            }
             ValidateUpsertUpdateExpressions(
                 statement.TableName,
                 updateAction.Assignments,
@@ -1451,7 +1444,7 @@ public sealed partial class EmbeddedDatabase
                 continue;
             }
 
-            var updated = BuildUpsertUpdatedRow(
+            var (updated, updatedRowId) = BuildUpsertUpdatedRow(
                 statement.TableName,
                 table,
                 updatePlan!,
@@ -1462,7 +1455,7 @@ public sealed partial class EmbeddedDatabase
                 doUpdateContext);
             var updateFrame = new TriggerRowFrame(
                 CreateTriggerRowImage(table, original, originalRowId),
-                CreateTriggerRowImage(table, updated, originalRowId));
+                CreateTriggerRowImage(table, updated, updatedRowId));
             if (FireRowTriggers(beforeUpdate, updateFrame, doUpdateContext))
                 continue;
 
@@ -1474,7 +1467,7 @@ public sealed partial class EmbeddedDatabase
                 statement.TableName,
                 table,
                 updated,
-                originalRowId,
+                updatedRowId,
                 parameters,
                 doUpdateContext);
             var updatedRows = table.Rows.Select(row => row.ToArray()).ToList();
@@ -1482,6 +1475,8 @@ public sealed partial class EmbeddedDatabase
             var updatedRowIds = table.RowIds.Count == table.Rows.Count
                 ? table.RowIds.ToList()
                 : Enumerable.Range(1, table.Rows.Count).Select(index => (long)index).ToList();
+            if (table.HasRowid && conflictPosition < updatedRowIds.Count)
+                updatedRowIds[conflictPosition] = updatedRowId;
             CommitUpdates(
                 doUpdateContext,
                 statement.TableName,
@@ -1498,7 +1493,7 @@ public sealed partial class EmbeddedDatabase
                 statement.TableName,
                 table,
                 updated,
-                originalRowId,
+                updatedRowId,
                 parameters,
                 doUpdateContext,
                 returningRows,

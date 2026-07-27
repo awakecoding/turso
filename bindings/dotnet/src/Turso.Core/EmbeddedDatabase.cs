@@ -5178,13 +5178,6 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             var updateStatement = new UpdateStatement(statement.TableName, updateAction.Assignments, Where: null);
             updatePlan = PrepareUpdate(updateStatement, table, context);
-            if (updatePlan.RowidAssignment is not null || updatePlan.ColumnAssignments.Any(
-                    assignment => assignment.Index == table.RowidAliasColumnIndex))
-            {
-                throw new EmbeddedSqlException(
-                    "Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.");
-            }
-
             ValidateUpsertUpdateExpressions(statement.TableName, updateAction.Assignments, updateAction.Where);
         }
 
@@ -5383,7 +5376,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     continue;
                 }
 
-                var updated = BuildUpsertUpdatedRow(
+                var (updated, updatedRowId) = BuildUpsertUpdatedRow(
                     statement.TableName,
                     table,
                     updatePlan!,
@@ -5395,6 +5388,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 var updatedRows = new List<SqlValue[]>(table.Rows);
                 updatedRows[conflictPosition] = updated;
                 var updatedRowIds = new List<long>(table.RowIds);
+                if (table.HasRowid && conflictPosition < updatedRowIds.Count)
+                    updatedRowIds[conflictPosition] = updatedRowId;
 
                 ValidateRowIdsUnique(statement.TableName, table, updatedRowIds, updatePlan!.AliasIndex);
                 table.ValidateRows(statement.TableName, updatedRows);
@@ -5418,7 +5413,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     [conflictPosition]);
 
                 affectedRows.Add(updated);
-                affectedRowIds.Add(originalRowId);
+                affectedRowIds.Add(updatedRowId);
                 affectedLastInsertRowIds.Add(context.LastInsertRowId);
                 FireMutationTriggers(updateTriggers, InsertConflictAlgorithm.Abort);
             }
@@ -5985,7 +5980,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return -1;
     }
 
-    private SqlValue[] BuildUpsertUpdatedRow(
+    private (SqlValue[] Row, long RowId) BuildUpsertUpdatedRow(
         string tableName,
         EmbeddedTable table,
         UpdatePlan plan,
@@ -6008,10 +6003,26 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         table.ApplyAffinities(updated);
+
+        // A DO UPDATE may assign the rowid pseudo-column or the INTEGER PRIMARY KEY
+        // alias, which moves the conflicting row exactly as the equivalent UPDATE would.
+        var updatedRowId = rowId;
+        if (plan.RowidAssignment is not null)
+        {
+            updatedRowId = CoerceRowidOrThrow(EvaluateAssignmentValue(
+                plan.RowidAssignment,
+                assignmentValues,
+                parameters,
+                source,
+                context));
+        }
+        else if (plan.AliasIndex >= 0)
+            updatedRowId = CoerceRowidOrThrow(updated[plan.AliasIndex]);
+
         if (plan.AliasIndex >= 0)
-            updated[plan.AliasIndex] = SqlValue.Integer(rowId);
+            updated[plan.AliasIndex] = SqlValue.Integer(updatedRowId);
         ComputeGeneratedColumns(table, tableName, updated, parameters, context);
-        return updated;
+        return (updated, updatedRowId);
     }
 
     private static SourceRow CreateUpsertSourceRow(

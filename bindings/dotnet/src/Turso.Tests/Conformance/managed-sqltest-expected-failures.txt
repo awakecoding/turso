@@ -187,7 +187,6 @@ alter_table.sqltest::drop-column-unreferenced-with-complex-trigger | expected su
 alter_table.sqltest::alter-table-rename-then-rename-column-with-trigger | expected success but got error: error in trigger tr after rename table: no such table: orders
 autoincr.sqltest::autoinc-create-sequence-table | expected 3 row(s), got 2 row(s); row 0 expected '__turso_internal_seq___turso_internal_autoincrement_t1' but was 'sqlite_sequence'
 autoincr.sqltest::autoinc-alter-column-clears-sequence-row | expected success but got error: Expected ADD, DROP, or RENAME after ALTER TABLE. At SQL offset 14.
-autoincr.sqltest::autoinc-with-upsert | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 before-update-trigger-correlated-subquery.sqltest::before-update-trigger-uncorrelated-subquery | expected 3 row(s), got 3 row(s); row 1 expected '2/600' but was '2/1100'
 boolean.sqltest::boolean-not-text-float-edge | expected 1 row(s), got 1 row(s); row 0 expected '0' but was '1'
 boolean.sqltest::where-string-numeric-prefix-1 | expected 1 row(s), got 0 row(s)
@@ -300,7 +299,6 @@ detach/transaction.sqltest::detach-fails-with-active-write-transaction | error '
 detach/transaction.sqltest::detach-succeeds-after-commit | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 foreign_keys.sqltest::fk-column-constraint-multi-parent | expected an error but the statement succeeded
 foreign_keys.sqltest::fk-self-ipk-text-child-coerces-rowid-ok | expected success but got error: FOREIGN KEY constraint failed
-foreign_keys.sqltest::fk-deferred-upsert-late-child | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 foreign_keys.sqltest::fk-deferred-update-self-ref-rowid-affinity-one-stmt | expected success but got error: FOREIGN KEY constraint failed
 foreign_keys.sqltest::fk-cascade-delete-self-referential-explain-terminates | expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
 foreign_keys.sqltest::fk-alter-table-add-column-enforced | expected success but got error: ALTER TABLE ADD COLUMN with REFERENCES is not supported.
@@ -566,7 +564,6 @@ null/default.sqltest::sel-true | expected success but got error: no such column:
 null/default.sqltest::sel-false | expected success but got error: no such column: false
 nulls-first-last.sqltest::window-two-different-nulls-orderings | expected 5 row(s), got 5 row(s); row 1 expected '4//2/5' but was '2/3/5/3'
 numeric-text-overflow.sqltest::ceil-text-i64-max-stays-integer | expected 1 row(s), got 1 row(s); row 0 expected '9223372036854775807/integer' but was '9.22337203685478e+18/real'
-on_conflict.sqltest::mvcc-upsert-set-pk-on-conflict-target-resolves | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 on_conflict_constraint_def.sqltest::update-pk-rollback | error 'Managed UPDATE cannot apply schema-level ON CONFLICT ROLLBACK until the pending row-update engine supports partial publication, transaction rollback, and
 on_conflict_constraint_def.sqltest::update-rollback-terminates-transaction | error 'Managed UPDATE cannot apply schema-level ON CONFLICT ROLLBACK until the pending row-update engine supports partial publication, transaction rollback, and
 on_conflict_constraint_def.sqltest::ddl-reject-multiple-pk-columns | expected an error but the statement succeeded
@@ -852,6 +849,7 @@ trigger_namespace.sqltest::trigger-if-not-exists-same-name-as-table | expected s
 trigger_namespace.sqltest::trigger-same-name-as-view | expected success but got error: there is already a view named v
 trigger_namespace.sqltest::drop-trigger-with-same-name-as-table | expected success but got error: there is already a table named t
 trigger_namespace.sqltest::multiple-triggers-sharing-names-with-tables | expected success but got error: there is already a table named a
+on_conflict.sqltest::mvcc-upsert-set-pk-on-conflict-target-resolves | expected success but got: PRAGMA journal_mode='MVCC' reports memory; managed engine has no MVCC journal mode
 trigger_on_conflict.sqltest::trigger-upsert-new-column | expected success but got error: no such table: NEW
 trigger_on_conflict.sqltest::trigger-upsert-new-in-where | expected success but got error: no such table: NEW
 trigger_on_conflict.sqltest::trigger-upsert-new-in-where-no-update | expected success but got error: no such table: NEW
@@ -880,12 +878,9 @@ upsert.sqltest::upsert-qualified-target | expected success but got error: ON CON
 upsert.sqltest::upsert-current-qualified_1 | expected success but got error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint on table dq.
 upsert.sqltest::upsert-doubly-qualified-target | expected success but got error: Unexpected token in index expression. At SQL offset 57.
 upsert.sqltest::upsert-targets-chain | expected success but got error: Expected End. At SQL offset 215.
-upsert.sqltest::upsert-unique-update-rowid-change | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 upsert.sqltest::upsert-unresolved-table-reference | error 'no such table: other' does not match pattern '.*no such column.*'
 upsert.sqltest::upsert-unresolved-table-in-where | error 'no such table: other' does not match pattern '.*no such column.*'
 upsert.sqltest::upsert-check-update-violates-check | expected an error but the statement succeeded
-upsert.sqltest::upsert-do-update-where-uses-column-affinity | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
-upsert.sqltest::upsert-do-update-where-uses-column-collation | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 view-rowid.sqltest::view-rowid-order-by-index | expected an error but the statement succeeded
 view-rowid.sqltest::view-rowid-select | expected an error but the statement succeeded
 views.sqltest::view-rejects-aggregate-order-by | error 'ORDER BY within aggregate functions is not supported by the managed engine. At SQL offset 32.' does not match pattern 'ORDER BY clause is not supported y

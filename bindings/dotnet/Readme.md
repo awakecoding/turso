@@ -79,8 +79,7 @@ the managed provider for write-heavy use.
 - Experimental MVCC and vector search.
 - `CREATE TEMP VIEW`/`CREATE TEMP TRIGGER`, `BEGIN CONCURRENT`, `ANALYZE`, and
   `pragma_*` table-valued functions. Each is rejected during parsing.
-- Chained `ON CONFLICT` clauses on a single `INSERT`, and `UPSERT DO UPDATE`
-  assignments that move a row's `INTEGER PRIMARY KEY`.
+- Chained `ON CONFLICT` clauses on a single `INSERT`.
 - Window functions combined with `GROUP BY` or ordinary aggregates.
 - `BEGIN DEFERRED`/`IMMEDIATE`/`EXCLUSIVE` parse for compatibility, but the mode
   is discarded and does not change managed locking behavior.
