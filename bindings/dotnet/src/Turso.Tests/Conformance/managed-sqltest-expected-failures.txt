@@ -16,13 +16,6 @@ after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-with-
 after-insert-trigger-cache-spill.sqltest::before-insert-trigger-cache-spill-with-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
 after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-no-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
 after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-multi-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
-agg-functions/avg-large-integers.sqltest::avg_large_integers_rounds_like_sqlite | expected 1 row(s), got 1 row(s); row 0 expected '0.5' but was '1.0'
-agg-functions/avg-large-integers.sqltest::avg_large_integers_ignore_nulls | expected 1 row(s), got 1 row(s); row 0 expected '0.5' but was '1.0'
-agg-functions/avg-large-integers.sqltest::avg_i64_edge_pair_positive | expected 1 row(s), got 1 row(s); row 0 expected '0.5' but was '0.0'
-agg-functions/avg-large-integers.sqltest::avg_i64_edge_pair_negative | expected 1 row(s), got 1 row(s); row 0 expected '-0.5' but was '0.0'
-agg-functions/avg-large-integers.sqltest::avg_large_integers_grouped | expected 2 row(s), got 2 row(s); row 0 expected '1/0.5' but was '1/1.0'
-agg-functions/avg-large-integers.sqltest::avg_infinite_cancellation_returns_null | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
-agg-functions/group-concat-types.sqltest::group-concat-zero-real-and-text | expected 1 row(s), got 1 row(s); row 0 expected '0.0,zero' but was '0,zero'
 agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_integer_label | expected success but got error: no such function: JSONB_GROUP_OBJECT
 agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_real_label | expected success but got error: no such function: JSONB_GROUP_OBJECT
 agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_text_numeric_label_unchanged | expected success but got error: no such function: JSONB_GROUP_OBJECT
@@ -33,10 +26,6 @@ agg-functions/order-by-aggregate-misuse.sqltest::order-by-min-misuse | expected 
 agg-functions/order-by-aggregate-misuse.sqltest::order-by-max-misuse | expected an error but the statement succeeded
 agg-functions/order-by-aggregate-misuse.sqltest::order-by-sum-misuse | expected an error but the statement succeeded
 agg-functions/order-by-aggregate-misuse.sqltest::order-by-count-misuse | expected an error but the statement succeeded
-agg-functions/sum-inf-cancel.sqltest::sum_inf_minus_inf | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
-agg-functions/sum-inf-cancel.sqltest::avg_inf_minus_inf | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
-agg-functions/sum-inf-cancel.sqltest::total_inf_minus_inf | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
-agg-functions/sum-inf-cancel.sqltest::sum_inf_cancel_with_finite_values | expected 1 row(s), got 1 row(s); row 0 expected 'null/' but was 'real/NaN'
 agg-functions/sum-large-float.sqltest::sum-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 33.
 agg-functions/sum-large-float.sqltest::total-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 35.
 agg-functions/sum-large-float.sqltest::avg-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 33.
@@ -195,11 +184,7 @@ changes.sqltest::changes-restores-previous-value-between-trigger-invocations | e
 changes.sqltest::changes-sub-trigger-isolation | expected 5 row(s), got 5 row(s); row 1 expected 'sub:1' but was 'sub:0'
 changes.sqltest::changes-update-trigger-body-reset-count | expected 8 row(s), got 8 row(s); row 7 expected '12' but was '6'
 changes.sqltest::changes-delete-trigger-body-reset-count | expected 8 row(s), got 8 row(s); row 7 expected '12' but was '6'
-char.sqltest::char-null | expected 1 row(s), got 1 row(s); row 0 expected '00' but was ''
 char.sqltest::char-non-integer | expected 1 row(s), got 1 row(s); row 0 expected '' but was ' '
-char.sqltest::char-null-produces-nul | expected 1 row(s), got 1 row(s); row 0 expected '00' but was ''
-char.sqltest::char-null-in-middle | expected 1 row(s), got 1 row(s); row 0 expected '410042' but was '4142'
-char.sqltest::char-multiple-nulls | expected 1 row(s), got 1 row(s); row 0 expected '004100004200' but was '4142'
 check_constraint.sqltest::check_constraint_pragma_ignore | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
 check_constraint.sqltest::check_constraint_upsert_do_update_violation | expected an error but the statement succeeded
 check_constraint.sqltest::check_constraint_update_or_ignore_single_row | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 70.
@@ -510,7 +495,6 @@ join/outer_hash_join.sqltest::left-hash-join-larger-null-count | expected succes
 join/outer_hash_join.sqltest::right-join-larger | expected success but got error: Expected Comma. At SQL offset 74.
 join/outer_hash_join.sqltest::full-outer-join-larger | expected success but got error: Expected Comma. At SQL offset 75.
 join/outer_hash_join.sqltest::full-outer-join-larger-verify-rows | expected success but got error: Expected Comma. At SQL offset 74.
-join/outer_hash_join.sqltest::full-outer-join-mixed-types | expected 4 row(s), got 4 row(s); row 1 expected '2/2.0' but was '2/2'
 join/outer_hash_join.sqltest::full-outer-join-using-errors | expected an error but the statement succeeded
 join/outer_hash_join.sqltest::full-outer-join-with-group-by | expected success but got error: no such column: key
 join/outer_hash_join.sqltest::left-hash-join-spill-unmatched | expected success but got error: Expected Comma. At SQL offset 78.

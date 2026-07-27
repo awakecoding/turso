@@ -22174,9 +22174,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool average)
     {
         RequireAggregateArgumentCount(function.Name.ToLowerInvariant(), function.Arguments, 1);
+
+        // SQLite's SumCtx keeps an exact 64-bit accumulator for as long as every input is an
+        // integer, and only switches to the Kahan-Babuska-Neumaier compensated double
+        // accumulator when a non-integer arrives or the integer sum overflows. avg() and total()
+        // share that accumulator, so avg(9223372036854775807, -9223372036854775806) is 0.5 and
+        // not the 0.0 that double accumulation produces.
         var integerTotal = 0L;
         var realTotal = 0d;
-        var hasReal = forceReal;
+        var realError = 0d;
+        var approximate = false;
+        var overflowed = false;
         var count = 0L;
         foreach (var row in rows)
         {
@@ -22190,29 +22198,106 @@ public sealed partial class EmbeddedDatabase : IDisposable
             // merely starts with a number - switches to floating point via sqlite3_value_double.
             var exact = ApplyComparisonNumericAffinity(value);
             count++;
-            if (!hasReal && exact.Kind == SqlValueKind.Integer)
+            if (exact.Kind != SqlValueKind.Integer)
             {
-                integerTotal = checked(integerTotal + exact.AsInteger());
+                var real = exact.Kind == SqlValueKind.Real
+                    ? AsReal(exact)
+                    : AsReal(ApplyNumericAffinity(value));
+                if (!approximate)
+                {
+                    KahanBabuskaNeumaierInit(integerTotal, out realTotal, out realError);
+                    approximate = true;
+                }
+                else
+                {
+                    // A real input clears a previous integer overflow, exactly as sumStep does:
+                    // the running total is already inexact, so the overflow no longer matters.
+                    overflowed = false;
+                }
+
+                KahanBabuskaNeumaierStep(real, ref realTotal, ref realError);
                 continue;
             }
 
-            if (!hasReal)
+            var addend = exact.AsInteger();
+            if (!approximate)
             {
-                realTotal = integerTotal;
-                hasReal = true;
+                var candidate = unchecked(integerTotal + addend);
+                if (((integerTotal ^ candidate) & (addend ^ candidate)) >= 0)
+                {
+                    integerTotal = candidate;
+                    continue;
+                }
+
+                overflowed = true;
+                KahanBabuskaNeumaierInit(integerTotal, out realTotal, out realError);
+                approximate = true;
             }
 
-            realTotal += exact.Kind is SqlValueKind.Integer or SqlValueKind.Real
-                ? AsReal(exact)
-                : AsReal(ApplyNumericAffinity(value));
+            KahanBabuskaNeumaierStepInt64(addend, ref realTotal, ref realError);
         }
 
-        if (average)
-            return count == 0 ? SqlValue.Null : SqlValue.Real(realTotal / count);
-        if (count == 0)
-            return forceReal ? SqlValue.Real(0) : SqlValue.Null;
+        var accumulated = approximate
+            ? (double.IsNaN(realError) ? realTotal : realTotal + realError)
+            : integerTotal;
 
-        return hasReal ? SqlValue.Real(realTotal) : SqlValue.Integer(integerTotal);
+        if (average)
+            return count == 0 ? SqlValue.Null : SqlValue.Real(accumulated / count);
+        if (forceReal)
+            return SqlValue.Real(count == 0 ? 0 : accumulated);
+        if (count == 0)
+            return SqlValue.Null;
+
+        // Only sum() reports the overflow. avg() and total() are documented to return a real, so
+        // sqlite3's avgFinalize and totalFinalize ignore the flag entirely.
+        if (overflowed)
+            throw new EmbeddedSqlException("integer overflow");
+
+        return approximate ? SqlValue.Real(accumulated) : SqlValue.Integer(integerTotal);
+    }
+
+    /// <summary>Seeds the compensated accumulator from an exact 64-bit running total.</summary>
+    /// <remarks>
+    /// Splitting off the low 14 bits keeps the high part exactly representable as a double, so
+    /// no precision is lost at the moment the accumulator switches modes.
+    /// </remarks>
+    private static void KahanBabuskaNeumaierInit(long value, out double sum, out double error)
+    {
+        if (value is <= -4503599627370496L or >= 4503599627370496L)
+        {
+            var low = value % 16384;
+            sum = value - low;
+            error = low;
+        }
+        else
+        {
+            sum = value;
+            error = 0d;
+        }
+    }
+
+    /// <summary>Adds one term to the Kahan-Babuska-Neumaier compensated sum.</summary>
+    private static void KahanBabuskaNeumaierStep(double term, ref double sum, ref double error)
+    {
+        var running = sum;
+        var next = running + term;
+        error += Math.Abs(running) > Math.Abs(term)
+            ? (running - next) + term
+            : (term - next) + running;
+        sum = next;
+    }
+
+    private static void KahanBabuskaNeumaierStepInt64(long value, ref double sum, ref double error)
+    {
+        if (value is <= -4503599627370496L or >= 4503599627370496L)
+        {
+            var low = value % 16384;
+            KahanBabuskaNeumaierStep(value - low, ref sum, ref error);
+            KahanBabuskaNeumaierStep(low, ref sum, ref error);
+            return;
+        }
+
+        KahanBabuskaNeumaierStep(value, ref sum, ref error);
     }
 
     private SqlValue EvaluateMinMax(
@@ -24285,12 +24370,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return value.Kind switch
         {
             SqlValueKind.Integer => value.AsInteger().ToString(CultureInfo.InvariantCulture),
-            SqlValueKind.Real => value.AsReal().ToString("R", CultureInfo.InvariantCulture),
+            SqlValueKind.Real => FormatRealAsText(value.AsReal()),
             SqlValueKind.Text => value.AsText(),
             SqlValueKind.Blob => System.Text.Encoding.UTF8.GetString(value.AsBlob().Span),
             _ => throw new EmbeddedSqlException($"Cannot convert {value.Kind} to text."),
         };
     }
+
+    /// <summary>Renders a REAL the way SQLite converts a floating point value to text.</summary>
+    /// <remarks>
+    /// SQLite never renders a floating point value as a bare integer, so <c>CAST(0.0 AS TEXT)</c>
+    /// is "0.0" and not "0", and 1e20 is "1.0e+20" rather than the platform's "1E+20".
+    /// </remarks>
+    internal static string FormatRealAsText(double value) => SqliteRealText.Format(value);
 
     private static string? GetCollation(Expression expression) =>
         GetExplicitCollation(expression);
