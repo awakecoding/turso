@@ -9,6 +9,12 @@
     the TRX result file back and fails when the run did not execute at least the
     expected number of tests, or when a class that must really run on this
     platform was never discovered or was skipped away entirely.
+
+    A platform where the engine is knowingly unimplemented can be described with
+    -KnownGapFailurePattern. That allowance is scoped to a failure *message*, not
+    to a platform, a class, or a hand-maintained list of test names: any failure
+    that does not carry the documented message still fails the run, so a real
+    regression on that platform cannot hide behind the gap.
 #>
 [CmdletBinding()]
 param(
@@ -17,12 +23,21 @@ param(
     [string]$Filter,
     [string]$Configuration = 'Debug',
     [string]$ResultsDirectory = './artifacts/test-results',
+    # Floor applied to both executed and passing tests, so a leg cannot go green
+    # by discovering nothing and cannot go green by failing almost everything.
     [int]$MinimumExecutedTests = 1,
     # Classes that must contribute at least one passing (non-skipped) result.
     [string[]]$RequirePassingClass = @(),
     # Classes that must be discovered and reported, even if the platform guards
     # every case away. This keeps a platform gap visible instead of silent.
     [string[]]$RequireDiscoveredClass = @(),
+    # Regular expression matched against a failure message. Failures that match
+    # are attributed to a documented, unimplemented platform primitive instead of
+    # failing the run. Every other failure still fails the run.
+    [string]$KnownGapFailurePattern,
+    # Human-readable explanation printed with every known-gap failure so the gap
+    # stays visible in the job log and step summary instead of becoming silent.
+    [string]$KnownGapReason,
     [switch]$NoBuild,
     # Reproduces the managed lane's "must not shell out to Rust" invariant by
     # putting failing cargo/rustc shims ahead of the real toolchain on PATH.
@@ -80,7 +95,7 @@ function Get-TrxSummary([string]$TrxPath) {
     $failed = 0
     $skipped = 0
     $other = 0
-    $failedNames = [System.Collections.Generic.List[string]]::new()
+    $failures = [System.Collections.Generic.List[psobject]]::new()
     $passedByClass = @{}
     $resultsByClass = @{}
 
@@ -96,7 +111,12 @@ function Get-TrxSummary([string]$TrxPath) {
             }
             'Failed' {
                 $failed++
-                $failedNames.Add($result.GetAttribute('testName'))
+                $messageNode = $result.SelectSingleNode("*[local-name()='Output']/*[local-name()='ErrorInfo']/*[local-name()='Message']")
+                $message = if ($null -ne $messageNode) { $messageNode.InnerText } else { '' }
+                $failures.Add([pscustomobject]@{
+                        Name    = "$className.$($result.GetAttribute('testName'))"
+                        Message = ($message -replace '\s+', ' ').Trim()
+                    })
             }
             { $_ -in @('NotExecuted', 'Inconclusive', 'Warning') } { $skipped++ }
             default { $other++ }
@@ -104,13 +124,13 @@ function Get-TrxSummary([string]$TrxPath) {
     }
 
     return [pscustomobject]@{
-        Passed        = $passed
-        Failed        = $failed
-        Skipped       = $skipped
-        Other         = $other
-        Total         = $passed + $failed + $skipped + $other
-        FailedNames   = $failedNames
-        PassedByClass = $passedByClass
+        Passed         = $passed
+        Failed         = $failed
+        Skipped        = $skipped
+        Other          = $other
+        Total          = $passed + $failed + $skipped + $other
+        Failures       = $failures
+        PassedByClass  = $passedByClass
         ResultsByClass = $resultsByClass
     }
 }
@@ -176,19 +196,55 @@ if (-not (Test-Path -LiteralPath $trxPath -PathType Leaf)) {
 
 $summary = Get-TrxSummary -TrxPath $trxPath
 $executed = $summary.Passed + $summary.Failed
+
+if ($KnownGapFailurePattern -and -not $KnownGapReason) {
+    Fail 'a -KnownGapFailurePattern was supplied without a -KnownGapReason; an unexplained allowance is indistinguishable from hiding a failure.'
+}
+
+$knownGapFailures = @()
+$realFailures = @($summary.Failures)
+if ($KnownGapFailurePattern) {
+    $knownGapFailures = @($summary.Failures | Where-Object { $_.Message -match $KnownGapFailurePattern })
+    $realFailures = @($summary.Failures | Where-Object { $_.Message -notmatch $KnownGapFailurePattern })
+}
+
 $headline = "$legName on $([System.Runtime.InteropServices.RuntimeInformation]::RuntimeIdentifier): executed $executed (passed $($summary.Passed), failed $($summary.Failed)), skipped $($summary.Skipped), discovered $($summary.Total)"
+if ($KnownGapFailurePattern) {
+    $headline += ", known-gap failures $($knownGapFailures.Count)"
+}
 Write-Host $headline
 
 if ($env:GITHUB_STEP_SUMMARY) {
     Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- $headline"
 }
 
-if ($summary.Failed -gt 0) {
-    Fail "$($summary.Failed) test(s) failed: $($summary.FailedNames -join ', ')."
+if ($KnownGapFailurePattern) {
+    if ($knownGapFailures.Count -gt 0) {
+        $gapNotice = "$($knownGapFailures.Count) failure(s) attributed to a documented platform gap: $KnownGapReason"
+        Write-Host "::warning::$gapNotice"
+        if ($env:GITHUB_STEP_SUMMARY) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "  - :warning: $gapNotice"
+        }
+
+        $gapClasses = $knownGapFailures | ForEach-Object { ($_.Name -split '\.')[-2] } | Sort-Object -Unique
+        Write-Host "known-gap classes: $($gapClasses -join ', ')"
+    }
+    else {
+        Write-Host "::notice::no failure matched the known-gap pattern; the gap appears closed, so remove -KnownGapFailurePattern from this leg."
+    }
+}
+
+if ($realFailures.Count -gt 0) {
+    $detail = ($realFailures | Select-Object -First 25 | ForEach-Object { "$($_.Name): $($_.Message)" }) -join "; "
+    Fail "$($realFailures.Count) test(s) failed for reasons outside any declared platform gap: $detail"
 }
 
 if ($executed -lt $MinimumExecutedTests) {
     Fail "only $executed test(s) executed but at least $MinimumExecutedTests were expected; a run this small means the suite was not really exercised."
+}
+
+if ($summary.Passed -lt $MinimumExecutedTests) {
+    Fail "only $($summary.Passed) test(s) passed but at least $MinimumExecutedTests were expected; a declared platform gap must not swallow the whole suite."
 }
 
 foreach ($className in $RequirePassingClass) {
@@ -203,6 +259,6 @@ foreach ($className in $RequireDiscoveredClass) {
     }
 }
 
-if ($testExitCode -ne 0) {
+if ($testExitCode -ne 0 -and $summary.Failed -eq 0) {
     Fail "dotnet test exited with code $testExitCode."
 }
