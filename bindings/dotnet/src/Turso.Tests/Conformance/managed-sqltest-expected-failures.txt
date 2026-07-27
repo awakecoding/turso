@@ -128,7 +128,6 @@ changes.sqltest::changes-update-trigger-body-reset-count | expected 8 row(s), go
 changes.sqltest::changes-delete-trigger-body-reset-count | expected 8 row(s), got 8 row(s); row 7 expected '12' but was '6'
 char.sqltest::char-non-integer | expected 1 row(s), got 1 row(s); row 0 expected '' but was ' '
 check_constraint.sqltest::check_constraint_pragma_ignore | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
-check_constraint.sqltest::check_constraint_upsert_do_update_violation | expected an error but the statement succeeded
 check_constraint.sqltest::check_constraint_update_or_ignore_single_row | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 70.
 check_constraint.sqltest::check_constraint_update_or_ignore_all_rows | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 69.
 check_constraint.sqltest::check_constraint_rename_table_qualified_ref | expected success but got error: ALTER TABLE RENAME cannot rewrite table-qualified CHECK expressions until managed schema token rewriting is implemented.
@@ -966,7 +965,6 @@ upsert.sqltest::upsert-collate-omitted-target-matches | expected success but got
 upsert.sqltest::upsert-unique-update-rowid-change | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 upsert.sqltest::upsert-unresolved-table-reference | error 'no such table: other' does not match pattern '.*no such column.*'
 upsert.sqltest::upsert-unresolved-table-in-where | error 'no such table: other' does not match pattern '.*no such column.*'
-upsert.sqltest::upsert-check-update-violates-check | expected an error but the statement succeeded
 upsert.sqltest::upsert-do-update-where-uses-column-affinity | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 upsert.sqltest::upsert-do-update-where-uses-column-collation | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 view-rowid.sqltest::view-rowid-order-by-index | expected an error but the statement succeeded

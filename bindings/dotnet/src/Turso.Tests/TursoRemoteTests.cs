@@ -513,6 +513,91 @@ public class TursoRemoteTests
     }
 
     [Test]
+    public void TestRemoteGetSchemaReadsTheCatalogOverTheWire()
+    {
+        // A remote connection has no local catalog handle, so GetSchema has to describe the
+        // database the connection is attached to by executing ordinary SQL against it. Fabricating
+        // an empty table here would be indistinguishable from "the database has no objects".
+        const string responseJson = """
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [
+                        { "name": "name", "decltype": "TEXT" },
+                        { "name": "type", "decltype": "TEXT" },
+                        { "name": "sql", "decltype": "TEXT" }
+                      ],
+                      "rows": [
+                        [
+                          { "type": "text", "value": "products" },
+                          { "type": "text", "value": "table" },
+                          { "type": "text", "value": "CREATE TABLE \"Products\"(id INTEGER)" }
+                        ],
+                        [
+                          { "type": "text", "value": "product_names" },
+                          { "type": "text", "value": "view" },
+                          { "type": "text", "value": "CREATE VIEW product_names AS SELECT 1" }
+                        ]
+                      ],
+                      "affected_row_count": 0,
+                      "last_insert_rowid": null
+                    }
+                  }
+                },
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson);
+        using var connection = new TursoConnection(
+            $"Data Source={server.Url};Auth Token=secret;Read Your Writes=False");
+        connection.Open();
+
+        var tables = connection.GetSchema("Tables");
+        tables.Rows.Cast<System.Data.DataRow>()
+            .Select(row => $"{row["TABLE_NAME"]}:{row["TABLE_TYPE"]}")
+            .Should().Equal("Products:BASE TABLE", "product_names:VIEW");
+
+        using var document = JsonDocument.Parse(server.RequestBody);
+        document.RootElement.GetProperty("requests")[0].GetProperty("stmt").GetProperty("sql").GetString()
+            .Should().Be(
+                "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view') "
+                + "AND name NOT LIKE 'sqlite_%' ORDER BY name;");
+    }
+
+    [Test]
+    public void TestRemoteGetSchemaSurfacesTheServerErrorInsteadOfAnEmptyCatalog()
+    {
+        const string responseJson = """
+            {
+              "results": [
+                {
+                  "type": "error",
+                  "error": { "message": "no such table: sqlite_master", "code": "SQLITE_ERROR" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson);
+        using var connection = new TursoConnection(
+            $"Data Source={server.Url};Auth Token=secret;Read Your Writes=False");
+        connection.Open();
+
+        var error = Assert.Catch(() => connection.GetSchema("Tables"))!;
+        error.GetType().Name.Should().Be("TursoRemoteSqlException");
+        error.Message.Should().Contain("no such table: sqlite_master");
+    }
+
+    [Test]
     public void TestRemoteCommandSerializesParametersAndReadsRows()
     {
         const string responseJson = """
