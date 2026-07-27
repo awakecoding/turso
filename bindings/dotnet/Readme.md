@@ -220,6 +220,18 @@ Windows and 64-bit Linux only, so the process-isolated WAL harness must pass on
 those legs and is required to stay discovered on macOS rather than being removed
 from the matrix.
 
+**Opening a WAL database races against other processes on Linux.**
+`SqliteWalWriterCheckpointCoordinator.Open` rebuilds the WAL index before it
+hands back a coordinator, and that rebuild takes the checkpoint, writer, and
+recovery leases with `TimeSpan.Zero`, so it never retries. If another process
+holds any of those leases at that instant the open fails outright with
+`SqliteWalByteRangeLockBusyException`, rather than waiting the way SQLite's own
+recovery path does. Five process-isolation tests hit this on the Linux CI
+runners and none on Windows, which reflects scheduling luck rather than a
+Windows-only code path, so the same race is latent on both. The Linux legs are
+left failing instead of being papered over, because the fix is a deliberate
+decision about how long `Open` may block and belongs with the WAL owner.
+
 ## Dynamic native compatibility
 
 Applications that intentionally select `Local Provider=Native` can reference the matching-version `Turso.Data.Sqlite.Native` companion package:
