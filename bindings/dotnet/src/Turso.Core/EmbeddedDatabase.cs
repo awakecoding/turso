@@ -421,7 +421,35 @@ public sealed partial class EmbeddedDatabase : IDisposable
         InsertConflictAlgorithm? TriggerConflictAlgorithm = null,
         bool PreserveUpsertFail = false,
         StatementExecutionState? StatementState = null,
-        bool CompilationEnabled = true);
+        bool CompilationEnabled = true,
+        ManagedStatementHooks? Hooks = null)
+    {
+        /// <summary>
+        /// Row-loop checkpoint. It honors cooperative cancellation exactly as before and
+        /// additionally drives the connection's progress handler, which can interrupt the
+        /// statement. Trigger and subquery contexts are derived with <c>with</c> expressions,
+        /// so the hooks propagate to nested execution automatically.
+        /// </summary>
+        internal void CheckInterrupt()
+        {
+            CancellationToken.ThrowIfCancellationRequested();
+            Hooks?.Progress?.Step();
+        }
+
+        /// <summary>
+        /// Reports a committed row change to the connection's update hook. Mirrors SQLite:
+        /// WITHOUT ROWID tables and internal <c>sqlite_*</c> tables never notify.
+        /// </summary>
+        internal void ReportRowChange(SqliteChangeOperation operation, string tableName, EmbeddedTable table, long rowId)
+        {
+            if (Hooks?.RowChanged is not { } rowChanged || !table.HasRowid)
+                return;
+            if (tableName.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            rowChanged(operation, tableName, rowId);
+        }
+    }
 
     internal sealed class StatementExecutionState(long lastInsertRowId)
     {
@@ -742,7 +770,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        ManagedStatementHooks? hooks = null)
     {
         var result = ExecuteCore(
             statement,
@@ -753,7 +782,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             deferForeignKeys,
             inTransaction,
             cancellationToken,
-            compilationEnabled);
+            compilationEnabled,
+            hooks);
 
         RecordChangeCounters(statement, result);
         return result;
@@ -781,7 +811,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        ManagedStatementHooks? hooks = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -798,13 +829,19 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 deferForeignKeys,
                 inTransaction,
                 cancellationToken,
-                compilationEnabled));
+                compilationEnabled,
+                hooks));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            if (cancellationToken.CanBeCanceled && MayMutate(statement))
+            // A commit hook can veto the implicit commit of an autocommit mutation, so the
+            // statement has to run against a working clone that can be discarded. The in-memory
+            // fast path below mutates the live catalog in place and cannot be rolled back, so an
+            // installed gate forces the clone-and-publish shape here.
+            var commitGate = hooks?.CommitGate;
+            if ((cancellationToken.CanBeCanceled || commitGate is not null) && MayMutate(statement))
             {
                 var cancellableWorking = new SchemaCatalog(_tables, _views, _triggers).Clone();
                 ExecutionResult cancellableResult;
@@ -820,11 +857,16 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         deferForeignKeys,
                         inTransaction,
                         cancellationToken,
-                        compilationEnabled);
+                        compilationEnabled,
+                        hooks);
                 }
                 catch (EmbeddedConflictFailException)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    // ON CONFLICT FAIL keeps the rows written before the failure, so this is still
+                    // a commit and the hook still gets to veto it.
+                    if (commitGate is not null && !commitGate())
+                        throw new EmbeddedCommitVetoException();
                     if (_fileStore is null)
                         PublishCatalog(cancellableWorking);
                     else
@@ -835,6 +877,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!cancellableResult.Changed)
                     return cancellableResult;
+
+                if (commitGate is not null && !commitGate())
+                    throw new EmbeddedCommitVetoException();
 
                 if (_fileStore is null)
                 {
@@ -873,7 +918,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         deferForeignKeys,
                         inTransaction,
                         cancellationToken,
-                        compilationEnabled);
+                        compilationEnabled,
+                        hooks);
                 }
                 catch (EmbeddedConflictFailException)
                 {
@@ -908,7 +954,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     deferForeignKeys,
                     inTransaction,
                     cancellationToken,
-                    compilationEnabled);
+                    compilationEnabled,
+                    hooks);
 
             var working = new SchemaCatalog(_tables, _views, _triggers).Clone();
             ExecutionResult result;
@@ -924,7 +971,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     deferForeignKeys,
                     inTransaction,
                     cancellationToken,
-                    compilationEnabled);
+                    compilationEnabled,
+                    hooks);
             }
             catch (EmbeddedConflictFailException)
             {
@@ -959,6 +1007,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         or CreateViewStatement or DropViewStatement or CreateTriggerStatement or DropTriggerStatement
         or AlterTableAddColumnStatement or AlterTableRenameStatement or AlterTableRenameColumnStatement
         or AlterTableDropColumnStatement;
+
+    /// <summary>
+    /// A read-only view over the live schema, used to resolve column ownership while an
+    /// authorizer inspects a statement. It deliberately does not clone, does not take a
+    /// transaction snapshot, and must never be mutated.
+    /// </summary>
+    internal SchemaCatalog CreateAuthorizationCatalog()
+    {
+        lock (_gate)
+            return new SchemaCatalog(_tables, _views, _triggers);
+    }
 
     internal TransactionSnapshot CreateTransactionSnapshot()
     {
@@ -1765,7 +1824,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         bool deferForeignKeys = false,
         bool inTransaction = false,
         CancellationToken cancellationToken = default,
-        bool compilationEnabled = true)
+        bool compilationEnabled = true,
+        ManagedStatementHooks? hooks = null)
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         if (RequiresRecursiveTriggerStack(
@@ -1783,7 +1843,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 deferForeignKeys,
                 inTransaction,
                 cancellationToken,
-                compilationEnabled));
+                compilationEnabled,
+                hooks));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -1804,7 +1865,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             ForeignKeyStatement: foreignKeysEnabled ? new ForeignKeyStatementState() : null,
             CancellationToken: cancellationToken,
             StatementState: new StatementExecutionState(lastInsertRowId),
-            CompilationEnabled: compilationEnabled);
+            CompilationEnabled: compilationEnabled,
+            Hooks: hooks);
         return statement switch
         {
             CreateTableStatement create => ExecuteCreateTable(create, catalog, cancellationToken),
@@ -5391,6 +5453,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     TriggerMutationKind.Update,
                     updatePlan);
                 ApplyUpsertRows(table, updatedRows, updatedRowIds);
+                updateContext.ReportRowChange(
+                    SqliteChangeOperation.Update,
+                    statement.TableName,
+                    table,
+                    updatedRowIds[conflictPosition]);
                 ValidateForeignKeysAfterUpdate(
                     updateContext,
                     statement.TableName,
@@ -6838,6 +6905,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             foreach (var rowId in insertedRowIds)
                 RecordBlobMutation(tableName, rowId);
         }
+
+        foreach (var rowId in insertedRowIds)
+            context.ReportRowChange(SqliteChangeOperation.Insert, tableName, table, rowId);
     }
 
     private void ValidateInserts(
@@ -7775,6 +7845,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 RecordBlobMutation(tableName, rowIds[position]);
             }
         }
+
+        // SQLite reports the post-update rowid, so an UPDATE that rewrites an INTEGER PRIMARY
+        // KEY notifies with the new value rather than the one the row had before.
+        foreach (var position in updatedPositions)
+            context.ReportRowChange(SqliteChangeOperation.Update, tableName, table, rowIds[position]);
     }
 
     // Foreign-key checks run against the complete post-statement image, but only inspect
@@ -8981,6 +9056,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     [deletedRow]);
                 if (table.HasRowid)
                     RecordBlobMutation(statement.TableName, selectedRowId);
+                context.ReportRowChange(
+                    SqliteChangeOperation.Delete,
+                    statement.TableName,
+                    table,
+                    selectedRowId);
                 deletedRows.Add(deletedRow);
                 deletedRowIds.Add(selectedRowId);
                 if (afterTriggers.Count > 0)
@@ -9186,6 +9266,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
             foreach (var rowId in deletedRowIds)
                 RecordBlobMutation(statement.TableName, rowId);
         }
+
+        foreach (var rowId in deletedRowIds)
+            context.ReportRowChange(SqliteChangeOperation.Delete, statement.TableName, table, rowId);
         if (statement.Returning is not null)
             return returningResult!;
 
@@ -9615,7 +9698,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         return statement switch
         {
             SelectStatement select => ExecuteSelectStatement(select, parameters, context, outerRow),
@@ -9667,7 +9750,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         ValidateSelectIndexDirectives(select, context);
         ValidateGroupByCollations(select.GroupBy);
         var canUseCompiledRoute = CanUseCompiledSelectRoute(select, context, outerRow);
@@ -12200,7 +12283,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         CompiledAggregateContext CreateContext() => new();
         object? CollectRow(object? stateObject, SqlValue[] values)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var state = (CompiledAggregateContext)stateObject!;
             state.Rows.Add(source.CreateSourceRow(values, outerRow));
             return state;
@@ -12217,7 +12300,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             Accumulate = CollectRow,
             Finalize = stateObject =>
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 var state = (CompiledAggregateContext)stateObject!;
                 var representative = GetRepresentative(state);
                 return aggregateMode
@@ -12916,7 +12999,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         object? CollectRow(object? stateObject, SqlValue[] values)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var state = (CompiledAggregateContext)stateObject!;
             state.Rows.Add(CreateScanSourceRow(target, values, context, outerRow));
             return state;
@@ -12935,13 +13018,13 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 Accumulate = CollectRow,
                 Finalize = stateObject =>
                 {
-                    context.CancellationToken.ThrowIfCancellationRequested();
+                    context.CheckInterrupt();
                     var state = (CompiledAggregateContext)stateObject!;
                     var representative = GetRepresentative(state);
                     var value = aggregateMode
                         ? EvaluateAggregate(expression, state.Rows, parameters, context, representative)
                         : Evaluate(expression, parameters, representative, context);
-                    context.CancellationToken.ThrowIfCancellationRequested();
+                    context.CheckInterrupt();
                     return value;
                 },
             };
@@ -12982,12 +13065,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 .ToArray();
             VdbeGroupKeyProjector groupKeyProjector = values =>
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 var row = CreateScanSourceRow(target, values, context, outerRow);
                 var key = new SqlValue[select.GroupBy.Count];
                 for (var index = 0; index < key.Length; index++)
                 {
-                    context.CancellationToken.ThrowIfCancellationRequested();
+                    context.CheckInterrupt();
                     key[index] = Evaluate(select.GroupBy[index], parameters, row, context);
                 }
 
@@ -13004,7 +13087,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 .ToArray();
             VdbeRowComparer outputOrderComparer = (left, right) =>
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 for (var index = 0; index < resolvedOrderBy.Count; index++)
                 {
                     var term = resolvedOrderBy[index];
@@ -14930,18 +15013,32 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 var keptRows = new List<SqlValue[]>(rowCount);
                 var keptRowIds = new List<long>(rowCount);
+                var deletedRowIds = new List<long>();
                 for (var index = 0; index < table.Rows.Count; index++)
                 {
+                    var rowId = index < table.RowIds.Count ? table.RowIds[index] : index + 1;
                     if (index < deleted.Length && deleted[index])
+                    {
+                        deletedRowIds.Add(rowId);
                         continue;
+                    }
                     keptRows.Add(table.Rows[index]);
-                    keptRowIds.Add(index < table.RowIds.Count ? table.RowIds[index] : index + 1);
+                    keptRowIds.Add(rowId);
                 }
 
                 table.Rows.Clear();
                 table.Rows.AddRange(keptRows);
                 table.RowIds.Clear();
                 table.RowIds.AddRange(keptRowIds);
+                foreach (var deletedRowId in deletedRowIds)
+                {
+                    context.ReportRowChange(
+                        SqliteChangeOperation.Delete,
+                        statement.TableName,
+                        table,
+                        deletedRowId);
+                }
+
                 return (long?)null;
             },
         };
@@ -16303,7 +16400,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var entries = new List<(int Position, SqlValue[] Key)>(table.Rows.Count);
         for (var position = 0; position < table.Rows.Count; position++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var rowId = table.HasRowid ? table.RowIds[position] : (long?)null;
             if (!IndexExpressionSemantics.Qualifies(
                     plan.Index,
@@ -16404,7 +16501,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context,
         SourceRow? outerRow)
     {
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         ValidateSelectIndexDirectives(statement, context);
         statement = ResolveNamedWindows(statement);
         context = EnterCollationSource(context, statement.Source);
@@ -16478,7 +16575,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var selectedRows = new List<SourceRow>();
         foreach (var row in source.Rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             if (streamProjectionRows
                 || statement.Where is null
                 || IsTrue(Evaluate(statement.Where, parameters, row, context)))
@@ -18654,7 +18751,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var key = new SqlValue[groupBy.Count];
         for (var index = 0; index < key.Length; index++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             key[index] = Evaluate(groupBy[index], parameters, row, context);
         }
 
@@ -20225,7 +20322,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? row,
         QueryContext context)
     {
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         var result = expression switch
         {
             LiteralExpression literal => literal.Value,
@@ -20256,7 +20353,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             QualifiedStarExpression => throw new EmbeddedSqlException("row value misused"),
             _ => throw new EmbeddedSqlException($"Unsupported expression type {expression.GetType().Name}."),
         };
-        context.CancellationToken.ThrowIfCancellationRequested();
+        context.CheckInterrupt();
         return result;
     }
 
@@ -21521,7 +21618,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? representative = null;
         foreach (var row in effectiveRows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var value = Evaluate(controllingExtremum.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -22061,7 +22158,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var filtered = new List<SourceRow>();
             foreach (var row in result)
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 if (IsTrue(Evaluate(function.Filter, parameters, row, context)))
                     filtered.Add(row);
             }
@@ -22079,7 +22176,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             var deduplicated = new List<SourceRow>();
             foreach (var row in result)
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 var value = Evaluate(function.Arguments[0], parameters, row, context);
                 if (seen.Any(existing => DistinctValuesEqual(existing, value, collation)))
                     continue;
@@ -22114,7 +22211,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var count = 0L;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             if (Evaluate(function.Arguments[0], parameters, row, context).Kind != SqlValueKind.Null)
                 count++;
         }
@@ -22188,7 +22285,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var count = 0L;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -22312,7 +22409,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var result = SqlValue.Null;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -22341,7 +22438,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var hasValue = false;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var value = Evaluate(function.Arguments[0], parameters, row, context);
             if (value.Kind == SqlValueKind.Null)
                 continue;
@@ -22381,7 +22478,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var accumulator = aggregate.Seed;
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var arguments = function.Arguments
                 .Select(argument => Evaluate(argument, parameters, row, context))
                 .ToArray();
@@ -22410,7 +22507,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         foreach (var row in rows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             if (!TryGetPercentileNumericValue(
                     Evaluate(function.Arguments[0], parameters, row, context),
                     out var value))
@@ -25451,7 +25548,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var results = new List<OrderByKeyed<SqlValue[]>>(grouped.Count);
         for (var index = 0; index < grouped.Count; index++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var substitution = windowValues[index];
             var values = statement.Projections
                 .Select(projection => EvaluateInGroup(
@@ -25509,7 +25606,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var groups = new List<(SqlValue[] Key, List<SourceRow> Rows)>();
         foreach (var row in selectedRows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var key = EvaluateGroupKey(groupBy, parameters, row, context);
             var groupIndex = groupIndexByKey is not null
                 && groupIndexByKey.TryGetValue(key, out var indexedGroup)
@@ -25707,7 +25804,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             foreach (var function in functions)
             {
                 var included = !IsAggregateWindowFunction(function)
@@ -25848,7 +25945,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var orderKeysBySource = new SqlValue[rowCount][];
         for (var index = 0; index < rowCount; index++)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var keys = spec.PartitionBy.Count == 0
                 ? []
                 : spec.PartitionBy.Select(expression => evaluate(index, expression)).ToArray();
@@ -25884,7 +25981,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
             : default;
         foreach (var partition in partitions)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var entries = new List<WindowOrderEntry>(partition.Members.Count);
             for (var ordinal = 0; ordinal < partition.Members.Count; ordinal++)
             {
@@ -25920,7 +26017,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             for (var position = 0; position < entries.Count; position++)
             {
-                context.CancellationToken.ThrowIfCancellationRequested();
+                context.CheckInterrupt();
                 var framePositions = needsFrame
                     ? ResolveWindowFramePositions(
                         spec,
@@ -29684,6 +29781,8 @@ public sealed class EmbeddedConnection : IDisposable
     private bool _recursiveTriggers;
     private bool _tempInitialized;
     private readonly Dictionary<EmbeddedDatabase, int> _pendingPageSizes = [];
+    private readonly ManagedConnectionHooks _hooks = new();
+    private bool _insideHookCallback;
     private bool _disposed;
 
     private sealed class AttachedDatabase : IDisposable
@@ -29873,9 +29972,135 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
+        ThrowIfInsideHookCallback();
         var parameterMap = SqlParameterMap.Parse(sql);
-        return new EmbeddedStatement(this, SqlParser.Parse(sql, parameterMap), parameterMap);
+        var statement = SqlParser.Parse(sql, parameterMap);
+        if (_hooks.Authorizer is not null)
+            statement = Authorize(statement);
+
+        return new EmbeddedStatement(this, statement, parameterMap, sql);
     }
+
+    /// <summary>
+    /// The callbacks registered on this connection. Mutating the returned instance takes effect
+    /// on the next prepared statement or execution, mirroring SQLite's hook registration APIs.
+    /// </summary>
+    public ManagedConnectionHooks Hooks => _hooks;
+
+    private ParsedStatement Authorize(ParsedStatement statement)
+    {
+        var authorizer = _hooks.Authorizer!;
+        var catalog = _transactionDatabases is not null
+            && _transactionDatabases.TryGetValue(_database, out var transactionState)
+            ? transactionState.Catalog
+            : _database.CreateAuthorizationCatalog();
+        var tempCatalog = _tempDatabase.CreateAuthorizationCatalog();
+        return SqlAuthorization.Apply(
+            statement,
+            catalog,
+            tempCatalog,
+            context => InvokeHook(() => authorizer(context)));
+    }
+
+    /// <summary>
+    /// Builds the per-execution hook payload for a routed statement. Returning <c>null</c> when
+    /// nothing is registered keeps the uninstrumented execution path byte-for-byte unchanged.
+    /// </summary>
+    private ManagedStatementHooks? CreateStatementHooks(EmbeddedDatabase database, bool includeCommitGate)
+    {
+        var updateHook = _hooks.UpdateHook;
+        var commitHook = includeCommitGate ? _hooks.CommitHook : null;
+        var progressHandler = _hooks.ProgressHandler;
+        var progressInterval = _hooks.ProgressInterval;
+        if (updateHook is null && commitHook is null && (progressHandler is null || progressInterval <= 0))
+            return null;
+
+        var schema = ResolveSchemaName(database);
+        return new ManagedStatementHooks
+        {
+            RowChanged = updateHook is null
+                ? null
+                : (operation, table, rowId) => InvokeHook(
+                    () => updateHook(new SqliteRowChange(operation, schema, table, rowId))),
+            CommitGate = commitHook is null ? null : () => InvokeHook(commitHook),
+            Progress = progressHandler is null || progressInterval <= 0
+                ? null
+                : new ManagedProgressCounter(progressInterval, () => InvokeHook(progressHandler)),
+        };
+    }
+
+    private string ResolveSchemaName(EmbeddedDatabase database)
+    {
+        if (ReferenceEquals(database, _tempDatabase))
+            return "temp";
+
+        foreach (var attachment in _attachedDatabases)
+        {
+            if (ReferenceEquals(attachment.Value.Database, database))
+                return attachment.Key;
+        }
+
+        return "main";
+    }
+
+    private void FireRollbackHook()
+    {
+        if (_hooks.RollbackHook is { } rollbackHook)
+            InvokeHook(rollbackHook);
+    }
+
+    internal void FireTraceHook(string sql)
+    {
+        if (_hooks.Trace is { } trace)
+            InvokeHook(() => trace(sql));
+    }
+
+    /// <summary>
+    /// Runs a user callback with reentrancy tracking. The managed engine cannot execute a
+    /// statement while a mutation is in flight, so a hook that calls back into its own
+    /// connection fails loudly instead of corrupting the working catalog.
+    /// </summary>
+    private void InvokeHook(Action callback)
+    {
+        if (_insideHookCallback)
+            ThrowHookReentry();
+
+        _insideHookCallback = true;
+        try
+        {
+            callback();
+        }
+        finally
+        {
+            _insideHookCallback = false;
+        }
+    }
+
+    private T InvokeHook<T>(Func<T> callback)
+    {
+        if (_insideHookCallback)
+            ThrowHookReentry();
+
+        _insideHookCallback = true;
+        try
+        {
+            return callback();
+        }
+        finally
+        {
+            _insideHookCallback = false;
+        }
+    }
+
+    internal void ThrowIfInsideHookCallback()
+    {
+        if (_insideHookCallback)
+            ThrowHookReentry();
+    }
+
+    private static void ThrowHookReentry()
+        => throw new EmbeddedSqlException(
+            "Managed connections do not support reentrant use of the connection from a hook callback.");
 
     public IReadOnlyList<EmbeddedStatement> PrepareScript(string sql)
     {
@@ -29897,6 +30122,13 @@ public sealed class EmbeddedConnection : IDisposable
         _recursiveTriggers = false;
         _tempInitialized = false;
         _pendingPageSizes.Clear();
+        _hooks.UpdateHook = null;
+        _hooks.CommitHook = null;
+        _hooks.RollbackHook = null;
+        _hooks.Authorizer = null;
+        _hooks.Trace = null;
+        _hooks.ProgressHandler = null;
+        _hooks.ProgressInterval = 0;
         foreach (var attachment in _attachedDatabases.Values)
             attachment.Dispose();
         _attachedDatabases.Clear();
@@ -30072,6 +30304,7 @@ public sealed class EmbeddedConnection : IDisposable
     {
         ThrowIfRecursiveTriggerCallbackReentry();
         ThrowIfDisposed();
+        ThrowIfInsideHookCallback();
         cancellationToken.ThrowIfCancellationRequested();
         if (_transactionMutationDatabase is not null && EmbeddedDatabase.MayMutate(statement))
         {
@@ -30110,6 +30343,7 @@ public sealed class EmbeddedConnection : IDisposable
                     throw new EmbeddedSqlException("cannot rollback - no transaction is active");
 
                 ResetTransactionState();
+                FireRollbackHook();
                 return ExecutionResult.Empty;
             case SavepointStatement savepoint:
                 CreateSavepoint(savepoint.Name);
@@ -30184,17 +30418,32 @@ public sealed class EmbeddedConnection : IDisposable
                     {
                         if (transactionState is null)
                         {
-                            result = routed.Database.Execute(
-                                routed.Statement,
-                                parameters,
-                                _lastInsertRowId,
-                                _foreignKeys,
-                                _recursiveTriggers,
-                                _deferForeignKeys,
-                                inTransaction: false,
-                                cancellationToken,
-                                compilationEnabled: !routed.IsAttached
-                                    && !ReferenceEquals(routed.Database, _tempDatabase));
+                            try
+                            {
+                                result = routed.Database.Execute(
+                                    routed.Statement,
+                                    parameters,
+                                    _lastInsertRowId,
+                                    _foreignKeys,
+                                    _recursiveTriggers,
+                                    _deferForeignKeys,
+                                    inTransaction: false,
+                                    cancellationToken,
+                                    compilationEnabled: !routed.IsAttached
+                                        && !ReferenceEquals(routed.Database, _tempDatabase),
+                                    CreateStatementHooks(routed.Database, includeCommitGate: true));
+                            }
+                            catch (Exception failure)
+                                when (failure is not EmbeddedConflictFailException
+                                    && EmbeddedDatabase.MayMutate(routed.Statement))
+                            {
+                                // SQLite rolls back the implicit transaction wrapping a failed
+                                // autocommit mutation and notifies the rollback hook. ON CONFLICT
+                                // FAIL is excluded because the rows written before the failure are
+                                // still committed.
+                                FireRollbackHook();
+                                throw;
+                            }
                         }
                         else
                         {
@@ -30212,7 +30461,8 @@ public sealed class EmbeddedConnection : IDisposable
                                 inTransaction: true,
                                 cancellationToken,
                                 compilationEnabled: !routed.IsAttached
-                                    && !ReferenceEquals(routed.Database, _tempDatabase));
+                                    && !ReferenceEquals(routed.Database, _tempDatabase),
+                                CreateStatementHooks(routed.Database, includeCommitGate: false));
                             if (EmbeddedDatabase.MayMutate(routed.Statement))
                                 cancellationToken.ThrowIfCancellationRequested();
                         }
@@ -30264,7 +30514,10 @@ public sealed class EmbeddedConnection : IDisposable
                     if (exception.LastInsertRowId is { } rolledBackInsertRowId)
                         _lastInsertRowId = rolledBackInsertRowId;
                     if (_transactionDatabases is not null)
+                    {
                         ResetTransactionState();
+                        FireRollbackHook();
+                    }
 
                     throw new EmbeddedSqlException(exception.Message, exception.InnerException ?? exception);
                 }
@@ -30329,7 +30582,10 @@ public sealed class EmbeddedConnection : IDisposable
                 catch (OperationCanceledException)
                 {
                     if (transactionState is not null && EmbeddedDatabase.MayMutate(routed.Statement))
+                    {
                         ResetTransactionState();
+                        FireRollbackHook();
+                    }
                     throw;
                 }
         }
@@ -32262,6 +32518,16 @@ public sealed class EmbeddedConnection : IDisposable
         var changed = _transactionDatabases
             .Where(pair => pair.Value.HasChanges)
             .ToArray();
+
+        // SQLite only consults the commit hook when the transaction actually has something to
+        // commit, and a veto turns the commit into a rollback.
+        if (changed.Length != 0 && _hooks.CommitHook is { } commitHook && !InvokeHook(commitHook))
+        {
+            ResetTransactionState();
+            FireRollbackHook();
+            throw new EmbeddedCommitVetoException();
+        }
+
         var persistentChanges = changed
             .Where(pair => !ReferenceEquals(pair.Key, _tempDatabase))
             .ToArray();
@@ -32788,6 +33054,7 @@ public sealed class EmbeddedStatement : IDisposable
     private readonly EmbeddedConnection _connection;
     private readonly ParsedStatement _statement;
     private readonly SqlParameterMap _parameters;
+    private readonly string _sql;
     private readonly SqlValue[] _boundValues;
     private readonly bool[] _isBound;
     private string[]? _columnNames;
@@ -32813,11 +33080,16 @@ public sealed class EmbeddedStatement : IDisposable
         Ineligible,
     }
 
-    internal EmbeddedStatement(EmbeddedConnection connection, ParsedStatement statement, SqlParameterMap parameters)
+    internal EmbeddedStatement(
+        EmbeddedConnection connection,
+        ParsedStatement statement,
+        SqlParameterMap parameters,
+        string sql = "")
     {
         _connection = connection;
         _statement = statement;
         _parameters = parameters;
+        _sql = sql;
         _boundValues = new SqlValue[parameters.Count + 1];
         _isBound = new bool[parameters.Count + 1];
     }
@@ -33007,6 +33279,9 @@ public sealed class EmbeddedStatement : IDisposable
                     ? $"Missing value for parameter {name}."
                     : $"Missing value for parameter at position {index}.");
         }
+
+        if (_sql.Length != 0)
+            _connection.FireTraceHook(_sql);
 
         // An eligible top-level VALUES reuses its cached lowering (compiled once for this statement) instead
         // of recompiling on every execution; every other statement -- and any fallback VALUES shape -- keeps
