@@ -48,6 +48,8 @@ it implements. What it does not share is the engine architecture:
 | `EXPLAIN` | Emits managed instruction names, not SQLite opcodes, and errors for evaluator-owned statements instead of fabricating a program. `EXPLAIN QUERY PLAN` reports the managed execution boundary (`MANAGED COMPILED VDBE`, `MANAGED EVALUATOR FALLBACK`, or a real `SCAN`/`SEARCH ... USING INDEX` row) rather than SQLite optimizer internals. |
 | Storage | Table rows are materialized in managed memory rather than paged incrementally from a B-tree, so a database must fit in the process heap. There is no page defragmentation, freelist reclamation on the bounded write path, interior-page split/merge balancing, `auto_vacuum`, or pointer-map support. Use `VACUUM` to compact. |
 | Working set | Nothing spills to disk. Sorters, joins, `DISTINCT`, and CTE materialization are in-memory, so result-set size is bounded by available memory. |
+| Result order | `GROUP BY` emits groups in first-encounter order rather than SQLite's sorted-by-key order. A grouped query without `ORDER BY` - including one whose window pass runs over those grouped rows, such as `row_number() OVER ()` - may therefore return a different order than SQLite. Add an `ORDER BY` when the order matters. |
+| REAL to TEXT | Layout matches SQLite exactly - a whole-number real keeps a fractional digit (`0.0`, not `0`), the fixed-notation window is the same, and the exponential form is `1.0e+20`. The digits are the shortest that read back as the same double. SQLite derives its digits from `sqlite3FpDecode`, which is deliberately cheap rather than correctly rounded, so for about one double in six it emits a redundant seventeenth digit, and that digit is sometimes wrong: it prints `3.1079236656039855e-160` where the correctly rounded value is `3.1079236656039854e-160`. Managed output always round-trips and is never longer than SQLite's. |
 | Async | Local managed async methods move blocking work to the thread pool rather than performing non-blocking I/O. Treat them as cancellation-aware wrappers, not as a scalability mechanism. |
 
 ### Write throughput
@@ -67,20 +69,94 @@ measured 2-3x slower at 100-400 rows. Batch writes into explicit transactions,
 keep individual tables modest, and benchmark your own workload before adopting
 the managed provider for write-heavy use.
 
+### Hooks, authorizer, tracing, and the progress handler
+
+`SqliteConnection` publishes `SetUpdateHook`, `SetCommitHook`, `SetRollbackHook`,
+`SetAuthorizer`, `SetTraceHandler`, and `SetProgressHandler`. Their semantics were
+derived from measurements of real SQLite and are re-checked against it at test
+time by `ManagedHookSqliteDifferentialTests`, so the surprising parts match:
+`INSERT OR REPLACE` does not report its implicit delete, `WITHOUT ROWID` tables
+report nothing, `sqlite_sequence` maintenance is invisible, a vetoing commit hook
+turns the commit into a rollback reported as `SQLITE_CONSTRAINT` (19), and the
+rollback hook fires for an explicit `ROLLBACK` even when nothing changed.
+
+Known divergences from SQLite:
+
+| Surface | Managed behavior |
+| --- | --- |
+| Update hook, unfiltered `DELETE FROM t` | Reports one change per row. SQLite reports none because it replaces the statement with a truncate; suppressing the notifications to imitate that would leave a change-tracking consumer silently stale. |
+| Commit hook | Not consulted for `VACUUM`, `ATTACH`/`DETACH`, `CREATE TABLE ... AS SELECT`, header pragma writes such as `PRAGMA user_version = n`, or incremental blob writes, because those bypass the statement commit path. |
+| Reentrancy | Using the connection from inside a hook throws. SQLite leaves this undefined and in practice permits it; the managed engine cannot, because a reentrant read would observe the published catalog rather than the in-flight working copy and would therefore return stale rows. |
+| Trace | Reports the prepared SQL text without expanding parameters, matching `sqlite3_trace_v2`'s `SQLITE_TRACE_STMT` rather than the legacy `sqlite3_trace`. The provider's own column-metadata probes are excluded, because native SQLite answers those through `sqlite3_column_decltype` without preparing a statement. |
+| Progress handler | Counts managed row-execution steps rather than VDBE opcodes, so the interval is not comparable to SQLite's. The interrupt semantics are: a `true` return fails the statement with `SQLITE_INTERRUPT` (9). |
+| Provider and cache scope | Callbacks require `Local Provider=Managed`, and are rejected on managed shared-memory databases for the same reason connection-local functions are: the catalog is shared across connections. |
+
+`sqlite3_profile` and `sqlite3_trace_v2`'s row and close events have no managed
+equivalent and are not published, because the managed engine has no per-statement
+wall-clock accounting that would make the reported numbers mean anything.
+
+### Disconnected ADO.NET
+
+`TursoDataAdapter` and `TursoCommandBuilder` support the classic `DataSet` model.
+`Fill`, `FillSchema` and `Update` round trips persist inserts, updates and deletes,
+and both `TursoConnection` and the `SqliteConnection` facade use the same adapter.
+Round trips are covered by tests on managed local connections, and on native local
+connections when the native companion is present.
+
+`GetSchema` is also shared: both connection types answer from one implementation that
+reads the catalog with ordinary SQL on the owning connection. A remote or replica
+connection therefore describes the database it is attached to, and a statement the
+target rejects surfaces that engine's own error instead of an empty table that would
+read as "no objects exist". Remote behaviour is covered against a canned Hrana server;
+it has not been validated against a live Turso Cloud instance.
+
+`GetSchema` runs those catalog statements on the caller's behalf, so an installed
+authorizer sees them and a trace handler reports them. That is deliberate: the
+`Tables` collection returns each object's stored DDL, so a schema call that bypassed
+a deny-by-default policy would disclose exactly what the policy was installed to hide.
+`MetaDataCollections` and `ReservedWords` describe the provider rather than the
+database and are answered without touching it. The reader's own column-metadata
+probes remain exempt, as documented above, because they describe a result set the
+caller has already been authorized to read.
+
+`ReservedWords` reports SQLite's full keyword list, checked as a set against
+`Microsoft.Data.Sqlite` at test time, because callers use it to decide which
+identifiers need quoting and a partial list yields invalid SQL rather than a
+cosmetic difference. `MetaDataCollections` uses the reference provider's column
+shape; its row set is a superset, since that provider defines only these two
+constant collections and leaves the four catalog collections undefined.
+
+Deliberate limits:
+
+- `TursoCommandBuilder` generates statements for a single-table `SELECT` only, and the
+  select list must expose a key column. Joins, expressions, and multi-table selects
+  need hand-written `InsertCommand`/`UpdateCommand`/`DeleteCommand`.
+- `UpdateBatchSize` stays at 1; each changed row is a separate round trip.
+- `MissingSchemaAction.AddWithKey` does not promote a rowid-alias `INTEGER PRIMARY KEY`
+  to a `DataTable` primary key. This matches `Microsoft.Data.Sqlite`: SQLite publishes
+  no uniqueness metadata for a rowid alias, so `System.Data` declines to infer the key.
+  `TursoCommandBuilder` is unaffected because it reads `IsKey` from the schema table.
+- `GetSchema` defines `MetaDataCollections`, `ReservedWords`, `Tables`, `Columns`,
+  `Indexes` and `IndexColumns`. Any other collection name is an `ArgumentException`.
+- An authorizer that returns `SqliteAuthorizerResult.Ignore` for an `UPDATE` makes
+  `Update` report the row as saved even though the assignment was neutralized, so the
+  `DataSet` accepts a change the database never took. `Deny` is reported correctly and
+  leaves the row pending; only `Ignore` is silent. The engine reports the matched-row
+  count, which is `1` for a neutralized update exactly as it is for one that rewrites
+  the value it already held, and a plain `ExecuteNonQuery` reports the same `1`, so the
+  adapter has nothing to distinguish. Use `Deny` if a rejected write must be visible.
+
 ### Not implemented
 
-- Update, commit, and rollback hooks; the authorizer; trace and profile
-  callbacks; and the progress handler.
 - Virtual-table modules and `CREATE VIRTUAL TABLE`, including FTS and R-Tree.
-- `DbDataAdapter`/`DataSet` support. `SqliteConnection.GetSchema` is implemented;
-  `TursoConnection` inherits the throwing base implementation.
+- Profile callbacks (`sqlite3_profile`), and the row/close events of
+  `sqlite3_trace_v2`.
 - Raw `sqlite3*` handle interop: `SqliteConnection.Handle` returns `null`.
   `ServerVersion` reports a managed placeholder, not a real SQLite version.
 - Experimental MVCC and vector search.
 - `UPDATE ... FROM`, `UPDATE OR <algorithm>`, `UPDATE`/`DELETE` target aliases,
   `CREATE TEMP VIEW`/`CREATE TEMP TRIGGER`, `BEGIN CONCURRENT`, and `ANALYZE`.
   Each is rejected during parsing.
-- Window functions combined with `GROUP BY` or ordinary aggregates.
 - `BEGIN DEFERRED`/`IMMEDIATE`/`EXCLUSIVE` parse for compatibility, but the mode
   is discarded and does not change managed locking behavior.
 - Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Turso's

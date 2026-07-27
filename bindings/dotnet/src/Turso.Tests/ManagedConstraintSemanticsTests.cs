@@ -188,16 +188,24 @@ public sealed class ManagedConstraintSemanticsTests
     }
 
     [Test]
-    public void RenameRejectsSchemasThatRequireConstraintExpressionRewriting()
+    public void RenameRewritesConstraintExpressionsThatReferenceTheRenamedColumn()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
         Execute(connection, "CREATE TABLE values_table(a INTEGER, b INTEGER, UNIQUE(a, b), CHECK(a < b));");
+        Execute(connection, "ALTER TABLE values_table RENAME COLUMN a TO first;");
 
-        Action rename = () => Execute(connection, "ALTER TABLE values_table RENAME COLUMN a TO first;");
-        rename.Should().Throw<EmbeddedSqlException>()
-            .WithMessage("*schema token rewriting*");
+        // SQLite rewrites the stored CHECK expression and the table-level UNIQUE key in place.
+        var schema = ReadRows(connection, "SELECT sql FROM sqlite_schema WHERE name='values_table';")
+            .Single()[0].AsText();
+        schema.Should().Contain("CHECK (first < b)").And.Contain("UNIQUE (\"first\", \"b\")")
+            .And.NotContain("(a ").And.NotContain("\"a\"");
+
         Execute(connection, "INSERT INTO values_table VALUES (1, 2);");
+        Action violation = () => Execute(connection, "INSERT INTO values_table VALUES (5, 2);");
+        violation.Should().Throw<EmbeddedSqlException>().WithMessage("*CHECK*");
+        ReadRows(connection, "SELECT first, b FROM values_table;").Single()
+            .Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
     }
 
     [Test]

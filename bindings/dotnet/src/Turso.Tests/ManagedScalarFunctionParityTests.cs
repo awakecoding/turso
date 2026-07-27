@@ -40,8 +40,6 @@ public sealed class ManagedScalarFunctionParityTests
     [TestCase("SELECT unicode('A');", 65L)]
     [TestCase("SELECT length(zeroblob(4));", 4L)]
     [TestCase("SELECT length(randomblob(4));", 4L)]
-    [TestCase("SELECT mod(7, 3);", 1L)]
-    [TestCase("SELECT mod(-7, 3);", -1L)]
     [TestCase("SELECT sign(-3);", -1L)]
     [TestCase("SELECT sign(0);", 0L)]
     [TestCase("SELECT sign(9);", 1L)]
@@ -75,6 +73,9 @@ public sealed class ManagedScalarFunctionParityTests
     [TestCase("SELECT sin(0.0);", 0.0d)]
     [TestCase("SELECT cos(0.0);", 1.0d)]
     [TestCase("SELECT atan2(0.0, 1.0);", 0.0d)]
+    // mod() maps to C fmod in SQLite, so it yields a real even for integer operands.
+    [TestCase("SELECT mod(7, 3);", 1.0d)]
+    [TestCase("SELECT mod(-7, 3);", -1.0d)]
     public void ManagedEngineEvaluatesRealReturningMathBuiltinsLikeSqlite(string sql, double expected)
     {
         using var database = new EmbeddedDatabase();

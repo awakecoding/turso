@@ -45,7 +45,7 @@ internal sealed record TableValuedFunctionCall(
     /// rather than an edit to every module.
     /// </remarks>
     public void CheckInterrupt()
-        => Context.CancellationToken.ThrowIfCancellationRequested();
+        => Context.CheckInterrupt();
 }
 
 /// <summary>

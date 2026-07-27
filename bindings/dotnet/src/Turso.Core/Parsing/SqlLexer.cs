@@ -178,6 +178,12 @@ internal sealed class SqlLexer
 
     private SqlToken ReadToken()
     {
+        var token = ReadTokenWithoutExtent();
+        return token with { End = _offset };
+    }
+
+    private SqlToken ReadTokenWithoutExtent()
+    {
         SkipWhitespaceAndComments();
         if (_offset == _sql.Length)
             return new SqlToken(TokenKind.End, string.Empty, _offset);
@@ -444,11 +450,20 @@ internal sealed class SqlLexer
     private static bool IsIdentifierContinue(char value) => char.IsAsciiLetterOrDigit(value) || value is '_' or '$';
 }
 
+/// <summary>
+/// A lexed token. <paramref name="Offset"/> and <see cref="End"/> delimit the token's
+/// exact source extent (including any surrounding quote characters), which
+/// <c>ALTER TABLE ... RENAME</c> uses to edit stored schema SQL in place the way SQLite
+/// does instead of re-rendering it from the parse tree.
+/// </summary>
 internal readonly record struct SqlToken(
     TokenKind Kind,
     string Text,
     int Offset,
-    bool IsQuoted = false);
+    bool IsQuoted = false)
+{
+    public int End { get; init; } = Offset;
+}
 
 internal readonly record struct LexerState(int Offset, SqlToken Token);
 

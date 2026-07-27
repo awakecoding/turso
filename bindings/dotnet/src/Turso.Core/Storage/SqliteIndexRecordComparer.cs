@@ -103,15 +103,12 @@ public sealed class SqliteIndexRecordComparer
     }
 
     /// <summary>Validates that <paramref name="record"/> is a supported index key record.</summary>
-    public void Validate(ReadOnlySpan<byte> record)
-    {
-        var values = SqliteRecordCodec.Decode(record, TextEncoding);
-        foreach (var value in values)
-        {
-            if (value.Kind == SqlValueKind.Real && double.IsNaN(value.AsReal()))
-                throw new InvalidDataException("SQLite index records containing NaN are not supported.");
-        }
-    }
+    /// <remarks>
+    /// A stored NaN is not rejected. SQLite's <c>sqlite3VdbeMemSetDouble</c> refuses to create one
+    /// and its <c>serialGet</c> reads one back as NULL, so the managed codec normalises it the same
+    /// way and no NaN can reach a comparison.
+    /// </remarks>
+    public void Validate(ReadOnlySpan<byte> record) => SqliteRecordCodec.Decode(record, TextEncoding);
 
     /// <summary>
     /// Returns whether a collation name is one of SQLite's built-in persisted
@@ -210,13 +207,7 @@ public sealed class SqliteIndexRecordComparer
             return left.AsInteger().CompareTo(right.AsInteger());
 
         if (left.Kind == SqlValueKind.Real && right.Kind == SqlValueKind.Real)
-        {
-            var leftReal = left.AsReal();
-            var rightReal = right.AsReal();
-            ThrowIfNaN(leftReal);
-            ThrowIfNaN(rightReal);
-            return leftReal.CompareTo(rightReal);
-        }
+            return left.AsReal().CompareTo(right.AsReal());
 
         var integer = left.Kind == SqlValueKind.Integer ? left.AsInteger() : right.AsInteger();
         var real = left.Kind == SqlValueKind.Real ? left.AsReal() : right.AsReal();
@@ -226,8 +217,6 @@ public sealed class SqliteIndexRecordComparer
 
     private static int CompareIntegerToReal(long integer, double real)
     {
-        ThrowIfNaN(real);
-
         // These boundaries are exactly representable doubles. The positive
         // boundary is one past Int64.MaxValue.
         const double MinimumInt64 = -9_223_372_036_854_775_808d;
@@ -243,12 +232,6 @@ public sealed class SqliteIndexRecordComparer
             return comparison;
 
         return real > 0 ? -1 : 1;
-    }
-
-    private static void ThrowIfNaN(double value)
-    {
-        if (double.IsNaN(value))
-            throw new InvalidDataException("SQLite index records containing NaN are not supported.");
     }
 
     private static int CompareBinary(ReadOnlySpan<byte> left, ReadOnlySpan<byte> right)
