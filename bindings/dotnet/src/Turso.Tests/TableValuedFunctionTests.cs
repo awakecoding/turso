@@ -216,6 +216,40 @@ public class TableValuedFunctionTests
         elapsed.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(10));
     }
 
+    /// <summary>
+    /// SQLite lets a table-valued function argument reference a column of an earlier
+    /// <c>FROM</c> entry (an implicit <c>LATERAL</c>), re-evaluating the source per outer
+    /// row. The managed join evaluates each source once, so the correlated form is not
+    /// supported. This pins the boundary: it must fail with a clear unresolved-column
+    /// error rather than silently returning rows computed from the wrong arguments.
+    /// Remove this test when a correlated join path lands.
+    /// </summary>
+    [Test]
+    public void ACorrelatedModuleArgumentFailsInsteadOfReturningAWrongAnswer()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Execute(connection, "CREATE TABLE t(a, b);");
+        Execute(connection, "INSERT INTO t VALUES (1, '[7]'), (2, '[8,9]');");
+
+        // A constant argument is unaffected: the module still runs for every outer row.
+        Rows(connection, "SELECT value FROM t JOIN json_each('[7]') AS j;")
+            .Should().Equal(["7", "7"]);
+
+        foreach (var correlated in new[]
+        {
+            "SELECT value FROM t, json_each(t.b);",
+            "SELECT value FROM t JOIN json_each(t.b) AS j;",
+            "SELECT s.value FROM t JOIN generate_series(1, t.a) AS s;",
+        })
+        {
+            Action query = () => Rows(connection, correlated);
+            query.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*no such column*", because: "{0} must not fabricate a result", correlated);
+        }
+    }
+
     [Test]
     public void UnregisteredModuleNamesAreRejected()
     {
