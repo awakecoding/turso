@@ -349,12 +349,8 @@ public sealed class ExtendedDmlGrammarSqlRoutingTests
             """);
         var cases = new[]
         {
-            ("UPDATE OR IGNORE t SET value = 20;", "conflict algorithms"),
-            ("UPDATE t AS target SET value = 20;", "target aliases"),
             ("UPDATE t INDEXED BY t_value SET value = 20;", "INDEXED BY"),
             ("UPDATE t NOT INDEXED SET value = 20;", "NOT INDEXED"),
-            ("UPDATE t SET value = source.value FROM source WHERE source.id = t.id;", "UPDATE FROM"),
-            ("DELETE FROM t AS target WHERE id = 1;", "target aliases"),
             ("DELETE FROM t INDEXED BY t_value WHERE id = 1;", "INDEXED BY"),
             ("UPDATE t SET value = 20 ORDER BY id;", "ORDER BY without LIMIT"),
             ("DELETE FROM t ORDER BY id;", "ORDER BY without LIMIT"),
@@ -369,6 +365,30 @@ public sealed class ExtendedDmlGrammarSqlRoutingTests
             })!.Message.Should().Contain(message, sql);
             Scalar(connection, "SELECT value FROM t WHERE id = 1;").Should().Be(10);
         }
+    }
+
+    [Test]
+    public void ExtendedUpdateFormsMutateTheTargetTable()
+    {
+        using var connection = Connect(
+            """
+            CREATE TABLE t(id INTEGER, value INTEGER);
+            CREATE TABLE source(id INTEGER, value INTEGER);
+            INSERT INTO t VALUES (1, 10);
+            INSERT INTO source VALUES (1, 99);
+            """);
+
+        ExecuteManaged(connection, "UPDATE OR IGNORE t SET value = 20;");
+        Scalar(connection, "SELECT value FROM t WHERE id = 1;").Should().Be(20);
+
+        ExecuteManaged(connection, "UPDATE t AS target SET value = target.value + 1;");
+        Scalar(connection, "SELECT value FROM t WHERE id = 1;").Should().Be(21);
+
+        ExecuteManaged(connection, "UPDATE t SET value = source.value FROM source WHERE source.id = t.id;");
+        Scalar(connection, "SELECT value FROM t WHERE id = 1;").Should().Be(99);
+
+        ExecuteManaged(connection, "DELETE FROM t AS target WHERE target.id = 1;");
+        Scalar(connection, "SELECT count(*) FROM t;").Should().Be(0);
     }
 
     [Test]

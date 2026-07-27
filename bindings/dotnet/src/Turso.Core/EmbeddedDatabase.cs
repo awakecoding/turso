@@ -3451,6 +3451,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
 
         var row = CreateSchemaValidationRow(statement.TableName, table, triggerRow);
+        if (statement.From is not null)
+        {
+            // A trigger body may drive its UPDATE from a source list, so schema validation has to
+            // see the joined target/source shape rather than the target table alone.
+            var joined = new JoinTableSource(
+                new NamedTableSource(statement.TableName, statement.TargetQualifier),
+                statement.From,
+                Condition: null,
+                JoinKind.Inner);
+            row = CreateQuerySchemaValidationRow(
+                joined,
+                context,
+                GetSourceColumns(joined, context),
+                GetOutputColumns(joined, context),
+                triggerRow);
+        }
+
         foreach (var assignment in statement.Assignments)
         {
             _ = table.GetColumnIndex(assignment.Column);
@@ -5733,8 +5750,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var target = upsert.Target;
         if (target.Count == 0)
         {
-            if (upsert.Action is not DoNothingUpsertAction || upsert.TargetWhere is not null)
-                throw new InvalidOperationException("Only target-less UPSERT DO NOTHING is supported.");
+            // SQLite treats an omitted conflict target as "any uniqueness constraint", so the
+            // action runs for whichever PRIMARY KEY or UNIQUE index the candidate row violates.
+            if (upsert.TargetWhere is not null)
+                throw new EmbeddedSqlException("ON CONFLICT clause requires a conflict target before WHERE.");
 
             return new UpsertConflictTarget(Index: null, Columns: null, CatchesAllUniqueConstraints: true);
         }
@@ -6791,12 +6810,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
         EmbeddedTable table,
         SqlValue[] row,
         QueryContext context)
+        => ResolveNotNullReplaceDefaults(statement.ConflictAlgorithm, table, row, context);
+
+    // REPLACE resolves a NOT NULL violation by substituting the column default; a column with no
+    // default falls through and the constraint failure is reported as ABORT would report it.
+    private void ResolveNotNullReplaceDefaults(
+        InsertConflictAlgorithm? statementAlgorithm,
+        EmbeddedTable table,
+        SqlValue[] row,
+        QueryContext context)
     {
         var changed = false;
         for (var columnIndex = 0; columnIndex < table.ColumnDefinitions.Length; columnIndex++)
         {
             var column = table.ColumnDefinitions[columnIndex];
-            var conflictAlgorithm = statement.ConflictAlgorithm ?? column.NotNullConflictAlgorithm;
+            var conflictAlgorithm = statementAlgorithm ?? column.NotNullConflictAlgorithm;
             if (!column.NotNull
                 || row[columnIndex].Kind != SqlValueKind.Null
                 || conflictAlgorithm != InsertConflictAlgorithm.Replace
@@ -7054,7 +7082,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var selectedPositions = statement.Limit is null
             ? null
             : SelectLimitedDmlPositions(
-                statement.TableName,
+                statement.TargetQualifier,
                 table,
                 statement.Where,
                 statement.EffectiveOrderBy,
@@ -7253,9 +7281,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
             statement.TableName,
             TriggerEvent.Update,
             updatedColumns);
+        // OR REPLACE removes the conflicting rows before the target row is rewritten, which the
+        // evaluated path cannot express: it stages every row and publishes once at the end. The
+        // row-triggered path commits row by row and already owns the delete-then-insert
+        // replacement used by INSERT OR REPLACE, so replacement updates route through it.
+        var replacesRows = statement.ConflictAlgorithm == InsertConflictAlgorithm.Replace;
         if (context.Views?.ContainsKey(statement.TableName) == true
             || HasTriggerEvent(context, statement.TableName, TriggerEvent.Update)
             || context.InsideTrigger && context.ConflictAlgorithmOverride is not null
+            || replacesRows
             || hasForeignKeyActionTriggers)
         {
             return ExecuteRowTriggeredUpdate(statement, parameters, context, updatedColumns);
@@ -7275,7 +7309,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         context = EnterCollationSource(
             context,
-            new NamedTableSource(statement.TableName));
+            new NamedTableSource(statement.TableName, statement.Alias));
         if (CanRouteUpdateThroughCompiler(statement, context)
             && TryCompileUpdate(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning, parameters);
@@ -7292,10 +7326,14 @@ public sealed partial class EmbeddedDatabase : IDisposable
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
         var plan = PrepareUpdate(statement, table, context);
+        var fromMatches = statement.From is null
+            ? null
+            : MatchUpdateFromRows(statement, table, parameters, context)
+                .ToDictionary(match => match.Position, match => match.Row);
         var selectedPositions = statement.Limit is null
             ? null
             : SelectLimitedDmlPositions(
-                statement.TableName,
+                statement.TargetQualifier,
                 table,
                 statement.Where,
                 statement.EffectiveOrderBy,
@@ -7320,19 +7358,20 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             var row = table.Rows[position];
             var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
-            if (selectedPositions is not null)
+            SourceRow? evaluationRow = null;
+            if (fromMatches is not null)
+            {
+                if (!fromMatches.TryGetValue(position, out evaluationRow))
+                    continue;
+            }
+            else if (selectedPositions is not null)
             {
                 if (!selectedPositions.Contains(position))
                     continue;
             }
             else if (statement.Where is not null)
             {
-                var source = new SourceRow(
-                    table.Columns,
-                    row,
-                    RowId: table.HasRowid ? rowid : null,
-                    RowIdQualifier: statement.TableName,
-                    ColumnDefinitions: table.ColumnDefinitions);
+                var source = CreateDmlTargetRow(table, statement.TargetQualifier, row, rowid);
                 if (!IsTrue(Evaluate(statement.Where, parameters, source, context)))
                     continue;
             }
@@ -7348,7 +7387,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     row,
                     rowid,
                     parameters,
-                    context);
+                    context,
+                    evaluationRow: evaluationRow);
                 rows[position] = updated;
                 rowIds[position] = newRowid;
                 ValidateRowIdsUnique(statement.TableName, table, rowIds, plan.AliasIndex);
@@ -7361,15 +7401,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
             {
                 rows[position] = row;
                 rowIds[position] = rowid;
-                var inheritedAlgorithm = context.InsideTrigger
+                // A trigger body ignores its own OR clause: the statement that fired the trigger
+                // supplies the policy. Outside a trigger the statement's OR clause wins over any
+                // schema-level ON CONFLICT recorded on the violated constraint.
+                var statementAlgorithm = context.InsideTrigger
                     ? context.TriggerConflictAlgorithm
-                    : null;
-                if (inheritedAlgorithm is not null && !IsConflictAlgorithmConstraint(exception))
+                    : statement.ConflictAlgorithm;
+                if (statementAlgorithm is not null && !IsConflictAlgorithmConstraint(exception))
                     throw;
-                var algorithm = inheritedAlgorithm ?? exception.ConflictAlgorithm;
+                var algorithm = statementAlgorithm ?? exception.ConflictAlgorithm;
                 if (algorithm == InsertConflictAlgorithm.Ignore)
                     continue;
-                if (inheritedAlgorithm == InsertConflictAlgorithm.Fail)
+                if (statementAlgorithm == InsertConflictAlgorithm.Fail)
                 {
                     if (rowsAffected > 0)
                     {
@@ -7389,7 +7432,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                         exception,
                         context.LastInsertRowId);
                 }
-                if (inheritedAlgorithm == InsertConflictAlgorithm.Rollback)
+                if (statementAlgorithm == InsertConflictAlgorithm.Rollback)
                     throw new EmbeddedConflictRollbackException(exception);
                 if (algorithm is InsertConflictAlgorithm.Fail
                     or InsertConflictAlgorithm.Rollback
@@ -7436,8 +7479,182 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return new ExecutionResult([], [], rowsAffected, rowsAffected > 0);
     }
 
+    // Pairs each target row with the FROM row that drives its assignments. SQLite compiles
+    // UPDATE ... FROM by prepending the target to the FROM list, so the target is invisible to
+    // join constraints written inside FROM: materialising FROM on its own reproduces that and
+    // snapshots the source before the first target row is written. Each target row is updated at
+    // most once; SQLite leaves the choice of source row unspecified when several match, and
+    // keeping the first one seen also keeps every SET column consistent with a single source row.
+    private List<(int Position, SourceRow Row)> MatchUpdateFromRows(
+        UpdateStatement statement,
+        EmbeddedTable table,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var from = statement.From!;
+        RejectDuplicateUpdateFromQualifiers(from, context);
+        RejectAmbiguousUpdateFromCoalescedColumns(from, context);
+        var qualifier = statement.TargetQualifier;
+        var joined = new JoinTableSource(
+            new NamedTableSource(statement.TableName, qualifier),
+            from,
+            Condition: null,
+            JoinKind.Inner);
+        var sourceData = GetSourceRows(from, parameters, context, maximumRows: null, outerRow: null);
+        var targetQualifiedColumns = BuildQualifiedColumns(qualifier, table.Columns);
+        var sourceQualifiedColumns = GetQualifiedColumns(from, context);
+        var columns = table.Columns.Concat(sourceData.Columns).ToArray();
+        var outputColumns = GetOutputColumns(joined, context);
+        var columnDefinitions = GetSourceColumnDefinitions(joined, context);
+        var qualifiedColumnDefinitions = GetSourceQualifiedColumnDefinitions(joined, context);
+        var targetWidth = table.Columns.Length;
+        // A source that reuses the target's qualifier does not hide it: SQLite resolves the
+        // qualified name against both and only complains when the column exists on both sides.
+        var ambiguousQualifiedColumns = targetQualifiedColumns.Keys
+            .Where(sourceQualifiedColumns.ContainsKey)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var matches = new List<(int Position, SourceRow Row)>();
+        for (var position = 0; position < table.Rows.Count; position++)
+        {
+            context.CancellationToken.ThrowIfCancellationRequested();
+            var targetValues = table.Rows[position];
+            var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
+            var targetRowIds = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase)
+            {
+                [qualifier] = table.HasRowid ? rowid : null,
+            };
+            foreach (var sourceRow in sourceData.Rows)
+            {
+                var combined = new SourceRow(
+                    columns,
+                    [.. targetValues, .. sourceRow.Values],
+                    CombineQualifiedColumns(targetQualifiedColumns, sourceRow.QualifiedColumns, targetWidth),
+                    Parent: null,
+                    OutputColumns: outputColumns,
+                    RowId: table.HasRowid ? rowid : null,
+                    RowIdQualifier: qualifier,
+                    QualifiedRowIds: CombineQualifiedRowIds(targetRowIds, GetQualifiedRowIds(sourceRow)),
+                    ColumnDefinitions: columnDefinitions,
+                    QualifiedColumnDefinitions: qualifiedColumnDefinitions,
+                    AmbiguousQualifiedColumns: ambiguousQualifiedColumns);
+                if (statement.Where is not null
+                    && !IsTrue(Evaluate(statement.Where, parameters, combined, context)))
+                {
+                    continue;
+                }
+
+                matches.Add((position, combined));
+                break;
+            }
+        }
+
+        return matches;
+    }
+
+    // SQLite adds a hidden rowid reference for every FROM entry so it can drive the update from
+    // an ephemeral table; two entries sharing a qualifier make that reference ambiguous. The
+    // target is exempt because its rowid is referenced positionally rather than by name.
+    private static void RejectDuplicateUpdateFromQualifiers(TableSource from, QueryContext context)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Walk(from);
+
+        void Walk(TableSource source)
+        {
+            switch (source)
+            {
+                case JoinTableSource join:
+                    Walk(join.Left);
+                    Walk(join.Right);
+                    return;
+                case NamedTableSource named:
+                    Add(named);
+                    return;
+                default:
+                    return;
+            }
+        }
+
+        void Add(NamedTableSource named)
+        {
+            var isCommonTableExpression = context.CommonTableExpressions.ContainsKey(named.Name);
+            var qualifier = named.Alias
+                ?? (isCommonTableExpression ? named.Name : ManagedSchemaName.Display(named.Name));
+            if (seen.Add(qualifier))
+                return;
+
+            var schema = ManagedSchemaName.TrySplit(named.Name, out var explicitSchema, out _)
+                ? explicitSchema
+                : "main";
+            throw new EmbeddedSqlException($"ambiguous column name: {schema}.{qualifier}._ROWID_");
+        }
+    }
+
+    // Compiling UPDATE ... FROM leaves SQLite with an unqualified reference to every column a
+    // NATURAL or USING join coalesced. That reference is resolved against the FROM list alone -
+    // the update target never takes part - and the right side of the coalescing join is hidden,
+    // so the statement is rejected as soon as any other FROM entry still exposes the same name.
+    private static void RejectAmbiguousUpdateFromCoalescedColumns(TableSource from, QueryContext context)
+    {
+        var leaves = new List<(TableSource Source, string[] Columns)>();
+        var hidden = new HashSet<(int Leaf, string Column)>();
+        var coalesced = new List<string>();
+        Walk(from);
+
+        foreach (var name in coalesced)
+        {
+            var visible = 0;
+            for (var leaf = 0; leaf < leaves.Count; leaf++)
+            {
+                if (hidden.Contains((leaf, name)))
+                    continue;
+                if (leaves[leaf].Columns.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    visible++;
+            }
+
+            if (visible > 1)
+                throw new EmbeddedSqlException($"ambiguous column name: {name}");
+        }
+
+        (int Start, int End) Walk(TableSource source)
+        {
+            if (source is not JoinTableSource join)
+            {
+                leaves.Add((source, GetSourceColumns(source, context)));
+                return (leaves.Count - 1, leaves.Count);
+            }
+
+            var (leftStart, leftEnd) = Walk(join.Left);
+            var (rightStart, rightEnd) = Walk(join.Right);
+            var names = join.UsingColumns
+                ?? (join.Natural
+                    ? leaves
+                        .Skip(rightStart)
+                        .Take(rightEnd - rightStart)
+                        .SelectMany(leaf => leaf.Columns)
+                        .Where(column => leaves
+                            .Skip(leftStart)
+                            .Take(leftEnd - leftStart)
+                            .Any(leaf => leaf.Columns.Contains(column, StringComparer.OrdinalIgnoreCase)))
+                        .ToArray()
+                    : null);
+            if (names is not null)
+            {
+                foreach (var name in names)
+                {
+                    coalesced.Add(name);
+                    for (var leaf = rightStart; leaf < rightEnd; leaf++)
+                        hidden.Add((leaf, name));
+                }
+            }
+
+            return (leftStart, rightEnd);
+        }
+    }
+
     private HashSet<int> SelectLimitedDmlPositions(
-        string tableName,
+        string qualifier,
         EmbeddedTable table,
         Expression? where,
         IReadOnlyList<OrderByTerm> orderBy,
@@ -7449,12 +7666,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         QueryContext context)
     {
         ValidateOrderByCollations(orderBy);
-        var validationRow = new SourceRow(
-            table.Columns,
+        var validationRow = CreateDmlTargetRow(
+            table,
+            qualifier,
             Enumerable.Repeat(SqlValue.Null, table.Columns.Length).ToArray(),
-            RowId: table.HasRowid ? 1 : null,
-            RowIdQualifier: tableName,
-            ColumnDefinitions: table.ColumnDefinitions);
+            1);
         ValidateColumnReferences(where, validationRow);
         foreach (var expression in mutationExpressions)
             ValidateColumnReferences(expression, validationRow);
@@ -7480,12 +7696,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         for (var position = 0; position < table.Rows.Count; position++)
         {
             var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
-            var source = new SourceRow(
-                table.Columns,
-                table.Rows[position],
-                RowId: table.HasRowid ? rowid : null,
-                RowIdQualifier: tableName,
-                ColumnDefinitions: table.ColumnDefinitions);
+            var source = CreateDmlTargetRow(table, qualifier, table.Rows[position], rowid);
             if (where is not null && !IsTrue(Evaluate(where, parameters, source, context)))
                 continue;
 
@@ -7606,7 +7817,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     // Applies the UPDATE assignments to one matched row, computing its new rowid and
-    // regenerated columns. The original row and its rowid drive the value expressions.
+    // regenerated columns. The original row and its rowid drive the value expressions;
+    // UPDATE ... FROM supplies the joined target/source row so assignments can read both.
     private (SqlValue[] Row, long RowId) BuildUpdatedRow(
         UpdateStatement statement,
         EmbeddedTable table,
@@ -7615,14 +7827,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
         long rowid,
         SqlValue[] parameters,
         QueryContext context,
-        bool validateCheckConstraints = true)
+        bool validateCheckConstraints = true,
+        SourceRow? evaluationRow = null)
     {
-        var source = new SourceRow(
-            table.Columns,
-            originalRow,
-            RowId: table.HasRowid ? rowid : null,
-            RowIdQualifier: statement.TableName,
-            ColumnDefinitions: table.ColumnDefinitions);
+        var source = evaluationRow
+            ?? CreateDmlTargetRow(table, statement.TargetQualifier, originalRow, rowid);
 
         var updated = originalRow.ToArray();
         var assignmentValues = new Dictionary<Expression, SqlValue[]>(ReferenceEqualityComparer.Instance);
@@ -8913,7 +9122,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var selectedPositions = statement.Limit is null
             ? null
             : SelectLimitedDmlPositions(
-                statement.TableName,
+                statement.TargetQualifier,
                 table,
                 statement.Where,
                 statement.EffectiveOrderBy,
@@ -9073,7 +9282,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
     {
         context = EnterCollationSource(
             context,
-            new NamedTableSource(statement.TableName));
+            new NamedTableSource(statement.TableName, statement.Alias));
         if (CanCompileDml(context)
             && TryCompileDelete(statement, parameters, context, out var compiled, out var columns, out var hasReturning))
             return RunCompiledDml(compiled, columns, hasReturning, parameters);
@@ -9114,7 +9323,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         var selectedPositions = statement.Limit is null
             ? null
             : SelectLimitedDmlPositions(
-                statement.TableName,
+                statement.TargetQualifier,
                 table,
                 statement.Where,
                 statement.EffectiveOrderBy,
@@ -9133,12 +9342,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         {
             var row = table.Rows[position];
             var rowid = position < table.RowIds.Count ? table.RowIds[position] : position + 1;
-            var source = new SourceRow(
-                table.Columns,
-                row,
-                RowId: table.HasRowid ? rowid : null,
-                RowIdQualifier: statement.TableName,
-                ColumnDefinitions: table.ColumnDefinitions);
+            var source = CreateDmlTargetRow(table, statement.TargetQualifier, row, rowid);
             var shouldDelete = selectedPositions is not null
                 ? selectedPositions.Contains(position)
                 : statement.Where is null || IsTrue(Evaluate(statement.Where, parameters, source, context));
@@ -14775,6 +14979,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (statement.Limit is not null
             || statement.Offset is not null
             || statement.EffectiveOrderBy.Count != 0
+            || statement.Alias is not null
+            || statement.From is not null
+            || statement.ConflictAlgorithm is not null
             || context.CommonTableExpressions.Count != 0
             || IsSchemaTable(statement.TableName)
             || !context.Tables.TryGetValue(statement.TableName, out var table))
@@ -14883,6 +15090,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (statement.Limit is not null
             || statement.Offset is not null
             || statement.EffectiveOrderBy.Count != 0
+            || statement.Alias is not null
             || context.CommonTableExpressions.Count != 0
             || IsSchemaTable(statement.TableName)
             || !context.Tables.TryGetValue(statement.TableName, out var table))
@@ -15040,10 +15248,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     }
 
     // Builds a per-row predicate for a compilable DML WHERE clause. The emitted filter
-    // builds the same SourceRow shape the evaluated UPDATE/DELETE use (no qualified
-    // columns), so column resolution matches exactly. A hidden-rowid reference becomes
-    // a rowid-aware filter only for a rowid table; WITHOUT ROWID tables keep the evaluator's
-    // diagnostic path.
+    // builds the same SourceRow shape the evaluated UPDATE/DELETE use, so column
+    // resolution matches exactly. A hidden-rowid reference becomes a rowid-aware filter
+    // only for a rowid table; WITHOUT ROWID tables keep the evaluator's diagnostic path.
     private DmlRowFilter? CompileDmlRowPredicate(
         Expression where,
         EmbeddedTable table,
@@ -15069,6 +15276,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 new SourceRow(
                     table.Columns,
                     row,
+                    qualifiedColumns,
                     RowIdQualifier: tableName,
                     ColumnDefinitions: table.ColumnDefinitions),
                 context)));
@@ -15080,12 +15288,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return DmlRowFilter.ForRowId((row, rowId) => IsTrue(Evaluate(
             where,
             parameters,
-            new SourceRow(
-                table.Columns,
-                row,
-                RowId: rowId,
-                RowIdQualifier: tableName,
-                ColumnDefinitions: table.ColumnDefinitions),
+            CreateDmlTargetRow(table, tableName, row, rowId),
             context)));
     }
 
@@ -18324,6 +18527,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 + (insert.Source is null ? 0 : CountAllReferences(insert.Source, name))
                 + (insert.Returning?.Sum(projection => CountReferencesInExpression(projection.Expression, name)) ?? 0),
             UpdateStatement update => update.Assignments.Sum(assignment => CountReferencesInExpression(assignment.Value, name))
+                + (update.From is null ? 0 : CountReferencesInTableSource(update.From, name))
                 + (update.Where is null ? 0 : CountReferencesInExpression(update.Where, name))
                 + update.EffectiveOrderBy.Sum(term => CountReferencesInExpression(term.Expression, name))
                 + (update.Limit is null ? 0 : CountReferencesInExpression(update.Limit, name))
@@ -19276,6 +19480,23 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         return qualifiedColumns;
     }
+
+    // Builds the evaluation row for one UPDATE/DELETE target row. Column references are
+    // resolvable through the statement's alias when one is present and through the table
+    // name otherwise, matching how SQLite scopes a qualified-table-name.
+    private static SourceRow CreateDmlTargetRow(
+        EmbeddedTable table,
+        string qualifier,
+        SqlValue[] row,
+        long rowid)
+        => new(
+            table.Columns,
+            row,
+            BuildQualifiedColumns(qualifier, table.Columns),
+            RowId: table.HasRowid ? rowid : null,
+            RowIdQualifier: qualifier,
+            ColumnDefinitions: table.ColumnDefinitions,
+            QualifiedColumnDefinitions: BuildQualifiedColumnDefinitions(qualifier, table.ColumnDefinitions));
 
     private static EmbeddedTable GetTable(NamedTableSource source, Dictionary<string, EmbeddedTable> tables)
     {
@@ -30666,6 +30887,7 @@ public sealed class EmbeddedConnection : IDisposable
                 AddPersistentObjectSchema(update.TableName, schemas);
                 foreach (var assignment in update.Assignments)
                     CollectExpressionSchemas(assignment.Value, schemas, commonTableExpressions);
+                CollectSourceSchemas(update.From, schemas, commonTableExpressions);
                 CollectExpressionSchemas(update.Where, schemas, commonTableExpressions);
                 foreach (var orderBy in update.EffectiveOrderBy)
                     CollectExpressionSchemas(orderBy.Expression, schemas, commonTableExpressions);
@@ -30929,6 +31151,7 @@ public sealed class EmbeddedConnection : IDisposable
             {
                 TableName = RewritePersistentObjectName(update.TableName, schema),
                 Assignments = RewriteAssignments(update.Assignments, schema, commonTableExpressions),
+                From = RewriteSourceSchema(update.From, schema, commonTableExpressions),
                 Where = RewriteNullableExpression(update.Where, schema, commonTableExpressions),
                 OrderBy = RewriteOrderBy(update.EffectiveOrderBy, schema, commonTableExpressions),
                 Limit = RewriteNullableExpression(update.Limit, schema, commonTableExpressions),
@@ -34415,7 +34638,8 @@ internal sealed record SourceRow(
     string? RowIdQualifier = null,
     IReadOnlyDictionary<string, long?>? QualifiedRowIds = null,
     IReadOnlyList<EmbeddedColumn?>? ColumnDefinitions = null,
-    IReadOnlyDictionary<string, EmbeddedColumn>? QualifiedColumnDefinitions = null)
+    IReadOnlyDictionary<string, EmbeddedColumn>? QualifiedColumnDefinitions = null,
+    IReadOnlySet<string>? AmbiguousQualifiedColumns = null)
 {
     public SqlValue GetValue(string name)
         => GetValue(name, allowQualifiedLookup: true);
@@ -34424,6 +34648,9 @@ internal sealed record SourceRow(
     {
         if (column.Qualifier is null)
             return GetValue(column.Name, allowQualifiedLookup: false);
+
+        if (AmbiguousQualifiedColumns?.Contains(column.Name) == true)
+            ThrowAmbiguousColumn(column.Name);
 
         if (QualifiedColumns is not null
             && QualifiedColumns.TryGetValue(column.Name, out var qualifiedIndex))
@@ -34468,6 +34695,8 @@ internal sealed record SourceRow(
             value = default;
             return false;
         }
+        if (AmbiguousQualifiedColumns?.Contains(column.Name) == true)
+            ThrowAmbiguousColumn(column.Name);
         if (QualifiedColumns is not null
             && QualifiedColumns.TryGetValue(column.Name, out var qualifiedIndex))
         {

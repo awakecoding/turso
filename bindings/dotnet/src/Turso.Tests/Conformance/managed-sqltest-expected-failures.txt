@@ -188,12 +188,7 @@ alter_table.sqltest::alter-table-rename-then-rename-column-with-trigger | expect
 autoincr.sqltest::autoinc-create-sequence-table | expected 3 row(s), got 2 row(s); row 0 expected '__turso_internal_seq___turso_internal_autoincrement_t1' but was 'sqlite_sequence'
 autoincr.sqltest::autoinc-alter-column-clears-sequence-row | expected success but got error: Expected ADD, DROP, or RENAME after ALTER TABLE. At SQL offset 14.
 autoincr.sqltest::autoinc-with-upsert | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
-before-update-trigger-correlated-subquery.sqltest::before-update-trigger-correlated-subquery-basic | expected success but got error: no such column: t.id
-before-update-trigger-correlated-subquery.sqltest::before-update-trigger-correlated-subquery-all-rows | expected success but got error: no such column: t.id
-before-update-trigger-correlated-subquery.sqltest::before-update-trigger-correlated-subquery-single-row | expected success but got error: no such column: t.id
 before-update-trigger-correlated-subquery.sqltest::before-update-trigger-uncorrelated-subquery | expected 3 row(s), got 3 row(s); row 1 expected '2/600' but was '2/1100'
-before-update-trigger-correlated-subquery.sqltest::before-update-trigger-subquery-in-where-and-set | expected success but got error: no such column: t.id
-before-update-trigger-correlated-subquery.sqltest::before-and-after-update-trigger-correlated-subquery | expected success but got error: no such column: t.id
 boolean.sqltest::boolean-not-text-float-edge | expected 1 row(s), got 1 row(s); row 0 expected '0' but was '1'
 boolean.sqltest::where-string-numeric-prefix-1 | expected 1 row(s), got 0 row(s)
 boolean.sqltest::where-string-numeric-prefix-2 | expected 1 row(s), got 0 row(s)
@@ -221,8 +216,6 @@ char.sqltest::char-null-in-middle | expected 1 row(s), got 1 row(s); row 0 expec
 char.sqltest::char-multiple-nulls | expected 1 row(s), got 1 row(s); row 0 expected '004100004200' but was '4142'
 check_constraint.sqltest::check_constraint_pragma_ignore | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
 check_constraint.sqltest::check_constraint_upsert_do_update_violation | expected an error but the statement succeeded
-check_constraint.sqltest::check_constraint_update_or_ignore_single_row | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 70.
-check_constraint.sqltest::check_constraint_update_or_ignore_all_rows | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 69.
 check_constraint.sqltest::check_constraint_rename_column_inline | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 check_constraint.sqltest::check_constraint_rename_column_table_level | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 check_constraint.sqltest::check_constraint_rename_column_qualified_ref | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
@@ -300,14 +293,7 @@ cte_expressions.sqltest::cte-schema-qualified-table-reference | expected success
 default_value.sqltest::default-value-identifier | expected success but got error: default value of column is not constant: asdf
 default_value.sqltest::default-value-ident-to-str | expected success but got error: default value of column is not constant: x
 default_value.sqltest::default-value-column-name | error 'default value of column is not constant: x' does not match pattern 'default value of column \[y\] is not constant'
-delete-correlated-subquery.sqltest::delete-correlated-min-per-group | expected success but got error: no such column: t.grp
-delete-correlated-subquery.sqltest::delete-correlated-min-with-condition | expected success but got error: no such column: t.id
-delete-correlated-subquery.sqltest::delete-correlated-single-row-groups | expected success but got error: no such column: t.grp
-delete-correlated-subquery.sqltest::delete-correlated-exists | expected success but got error: no such column: t.grp
-delete-correlated-subquery.sqltest::delete-correlated-max-per-group | expected success but got error: no such column: t.grp
 delete.sqltest::doubly-qualified-delete | expected success but got error: Expected End. At SQL offset 32.
-delete.sqltest::delete-exists-subquery-1 | expected success but got error: no such column: orders.id
-delete.sqltest::delete-not-exists-subquery-1 | expected success but got error: no such column: orders.id
 delete.sqltest::mvcc-delete-via-index-removes-checkpointed-rows | expected success but got error: Unsupported PRAGMA wal_checkpoint. At SQL offset 21.
 detach/transaction.sqltest::detach-fails-with-active-read-transaction | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern '.*database aux is locked.*'
 detach/transaction.sqltest::detach-fails-with-active-write-transaction | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern '.*database aux is locked.*'
@@ -315,23 +301,8 @@ detach/transaction.sqltest::detach-succeeds-after-commit | expected success but 
 foreign_keys.sqltest::fk-column-constraint-multi-parent | expected an error but the statement succeeded
 foreign_keys.sqltest::fk-self-ipk-text-child-coerces-rowid-ok | expected success but got error: FOREIGN KEY constraint failed
 foreign_keys.sqltest::fk-deferred-upsert-late-child | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
-foreign_keys.sqltest::fk-deferred-parent-update-ignore-notnull-noop-keeps-old-key-valid | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-deferred-child-update-or-ignore-noop-keeps-old-key-valid | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 foreign_keys.sqltest::fk-deferred-update-self-ref-rowid-affinity-one-stmt | expected success but got error: FOREIGN KEY constraint failed
-foreign_keys.sqltest::fk-deferred-update-or-replace-parent-pk-resolves-without-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 24.
-foreign_keys.sqltest::fk-deferred-update-or-replace-parent-unique-key-resolves | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 46.
 foreign_keys.sqltest::fk-cascade-delete-self-referential-explain-terminates | expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
-foreign_keys.sqltest::fk-update-or-replace-cascade-on-unique-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-set-null-on-unique-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-cascade-multiple-children | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-set-default-on-unique-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-no-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-cascade-on-rowid-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-set-null-on-rowid-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-set-default-on-rowid-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-set-null-update-on-rowid-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-set-default-update-on-rowid-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-foreign_keys.sqltest::fk-update-or-replace-rowid-conflict-with-update-cascade-only | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 foreign_keys.sqltest::fk-alter-table-add-column-enforced | expected success but got error: ALTER TABLE ADD COLUMN with REFERENCES is not supported.
 gencol.sqltest::gencol_self_table_affinity_indexed_update_returning | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 9.
 gencol.sqltest::gencol_self_table_affinity_indexed_delete_returning | expected success but got error: Managed DELETE does not support INDEXED BY or NOT INDEXED. At SQL offset 14.
@@ -339,7 +310,6 @@ gencol.sqltest::gencol_validate_isnull | expected success but got error: Expecte
 gencol.sqltest::gencol_validate_notnull | expected success but got error: Expected RightParen. At SQL offset 35.
 gencol.sqltest::gencol_func_substr | expected success but got error: function substr() is not allowed in a generated column
 gencol.sqltest::gencol_func_nested_upper_substr | expected success but got error: function substr() is not allowed in a generated column
-gencol.sqltest::gencol_insert_or_replace_not_null_no_default | error 'Managed UPDATE conflict algorithms are not supported. At SQL offset 7.' does not match pattern 'NOT NULL constraint failed: t.b'
 gencol.sqltest::gencol_tvf_comma_join_json_each_virtual_column | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
 gencol.sqltest::gencol_tvf_comma_join_generate_series_virtual_column | expected success but got error: Expected Comma. At SQL offset 47.
 gencol.sqltest::gencol_tvf_left_join_virtual_column | expected success but got error: Expected Comma. At SQL offset 36.
@@ -347,7 +317,6 @@ gencol.sqltest::gencol_tvf_first_comma_join_virtual_column | expected success bu
 gencol.sqltest::gencol_tvf_comma_join_base_column | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
 gencol.sqltest::gencol_tvf_left_join_virtual_column_table_first | expected success but got error: Expected Comma. At SQL offset 49.
 gencol.sqltest::gencol_tvf_subquery_virtual_column | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
-gencol.sqltest::gencol_check_update_or_ignore | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 gencol.sqltest::gencol_alter_add_virtual | expected 2 row(s), got 2 row(s); row 0 expected '5/10' but was '5/'
 gencol.sqltest::gencol_alter_add_virtual_explicit | expected 1 row(s), got 1 row(s); row 0 expected '3/103' but was '3/'
 gencol.sqltest::gencol_alter_add_multiple_virtual | expected 1 row(s), got 1 row(s); row 0 expected '5/10/15' but was '5//'
@@ -444,8 +413,6 @@ groupby/memory.sqltest::having_without_group_by_max_min | expected success but g
 groupby/memory.sqltest::group-by-zero | expected an error but the statement succeeded
 groupby/memory.sqltest::group-by-out-of-range | expected an error but the statement succeeded
 groupby/memory.sqltest::group-by-negative | expected an error but the statement succeeded
-in-index-seek.sqltest::in-index-update-or-replace | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-in-index-seek.sqltest::in-index-update-or-replace-multirow | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 in-null-or.sqltest::not-in-self-or-true-counts-all-rows | expected success but got error: no such column: TRUE
 in-null-or.sqltest::not-in-self-or-true-is-true-for-all-rows | expected success but got error: no such column: TRUE
 in-null-or.sqltest::not-in-self-or-false-filters-all-rows | expected success but got error: no such column: FALSE
@@ -467,7 +434,6 @@ insert.sqltest::returning-true-literal | expected success but got error: no such
 insert.sqltest::returning-false-literal | expected success but got error: no such column: false
 insert.sqltest::boolean-literal-edgecase | expected success but got error: no such column: true
 insert.sqltest::boolean-literal-edgecase-false | expected success but got error: no such column: false
-insert.sqltest::collate-unique-index-upsert | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 58.
 insert.sqltest::insert-integer-pk-i64-min-float-error | expected an error but the statement succeeded
 insert.sqltest::insert-or-replace-unique-index-no-corruption | expected success but got error: Expected Comma. At SQL offset 66.
 insert.sqltest::insert-or-replace-unique-index-no-corruption-2 | expected success but got error: Expected Comma. At SQL offset 68.
@@ -476,7 +442,6 @@ insert.sqltest::insert-1-3 | error 'table has a different number of columns' doe
 insert.sqltest::insert-1-3b | error 'table has a different number of columns' does not match pattern 'table test1 has 3 columns but 4 values were supplied'
 insert.sqltest::insert-column-count-mismatch-values | error 'table has a different number of columns' does not match pattern 'table t1 has 1 columns but 3 values were supplied'
 insert.sqltest::insert-column-count-mismatch-select | error 'table has a different number of columns' does not match pattern 'table t1 has 1 columns but 7 values were supplied'
-insert_autorowid_index.sqltest::auto-rowid-upsert-index | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 98.
 join/hash.sqltest::grace-inner-join-basic | expected success but got error: Expected Comma. At SQL offset 72.
 join/hash.sqltest::grace-inner-many-to-many | expected success but got error: Expected Comma. At SQL offset 155.
 join/hash.sqltest::grace-inner-many-to-many-agg | expected success but got error: Expected Comma. At SQL offset 77.
@@ -601,26 +566,10 @@ null/default.sqltest::sel-true | expected success but got error: no such column:
 null/default.sqltest::sel-false | expected success but got error: no such column: false
 nulls-first-last.sqltest::window-two-different-nulls-orderings | expected 5 row(s), got 5 row(s); row 1 expected '4//2/5' but was '2/3/5/3'
 numeric-text-overflow.sqltest::ceil-text-i64-max-stays-integer | expected 1 row(s), got 1 row(s); row 0 expected '9223372036854775807/integer' but was '9.22337203685478e+18/real'
-on_conflict.sqltest::update-or-ignore-notnull | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-ignore-unique | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-ignore-pk | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-ignore-no-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-ignore-continue | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-ignore-partial-update | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-replace-unique | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-replace-notnull-default | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-replace-pk | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-replace-no-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-replace-multiple-conflicts | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::self-ref-update-or-ignore | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-ignore-returning | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-on_conflict.sqltest::update-or-replace-returning | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 on_conflict.sqltest::mvcc-upsert-set-pk-on-conflict-target-resolves | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
-on_conflict_constraint_def.sqltest::gencol_insert_or_replace_not_null_no_default | error 'Managed UPDATE conflict algorithms are not supported. At SQL offset 7.' does not match pattern 'NOT NULL constraint failed: t.a'
 on_conflict_constraint_def.sqltest::update-pk-rollback | error 'Managed UPDATE cannot apply schema-level ON CONFLICT ROLLBACK until the pending row-update engine supports partial publication, transaction rollback, and
 on_conflict_constraint_def.sqltest::update-rollback-terminates-transaction | error 'Managed UPDATE cannot apply schema-level ON CONFLICT ROLLBACK until the pending row-update engine supports partial publication, transaction rollback, and
 on_conflict_constraint_def.sqltest::ddl-reject-multiple-pk-columns | expected an error but the statement succeeded
-openread-cursor-reuse-stale-cache.sqltest::openread-reuse-trigger-grow-splits-root | expected success but got error: no such column: u.a
 openread-cursor-reuse-stale-cache.sqltest::openread-reuse-trigger-grow-splits-leaf | setup 'grow_split_leaf' failed: Expected Comma. At SQL offset 68.
 openread-cursor-reuse-stale-cache.sqltest::openread-reuse-same-statement-writer | setup 'no_trigger_self_update' failed: Expected Comma. At SQL offset 70.
 openread-cursor-reuse-stale-cache.sqltest::openread-reuse-trigger-delete-shrinks | setup 'shrink_delete' failed: Expected Comma. At SQL offset 54.
@@ -633,16 +582,6 @@ orderby/memory.sqltest::order-by-negative-1 | expected an error but the statemen
 orderby/memory.sqltest::order-by-negative-100 | expected an error but the statement succeeded
 orderby/memory.sqltest::order-by-out-of-range | expected an error but the statement succeeded
 orderby/memory.sqltest::order-by-zero | expected an error but the statement succeeded
-partial_idx.sqltest::upsert-partial-doupdate-basic | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 98.
-partial_idx.sqltest::upsert-partial-doupdate-leave-predicate | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 86.
-partial_idx.sqltest::upsert-partial-doupdate-where-skip | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 86.
-partial_idx.sqltest::upsert-partial-omitted-target-matches | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 91.
-partial_idx.sqltest::upsert-partial-multicol-leave-predicate | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 85.
-partial_idx.sqltest::upsert-partial-func-predicate | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 69.
-partial_idx.sqltest::upsert-partial-rowid-predicate | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 72.
-partial_idx.sqltest::upsert-partial-excluded-rewrite | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 74.
-partial_idx.sqltest::upsert-partial-stay-change-to-unique | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 68.
-partial_idx.sqltest::upsert-partial-toggle-predicate | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 66.
 partial_idx.sqltest::partial-index-qualified-column-in-function | expected success but got error: the "." operator is prohibited in partial index WHERE clauses
 partial_idx.sqltest::partial-index-doubly-qualified-column-in-function | expected success but got error: Expected RightParen. At SQL offset 51.
 partial_idx.sqltest::plan-partial-index-and-where-eq-seek | expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH samples USING INDEX samples_pidx (name=?)' but was '0/0/0/SEARCH samples USING INDEX samples_pidx'
@@ -714,27 +653,11 @@ reindex.sqltest::reindex-expression-index-after-rename-column | expected success
 reindex.sqltest::reindex-expression-index-outer-collate-target | expected 2 row(s), got 2 row(s); row 0 expected '0/0/a/0/RTRIM/1' but was '0/-2//0/RTRIM/1'
 reindex.sqltest::reindex-non-ascii-identifiers-use-ascii-case-folding | error 'Unexpected SQL character 'é' at offset 16.' does not match pattern 'unable to identify the object to be reindexed'
 reindex.sqltest::reindex-unquoted-compound-keyword-target-rejected | expected an error but the statement succeeded
-returning.sqltest::upsert-returning-insert-path | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 51.
-returning.sqltest::upsert-returning-update-path | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 51.
-returning.sqltest::upsert-returning-table-qualified | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 51.
-returning.sqltest::upsert-returning-expression-insert | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 48.
-returning.sqltest::upsert-returning-expression-update | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 48.
-returning.sqltest::upsert-returning-complex-expression | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 50.
-returning.sqltest::upsert-returning-function | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 53.
-returning.sqltest::upsert-returning-multiple-rows | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 78.
-returning.sqltest::upsert-returning-where-update | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 48.
-returning.sqltest::upsert-returning-where-no-update | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 47.
-returning.sqltest::upsert-returning-literal | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 52.
-returning.sqltest::upsert-returning-mixed-operations | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 57.
 returning.sqltest::insert-select-returning-where | expected success but got error: Expected Comma. At SQL offset 75.
-returning.sqltest::update-returning-may-reference-base-table-name-when-aliased | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
-returning.sqltest::update-returning-correlated-in-selfread | expected success but got error: no such column: t.grp
 returning.sqltest::update-returning-target-selfread-reruns-per-row | expected 2 row(s), got 2 row(s); row 1 expected '2/2' but was '2/1'
 returning.sqltest::update-returning-target-selfread-correlated-updated-group | expected 2 row(s), got 2 row(s); row 0 expected '1/11/1' but was '1/11/0'
 returning.sqltest::update-returning-after-trigger-same-row-direct | expected 2 row(s), got 2 row(s); row 0 expected '120' but was '20'
 returning.sqltest::update-returning-after-trigger-same-row-subquery | expected 2 row(s), got 2 row(s); row 0 expected '120/120' but was '20/20'
-returning.sqltest::delete-alias-correlated-subquery-returning | expected success but got error: Managed DELETE target aliases are not supported. At SQL offset 14.
-returning.sqltest::delete-returning-correlated-in-selfread | expected success but got error: no such column: t.grp
 returning.sqltest::delete-returning-target-selfread-reruns-per-row | expected 2 row(s), got 2 row(s); row 0 expected '1/2' but was '1/3'
 returning.sqltest::delete-returning-target-selfread-correlated-group-count | expected 2 row(s), got 2 row(s); row 0 expected '1/1' but was '1/2'
 returning.sqltest::insert-returning-last-insert-rowid | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
@@ -807,7 +730,6 @@ snapshot_tests/subqueries/subquery-sort-elision.sqltest::partial-partition-match
 snapshot_tests/subqueries/subquery-sort-elision.sqltest::window-partial-not-elided | expected 7 row(s), got 7 row(s); row 0 expected '1/20/20' but was '1/30/50'
 snapshot_tests/subqueries/subquery-sort-elision.sqltest::window-no-cte-order-not-elided | expected 7 row(s), got 7 row(s); row 0 expected '1/50' but was '3/100'
 subquery/cte_materialization_adversarial.sqltest::range-scan-text-vs-int-affinity | expected 1 row(s), got 4 row(s); row 0 expected '3/30' but was '1/10'
-subquery/cte_materialization_adversarial.sqltest::internals-update-via-correlated-cte | expected success but got error: no such column: upd_t.id
 subquery/expressions.sqltest::subquery-empty-in-comparison | expected success but got error: no such column: FALSE
 subquery/expressions.sqltest::subquery-empty-aggregate-sum | expected success but got error: no such column: FALSE
 subquery/expressions.sqltest::subquery-empty-aggregate-count | expected success but got error: no such column: FALSE
@@ -872,11 +794,7 @@ trigger-virtual-table-innocuous.sqltest::json-tree-in-trigger | expected success
 trigger-virtual-table-innocuous.sqltest::json-each-nested-array-in-trigger | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
 trigger-virtual-table-innocuous.sqltest::json-each-with-subquery-in-trigger | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
 trigger-virtual-table-innocuous.sqltest::json-each-before-trigger | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
-trigger.sqltest::trigger-update-old-reference | expected 2 row(s), got 2 row(s); row 0 expected '1/20/30' but was '1/20/0'
-trigger.sqltest::trigger-old-new-arithmetic | expected 1 row(s), got 1 row(s); row 0 expected '1/25/15' but was '1/25/0'
-trigger.sqltest::trigger-before-update-parent-expression-old-values | expected 1 row(s), got 1 row(s); row 0 expected '2/666/666' but was '2/1/1'
 trigger.sqltest::trigger-col-name-trigger-subquery | expected success but got error: no such column: TRUE
-trigger.sqltest::trigger-table-qualified-where-clause | expected success but got error: no such column: t1.c
 trigger.sqltest::trigger-when-rowid-alias-string-literal-affinity | expected 1 row(s), got 0 row(s)
 trigger.sqltest::trigger-raise-shorthand | error 'Expected ROLLBACK, ABORT, FAIL, or IGNORE in RAISE(). At SQL offset 81.' does not match pattern 'shorthand abort'
 trigger.sqltest::trigger-raise-expr-concat | error 'Expected RightParen. At SQL offset 118.' does not match pattern 'bad: -5'
@@ -936,210 +854,32 @@ trigger_namespace.sqltest::drop-trigger-with-same-name-as-table | expected succe
 trigger_namespace.sqltest::multiple-triggers-sharing-names-with-tables | expected success but got error: there is already a table named a
 trigger_on_conflict.sqltest::trigger-upsert-new-column | expected success but got error: no such table: NEW
 trigger_on_conflict.sqltest::trigger-upsert-new-in-where | expected success but got error: no such table: NEW
-trigger_on_conflict.sqltest::update-or-ignore-notnull-fires-before-trigger | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-trigger_on_conflict.sqltest::update-or-ignore-notnull-no-violation | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-trigger_on_conflict.sqltest::update-or-ignore-notnull-multiple-rows | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-trigger_on_conflict.sqltest::update-or-ignore-unique-fires-before-trigger | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 trigger_on_conflict.sqltest::trigger-upsert-new-in-where-no-update | expected success but got error: no such table: NEW
-trigger_on_conflict.sqltest::outer-update-replace-overrides-trigger-ignore | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 unnest-exists.sqltest::exists-is-true-wrapper | expected success but got error: no such column: TRUE
 unnest-exists.sqltest::exists-is-false-wrapper | expected success but got error: no such column: FALSE
 unnest-exists.sqltest::not-exists-is-true-wrapper | expected success but got error: no such column: TRUE
 unnest-exists.sqltest::not-exists-is-false-wrapper | expected success but got error: no such column: FALSE
-update-from.sqltest::update-from-basic-equijoin | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 59.
-update-from.sqltest::update-from-multiple-columns | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 67.
-update-from.sqltest::update-from-expression-mixing-sides | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 58.
-update-from.sqltest::update-from-extra-where-filter | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 45.
-update-from.sqltest::update-from-unqualified-set-columns | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 38.
-update-from.sqltest::update-from-no-match-leaves-unchanged | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 38.
-update-from.sqltest::update-from-empty-source | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 38.
-update-from.sqltest::update-from-null-join-key-no-match | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 38.
-update-from.sqltest::update-from-aggregated-subquery | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 66.
-update-from.sqltest::update-from-explicit-inner-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 43.
-update-from.sqltest::update-from-join-using | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 48.
-update-from.sqltest::update-from-natural-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 48.
-update-from.sqltest::update-from-with-cte | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 106.
-update-from.sqltest::update-from-values-cte-source | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 106.
-update-from.sqltest::update-from-self-join-aliased | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 54.
-update-from.sqltest::update-from-three-tables | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 43.
-update-from.sqltest::update-from-returning-target | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 45.
-update-from.sqltest::update-from-returning-star | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 45.
-update-from.sqltest::update-from-returning-complex-expressions | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 97.
-update-from.sqltest::update-from-returning-correlated-subquery-can-see-target | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 52.
-update-from.sqltest::update-from-set-subquery | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 84.
-update-from.sqltest::update-from-row-value-set | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 55.
-update-from.sqltest::update-from-row-value-set-extra-parens | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 57.
-update-from.sqltest::update-from-row-value-set-subquery | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 171.
-update-from.sqltest::update-from-set-subquery-may-reference-source-table | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 73.
-update-from.sqltest::update-from-returning-subquery-can-see-cte | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 81.
-update-from.sqltest::update-from-returning-reuses-cte-snapshot-after-trigger-mutation | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 82.
 update-from.sqltest::update-from-returning-reuses-row-cte-snapshot-after-trigger-mutation | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 88.
-update-from.sqltest::update-from-target-alias | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 14.
-update-from.sqltest::update-from-target-alias-allows-source-alias-matching-base-name | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
-update-from.sqltest::update-from-target-alias-allows-different-table-same-alias | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
-update-from.sqltest::update-from-source-alias-collision-still-allows-source-only-column | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
-update-from.sqltest::update-from-source-alias-collision-still-allows-source-only-column-in-subquery | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
-update-from.sqltest::update-from-target-alias-allows-unaliased-self-reference | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
-update-from.sqltest::update-from-updates-indexed-column | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 38.
-update-from.sqltest::update-from-duplicate-match-updates-once | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 52.
-update-from.sqltest::update-from-duplicate-match-keeps-set-columns-consistent | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 74.
 update-from.sqltest::update-from-indexed-by-target-hint-is-preserved | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 9.
 update-from.sqltest::update-from-vtab-source-arguments | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 41.
 update-from.sqltest::update-from-attached-constant-where-literal-set | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 41.
 update-from.sqltest::update-from-attached-constant-where-zero | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 37.
 update-from.sqltest::update-from-attached-constant-where-one | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 37.
 update-from.sqltest::update-from-attached-constant-where-noop-set | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 37.
-update-from.sqltest::update-from-triggers-see-updated-values | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 49.
-update-from.sqltest::update-from-before-trigger-raise-ignore-skips-row | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 52.
-update-from.sqltest::update-from-trigger-derived-source-sees-new | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 97.
-update-from.sqltest::update-from-trigger-derived-source-limit-sees-old | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 97.
-update-from.sqltest::update-from-left-join-source-graph | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 58.
-update-from.sqltest::update-from-right-join-source-graph | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 66.
-update-from.sqltest::update-from-right-join-using-preserves-right-row-payload | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 36.
-update-from.sqltest::update-from-maintains-partial-index | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 81.
-update-from.sqltest::update-from-maintains-expression-index | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 49.
-update-from.sqltest::update-from-rowid-update-cascades-foreign-keys | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 47.
-update-from.sqltest::update-from-composite-key-update-cascades-foreign-keys | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 71.
-update-from.sqltest::update-from-or-ignore-skips-conflicting-row | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-or-replace-deletes-conflicting-row | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-strict-table-coerces-compatible-values | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 45.
-update-from.sqltest::update-from-updates-generated-columns | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 51.
-update-from.sqltest::update-from-or-replace-cascades-foreign-key-deletes | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-snapshot-shift-predecessor | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 30.
-update-from.sqltest::update-from-snapshot-shift-successor | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 29.
-update-from.sqltest::update-from-snapshot-reverse-three-rows | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
-update-from.sqltest::update-from-from-subquery-reads-target-snapshot | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 58.
-update-from.sqltest::update-from-snapshot-set-to-pre-update-aggregate | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 40.
-update-from.sqltest::update-from-type-preservation-mixed-types | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 19.
-update-from.sqltest::update-from-affinity-coercion-at-insert | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 19.
-update-from.sqltest::update-from-i64-extremes-through-ephemeral | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 19.
-update-from.sqltest::update-from-triple-self-join | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
-update-from.sqltest::update-from-self-join-linked-list | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 23.
-update-from.sqltest::update-from-self-join-preserves-non-set-columns | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 31.
-update-from.sqltest::update-from-self-join-using-preserves-non-set-columns | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 31.
-update-from.sqltest::update-from-three-indexes-maintained | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 36.
-update-from.sqltest::update-from-expression-index-partial-column-update | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 23.
-update-from.sqltest::update-from-or-replace-cascading-unique-chain | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-or-replace-swap-unique-keys | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-or-ignore-skips-notnull-violation | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-or-ignore-skips-check-violation | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-before-trigger-modifies-target-row | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-cartesian-updates-once | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 21.
-update-from.sqltest::update-from-no-pk-duplicate-target-rows | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 19.
-update-from.sqltest::update-from-correlated-subquery-refs-from-source | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 85.
-update-from.sqltest::update-from-window-function-in-from-subquery | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 39.
-update-from.sqltest::update-from-rowid-mutation | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 27.
-update-from.sqltest::update-from-or-replace-rowid-collision | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-unqualified-set-rhs-is-ambiguous | error 'Managed UPDATE FROM is not supported. At SQL offset 36.' does not match pattern 'ambiguous column name: v'
-update-from.sqltest::update-from-duplicate-source-alias-using-is-ambiguous | error 'Managed UPDATE FROM is not supported. At SQL offset 32.' does not match pattern 'ambiguous column name: main.x._ROWID_'
-update-from.sqltest::update-from-duplicate-source-alias-natural-is-ambiguous | error 'Managed UPDATE FROM is not supported. At SQL offset 32.' does not match pattern 'ambiguous column name: main.x._ROWID_'
-update-from.sqltest::update-from-dup-unaliased-comma | error 'Managed UPDATE FROM is not supported. At SQL offset 28.' does not match pattern 'ambiguous column name'
-update-from.sqltest::update-from-dup-unaliased-cross-join | error 'Managed UPDATE FROM is not supported. At SQL offset 28.' does not match pattern 'ambiguous column name'
-update-from.sqltest::update-from-dup-unaliased-triple | error 'Managed UPDATE FROM is not supported. At SQL offset 28.' does not match pattern 'ambiguous column name'
-update-from.sqltest::update-from-natural-plus-join-ambiguous | error 'Managed UPDATE FROM is not supported. At SQL offset 27.' does not match pattern 'ambiguous column name'
-update-from.sqltest::update-from-using-plus-join-ambiguous | error 'Managed UPDATE FROM is not supported. At SQL offset 27.' does not match pattern 'ambiguous column name'
-update-from.sqltest::update-from-natural-plus-left-join-ambiguous | error 'Managed UPDATE FROM is not supported. At SQL offset 28.' does not match pattern 'ambiguous column name'
-update-from.sqltest::update-from-natural-plus-inner-join-ambiguous | error 'Managed UPDATE FROM is not supported. At SQL offset 28.' does not match pattern 'ambiguous column name'
-update-from.sqltest::update-from-subquery-source | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 30.
-update-from.sqltest::update-from-three-way-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 31.
-update-from.sqltest::update-from-cross-join-no-where | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-no-matches-extra | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-null-source-value | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-null-join-key-extra | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-is-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-range-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 20.
-update-from.sqltest::update-from-view-source | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-aggregate-subquery-extra | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 28.
-update-from.sqltest::update-from-having-subquery | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 32.
-update-from.sqltest::update-from-window-function-extra | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 38.
-update-from.sqltest::update-from-union-all | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 30.
-update-from.sqltest::update-from-intersect | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 30.
-update-from.sqltest::update-from-except | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 30.
-update-from.sqltest::update-from-cte-chain | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 203.
-update-from.sqltest::update-from-self-join-shift | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 27.
-update-from.sqltest::update-from-rotate-values | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 24.
-update-from.sqltest::update-from-self-ref-aggregate | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 28.
-update-from.sqltest::update-from-snapshot-where-set-same-col | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 22.
-update-from.sqltest::update-from-correlated-sub-refs-from-extra | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 68.
-update-from.sqltest::update-from-nested-join-subquery | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 80.
-update-from.sqltest::update-from-deep-join-chain | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 76.
-update-from.sqltest::update-from-subquery-with-limit | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 30.
-update-from.sqltest::update-from-case-expression | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 114.
-update-from.sqltest::update-from-mixed-target-source-set | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 72.
-update-from.sqltest::update-from-multi-tables | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 40.
-update-from.sqltest::update-from-group-concat | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 32.
-update-from.sqltest::update-from-complex-multi-col | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 220.
-update-from.sqltest::update-from-sequential-visibility | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-repeated-accumulate | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 38.
-update-from.sqltest::update-from-like-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 33.
-update-from.sqltest::update-from-double-natural-join-ok | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 23.
-update-from.sqltest::update-from-multi-using-cols | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 37.
-update-from.sqltest::update-from-left-join-coalesce | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 63.
-update-from.sqltest::update-from-mixed-types-union | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 30.
-update-from.sqltest::update-from-all-types | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-numeric-affinity | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-integer-affinity | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-before-after-triggers | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-trigger-cascading-update | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-fk-cascade-extra | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 34.
-update-from.sqltest::update-from-savepoint-rollback | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-where-false | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-json-extract | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 50.
-update-from.sqltest::update-from-snapshot-accumulate-stays-one | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 27.
-update-from.sqltest::update-from-before-trigger-raise-ignore-conditional | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 21.
-update-from.sqltest::update-from-trigger-deletes-source-mid-flight | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 21.
-update-from.sqltest::update-from-trigger-inserts-target-not-matched | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 21.
-update-from.sqltest::update-from-glob-pattern-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 24.
-update-from.sqltest::update-from-like-escape-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 24.
-update-from.sqltest::update-from-row-value-equality-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 24.
-update-from.sqltest::update-from-is-not-distinct-from-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 21.
 update-from.sqltest::update-from-pragma-table-info-source | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 31.
-update-from.sqltest::update-from-source-rowid-in-set-expr | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 38.
-update-from.sqltest::update-from-explicit-cross-join | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 27.
-update-from.sqltest::update-from-between-source-bounds | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 29.
-update-from.sqltest::update-from-chain-rowid-remap | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 25.
-update-from.sqltest::update-from-rowid-alias-plus-column | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 37.
-update-from.sqltest::update-from-or-ignore-mutual-unique-conflict | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update-from.sqltest::update-from-before-trigger-new-is-source-value | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 21.
-update-from.sqltest::update-from-left-join-null-in-set | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 35.
-update-from.sqltest::update-from-cascade-afters-through-three-tables | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 21.
-update.sqltest::update-expression-index-json-extract-updates-all-matching-rows-alias | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
 update.sqltest::update-set-expression-missing-identifier | expected an error but the statement succeeded
-update.sqltest::row-values-from-subquery | expected success but got error: no such column: target.id
-update.sqltest::update-alias-visibility-in-where-clause | expected success but got error: Managed UPDATE target aliases are not supported. At SQL offset 9.
 update.sqltest::update-integer-pk-underflow-error | expected an error but the statement succeeded
-update.sqltest::update-exists-subquery-1 | expected success but got error: no such column: orders.id
-update.sqltest::update-correlated-self-exists-where | expected success but got error: no such column: t.id
-update.sqltest::update-correlated-self-not-exists-where | expected success but got error: no such column: t.id
-update.sqltest::update-not-exists-subquery-1 | expected success but got error: no such column: orders.id
-update.sqltest::update-or-ignore-rowid-change-preserves-index | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update.sqltest::update-set-correlated-subquery | expected success but got error: no such column: categories.id
 update_attached_db_index.sqltest::update-attached-db-rowid-change-with-unique-index | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 update_attached_db_index.sqltest::update-attached-db-rowid-with-where-subquery | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 update_attached_db_index.sqltest::update-attached-db-integrity-after-rowid-change | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 update_attached_db_index.sqltest::update-attached-db-non-rowid-column | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 update_expression_index.sqltest::substr-expression-index | expected success but got error: non-deterministic functions are prohibited in index expressions
-update_or_replace_rowid_secondary_index.sqltest::update-or-replace-rowid-conflict-preserves-secondary-index | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 195.
-update_or_replace_rowid_secondary_index.sqltest::update-or-replace-conflict-delete-changes-count | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-update_or_replace_rowid_secondary_index.sqltest::update-or-replace-rowid-no-conflict-preserves-secondary-index | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 71.
-upsert-expr-index.sqltest::upsert-expr-index-basic-no-target | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 50.
-upsert-expr-index.sqltest::upsert-expr-index-mixed-columns-no-target | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 60.
-upsert-expr-index.sqltest::upsert-expr-index-no-conflict-no-target | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 50.
-upsert.sqltest::upsert-pk-update | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 46.
 upsert.sqltest::upsert-select-single | expected success but got error: Managed UPSERT supports VALUES rows only and does not support INSERT ... SELECT or CTE sources.
-upsert.sqltest::upsert-returning-update | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 50.
-upsert.sqltest::upsert-returning-insert | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 51.
-upsert.sqltest::upsert-rowid-in-set | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 54.
-upsert.sqltest::upsert-omitted-target-matches-pk | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 59.
-upsert.sqltest::upsert-rowvalue-set | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 55.
 upsert.sqltest::upsert-multilple-conflict-targets | expected success but got error: Expected End. At SQL offset 183.
 upsert.sqltest::upsert-qualified-target | expected success but got error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint on table qt.
-upsert.sqltest::upsert-pk-where-false | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 54.
-upsert.sqltest::upsert-omitted-target-updates-unique | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 51.
 upsert.sqltest::upsert-current-qualified_1 | expected success but got error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint on table dq.
 upsert.sqltest::upsert-doubly-qualified-target | expected success but got error: Unexpected token in index expression. At SQL offset 57.
 upsert.sqltest::upsert-targets-chain | expected success but got error: Expected End. At SQL offset 215.
-upsert.sqltest::upsert-collate-omitted-target-matches | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 56.
 upsert.sqltest::upsert-unique-update-rowid-change | expected success but got error: Managed UPSERT DO UPDATE does not support assignments to rowid or an INTEGER PRIMARY KEY alias.
 upsert.sqltest::upsert-unresolved-table-reference | error 'no such table: other' does not match pattern '.*no such column.*'
 upsert.sqltest::upsert-unresolved-table-in-where | error 'no such table: other' does not match pattern '.*no such column.*'

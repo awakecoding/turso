@@ -638,20 +638,20 @@ public sealed class ManagedUpsertTargetInferenceTests
     }
 
     [Test]
-    public void TargetlessDoUpdateRemainsConservativelyRejectedBeforeMutation()
+    public void TargetlessDoUpdateResolvesAnyUniquenessConflict()
     {
         using var database = new EmbeddedDatabase();
         using var connection = database.Connect();
-        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);");
-        Execute(connection, "INSERT INTO t VALUES (1, 1);");
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, code TEXT UNIQUE, value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 'one', 1);");
 
-        Assert.Throws<EmbeddedSqlException>(
-                () => Execute(
-                    connection,
-                    "INSERT INTO t VALUES (1, 2) ON CONFLICT DO UPDATE SET value = excluded.value;"))!
-            .Message.Should().Contain("requires a parenthesized PRIMARY KEY or UNIQUE conflict target");
-        QueryManaged(connection, "SELECT id, value FROM t;")
-            .Rows.Should().Equal("I:1\u001fI:1");
+        Execute(connection, "INSERT INTO t VALUES (1, 'one', 2) ON CONFLICT DO UPDATE SET value = excluded.value;");
+        QueryManaged(connection, "SELECT id, code, value FROM t;")
+            .Rows.Should().Equal("I:1\u001fT:one\u001fI:2");
+
+        Execute(connection, "INSERT INTO t VALUES (9, 'one', 3) ON CONFLICT DO UPDATE SET value = excluded.value;");
+        QueryManaged(connection, "SELECT id, code, value FROM t;")
+            .Rows.Should().Equal("I:1\u001fT:one\u001fI:3");
     }
 
     [Test]
