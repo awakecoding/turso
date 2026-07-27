@@ -421,10 +421,14 @@ public sealed class FromSourcePlannerParityTests
             .Select(row => row[0].AsInteger())
             .Should().Equal(1, 2, 3);
 
+        Query(connection, "SELECT value FROM json_each('[1,2]');")
+            .Select(row => row[0].AsInteger())
+            .Should().Equal(1, 2);
+
         Action unsupportedQuery = () =>
-            connection.Prepare("SELECT * FROM json_each('[1]');");
+            connection.Prepare("SELECT * FROM fts5vocab('t','row');");
         unsupportedQuery.Should().Throw<EmbeddedSqlException>().WithMessage(
-            "Managed table-valued source 'json_each' is not supported: "
+            "Managed table-valued source 'fts5vocab' is not supported: "
             + "no module registration, planner, or execution contract is available.*");
 
         var schemaVersion = ReadScalar(connection, "PRAGMA schema_version;");

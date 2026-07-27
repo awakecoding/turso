@@ -1961,21 +1961,39 @@ internal sealed class SqlParser
             var alias = ParseTableAlias();
             return new NamedTableSource(name, alias, ParseTableIndexDirective());
         }
-        if (!string.Equals(name, "generate_series", StringComparison.OrdinalIgnoreCase))
-        {
-            throw Error(
-                $"Managed table-valued source '{name}' is not supported: "
-                + "no module registration, planner, or execution contract is available.");
-        }
+
+        var qualified = ManagedSchemaName.TrySplit(name, out var schema, out var functionName);
+        if (!TableValuedFunctionRegistry.TryResolve(functionName, out var module))
+            throw Error(TableValuedFunctionRegistry.UnsupportedMessage(ManagedSchemaName.Display(name)));
 
         Expect(TokenKind.LeftParen);
-        var start = ParseExpression();
-        Expect(TokenKind.Comma);
-        var stop = ParseExpression();
-        Expect(TokenKind.Comma);
-        var step = ParseExpression();
-        Expect(TokenKind.RightParen);
-        return new GenerateSeriesSource(start, stop, step, ParseTableAlias());
+        var arguments = new List<Expression>();
+        if (!Consume(TokenKind.RightParen))
+        {
+            do
+            {
+                arguments.Add(ParseExpression());
+            }
+            while (Consume(TokenKind.Comma));
+            Expect(TokenKind.RightParen);
+        }
+
+        if (arguments.Count > module.MaximumArgumentCount)
+        {
+            throw Error(
+                $"too many arguments on {functionName}() - max {module.MaximumArgumentCount}");
+        }
+        if (arguments.Count < module.MinimumArgumentCount)
+        {
+            throw Error(
+                $"too few arguments on {functionName}() - min {module.MinimumArgumentCount}");
+        }
+
+        return new TableValuedFunctionSource(
+            functionName,
+            arguments,
+            ParseTableAlias(),
+            qualified ? schema : null);
     }
 
     private string? ParseTableAlias()

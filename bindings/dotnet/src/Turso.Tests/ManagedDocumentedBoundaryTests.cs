@@ -38,7 +38,7 @@ public sealed class ManagedDocumentedBoundaryTests
         "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
         "BEGIN CONCURRENT",
         "ANALYZE",
-        "SELECT * FROM pragma_table_info('t')",
+        "SELECT * FROM fts5vocab('t', 'row')",
         "CREATE VIRTUAL TABLE vt USING fts5(x)",
         "SELECT a, count(*), row_number() OVER () FROM t GROUP BY a",
         "SELECT count(*) OVER () FROM t GROUP BY a",
