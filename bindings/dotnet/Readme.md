@@ -110,6 +110,22 @@ target rejects surfaces that engine's own error instead of an empty table that w
 read as "no objects exist". Remote behaviour is covered against a canned Hrana server;
 it has not been validated against a live Turso Cloud instance.
 
+`GetSchema` runs those catalog statements on the caller's behalf, so an installed
+authorizer sees them and a trace handler reports them. That is deliberate: the
+`Tables` collection returns each object's stored DDL, so a schema call that bypassed
+a deny-by-default policy would disclose exactly what the policy was installed to hide.
+`MetaDataCollections` and `ReservedWords` describe the provider rather than the
+database and are answered without touching it. The reader's own column-metadata
+probes remain exempt, as documented above, because they describe a result set the
+caller has already been authorized to read.
+
+`ReservedWords` reports SQLite's full keyword list, checked as a set against
+`Microsoft.Data.Sqlite` at test time, because callers use it to decide which
+identifiers need quoting and a partial list yields invalid SQL rather than a
+cosmetic difference. `MetaDataCollections` uses the reference provider's column
+shape; its row set is a superset, since that provider defines only these two
+constant collections and leaves the four catalog collections undefined.
+
 Deliberate limits:
 
 - `TursoCommandBuilder` generates statements for a single-table `SELECT` only, and the
@@ -122,6 +138,13 @@ Deliberate limits:
   `TursoCommandBuilder` is unaffected because it reads `IsKey` from the schema table.
 - `GetSchema` defines `MetaDataCollections`, `ReservedWords`, `Tables`, `Columns`,
   `Indexes` and `IndexColumns`. Any other collection name is an `ArgumentException`.
+- An authorizer that returns `SqliteAuthorizerResult.Ignore` for an `UPDATE` makes
+  `Update` report the row as saved even though the assignment was neutralized, so the
+  `DataSet` accepts a change the database never took. `Deny` is reported correctly and
+  leaves the row pending; only `Ignore` is silent. The engine reports the matched-row
+  count, which is `1` for a neutralized update exactly as it is for one that rewrites
+  the value it already held, and a plain `ExecuteNonQuery` reports the same `1`, so the
+  adapter has nothing to distinguish. Use `Deny` if a rejected write must be visible.
 
 ### Not implemented
 
