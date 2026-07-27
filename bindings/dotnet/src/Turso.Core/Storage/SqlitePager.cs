@@ -1152,6 +1152,7 @@ public sealed class SqlitePager : IDisposable
         }
         finally
         {
+            _lockManager.ReleaseRetainedSharedReaderLock();
             _clientOwnership?.Dispose();
         }
 

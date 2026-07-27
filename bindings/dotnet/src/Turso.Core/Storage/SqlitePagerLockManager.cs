@@ -91,6 +91,7 @@ public sealed class SqlitePagerLockManager
     private bool _writerActive;
     private bool _checkpointActive;
     private long _generation;
+    private IDisposable? _sharedReaderLock;
 
     /// <summary>Creates a process-local SQLite pager lock manager.</summary>
     public SqlitePagerLockManager()
@@ -181,6 +182,8 @@ public sealed class SqlitePagerLockManager
         if (timeout == TimeSpan.Zero && configuredTimeout != TimeSpan.Zero)
             throw new SqlitePagerBusyException(SqlitePagerLockOperation.Writer, configuredTimeout);
 
+        ReleaseIdleSharedReaderLock();
+
         try
         {
             return _coordinator.AcquireRecovery(timeout)
@@ -237,8 +240,20 @@ public sealed class SqlitePagerLockManager
                 if (coordinatorTimeout == TimeSpan.Zero && timeout != TimeSpan.Zero)
                     throw new SqlitePagerBusyException(operation, timeout);
 
-                externalLock = _coordinator.Acquire(operation, coordinatorTimeout)
-                    ?? throw new InvalidOperationException("SQLite pager lock coordinator returned no lease.");
+                if (operation == SqlitePagerLockOperation.Reader)
+                {
+                    AcquireSharedReaderLock(coordinatorTimeout);
+                }
+                else
+                {
+                    // A writer coexists with readers, but a checkpoint or recovery must
+                    // exclude them, and this manager just proved no local reader is active.
+                    if (operation != SqlitePagerLockOperation.Writer)
+                        ReleaseIdleSharedReaderLock();
+
+                    externalLock = _coordinator.Acquire(operation, coordinatorTimeout)
+                        ?? throw new InvalidOperationException("SQLite pager lock coordinator returned no lease.");
+                }
             }
 
             var lease = new SqlitePagerLockLease(this, operation, externalLock);
@@ -314,6 +329,70 @@ public sealed class SqlitePagerLockManager
 
             Monitor.PulseAll(_gate);
         }
+    }
+
+    /// <summary>
+    /// Acquires the coordinator's shared reader range once and keeps it while any
+    /// local reader is active. A per-page acquisition would otherwise cost an
+    /// operating-system lock round trip for every committed page read.
+    /// </summary>
+    private void AcquireSharedReaderLock(TimeSpan timeout)
+    {
+        lock (_gate)
+        {
+            if (_sharedReaderLock is not null)
+                return;
+        }
+
+        var acquired = _coordinator!.Acquire(SqlitePagerLockOperation.Reader, timeout)
+            ?? throw new InvalidOperationException("SQLite pager lock coordinator returned no lease.");
+
+        var redundant = false;
+        lock (_gate)
+        {
+            if (_sharedReaderLock is null)
+                _sharedReaderLock = acquired;
+            else
+                redundant = true;
+        }
+
+        if (redundant)
+            acquired.Dispose();
+    }
+
+    /// <summary>
+    /// Releases the retained shared reader range so an exclusive role can take it.
+    /// Callers must already have established that no local reader is active.
+    /// </summary>
+    private void ReleaseIdleSharedReaderLock()
+    {
+        IDisposable? retained;
+        lock (_gate)
+        {
+            if (_readerCount != 0)
+                return;
+
+            retained = _sharedReaderLock;
+            _sharedReaderLock = null;
+        }
+
+        retained?.Dispose();
+    }
+
+    /// <summary>
+    /// Releases the retained shared reader range during pager teardown, which ends
+    /// every reader this manager could still be holding it for.
+    /// </summary>
+    internal void ReleaseRetainedSharedReaderLock()
+    {
+        IDisposable? retained;
+        lock (_gate)
+        {
+            retained = _sharedReaderLock;
+            _sharedReaderLock = null;
+        }
+
+        retained?.Dispose();
     }
 
     private bool CanEnter(SqlitePagerLockOperation operation)
