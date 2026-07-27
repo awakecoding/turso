@@ -54,7 +54,9 @@ public sealed partial class PhysicalFileSystem
 /// A physical, file-backed SQLite shared-memory mapping. Its mapped range follows
 /// the file length and writable mappings grow it only through <see cref="Write"/>.
 /// </summary>
-internal sealed partial class PhysicalSqliteWalSharedMemoryMapping : ISqliteWalSharedMemoryMapping
+internal sealed partial class PhysicalSqliteWalSharedMemoryMapping :
+    ISqliteWalSharedMemoryMapping,
+    ISqliteWalSharedMemoryCarrierIdentity
 {
     private const uint PageReadOnly = 0x02;
     private const uint PageReadWrite = 0x04;
@@ -75,6 +77,7 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping : ISqliteWalS
     internal PhysicalSqliteWalSharedMemoryMapping(SafeFileHandle fileHandle, bool readOnly)
     {
         _fileHandle = fileHandle;
+        CarrierIdentity = SqliteWalSharedMemoryCarrierIdentity.FromHandle(fileHandle);
         IsReadOnly = readOnly;
 
         lock (_gate)
@@ -84,6 +87,11 @@ internal sealed partial class PhysicalSqliteWalSharedMemoryMapping : ISqliteWalS
     }
 
     public bool IsReadOnly { get; }
+
+    internal SqliteWalSharedMemoryCarrierIdentity CarrierIdentity { get; }
+
+    SqliteWalSharedMemoryCarrierIdentity ISqliteWalSharedMemoryCarrierIdentity.CarrierIdentity
+        => CarrierIdentity;
 
     public long Length
     {

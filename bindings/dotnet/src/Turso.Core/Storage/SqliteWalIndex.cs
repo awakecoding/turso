@@ -56,6 +56,15 @@ public interface ISqliteWalSharedMemoryMapping : IDisposable
     void MemoryBarrier();
 }
 
+/// <summary>
+/// Provides the immutable identity of the physical file backing a mapped SQLite
+/// WAL shared-memory region.
+/// </summary>
+internal interface ISqliteWalSharedMemoryCarrierIdentity
+{
+    SqliteWalSharedMemoryCarrierIdentity CarrierIdentity { get; }
+}
+
 /// <summary>Defines the fixed layout of SQLite's 32 KiB WAL-index blocks.</summary>
 public static class SqliteWalIndexLayout
 {
@@ -689,6 +698,9 @@ public sealed class SqliteWalIndexSharedMemory
         _mapping = mapping;
     }
 
+    internal SqliteWalSharedMemoryCarrierIdentity? CarrierIdentity
+        => (_mapping as ISqliteWalSharedMemoryCarrierIdentity)?.CarrierIdentity;
+
     /// <summary>
     /// Reads a stable dual-header snapshot and validates it against the WAL.
     /// </summary>
@@ -756,12 +768,8 @@ public sealed class SqliteWalIndexSharedMemory
             {
                 if (firstHeader == secondHeader)
                     return firstHeader;
-                if (firstHeader.MaximumFrame == 0)
-                    return firstHeader;
-                if (secondHeader.MaximumFrame == 0)
-                    return secondHeader;
                 throw new InvalidDataException(
-                    "SQLite WAL-index header copies disagree on nonempty committed state; recovery cannot select an incarnation.");
+                    "SQLite WAL-index header copies disagree; recovery cannot select trustworthy tail evidence.");
             }
 
             return firstHeader ?? secondHeader!;
