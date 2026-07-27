@@ -34,6 +34,57 @@ public sealed class SqlitePagerBoundedReadCacheSliceTests
     }
 
     [Test]
+    public void ReadCacheEvictsAnImageFromAnotherCommittedViewGeneration()
+    {
+        var cache = new SqlitePagerReadCache(capacity: 2);
+        var page = CreatePage(SqlitePageSize.Default, 0x44);
+
+        cache.Add(pageNumber: 2, viewGeneration: 7, page);
+        cache.TryGetValue(pageNumber: 2, viewGeneration: 7, out var cached).Should().BeTrue();
+        cached.Should().BeSameAs(page);
+
+        cache.TryGetValue(pageNumber: 2, viewGeneration: 8, out _).Should().BeFalse();
+        cache.Count.Should().Be(0);
+    }
+
+    [Test]
+    public void SnapshotReusesOnlyItsCapturedCleanMainStoreGeneration()
+    {
+        var faults = new DeterministicFaultInjector();
+        var fileSystem = new InMemoryFileSystem(faults);
+        var original = CreatePage(SqlitePageSize.Default, 0x45);
+        var replacement = CreatePage(SqlitePageSize.Default, 0x46);
+
+        using (var seed = CreatePager(fileSystem, "snapshot-cache-generation", pageCacheCapacity: 2))
+            MaterializeCleanPages(seed, original);
+
+        using var snapshotPager = SqlitePager.Open(
+            fileSystem,
+            "snapshot-cache-generation.db",
+            "snapshot-cache-generation.db-wal",
+            pageCacheCapacity: 2);
+        snapshotPager.ReadCommittedPage(2).Should().Equal(original);
+        snapshotPager.CachedPageCount.Should().Be(1);
+
+        using var snapshot = snapshotPager.BeginReadTransaction();
+        using (var writer = SqlitePager.Open(
+                   fileSystem,
+                   "snapshot-cache-generation.db",
+                   "snapshot-cache-generation.db-wal",
+                   pageCacheCapacity: 2))
+        {
+            using var transaction = writer.BeginTransaction(targetDatabaseSizeInPages: 2);
+            transaction.WritePage(2, replacement);
+            transaction.Commit();
+            writer.ReadCommittedPage(2).Should().Equal(replacement);
+        }
+
+        var readsBeforeSnapshot = faults.GetOperationCount(FileSystemOperation.Read);
+        snapshot.ReadPage(2).Should().Equal(original);
+        faults.GetOperationCount(FileSystemOperation.Read).Should().Be(readsBeforeSnapshot);
+    }
+
+    [Test]
     public void ReadCacheKeepsCommittedImageWhenTransactionRollsBack()
     {
         var fileSystem = new InMemoryFileSystem();

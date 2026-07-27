@@ -1,7 +1,7 @@
 namespace Turso.Core.Storage;
 
 /// <summary>
-/// A pager-owned bounded LRU cache for clean main-database page images.
+/// A pager-owned bounded LRU cache for clean main-database page images scoped to one committed view.
 /// </summary>
 /// <remarks>
 /// WAL-overlay and transaction pages are deliberately excluded: the overlay is
@@ -23,10 +23,18 @@ internal sealed class SqlitePagerReadCache
 
     public int Count => _entries.Count;
 
-    public bool TryGetValue(uint pageNumber, out byte[] page)
+    public bool TryGetValue(uint pageNumber, long viewGeneration, out byte[] page)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(viewGeneration);
         if (_entries.TryGetValue(pageNumber, out var entry))
         {
+            if (entry.ViewGeneration != viewGeneration)
+            {
+                Remove(pageNumber);
+                page = null!;
+                return false;
+            }
+
             _leastToMostRecent.Remove(entry.RecencyNode);
             _leastToMostRecent.AddLast(entry.RecencyNode);
             page = entry.Page;
@@ -37,8 +45,9 @@ internal sealed class SqlitePagerReadCache
         return false;
     }
 
-    public void Add(uint pageNumber, byte[] page)
+    public void Add(uint pageNumber, long viewGeneration, byte[] page)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(viewGeneration);
         ArgumentNullException.ThrowIfNull(page);
 
         Remove(pageNumber);
@@ -52,7 +61,7 @@ internal sealed class SqlitePagerReadCache
         }
 
         var recencyNode = _leastToMostRecent.AddLast(pageNumber);
-        _entries.Add(pageNumber, new Entry(page, recencyNode));
+        _entries.Add(pageNumber, new Entry(page, viewGeneration, recencyNode));
     }
 
     public void Remove(uint pageNumber)
@@ -69,5 +78,5 @@ internal sealed class SqlitePagerReadCache
         _leastToMostRecent.Clear();
     }
 
-    private sealed record Entry(byte[] Page, LinkedListNode<uint> RecencyNode);
+    private sealed record Entry(byte[] Page, long ViewGeneration, LinkedListNode<uint> RecencyNode);
 }
