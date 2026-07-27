@@ -231,7 +231,46 @@ internal sealed class SqlParser
             return new PragmaFreelistCountStatement(schema);
         }
 
+        if (name.Equals("integrity_check", StringComparison.OrdinalIgnoreCase))
+            return ParsePragmaIntegrityCheck(name, quick: false, schema);
+        if (name.Equals("quick_check", StringComparison.OrdinalIgnoreCase))
+            return ParsePragmaIntegrityCheck(name, quick: true, schema);
+
         throw Error($"Unsupported PRAGMA {name}.");
+    }
+
+    /// <remarks>
+    /// SQLite accepts either an integer maximum error count or a single bare
+    /// table name. An integer bounds the number of reported problems; a name
+    /// restricts the check to that table in the pragma's schema. SQLite's pragma
+    /// grammar takes one token, so a schema-qualified argument is a syntax error.
+    /// </remarks>
+    private ParsedStatement ParsePragmaIntegrityCheck(string name, bool quick, string? schema)
+    {
+        if (_lexer.Current.Kind is TokenKind.Semicolon or TokenKind.End)
+            return new PragmaIntegrityCheckStatement(quick, null, null, schema);
+        if (!Consume(TokenKind.LeftParen))
+            throw Error($"PRAGMA {name} requires a parenthesized value.");
+
+        int? maxErrors = null;
+        string? tableName = null;
+        var token = _lexer.Current;
+        if (token.Kind == TokenKind.Integer)
+        {
+            maxErrors = ParsePragmaInteger(name);
+        }
+        else if (token.Kind is TokenKind.Identifier or TokenKind.String)
+        {
+            _lexer.Next();
+            tableName = token.Text;
+        }
+        else
+        {
+            throw Error($"Invalid value for PRAGMA {name}.");
+        }
+
+        Expect(TokenKind.RightParen);
+        return new PragmaIntegrityCheckStatement(quick, maxErrors, tableName, schema);
     }
 
     private string ParsePragmaObjectName(string? pragmaSchema)

@@ -201,6 +201,9 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private const int MaximumTriggerDepth = 1_000;
     private const int MaximumForeignKeyActionDepth = 1_000;
     private const int RecursiveTriggerStackSize = 32 * 1024 * 1024;
+
+    /// <summary>SQLite's default PRAGMA integrity_check error budget.</summary>
+    private const int DefaultIntegrityCheckErrorLimit = 100;
     [ThreadStatic]
     private static bool s_hasRecursiveTriggerStack;
     [ThreadStatic]
@@ -1848,6 +1851,11 @@ public sealed partial class EmbeddedDatabase : IDisposable
             PragmaIndexXInfoStatement indexXInfo => ExecutePragmaIndexXInfo(indexXInfo, tables),
             PragmaForeignKeyListStatement foreignKeyList => ExecutePragmaForeignKeyList(foreignKeyList, tables),
             PragmaForeignKeyCheckStatement foreignKeyCheck => ExecutePragmaForeignKeyCheck(foreignKeyCheck, tables),
+            PragmaIntegrityCheckStatement integrityCheck => ExecutePragmaIntegrityCheck(
+                integrityCheck,
+                tables,
+                parameters,
+                context),
             PragmaTableListStatement tableList => ExecutePragmaTableList(
                 catalog,
                 tableList.Schema ?? "main"),
@@ -2342,6 +2350,103 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         return new ExecutionResult(columns, rows, 0);
     }
+
+    /// <summary>
+    /// Reports the SQLite integrity problems the managed catalog can actually
+    /// prove: declared NOT NULL and CHECK constraints that stored rows violate.
+    /// </summary>
+    /// <remarks>
+    /// Index and page-structure problems are unreachable here. The managed file
+    /// store validates stored index records, page linkage, and record framing
+    /// while loading a database, so a database that would make SQLite report
+    /// <c>non-unique entry in index</c> or <c>wrong # of entries in index</c>
+    /// fails to open at all. That makes <c>quick_check</c> and
+    /// <c>integrity_check</c> report the same problems, differing only in their
+    /// result column name.
+    /// </remarks>
+    private ExecutionResult ExecutePragmaIntegrityCheck(
+        PragmaIntegrityCheckStatement statement,
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        var columns = new[] { statement.Quick ? "quick_check" : "integrity_check" };
+        if (statement.TableName is { } requested && !tables.ContainsKey(requested))
+            throw new EmbeddedSqlException($"no such table: {requested}");
+
+        var maxErrors = statement.MaxErrors ?? DefaultIntegrityCheckErrorLimit;
+        if (maxErrors <= 0)
+            return new ExecutionResult(columns, [], 0);
+
+        var problems = new List<string>();
+        foreach (var (tableName, table) in tables)
+        {
+            if (statement.TableName is { } selected
+                && !selected.Equals(tableName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (problems.Count >= maxErrors)
+                break;
+
+            AppendIntegrityRowProblems(tableName, table, parameters, context, maxErrors, problems);
+        }
+
+        var rows = problems.Count == 0
+            ? (IReadOnlyList<SqlValue[]>)[[SqlValue.Text("ok")]]
+            : [.. problems.Take(maxErrors).Select(problem => new[] { SqlValue.Text(problem) })];
+        return new ExecutionResult(columns, rows, 0);
+    }
+
+    private void AppendIntegrityRowProblems(
+        string tableName,
+        EmbeddedTable table,
+        SqlValue[] parameters,
+        QueryContext context,
+        int maxErrors,
+        List<string> problems)
+    {
+        for (var rowIndex = 0; rowIndex < table.Rows.Count && problems.Count < maxErrors; rowIndex++)
+        {
+            var row = table.Rows[rowIndex];
+            for (var columnIndex = 0;
+                 columnIndex < table.ColumnDefinitions.Length && problems.Count < maxErrors;
+                 columnIndex++)
+            {
+                var column = table.ColumnDefinitions[columnIndex];
+                if (column.NotNull && columnIndex < row.Length && row[columnIndex].Kind == SqlValueKind.Null)
+                    problems.Add($"NULL value in {tableName}.{column.Name}");
+            }
+
+            if (problems.Count >= maxErrors || !table.HasCheckConstraints)
+                continue;
+
+            var rowid = table.HasRowid && rowIndex < table.RowIds.Count ? table.RowIds[rowIndex] : 0;
+            if (!SatisfiesCheckConstraints(tableName, table, row, rowid, parameters, context))
+                problems.Add($"CHECK constraint failed in {tableName}");
+        }
+    }
+
+    private bool SatisfiesCheckConstraints(
+        string tableName,
+        EmbeddedTable table,
+        SqlValue[] row,
+        long rowid,
+        SqlValue[] parameters,
+        QueryContext context)
+    {
+        try
+        {
+            ValidateCheckConstraints(tableName, table, row, rowid, parameters, context);
+            return true;
+        }
+        catch (EmbeddedSqlException)
+        {
+            // A stored row that cannot be evaluated is itself an integrity problem.
+            return false;
+        }
+    }
+
 
     private ExecutionResult ExecuteCreateTable(
         CreateTableStatement statement,
@@ -30011,6 +30116,18 @@ public sealed class EmbeddedConnection : IDisposable
                     foreignKeySchema,
                     string.Empty,
                     _ => foreignKeyCheck with { Schema = null }),
+            PragmaIntegrityCheckStatement { TableName: { } integrityTable } integrityCheck
+                => RouteExistingNamedStatement(
+                    integrityCheck.Schema is null
+                        ? integrityTable
+                        : ManagedSchemaName.Create(integrityCheck.Schema, integrityTable),
+                    ManagedSchemaObjectKind.Table,
+                    name => integrityCheck with { TableName = name, Schema = null }),
+            PragmaIntegrityCheckStatement { TableName: null, Schema: { } integritySchema } integrityCheck
+                => RouteSchema(
+                    integritySchema,
+                    string.Empty,
+                    _ => integrityCheck with { Schema = null }),
             PragmaTableListStatement { Schema: { } schema } tableList
                 => RouteSchema(schema, string.Empty, _ => tableList),
             ReindexStatement reindex => RouteReindex(reindex),
@@ -31850,6 +31967,8 @@ public sealed class EmbeddedConnection : IDisposable
             return ["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"];
         if (statement is PragmaForeignKeyCheckStatement)
             return ["table", "rowid", "parent", "fkid"];
+        if (statement is PragmaIntegrityCheckStatement integrityCheck)
+            return integrityCheck.Quick ? ["quick_check"] : ["integrity_check"];
         if (statement is PragmaTableListStatement)
             return ["schema", "name", "type", "ncol", "wr", "strict"];
         if (statement is PragmaDatabaseListStatement)
@@ -32081,6 +32200,7 @@ public sealed class EmbeddedStatement : IDisposable
             or PragmaIndexListStatement or PragmaIndexInfoStatement or PragmaIndexXInfoStatement
             or PragmaForeignKeyListStatement
             or PragmaForeignKeyCheckStatement or PragmaTableListStatement
+            or PragmaIntegrityCheckStatement
             or PragmaDatabaseListStatement or PragmaEncodingStatement
             or PragmaPageCountStatement or PragmaFreelistCountStatement
             or ExplainStatement)

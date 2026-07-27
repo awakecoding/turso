@@ -219,6 +219,17 @@ internal sealed record PragmaForeignKeyCheckStatement(
     string? TableName,
     string? Schema = null) : ParsedStatement;
 
+/// <summary>
+/// <c>PRAGMA integrity_check</c> and <c>PRAGMA quick_check</c>. The optional
+/// argument is either a maximum error count or a single table to restrict the
+/// check to, matching SQLite.
+/// </summary>
+internal sealed record PragmaIntegrityCheckStatement(
+    bool Quick,
+    int? MaxErrors,
+    string? TableName,
+    string? Schema = null) : ParsedStatement;
+
 internal sealed record PragmaTableListStatement(string? Schema = null) : ParsedStatement;
 
 internal sealed record PragmaDatabaseListStatement(string? Schema = null) : ParsedStatement;
