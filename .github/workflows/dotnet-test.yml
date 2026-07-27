@@ -125,6 +125,7 @@ jobs:
             Framework            = '${{ matrix.framework }}'
             MinimumExecutedTests = 2500
             DenyNativeToolchain  = $true
+            HangTimeoutMinutes   = 10
           }
           if ($IsMacOS) {
             $arguments.RequireDiscoveredClass = 'SqliteWalProcessIsolationHarnessTests'
@@ -141,7 +142,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: managed-test-results-${{ matrix.os }}-${{ matrix.framework }}
-          path: ${{ env.working-directory }}/artifacts/test-results/**/*.trx
+          path: |
+            ${{ env.working-directory }}/artifacts/test-results/**/*.trx
+            ${{ env.working-directory }}/artifacts/test-results/**/Sequence*.xml
           if-no-files-found: error
 
   # Packaging closure validation is platform independent and expensive, so it stays on a

@@ -38,6 +38,10 @@ param(
     # Human-readable explanation printed with every known-gap failure so the gap
     # stays visible in the job log and step summary instead of becoming silent.
     [string]$KnownGapReason,
+    # Aborts the run and names the offending test when a single test stops making
+    # progress for this long. Without it a hung test burns the whole job timeout and
+    # reports as a cancelled job with no indication of which test stalled.
+    [int]$HangTimeoutMinutes = 0,
     [switch]$NoBuild,
     # Reproduces the managed lane's "must not shell out to Rust" invariant by
     # putting failing cargo/rustc shims ahead of the real toolchain on PATH.
@@ -163,6 +167,9 @@ $arguments = @(
 if ($Framework) { $arguments += @('--framework', $Framework) }
 if ($Filter) { $arguments += @('--filter', $Filter) }
 if ($NoBuild) { $arguments += '--no-build' }
+if ($HangTimeoutMinutes -gt 0) {
+    $arguments += @('--blame-hang', '--blame-hang-timeout', "${HangTimeoutMinutes}m", '--blame-hang-dump-type', 'none')
+}
 
 $denyDirectory = $null
 $originalPath = $env:PATH
@@ -190,6 +197,20 @@ finally {
 }
 
 $trxPath = Join-Path $resultsRoot $trxFileName
+
+# `--blame-hang` writes a sequence file naming the test that stopped making progress
+# and then aborts the run, so surface it before any other diagnosis: an aborted run
+# also looks like a short run, and the hung test is the far more useful signal.
+$sequenceFiles = @(Get-ChildItem -Path $resultsRoot -Recurse -Filter 'Sequence*.xml' -ErrorAction SilentlyContinue)
+if ($sequenceFiles.Count -gt 0) {
+    foreach ($sequence in $sequenceFiles) {
+        Write-Host "::error::a test stopped making progress; blame sequence follows"
+        Get-Content -LiteralPath $sequence.FullName | Write-Host
+    }
+
+    Fail "a test hung and the run was aborted after $HangTimeoutMinutes minute(s) without progress; see the blame sequence above for the offending test."
+}
+
 if (-not (Test-Path -LiteralPath $trxPath -PathType Leaf)) {
     Fail "the run produced no TRX report at '$trxPath', so it cannot be proven to have executed any test (dotnet test exit code $testExitCode)."
 }
