@@ -710,26 +710,6 @@ savepoint.sqltest::savepoint-rollback-overflow-nested-issue-6352 | expected succ
 savepoint.sqltest::savepoint-rollback-overflow-repeated-issue-6352 | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
 savepoint.sqltest::savepoint-rollback-overflow-grow-issue-6352 | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
 savepoint.sqltest::savepoint-rollback-cache-spill-issue-6351 | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
-scalar-functions-printf.sqltest::printf-altform2-float-basic | expected 1 row(s), got 1 row(s); row 0 expected '3.14' but was '3.140000'
-scalar-functions-printf.sqltest::printf-altform2-float-trailing | expected 1 row(s), got 1 row(s); row 0 expected '1.0' but was '1.000000'
-scalar-functions-printf.sqltest::printf-altform2-float-zero | expected 1 row(s), got 1 row(s); row 0 expected '0.0' but was '0.000000'
-scalar-functions-printf.sqltest::printf-altform2-float-precision-4 | expected 1 row(s), got 1 row(s); row 0 expected '3.14' but was '3.1400'
-scalar-functions-printf.sqltest::printf-altform2-float-negative | expected 1 row(s), got 1 row(s); row 0 expected '-3.14' but was '-3.140000'
-scalar-functions-printf.sqltest::printf-altform2-float-sign | expected 1 row(s), got 1 row(s); row 0 expected '+3.14' but was '+3.140000'
-scalar-functions-printf.sqltest::printf-altform2-exp-basic | expected 1 row(s), got 1 row(s); row 0 expected '2.3e+07' but was '2.300000e+07'
-scalar-functions-printf.sqltest::printf-altform2-exp-zero | expected 1 row(s), got 1 row(s); row 0 expected '0.0e+00' but was '0.000000e+00'
-scalar-functions-printf.sqltest::printf-altform2-exp-precision-2 | expected 1 row(s), got 1 row(s); row 0 expected '2.3e+07' but was '2.30e+07'
-scalar-functions-printf.sqltest::printf-float-left-zero-combined | expected 1 row(s), got 1 row(s); row 0 expected '/3.14      /' but was '/0000003.14/'
-scalar-functions-printf.sqltest::printf-alt-hex-zeropad-4 | expected 1 row(s), got 1 row(s); row 0 expected '0x00ff' but was '0xff'
-scalar-functions-printf.sqltest::printf-inf-zeropad-f | expected 1 row(s), got 1 row(s); row 0 expected '1007' but was '20'
-scalar-functions-printf.sqltest::printf-inf-zeropad-f-prefix | expected 1 row(s), got 1 row(s); row 0 expected '90000' but was '00000'
-scalar-functions-printf.sqltest::printf-inf-zeropad-e | expected 1 row(s), got 1 row(s); row 0 expected '00000009.000000e+999' but was '00000000000000000Inf'
-scalar-functions-printf.sqltest::printf-inf-zeropad-g | expected 1 row(s), got 1 row(s); row 0 expected '000000000000009e+999' but was '00000000000000000Inf'
-scalar-functions-printf.sqltest::printf-inf-neg-zeropad-e | expected 1 row(s), got 1 row(s); row 0 expected '-0000009.000000e+999' but was '-0000000000000000Inf'
-scalar-functions-printf.sqltest::printf-sigdigits-f-20 | expected 1 row(s), got 1 row(s); row 0 expected '0.33333333333333330000' but was '0.33333333333333331483'
-scalar-functions-printf.sqltest::printf-sigdigits-e-20 | expected 1 row(s), got 1 row(s); row 0 expected '3.33333333333333300000e-01' but was '3.33333333333333314830e-01'
-scalar-functions-printf.sqltest::printf-sigdigits-g-20 | expected 1 row(s), got 1 row(s); row 0 expected '0.3333333333333333' but was '0.33333333333333331483'
-scalar-functions-printf.sqltest::printf-sigdigits-f-15 | expected 1 row(s), got 1 row(s); row 0 expected '1234567890.123457000000000' but was '1234567890.123456716537476'
 select/memory.sqltest::select-intersect-union-with-limit | expected 3 row(s), got 3 row(s); row 0 expected 'a/a' but was 'z/z'
 select/memory.sqltest::select-except-union | expected 3 row(s), got 3 row(s); row 0 expected 'x/x' but was 'y/y'
 select/memory.sqltest::limit-underscore-literal | expected success but got error: Expected End. At SQL offset 16.

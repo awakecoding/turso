@@ -22823,12 +22823,18 @@ public sealed partial class EmbeddedDatabase : IDisposable
             or 'f' or 'e' or 'E' or 'g' or 'G';
         var signedNumeric = verb is 'd' or 'i' or 'r' or 'f' or 'e' or 'E' or 'g' or 'G';
 
+        // SQLite resolves a "-" and "0" flag pair differently per conversion class: an integer
+        // stays zero padded (%-05d is "00042") while a real is left justified (%-010.2f is
+        // "3.14      "). A "0" on a string conversion is ignored entirely.
+        var realVerb = verb is 'f' or 'e' or 'E' or 'g' or 'G';
+        var zeroPadsNumeric = zeroPad && numeric;
+
         return new PrintfSpecifier(
             verb,
-            leftJustify && !(zeroPad && numeric),
+            leftJustify && !(zeroPadsNumeric && !realVerb),
             forceSign && signedNumeric,
             spaceSign && signedNumeric,
-            zeroPad && numeric,
+            zeroPadsNumeric && !(leftJustify && realVerb),
             alternate,
             alternate2,
             comma,
@@ -23032,7 +23038,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
             Math.Abs(value),
             specifier.Precision,
             specifier.Alternate,
-            specifier.Alternate2);
+            specifier.Alternate2,
+            specifier.ZeroPad);
         if (specifier.Comma && specifier.Verb == 'f')
         {
             var decimalIndex = digits.IndexOf('.');
@@ -23216,7 +23223,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
     private static PrintfText ApplyPrintfNumericWidth(PrintfSpecifier specifier, string sign, string digits)
     {
-        var padding = Math.Max(0, (specifier.Width ?? 0) - sign.Length - digits.Length);
+        // An alternate-form integer prefix such as "0x" sits outside the zero padded field in
+        // SQLite, so %#04x of 255 pads the digits to four and still emits the prefix: "0x00ff".
+        var prefixIsAlternateInteger = sign is "0" or "0x" or "0X";
+        var zeroPadsDigitsOnly = specifier.ZeroPad && prefixIsAlternateInteger && !specifier.LeftJustify;
+        var occupied = zeroPadsDigitsOnly ? digits.Length : sign.Length + digits.Length;
+        var padding = Math.Max(0, (specifier.Width ?? 0) - occupied);
         if (padding == 0)
             return new PrintfText(string.Concat(sign, digits), sign.Length + digits.Length);
 
@@ -23228,10 +23240,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         if (specifier.ZeroPad)
         {
-            var prefixIsAlternateInteger = sign is "0" or "0x" or "0X";
-            var zeroes = new string(
-                '0',
-                prefixIsAlternateInteger ? padding + sign.Length : padding);
+            var zeroes = new string('0', padding);
             var formatted = string.Concat(sign, zeroes, digits);
             return new PrintfText(formatted, formatted.Length);
         }
@@ -23458,17 +23467,25 @@ public sealed partial class EmbeddedDatabase : IDisposable
         double value,
         int? requestedPrecision,
         bool alternate,
-        bool alternate2)
+        bool alternate2,
+        bool zeroPad)
     {
         if (double.IsNaN(value))
             return "NaN";
         if (double.IsPositiveInfinity(value))
-            return "Inf";
+        {
+            // SQLite renders an infinity as "Inf" unless zero padding was requested, in which
+            // case zero padding a three character word would be meaningless, so it substitutes
+            // the largest value its formatter can describe: 9.0e+999.
+            if (!zeroPad)
+                return "Inf";
+            return FormatPrintfInfinitySubstitute(verb, requestedPrecision, alternate, alternate2);
+        }
 
         if (alternate2 && requestedPrecision is > 26)
             requestedPrecision = 26;
         var forceDecimalPoint = alternate || alternate2;
-        return verb switch
+        var formatted = verb switch
         {
             'f' => EnsurePrintfDecimalPoint(
                 FormatPrintfFixed(value, requestedPrecision ?? 6),
@@ -23500,6 +23517,85 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 alternate2),
             _ => throw new InvalidOperationException($"Unexpected printf real verb {verb}."),
         };
+
+        return alternate2 ? StripPrintfFractionZeros(formatted) : formatted;
+    }
+
+    /// <summary>
+    /// Applies SQLite's <c>!</c> (alternate form 2) flag to an already formatted real: trailing
+    /// fractional zeroes are removed while at least one fractional digit is retained, so
+    /// <c>%!f</c> of 3.14 is "3.14" and of 1.0 is "1.0" rather than "1".
+    /// </summary>
+    private static string StripPrintfFractionZeros(string value)
+    {
+        var exponentIndex = value.IndexOfAny(['e', 'E']);
+        var mantissa = exponentIndex < 0 ? value : value[..exponentIndex];
+        var exponent = exponentIndex < 0 ? string.Empty : value[exponentIndex..];
+        var pointIndex = mantissa.IndexOf('.');
+        if (pointIndex < 0)
+            return string.Concat(mantissa, ".0", exponent);
+
+        var end = mantissa.Length;
+        while (end > pointIndex + 2 && mantissa[end - 1] == '0')
+            end--;
+
+        return string.Concat(mantissa.AsSpan(0, end), exponent);
+    }
+
+    /// <summary>
+    /// Renders the 9.0e+999 value SQLite substitutes for an infinity when zero padding is
+    /// requested. The magnitude is beyond <see cref="double"/> range, so its digits are
+    /// synthesized rather than computed.
+    /// </summary>
+    private static string FormatPrintfInfinitySubstitute(
+        char verb,
+        int? requestedPrecision,
+        bool alternate,
+        bool alternate2)
+    {
+        const int InfinityExponent = 999;
+        var precision = requestedPrecision ?? 6;
+        var forceDecimalPoint = alternate || alternate2;
+        switch (verb)
+        {
+            case 'f':
+                {
+                    var digits = string.Concat("9", new string('0', InfinityExponent));
+                    var formatted = precision > 0
+                        ? string.Concat(digits, ".", new string('0', precision))
+                        : digits;
+                    return EnsurePrintfDecimalPoint(formatted, forceDecimalPoint, alternate2);
+                }
+
+            case 'e':
+            case 'E':
+                {
+                    var mantissa = precision > 0
+                        ? string.Concat("9.", new string('0', precision))
+                        : "9";
+                    var formatted = string.Concat(
+                        mantissa,
+                        verb == 'E' ? "E+" : "e+",
+                        InfinityExponent.ToString(CultureInfo.InvariantCulture));
+                    return EnsurePrintfDecimalPoint(formatted, forceDecimalPoint, alternate2);
+                }
+
+            default:
+                {
+                    // %g selects the exponential form because the exponent is far outside the
+                    // range where the fixed form is used, and drops trailing zeroes unless the
+                    // alternate flag asked for them.
+                    var significant = Math.Max(1, precision);
+                    var mantissa = alternate && significant > 1
+                        ? string.Concat("9.", new string('0', significant - 1))
+                        : "9";
+                    var formatted = string.Concat(
+                        mantissa,
+                        verb == 'G' ? "E+" : "e+",
+                        InfinityExponent.ToString(CultureInfo.InvariantCulture));
+                    return EnsurePrintfDecimalPoint(formatted, alternate2, alternate2);
+                }
+        }
     }
 
     private static string EnsurePrintfDecimalPoint(
@@ -23646,7 +23742,31 @@ public sealed partial class EmbeddedDatabase : IDisposable
             denominator <<= -binaryScale;
 
         var quotient = BigInteger.DivRem(numerator, denominator, out var remainder);
-        return remainder * 2 >= denominator ? quotient + 1 : quotient;
+        var rounded = remainder * 2 >= denominator ? quotient + 1 : quotient;
+        return ClampPrintfSignificantDigits(rounded);
+    }
+
+    /// <summary>
+    /// SQLite decodes a double to at most 16 significant decimal digits and zero fills the rest,
+    /// so <c>printf('%.25f', 0.1)</c> is "0.1000000000000000000000000" rather than the exact
+    /// binary expansion "0.1000000000000000055511151".
+    /// </summary>
+    private static BigInteger ClampPrintfSignificantDigits(BigInteger digits)
+    {
+        const int MaximumSignificantDigits = 16;
+        if (digits.IsZero)
+            return digits;
+
+        var length = BigInteger.Abs(digits).ToString(CultureInfo.InvariantCulture).Length;
+        if (length <= MaximumSignificantDigits)
+            return digits;
+
+        var scale = BigInteger.Pow(10, length - MaximumSignificantDigits);
+        var quotient = BigInteger.DivRem(digits, scale, out var remainder);
+        if (remainder * 2 >= scale)
+            quotient += 1;
+
+        return quotient * scale;
     }
 
     private static int GetPrintfDecimalExponent(double value)
