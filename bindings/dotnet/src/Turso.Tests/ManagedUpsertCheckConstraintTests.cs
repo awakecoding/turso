@@ -353,7 +353,9 @@ public sealed class ManagedUpsertCheckConstraintTests
     /// merged without textual conflict, but the CHECK call still passed the
     /// conflicting row's original rowid. A bare <c>rowid</c> reference in a CHECK
     /// expression therefore saw the pre-move value and the violating row was stored.
-    /// Verified against real SQLite: the move to 500 is rejected.
+    /// Verified against real SQLite: the move to 500 is rejected. This is the only
+    /// one of the three cases below that discriminates: reverting the argument to
+    /// the pre-move rowid fails this test and no other.
     /// </remarks>
     [Test]
     public void ADoUpdateThatMovesTheRowidValidatesChecksAgainstTheNewRowid()
@@ -371,8 +373,16 @@ public sealed class ManagedUpsertCheckConstraintTests
 
     /// <summary>
     /// The same reassignment expressed through the INTEGER PRIMARY KEY's declared
-    /// column name, which reads from the row image rather than the rowid slot.
+    /// column name.
     /// </summary>
+    /// <remarks>
+    /// This case passed both before and after the rowid fix, because a named
+    /// INTEGER PRIMARY KEY is read out of the row image, which already carries the
+    /// assigned value. It is kept as a guard rather than as a discriminator: it
+    /// pins the named-column spelling to the same outcome as the bare
+    /// <c>rowid</c> spelling above, which is the only one that observed the stale
+    /// identity.
+    /// </remarks>
     [Test]
     public void ADoUpdateThatMovesTheRowidValidatesChecksNamingThatColumn()
     {
