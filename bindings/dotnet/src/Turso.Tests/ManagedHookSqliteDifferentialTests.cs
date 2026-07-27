@@ -150,7 +150,8 @@ public sealed class ManagedHookSqliteDifferentialTests
         ExecuteScript(connection, script);
         raw.sqlite3_update_hook(connection.Handle!, (delegate_update?)null, null);
         GC.KeepAlive(hook);
-        return log;    }
+        return log;
+    }
 
     private static string VetoManaged()
     {
