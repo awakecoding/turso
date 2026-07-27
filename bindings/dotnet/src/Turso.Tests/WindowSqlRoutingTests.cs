@@ -441,14 +441,22 @@ public class WindowSqlRoutingTests
     }
 
     [Test]
-    public void WindowCombinedWithGroupByFallsBackAndEvaluatorRejects()
+    public void WindowCombinedWithGroupByFallsBackToEvaluator()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(id INTEGER, v INTEGER);");
         Execute(connection, "INSERT INTO t VALUES (1, 10), (2, 20);");
 
+        // GROUP BY runs first and the window pass then runs over the grouped rows, which this
+        // route cannot model, so the evaluator keeps ownership and produces SQLite's answer.
         var query = $"SELECT sum(v) OVER (ORDER BY id {RunningFrame}), count(*) FROM t GROUP BY id;";
-        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, query));
+        var rows = ReadRows(connection, query);
+        rows.Should().HaveCount(2);
+        rows[0][0].AsInteger().Should().Be(10);
+        rows[0][1].AsInteger().Should().Be(1);
+        rows[1][0].AsInteger().Should().Be(30);
+        rows[1][1].AsInteger().Should().Be(1);
+
         Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "EXPLAIN " + query));
     }
 

@@ -39,7 +39,17 @@ public readonly struct SqlValue : IEquatable<SqlValue>
 
     public static SqlValue Integer(long value) => new(SqlValueKind.Integer, value, default, null, default, false);
 
-    public static SqlValue Real(double value) => new(SqlValueKind.Real, default, value, null, default, false);
+    /// <summary>Creates a REAL value, or NULL when <paramref name="value"/> is NaN.</summary>
+    /// <remarks>
+    /// SQLite has no NaN: <c>sqlite3VdbeMemSetDouble</c> stores a NULL instead, and
+    /// <c>serialGet</c> reads a stored NaN back as NULL, so <c>0.0/0.0</c> and
+    /// <c>1e999 - 1e999</c> are both NULL rather than a real. Folding the substitution into the
+    /// factory keeps that invariant on every path that can produce a floating point result.
+    /// </remarks>
+    public static SqlValue Real(double value)
+        => double.IsNaN(value)
+            ? Null
+            : new(SqlValueKind.Real, default, value, null, default, false);
 
     public static SqlValue Text(string value)
     {

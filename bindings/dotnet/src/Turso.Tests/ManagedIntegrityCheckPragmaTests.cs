@@ -121,7 +121,8 @@ public sealed class ManagedIntegrityCheckPragmaTests
     }
 
     [Test]
-    public void AnUnknownRestrictedTableFailsLikeSqlite()    {
+    public void AnUnknownRestrictedTableFailsLikeSqlite()
+    {
         using var managedDatabase = new EmbeddedDatabase();
         using var managed = managedDatabase.Connect();
         using var sqlite = OpenSqlite();

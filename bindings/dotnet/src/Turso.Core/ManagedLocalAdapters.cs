@@ -162,6 +162,13 @@ public interface IManagedConnectionAdapter : IDisposable
 
     void ApplySnapshotPragmaHeader(int schemaVersion, int userVersion, int applicationId)
         => throw new NotSupportedException("Managed snapshot PRAGMA metadata is not supported by this connection adapter.");
+
+    /// <summary>
+    /// The update, commit, rollback, authorizer, trace and progress callbacks registered on this
+    /// connection. Adapters that cannot deliver them throw so a caller never silently loses a hook.
+    /// </summary>
+    ManagedConnectionHooks Hooks
+        => throw new NotSupportedException("Managed SQL hooks are not supported by this connection adapter.");
 }
 
 public interface IManagedStatementAdapter : IDisposable
@@ -343,6 +350,8 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
     }
 
     public bool HasAttachedDatabases => GetConnection().HasAttachedDatabases;
+
+    public ManagedConnectionHooks Hooks => GetConnection().Hooks;
 
     public IManagedStatementAdapter Prepare(string sql)
     {

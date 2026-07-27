@@ -16,16 +16,15 @@ public sealed partial class EmbeddedDatabase
     private long _totalChanges;
 
     /// <summary>
-    /// Coerces an argument for a math builtin. SQLite returns NULL rather than
-    /// raising when an argument has no numeric representation.
+    /// Coerces an argument for a math builtin. These use <c>sqlite3_value_numeric_type</c>, which
+    /// converts only a value that is entirely a well-formed number, and SQLite returns NULL rather
+    /// than raising when an argument has no such representation. This is deliberately stricter than
+    /// the numerification used by CAST, arithmetic, <c>abs()</c> and <c>round()</c>, so
+    /// <c>sqrt('4x')</c> is NULL while <c>abs('4x')</c> is 4.0.
     /// </summary>
     private static bool TryGetMathOperand(SqlValue value, out double result)
     {
-        result = 0;
-        if (value.Kind == SqlValueKind.Null)
-            return false;
-
-        var numeric = ApplyNumericAffinity(value);
+        var numeric = ApplyComparisonNumericAffinity(value);
         switch (numeric.Kind)
         {
             case SqlValueKind.Integer:
@@ -35,6 +34,7 @@ public sealed partial class EmbeddedDatabase
                 result = numeric.AsReal();
                 return true;
             default:
+                result = 0;
                 return false;
         }
     }
@@ -75,16 +75,19 @@ public sealed partial class EmbeddedDatabase
     private static SqlValue EvaluateRound(IReadOnlyList<SqlValue> arguments)
     {
         RequireArgumentCount("round", arguments, 1, 2);
-        if (!TryGetMathOperand(arguments[0], out var operand))
+        if (arguments[0].Kind == SqlValueKind.Null)
             return SqlValue.Null;
 
+        // round() reads its operand with sqlite3_value_double, so unlike the math builtins a
+        // numeric prefix is enough and non-numeric text is 0.0 rather than NULL.
+        var operand = AsReal(ApplyNumericAffinity(arguments[0]));
         var digits = 0L;
         if (arguments.Count == 2)
         {
             if (arguments[1].Kind == SqlValueKind.Null)
                 return SqlValue.Null;
 
-            digits = ToSqliteInteger(arguments[1]);
+            digits = ToSqliteInteger(AsReal(ApplyNumericAffinity(arguments[1])));
         }
 
         if (digits < 0)
@@ -135,37 +138,22 @@ public sealed partial class EmbeddedDatabase
     }
 
     /// <summary>
-    /// mod() follows SQLite: integer operands produce an integer remainder and a
-    /// zero divisor yields NULL.
+    /// mod() maps to C <c>fmod</c> in SQLite, so it always yields a real - even for integer
+    /// operands - and a zero divisor yields NULL.
     /// </summary>
     private static SqlValue EvaluateModulo(IReadOnlyList<SqlValue> arguments)
     {
         RequireArgumentCount("mod", arguments, 2);
-        if (arguments[0].Kind == SqlValueKind.Null || arguments[1].Kind == SqlValueKind.Null)
-            return SqlValue.Null;
-
-        var left = ApplyNumericAffinity(arguments[0]);
-        var right = ApplyNumericAffinity(arguments[1]);
-        if (left.Kind == SqlValueKind.Integer && right.Kind == SqlValueKind.Integer)
+        if (!TryGetMathOperand(arguments[0], out var dividend)
+            || !TryGetMathOperand(arguments[1], out var divisor))
         {
-            var divisor = right.AsInteger();
-            if (divisor == 0)
-                return SqlValue.Null;
-
-            // long.MinValue % -1 overflows on some platforms; the result is zero.
-            if (divisor == -1)
-                return SqlValue.Integer(0);
-
-            return SqlValue.Integer(left.AsInteger() % divisor);
+            return SqlValue.Null;
         }
 
-        if (!TryGetMathOperand(left, out var dividend) || !TryGetMathOperand(right, out var realDivisor))
+        if (divisor == 0)
             return SqlValue.Null;
 
-        if (realDivisor == 0)
-            return SqlValue.Null;
-
-        return FromMathResult(dividend % realDivisor);
+        return FromMathResult(dividend % divisor);
     }
 
     private static SqlValue EvaluateSign(IReadOnlyList<SqlValue> arguments)

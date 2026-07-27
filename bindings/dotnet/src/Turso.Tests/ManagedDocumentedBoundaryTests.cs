@@ -1,3 +1,4 @@
+using System.Data;
 using System.Reflection;
 using AwesomeAssertions;
 using Turso.Data.Sqlite;
@@ -40,8 +41,6 @@ public sealed class ManagedDocumentedBoundaryTests
         "ANALYZE",
         "SELECT * FROM pragma_table_info('t')",
         "CREATE VIRTUAL TABLE vt USING fts5(x)",
-        "SELECT a, count(*), row_number() OVER () FROM t GROUP BY a",
-        "SELECT count(*) OVER () FROM t GROUP BY a",
     ];
 
     [Test]
@@ -71,20 +70,84 @@ public sealed class ManagedDocumentedBoundaryTests
     }
 
     [Test]
-    [TestCase("Authorizer")]
-    [TestCase("UpdateHook")]
-    [TestCase("CommitHook")]
-    [TestCase("RollbackHook")]
-    [TestCase("Trace")]
-    [TestCase("ProgressHandler")]
     [TestCase("CreateModule")]
-    public void NoHookOrModuleSurfaceIsPublished(string fragment)
+    public void NoModuleSurfaceIsPublished(string fragment)
     {
         typeof(SqliteConnection)
             .GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static)
             .Select(member => member.Name)
             .Should()
             .NotContain(name => name.Contains(fragment, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Update, commit and rollback hooks, the authorizer, tracing and the progress handler moved
+    /// out of the "Not implemented" list in <c>bindings/dotnet/Readme.md</c>, so this asserts the
+    /// documented direction of that scope change: the surface must stay published. Behavior lives
+    /// in <c>ManagedHookAndAuthorizerTests</c> and <c>ManagedHookSqliteDifferentialTests</c>.
+    /// </summary>
+    [Test]
+    [TestCase("SetUpdateHook")]
+    [TestCase("SetCommitHook")]
+    [TestCase("SetRollbackHook")]
+    [TestCase("SetAuthorizer")]
+    [TestCase("SetTraceHandler")]
+    [TestCase("SetProgressHandler")]
+    public void TheDocumentedHookSurfaceIsPublished(string member)
+    {
+        typeof(SqliteConnection)
+            .GetMembers(BindingFlags.Public | BindingFlags.Instance)
+            .Select(candidate => candidate.Name)
+            .Should()
+            .Contain(member);
+    }
+
+    [Test]
+    public void OnlyTheDocumentedSchemaCollectionsAreDefined()
+    {
+        using var connection = Open();
+
+        connection.GetSchema("MetaDataCollections").Rows.Cast<DataRow>()
+            .Select(row => (string)row["CollectionName"])
+            .Should().Equal(
+                "MetaDataCollections",
+                "ReservedWords",
+                "Tables",
+                "Columns",
+                "Indexes",
+                "IndexColumns");
+
+        foreach (var undefined in new[] { "DataSourceInformation", "DataTypes", "Restrictions", "ForeignKeys", "Views" })
+        {
+            Assert.Throws<ArgumentException>(() => connection.GetSchema(undefined))!
+                .Message.Should().Be($"Unknown collection: {undefined}.");
+        }
+    }
+
+    [Test]
+    public void TheCommandBuilderRefusesSelectsItCannotRoundTrip()
+    {
+        using var connection = Open();
+
+        // Documented limit: single-table selects exposing a key column only. A join and a keyless
+        // table are the two shapes callers hit first, so both have to fail loudly at command
+        // generation rather than silently producing a statement that updates nothing.
+        using var join = new TursoDataAdapter("SELECT t.a, s.b FROM t JOIN s ON t.a = s.a", connection);
+        using var joinBuilder = new TursoCommandBuilder(join);
+        Assert.Throws<InvalidOperationException>(() => joinBuilder.GetUpdateCommand());
+
+        using var keyless = new TursoDataAdapter("SELECT a, b FROM t", connection);
+        using var keylessBuilder = new TursoCommandBuilder(keyless);
+        Assert.Throws<InvalidOperationException>(() => keylessBuilder.GetUpdateCommand());
+    }
+
+    [Test]
+    public void TheAdapterDoesNotBatchRowUpdates()
+    {
+        using var adapter = new TursoDataAdapter();
+
+        adapter.UpdateBatchSize.Should().Be(1);
+        Assert.Throws<NotSupportedException>(() => adapter.UpdateBatchSize = 10);
     }
 
     private static SqliteConnection Open()
