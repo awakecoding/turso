@@ -262,3 +262,10 @@ foreach ($className in $RequireDiscoveredClass) {
 if ($testExitCode -ne 0 -and $summary.Failed -eq 0) {
     Fail "dotnet test exited with code $testExitCode."
 }
+
+# The TRX is now the authority on success, not `dotnet test`'s exit code, because a
+# leg with a declared platform gap deliberately tolerates specific failures. Exit
+# explicitly so the surviving $LASTEXITCODE from `dotnet test` cannot leak out: the
+# GitHub Actions pwsh wrapper appends `exit $LASTEXITCODE`, which would otherwise
+# fail a validated run. `Fail` throws, which exits non-zero under `Stop`.
+exit 0
