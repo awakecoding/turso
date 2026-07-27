@@ -56,11 +56,21 @@ jobs:
   #
   # Scope: every leg runs the *full* suite rather than a per-platform subset. A subset
   # would be a hand-maintained allow-list that silently rots, which is the same class of
-  # failure as the job that used to pass while running no tests at all. The legs run in
-  # parallel, so the wall-clock cost is roughly one leg, and this workflow only triggers
-  # on pushes to main and pull requests targeting main. If the billed macOS minutes ever
-  # become a problem, the honest lever is to remove legs from this matrix - which stays
-  # visible in the checks list - not to quietly narrow what a leg executes.
+  # failure as the job that used to pass while running no tests at all. That is not a
+  # theoretical worry: expanding this matrix found a net8.0-only packaging defect in
+  # TursoDataSqlitePackageArtifactReleaseTests, which no "platform-focused" subset would
+  # have contained, because nothing about it looks platform-specific until you run it.
+  #
+  # Cost: one leg is roughly 19 minutes of test time on a developer machine, but hosted
+  # runners are far slower - run 30283745949 had all six Linux and Windows legs killed by
+  # a 45-minute timeout while still inside the test step. The timeout below is therefore
+  # sized against measured runner speed, not local speed. The suite runs serially (NUnit
+  # has no assembly-level Parallelizable attribute here), so there is no cheap
+  # concurrency win to take without changing test isolation semantics. The legs run in
+  # parallel with each other, so wall-clock is about one leg, and this workflow only
+  # triggers on pushes to main and pull requests targeting main. If that ever becomes too
+  # expensive, the honest lever is to remove legs from this matrix - which stays visible
+  # in the checks list - not to quietly narrow what a leg executes.
   #
   # `make` is deliberately not used here: it is not part of the base GitHub Windows
   # runner image, and the managed Makefile recipes rely on bash builtins. The legs call
@@ -68,7 +78,7 @@ jobs:
   managed:
     name: managed (${{ matrix.os }}, ${{ matrix.framework }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     strategy:
       fail-fast: false
