@@ -40,8 +40,6 @@ public sealed class ManagedDocumentedBoundaryTests
         "ANALYZE",
         "SELECT * FROM pragma_table_info('t')",
         "CREATE VIRTUAL TABLE vt USING fts5(x)",
-        "SELECT a, count(*), row_number() OVER () FROM t GROUP BY a",
-        "SELECT count(*) OVER () FROM t GROUP BY a",
     ];
 
     [Test]

@@ -416,9 +416,14 @@ public class WindowAndReturningTests
     }
 
     [Test]
-    public void WindowRejectsCombinationWithGroupBy()
+    public void WindowCombinedWithGroupByMatchesSqlite()
     {
-        AssertRejected("SELECT sum(value) OVER (ORDER BY id), count(*) FROM t GROUP BY id;");
+        AssertMatchesSqlite(
+            [
+                "CREATE TABLE t(id INTEGER, value INTEGER);",
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);",
+            ],
+            "SELECT sum(value) OVER (ORDER BY id), count(*) FROM t GROUP BY id;");
     }
 
     private static void AssertRejected(string query)
