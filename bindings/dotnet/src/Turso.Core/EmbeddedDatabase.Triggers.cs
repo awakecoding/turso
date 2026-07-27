@@ -430,7 +430,7 @@ public sealed partial class EmbeddedDatabase
 
         foreach (var values in inputRows)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             ResetInsertPlan(table, plan);
             var (row, rowId) = BuildInsertRow(
                 statement,
@@ -609,7 +609,7 @@ public sealed partial class EmbeddedDatabase
 
         foreach (var identity in candidates)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var position = FindTriggerRowPosition(table, identity);
             if (position < 0)
                 continue;
@@ -769,7 +769,7 @@ public sealed partial class EmbeddedDatabase
 
         foreach (var identity in candidates)
         {
-            context.CancellationToken.ThrowIfCancellationRequested();
+            context.CheckInterrupt();
             var position = FindTriggerRowPosition(table, identity);
             if (position < 0)
                 continue;
@@ -897,6 +897,7 @@ public sealed partial class EmbeddedDatabase
             [deletedRow]);
         if (table.HasRowid)
             RecordBlobMutation(tableName, deletedRowId);
+        context.ReportRowChange(SqliteChangeOperation.Delete, tableName, table, deletedRowId);
     }
 
     private void AppendReturningRow(

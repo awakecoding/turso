@@ -662,9 +662,11 @@ public class AggregateSqlRoutingTests
         ];
 
         using var connection = OpenManaged(setup);
-        Assert.Throws<OverflowException>(() => ReadRows(connection, "SELECT sum(v) FROM t;"));
-        Assert.Throws<OverflowException>(
-            () => ReadRows(connection, "SELECT sum(v) FROM (SELECT v FROM t);"));
+        Assert.Throws<EmbeddedSqlException>(() => ReadRows(connection, "SELECT sum(v) FROM t;"))!
+            .Message.Should().Contain("integer overflow");
+        Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "SELECT sum(v) FROM (SELECT v FROM t);"))!
+            .Message.Should().Contain("integer overflow");
         Opcodes(ReadRows(connection, "EXPLAIN SELECT sum(v) FROM t;"))
             .Should().Contain("AggStep").And.Contain("AggFinalize");
 

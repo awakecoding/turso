@@ -196,7 +196,7 @@ build-dotnet:
 # The default restore/build/test/pack path is managed-only: it neither invokes
 # Cargo nor requires rs_compiled native runtime assets. Native distribution
 # targets remain explicit below.
-.PHONY: restore build test pack restore-managed build-managed test-managed pack-managed validate-managed-project-closure validate-managed-packed-closure validate-managed-package validate-managed-nativeaot build-native build-sync-native test-native test-sync pack-native pack-sync pack-nativeaot-static pack-release
+.PHONY: restore build test pack format-check restore-managed build-managed test-managed pack-managed validate-managed-project-closure validate-managed-packed-closure validate-managed-package validate-managed-nativeaot build-native build-sync-native test-native test-sync pack-native pack-sync pack-nativeaot-static pack-release
 restore: restore-managed
 
 restore-managed:
@@ -213,6 +213,13 @@ build-managed: restore-managed
 
 test-managed: validate-managed-package
 	dotnet test ./src/Turso.Tests/Turso.Tests.csproj
+
+# Turso.slnx intentionally contains only the six shipping projects, so a
+# solution-scoped format check silently skips the test project. Verify it
+# explicitly; that omission let real whitespace violations reach the branch.
+format-check:
+	dotnet format ./Turso.slnx --verify-no-changes
+	dotnet format ./src/Turso.Tests/Turso.Tests.csproj --verify-no-changes
 
 pack-managed: restore-managed validate-managed-project-closure
 	rm -rf "$(MANAGED_PACKAGE_OUTPUT)"

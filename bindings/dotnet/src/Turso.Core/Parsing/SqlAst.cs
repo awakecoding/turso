@@ -145,7 +145,16 @@ internal sealed record AlterTableAddColumnStatement(string TableName, EmbeddedCo
 
 internal sealed record AlterTableRenameStatement(string TableName, string NewName) : ParsedStatement;
 
-internal sealed record AlterTableRenameColumnStatement(string TableName, string ColumnName, string NewName) : ParsedStatement;
+/// <summary>
+/// <paramref name="QuoteNewName"/> mirrors SQLite's <c>bQuote</c>: when the replacement name
+/// was written quoted in the ALTER statement, every rewritten reference in dependent schema
+/// SQL is emitted quoted as well.
+/// </summary>
+internal sealed record AlterTableRenameColumnStatement(
+    string TableName,
+    string ColumnName,
+    string NewName,
+    bool QuoteNewName = false) : ParsedStatement;
 
 internal sealed record AlterTableDropColumnStatement(string TableName, string ColumnName) : ParsedStatement;
 
@@ -517,6 +526,51 @@ internal sealed record EmbeddedColumn(
             .ToArray());
 
     public bool HasDefault => DefaultValue.HasValue || DefaultExpression is not null;
+
+    /// <summary>
+    /// Rebuilds the column with different constraint clauses. <see cref="CheckConstraints"/> and
+    /// <see cref="ForeignKeyConstraints"/> are property initializers, which a record <c>with</c>
+    /// copy does not re-run, so editing <see cref="Checks"/>, <see cref="ForeignKey"/>, or
+    /// <see cref="AdditionalForeignKeys"/> through <c>with</c> would leave those projections
+    /// stale. Constraint edits go through this explicit rebuild instead.
+    /// </summary>
+    public EmbeddedColumn WithConstraints(
+        IReadOnlyList<CheckConstraint>? checks,
+        ForeignKeyDefinition? foreignKey,
+        IReadOnlyList<ForeignKeyDefinition>? additionalForeignKeys)
+        => new(
+            Name,
+            DeclaredType,
+            PrimaryKey,
+            NotNull,
+            Unique,
+            DefaultValue,
+            PrimaryKeyDescending,
+            GenerationExpression,
+            GeneratedStored,
+            GenerationSql,
+            Collation,
+            foreignKey,
+            checks,
+            DefaultExpression,
+            DefaultSql,
+            PrimaryKeyConflictAlgorithm,
+            NotNullConflictAlgorithm,
+            UniqueConflictAlgorithm,
+            PrimaryKeyConstraintName,
+            NotNullConstraintName,
+            UniqueConstraintName,
+            DefaultConstraintName,
+            CollationConstraintName,
+            GenerationConstraintName,
+            NullConstraintName,
+            ExplicitNull,
+            GenerationAlways,
+            AutoIncrement,
+            additionalForeignKeys,
+            PrimaryKeyDeclarationOrder,
+            UniqueDeclarationOrder,
+            StrictAny);
 }
 
 // A column participating in a table-level PRIMARY KEY(...) clause, preserving the
@@ -624,10 +678,16 @@ internal sealed record RaiseExpression(RaiseAction Action, string? Message) : Ex
 
 internal sealed record RowValueExpression(IReadOnlyList<Expression> Values) : Expression;
 
+/// <summary>
+/// A column reference. <see cref="BooleanKeyword"/> is set when the reference came from a bare,
+/// unquoted <c>TRUE</c>/<c>FALSE</c> keyword: SQLite parses those as ordinary identifiers and only
+/// rewrites them into the integer literals 1/0 when no column of that name is in scope.
+/// </summary>
 internal sealed record ColumnExpression(
     string Name,
     string? Qualifier = null,
-    string? UnqualifiedName = null) : Expression;
+    string? UnqualifiedName = null,
+    bool? BooleanKeyword = null) : Expression;
 
 internal sealed record FunctionExpression(
     string Name,

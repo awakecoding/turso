@@ -38,6 +38,10 @@ jobs:
             9.0.x
             10.0.x
 
+      - name: Verify formatting
+        shell: bash
+        run: make format-check
+
       - name: Run managed-only tests without Rust
         shell: bash
         run: |
