@@ -29,6 +29,76 @@ The primary package uses the managed provider by default. No Rust toolchain or
 native runtime asset is needed to restore, build, pack, or run managed local or
 remote Hrana applications.
 
+## Managed engine scope
+
+The managed local engine is an independent C# SQL engine that reads and writes
+SQLite's on-disk format. It is not a port of Turso's Rust core, and it is not a
+drop-in replacement for `Microsoft.Data.Sqlite` or for SQLite itself. Choose it
+when you need a fully managed, native-asset-free local database for small to
+moderate workloads; choose `Local Provider=Native` when you need SQLite's own
+engine characteristics.
+
+What it shares with SQLite is the file format and the observable SQL semantics
+it implements. What it does not share is the engine architecture:
+
+| Area | Managed engine reality |
+| --- | --- |
+| Execution | A tree-walking evaluator with a partial bytecode compiler layered on top. The managed VDBE defines its own instruction set rather than SQLite's or Turso's; compiled predicates re-enter the evaluator for row-local expressions. Any statement stepped with a cancellation token, and many statement shapes listed below, run entirely in the evaluator. |
+| Query planning | No cost model, join reordering, predicate pushdown, subquery flattening, covering-index detection, or `sqlite_stat*` statistics. Index selection scans the table's indexes in name order and takes the first usable match. `ANALYZE` is an explicit error rather than a no-op. |
+| `EXPLAIN` | Emits managed instruction names, not SQLite opcodes, and errors for evaluator-owned statements instead of fabricating a program. `EXPLAIN QUERY PLAN` reports the managed execution boundary (`MANAGED COMPILED VDBE`, `MANAGED EVALUATOR FALLBACK`, or a real `SCAN`/`SEARCH ... USING INDEX` row) rather than SQLite optimizer internals. |
+| Storage | Table rows are materialized in managed memory rather than paged incrementally from a B-tree, so a database must fit in the process heap. There is no page defragmentation, freelist reclamation on the bounded write path, interior-page split/merge balancing, `auto_vacuum`, or pointer-map support. Use `VACUUM` to compact. |
+| Working set | Nothing spills to disk. Sorters, joins, `DISTINCT`, and CTE materialization are in-memory, so result-set size is bounded by available memory. |
+| Async | Local managed async methods move blocking work to the thread pool rather than performing non-blocking I/O. Treat them as cancellation-aware wrappers, not as a scalability mechanism. |
+
+### Write throughput
+
+Managed writes are substantially slower than SQLite's, and the gap widens as a
+table grows because each mutating statement works against a copy of the affected
+catalog and each commit rewrites durable state. Measured on Windows against
+`Microsoft.Data.Sqlite` 9.0.8 with two-column rows in a file-backed database
+(release build, single machine, indicative only):
+
+| Shape | 250 rows | 1,000 rows | 4,000 rows |
+| --- | --- | --- | --- |
+| Inserts inside one transaction | ~10x slower | ~29x slower | ~56x slower |
+
+Autocommit inserts, where both engines are dominated by per-commit durability,
+measured 2-3x slower at 100-400 rows. Batch writes into explicit transactions,
+keep individual tables modest, and benchmark your own workload before adopting
+the managed provider for write-heavy use.
+
+### Not implemented
+
+- Update, commit, and rollback hooks; the authorizer; trace and profile
+  callbacks; and the progress handler.
+- Virtual-table modules and `CREATE VIRTUAL TABLE`, including FTS and R-Tree.
+- `DbDataAdapter`/`DataSet` support. `SqliteConnection.GetSchema` is implemented;
+  `TursoConnection` inherits the throwing base implementation.
+- Raw `sqlite3*` handle interop: `SqliteConnection.Handle` returns `null`.
+  `ServerVersion` reports a managed placeholder, not a real SQLite version.
+- Experimental MVCC and vector search.
+- `UPDATE ... FROM`, `UPDATE OR <algorithm>`, `UPDATE`/`DELETE` target aliases,
+  `CREATE TEMP VIEW`/`CREATE TEMP TRIGGER`, `BEGIN CONCURRENT`, `ANALYZE`, and
+  `pragma_*` table-valued functions. Each is rejected during parsing.
+- Window functions combined with `GROUP BY` or ordinary aggregates.
+- `BEGIN DEFERRED`/`IMMEDIATE`/`EXCLUSIVE` parse for compatibility, but the mode
+  is discarded and does not change managed locking behavior.
+- Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Turso's
+  AEGIS ciphers fail closed rather than being partially read.
+
+### Testing scope
+
+The managed engine has its own regression suite plus a curated subset of the
+repository's `.sqltest` conformance corpus; it does not run the full corpus or
+the upstream SQLite TCL suites. Fault injection is limited to the detached WAL
+coordinator primitives, where process-isolated workers cover writer and
+checkpoint interruption, torn and uncommitted tails, and carrier replacement.
+The ordinary pager and commit path has no fsync-failure, disk-full, torn-write,
+or power-loss injection, and there is no fuzzing or property-based testing, so
+managed durability rests on targeted deterministic tests rather than randomized
+validation. Managed CI runs Ubuntu on `net10.0`; Windows and macOS behavior is
+validated locally and through the release gates rather than on every commit.
+
 ## Dynamic native compatibility
 
 Applications that intentionally select `Local Provider=Native` can reference the matching-version `Turso.Data.Sqlite.Native` companion package:
@@ -494,7 +564,8 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
 - Managed physical databases are not concurrently interoperable with ordinary SQLite clients. All managed connections in one process share exclusive ownership of SQLite's main-file lock-byte range until the last connection is disposed; other managed processes and SQLite clients receive a busy/ownership failure. Windows uses its native byte-range locks and 64-bit Linux uses open-file-description locks so closing a secondary database descriptor cannot silently release ownership. Do not mix a native SQLite client into the owning process. A handoff to SQLite is one-way: dispose every managed connection after a successful commit and, in WAL mode, checkpoint, then let SQLite own the database and companion-file lifecycle. SQLite may delete or replace managed WAL sidecars, so the managed provider deliberately refuses to reopen an altered WAL pair. After an interrupted managed writer, reopen it with the managed provider first so managed WAL or rollback-journal recovery completes. Windows can retain the ownership lock through a read-only database handle; platforms whose lock primitive requires writable access still reject read-only ownership when the file cannot be opened accordingly. The managed `-shm` file is a byte-lock carrier only and never contains a SQLite WAL-index. [Managed WAL interoperability contract](docs/managed-wal-interoperability-contract.md) documents the exact lock-byte map, busy/recovery/cache-invalidation rules, and the staged work required before multi-process WAL access could be supported.
 - Managed file databases implement durable `WAL` and `DELETE` journal modes. `DELETE` writes use SQLite-compatible rollback journals containing exact on-disk page images, so encrypted pages remain encrypted; writable reopen recovers a valid hot journal, while read-only reopen fails without modifying it. `PERSIST`, `TRUNCATE`, `MEMORY`, and `OFF` are not implemented for files and leave the current mode unchanged.
-- Managed metadata PRAGMAs are schema-aware for `main`, `temp`, and attached databases. The supported catalog surface includes `database_list`, `table_list`, `table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, and `foreign_key_check`; `WITHOUT ROWID` primary-key pseudo-indexes, generated columns, STRICT flags, partial/expression terms, and foreign-key actions retain SQLite-compatible result shapes. `encoding` reports the selected database header. File-backed `page_count` and `freelist_count` report the committed pager; memory and TEMP databases reject those two queries rather than inventing page allocation. `schema_version`, `user_version`, and `application_id` are durable and transactional. Unsupported PRAGMAs still fail rather than claiming pager behavior that is not implemented.
+- Managed metadata PRAGMAs are schema-aware for `main`, `temp`, and attached databases. The supported catalog surface includes `database_list`, `table_list`, `table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, and `foreign_key_check`; `WITHOUT ROWID` primary-key pseudo-indexes, generated columns, STRICT flags, partial/expression terms, and foreign-key actions retain SQLite-compatible result shapes. `encoding` reports the selected database header. File-backed `page_count` and `freelist_count` report the committed pager; memory and TEMP databases reject those two queries rather than inventing page allocation. `schema_version`, `user_version`, and `application_id` are durable and transactional. Unsupported PRAGMAs still fail rather than claiming pager behavior that is not implemented. Tuning PRAGMAs that would imply unimplemented pager behavior, including `cache_size`, `synchronous`, `locking_mode`, `busy_timeout`, `wal_checkpoint`, `wal_autocheckpoint`, `auto_vacuum`, `max_page_count`, `temp_store`, and `mmap_size`, are rejected.
+- `PRAGMA integrity_check` and `PRAGMA quick_check` report the declared NOT NULL and CHECK constraints that stored rows violate, honor SQLite's default 100-problem budget and its optional integer limit, accept a bare table-name restriction, and return a single `ok` row for a healthy database. Both return the same problems and differ only in their result column name: the managed file store validates stored index records and page structure while loading, so a database SQLite would describe as `non-unique entry in index` or `wrong # of entries in index` fails to open instead of being reported. There is no managed auto-checkpoint policy, so a WAL grows until one of the engine's own checkpoint points is reached.
 - `REINDEX` atomically rebuilds the selected managed table/index (including rich, partial, expression, constraint, and `WITHOUT ROWID` forms) through a forced full-catalog pager rewrite without changing the schema cookie. Unqualified all-index and collation forms are supported when no database is attached; with attachments, callers must qualify one table or index so independent files are never presented as one atomic mutation. `ANALYZE` is an explicit pre-mutation error because managed `sqlite_stat*` persistence and planner consumption are not implemented.
 - `PRAGMA page_size` accepts SQLite page sizes from 512 through 65536 as a pending value per selected database. `PRAGMA [schema.]journal_mode`, `VACUUM`, `VACUUM main`, and attached-schema `VACUUM` target that database independently; in-place page-size changes apply only in `DELETE` mode, while `VACUUM ... INTO <expression>` may apply the pending size in either journal mode without changing the source. `INTO` publishes a compact `DELETE`-mode snapshot through an atomic file-system replacement, retains encryption, AUTOINCREMENT sequence state, and supported catalog/header semantics, and accepts only ordinary file paths on file systems that provide that guarantee. VACUUM rejects active transactions, result readers, blob handles, read-only/query-only connections, unsafe output aliases, and non-empty destinations before mutating authoritative storage.
 - Managed named shared-memory databases use `Data Source=NAME;Mode=Memory;Cache=Shared`. Connections with the same case-sensitive name share one managed catalog and page/cache owner until the last logical connection closes. Reopening while another connection remains open preserves the database; reopening after the last close creates an empty database. The SQLite facade accepts `Pooling=True` for connection-string compatibility but never pools shared memory; `TursoConnection` requires `Pooling=False` and rejects `Pooling=True` before opening. `ClearPool` and `ClearAllPools` affect file pools only.
