@@ -613,10 +613,16 @@ internal sealed record RaiseExpression(RaiseAction Action, string? Message) : Ex
 
 internal sealed record RowValueExpression(IReadOnlyList<Expression> Values) : Expression;
 
+/// <summary>
+/// A column reference. <see cref="BooleanKeyword"/> is set when the reference came from a bare,
+/// unquoted <c>TRUE</c>/<c>FALSE</c> keyword: SQLite parses those as ordinary identifiers and only
+/// rewrites them into the integer literals 1/0 when no column of that name is in scope.
+/// </summary>
 internal sealed record ColumnExpression(
     string Name,
     string? Qualifier = null,
-    string? UnqualifiedName = null) : Expression;
+    string? UnqualifiedName = null,
+    bool? BooleanKeyword = null) : Expression;
 
 internal sealed record FunctionExpression(
     string Name,

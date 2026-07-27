@@ -39,6 +39,113 @@ public sealed class ExpressionOperatorParityTests
             SqlValue.Real(3.9));
     }
 
+    // TRUE and FALSE are not reserved words: SQLite parses them as identifiers and only rewrites
+    // them into the integer literals 1/0 when no column of that name resolves. `IS TRUE`/`IS FALSE`
+    // are truth tests rather than equality tests, so `2 IS TRUE` is 1 while `2 IS 1` is 0.
+    [TestCase("TRUE, FALSE")]
+    [TestCase("typeof(true), typeof(false)")]
+    [TestCase("8 IS TRUE, 1 IS TRUE, 0 IS TRUE, -1 IS TRUE")]
+    [TestCase("0.0 IS TRUE, 0.5 IS TRUE, -0.5 IS TRUE")]
+    [TestCase("'hello' IS TRUE, '' IS TRUE, '0' IS TRUE, '1' IS TRUE, '42' IS TRUE")]
+    [TestCase("8 IS FALSE, 1 IS FALSE, 0 IS FALSE, -1 IS FALSE")]
+    [TestCase("'hello' IS FALSE, '' IS FALSE, '0' IS FALSE, '1' IS FALSE")]
+    [TestCase("8 IS NOT TRUE, 0 IS NOT TRUE, 8 IS NOT FALSE, 0 IS NOT FALSE")]
+    [TestCase("NULL IS TRUE, NULL IS FALSE, NULL IS NOT TRUE, NULL IS NOT FALSE")]
+    [TestCase("2 IS TRUE, 2 IS 1, 2 = TRUE, 2 IS (TRUE)")]
+    [TestCase("2 IS TRUE COLLATE BINARY, 2 IS DISTINCT FROM TRUE, 2 IS NOT DISTINCT FROM TRUE")]
+    [TestCase("true + 1, true = 1, true == true, +true, -true, ~true")]
+    [TestCase("true AND false, true OR false, NOT true")]
+    public void BooleanKeywordLiteralsMatchSqlite(string projection)
+        => AssertQueryMatchesSqlite($"SELECT {projection};");
+
+    [Test]
+    public void BooleanKeywordsBoundAgainstParametersMatchSqlite()
+    {
+        AssertQueryMatchesSqlite(
+            "SELECT ?1 IS TRUE, ?1 IS FALSE, ?1 = TRUE, ?2 IS TRUE, ?2 IS NOT FALSE, ?3 IS TRUE, ?3 IS NOT TRUE;",
+            setup: null,
+            [SqlValue.Text("42"), SqlValue.Integer(0), SqlValue.Null]);
+    }
+
+    // The shadowing column values are chosen so a keyword-only implementation disagrees: "true" is
+    // 0 while the probed value is truthy, and "false" is 7 so it equals the probed value.
+    [Test]
+    public void BooleanKeywordsResolveToColumnsOfThatNameWhenInScope()
+    {
+        const string setup = """
+            CREATE TABLE shadowed("true" INTEGER, "false" INTEGER, value INTEGER);
+            INSERT INTO shadowed VALUES (0, 7, 7);
+            """;
+        AssertQueryMatchesSqlite(
+            "SELECT true, false, shadowed.true, value IS TRUE, value IS FALSE FROM shadowed;",
+            setup);
+    }
+
+    [Test]
+    public void BooleanKeywordsFallBackToLiteralsForNamesThatAreNotInScope()
+    {
+        const string setup = """
+            CREATE TABLE partly_shadowed("true" INTEGER, value INTEGER);
+            INSERT INTO partly_shadowed VALUES (42, 0);
+            """;
+        AssertQueryMatchesSqlite(
+            "SELECT true, false, value IS TRUE, value IS FALSE FROM partly_shadowed;",
+            setup);
+    }
+
+    [Test]
+    public void QuotedBooleanKeywordsAreNeverLiterals()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        var error = Assert.Throws<EmbeddedSqlException>(
+            () => ReadManaged(connection, "SELECT \"true\", \"false\";"));
+        error!.Message.Should().Contain("no such column");
+    }
+
+    [Test]
+    public void BooleanKeywordDefaultsAndCheckConstraintsMatchSqlite()
+    {
+        const string setup = """
+            CREATE TABLE flagged(value INTEGER CHECK(value IS TRUE), yes DEFAULT TRUE, no DEFAULT FALSE);
+            INSERT INTO flagged(value) VALUES (5);
+            """;
+        AssertQueryMatchesSqlite("SELECT value, yes, no FROM flagged;", setup);
+    }
+
+    [Test]
+    public void BooleanKeywordCheckConstraintRejectsFalsyValues()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        ExecuteManaged(connection, "CREATE TABLE flagged(value INTEGER CHECK(value IS TRUE));");
+        var error = Assert.Throws<EmbeddedSqlException>(
+            () => ExecuteManaged(connection, "INSERT INTO flagged VALUES (0);"));
+        error!.Message.Should().Contain("CHECK constraint failed");
+    }
+
+    // A DEFAULT of TRUE/FALSE is a constant, so ADD COLUMN may backfill pre-existing rows with it.
+    [Test]
+    public void BooleanKeywordDefaultsAreConstantForAlterTableAddColumn()
+    {
+        const string setup = """
+            CREATE TABLE existing(x INTEGER);
+            INSERT INTO existing VALUES (1);
+            ALTER TABLE existing ADD COLUMN yes DEFAULT TRUE;
+            ALTER TABLE existing ADD COLUMN no DEFAULT FALSE;
+            """;
+        AssertQueryMatchesSqlite("SELECT x, yes, no FROM existing;", setup);
+    }
+
+    [Test]
+    public void BooleanKeywordsAreAllowedInPartialIndexPredicates()
+    {
+        const string setup = """
+            CREATE TABLE flags(x INTEGER, flag INTEGER);
+            CREATE INDEX flags_enabled ON flags(x) WHERE flag IS TRUE;
+            INSERT INTO flags VALUES (1, 1), (2, 0), (3, 2), (4, NULL);
+            """;
+        AssertQueryMatchesSqlite("SELECT x FROM flags WHERE flag IS TRUE ORDER BY x;", setup);
+    }
+
     [TestCase("(1, 2) = (1, 2)")]
     [TestCase("(1, NULL) = (1, NULL)")]
     [TestCase("(1, NULL) = (2, NULL)")]

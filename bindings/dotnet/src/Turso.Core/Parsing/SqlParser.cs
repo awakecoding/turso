@@ -2426,10 +2426,27 @@ internal sealed class SqlParser
                     return new FunctionExpression(functionName, arguments, false, distinct, filter, window);
                 }
 
-                return new ColumnExpression(token.Text);
+                return new ColumnExpression(token.Text, BooleanKeyword: GetBooleanKeyword(token));
             default:
                 throw Error("Expected an expression.");
         }
+    }
+
+    /// <summary>
+    /// Reports whether <paramref name="token"/> is a bare <c>TRUE</c>/<c>FALSE</c> keyword. Those are
+    /// not reserved words in SQLite, so the name still has to be resolved against the columns in
+    /// scope first; the value is only the fallback used when no such column exists.
+    /// </summary>
+    private static bool? GetBooleanKeyword(SqlToken token)
+    {
+        if (token.IsQuoted)
+            return null;
+        if (string.Equals(token.Text, "TRUE", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return null;
     }
 
     private Expression ParseRaiseExpression()
@@ -2870,6 +2887,14 @@ internal sealed class SqlParser
         if (expression is LiteralExpression literal)
         {
             value = literal.Value;
+            return true;
+        }
+
+        // DEFAULT expressions are resolved with no columns in scope, so a bare TRUE/FALSE
+        // keyword is always the integer literal 1/0 and stays a constant default.
+        if (expression is ColumnExpression { BooleanKeyword: { } keyword })
+        {
+            value = SqlValue.Integer(keyword ? 1 : 0);
             return true;
         }
 

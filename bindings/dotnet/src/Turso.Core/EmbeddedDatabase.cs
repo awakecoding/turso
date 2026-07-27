@@ -20274,8 +20274,51 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 ?? throw new EmbeddedSqlException($"no such column: {column.Name}");
         }
 
-        return row?.GetValue(column)
-            ?? throw new EmbeddedSqlException($"no such column: {column.Name}");
+        if (row is not null && row.TryGetValue(column, out var value))
+            return value;
+
+        // TRUE/FALSE are not reserved words: they only become the integer literals 1/0 once the
+        // name fails to resolve against the columns in scope, exactly as SQLite does.
+        if (column.BooleanKeyword is { } boolean)
+            return SqlValue.Integer(boolean ? 1 : 0);
+
+        throw new EmbeddedSqlException($"no such column: {column.Name}");
+    }
+
+    /// <summary>
+    /// Reports whether <paramref name="expression"/> is the right-hand operand of an
+    /// <c>IS [NOT] TRUE|FALSE</c> test, meaning a bare <c>TRUE</c>/<c>FALSE</c> keyword that does not
+    /// resolve to a column. SQLite turns those comparisons into a truth test rather than an
+    /// equality test, so <c>2 IS TRUE</c> is 1 while <c>2 IS 1</c> is 0.
+    /// </summary>
+    private static bool IsTruthKeyword(Expression expression, SourceRow? row, out bool expected)
+    {
+        if (UnwrapCollation(expression) is ColumnExpression { BooleanKeyword: { } keyword } column
+            && (row is null || !row.TryGetValue(column, out _)))
+        {
+            expected = keyword;
+            return true;
+        }
+
+        expected = false;
+        return false;
+    }
+
+    /// <summary>
+    /// Evaluates <c>X IS TRUE</c>, <c>X IS FALSE</c> and their negations, mirroring SQLite's
+    /// <c>OP_IsTrue</c>: the result is never NULL, and NULL counts as neither true nor false.
+    /// </summary>
+    private SqlValue EvaluateTruthTest(
+        BinaryExpression expression,
+        bool expected,
+        SqlValue[] parameters,
+        SourceRow? row,
+        QueryContext context)
+    {
+        var operand = Evaluate(expression.Left, parameters, row, context);
+        var truth = operand.Kind == SqlValueKind.Null ? !expected : IsTrue(operand);
+        var negate = expected ^ (expression.Operator == BinaryOperator.Is);
+        return SqlValue.Integer(truth ^ negate ? 1 : 0);
     }
 
     private static SqlValue EvaluateRaise(RaiseExpression expression, QueryContext context)
@@ -20385,6 +20428,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
         SourceRow? row,
         QueryContext context)
     {
+        if (expression.Operator is BinaryOperator.Is or BinaryOperator.IsNot
+            && IsTruthKeyword(expression.Right, row, out var expectedTruth))
+        {
+            return EvaluateTruthTest(expression, expectedTruth, parameters, row, context);
+        }
+
         var leftCount = GetExpressionValueCount(expression.Left, context);
         var rightCount = GetExpressionValueCount(expression.Right, context);
         if (leftCount != rightCount)
@@ -33031,6 +33080,11 @@ internal sealed class EmbeddedTable
             case CurrentTimeExpression:
                 return;
             case ColumnExpression column:
+                // A bare TRUE/FALSE keyword is the integer literal 1/0 unless a column of that
+                // name is in scope. DEFAULT expressions resolve with no columns in scope at all,
+                // so there the keyword is always the literal.
+                if (column.BooleanKeyword is not null && (!allowColumns || !IsConstraintColumn(column)))
+                    return;
                 if (!allowColumns)
                     throw new EmbeddedSqlException($"default value of column is not constant: {column.Name}");
                 if (!IsConstraintColumn(column))
@@ -34422,13 +34476,22 @@ internal sealed record SourceRow(
 
     public SqlValue GetValue(ColumnExpression column)
     {
+        if (TryGetValue(column, out var value))
+            return value;
+
+        throw new EmbeddedSqlException($"no such column: {column.Name}");
+    }
+
+    public bool TryGetValue(ColumnExpression column, out SqlValue value)
+    {
         if (column.Qualifier is null)
-            return GetValue(column.Name, allowQualifiedLookup: false);
+            return TryGetValue(column.Name, allowQualifiedLookup: false, out value);
 
         if (QualifiedColumns is not null
             && QualifiedColumns.TryGetValue(column.Name, out var qualifiedIndex))
         {
-            return Values[qualifiedIndex];
+            value = Values[qualifiedIndex];
+            return true;
         }
 
         if (QualifiedRowIds is not null
@@ -34437,13 +34500,17 @@ internal sealed record SourceRow(
             && EmbeddedTable.IsRowidAliasName(rowIdName)
             && QualifiedRowIds.TryGetValue(column.Qualifier, out var qualifiedRowId))
         {
-            return qualifiedRowId is { } rowId ? SqlValue.Integer(rowId) : SqlValue.Null;
+            value = qualifiedRowId is { } rowId ? SqlValue.Integer(rowId) : SqlValue.Null;
+            return true;
         }
 
         for (var index = 0; index < Columns.Length; index++)
         {
             if (string.Equals(Columns[index], column.Name, StringComparison.OrdinalIgnoreCase))
-                return Values[index];
+            {
+                value = Values[index];
+                return true;
+            }
         }
 
         if (RowId is { } rowid
@@ -34452,13 +34519,15 @@ internal sealed record SourceRow(
             && column.UnqualifiedName is { } bareName
             && EmbeddedTable.IsRowidAliasName(bareName))
         {
-            return SqlValue.Integer(rowid);
+            value = SqlValue.Integer(rowid);
+            return true;
         }
 
         if (Parent is not null)
-            return Parent.GetValue(column);
+            return Parent.TryGetValue(column, out value);
 
-        throw new EmbeddedSqlException($"no such column: {column.Name}");
+        value = default;
+        return false;
     }
 
     public bool TryGetQualifiedValue(ColumnExpression column, out SqlValue value)
@@ -34534,11 +34603,20 @@ internal sealed record SourceRow(
 
     private SqlValue GetValue(string name, bool allowQualifiedLookup)
     {
+        if (TryGetValue(name, allowQualifiedLookup, out var value))
+            return value;
+
+        throw new EmbeddedSqlException($"no such column: {name}");
+    }
+
+    private bool TryGetValue(string name, bool allowQualifiedLookup, out SqlValue value)
+    {
         if (allowQualifiedLookup
             && QualifiedColumns is not null
             && QualifiedColumns.TryGetValue(name, out var qualifiedIndex))
         {
-            return Values[qualifiedIndex];
+            value = Values[qualifiedIndex];
+            return true;
         }
 
         // Columns joined with USING/NATURAL are coalesced: an unqualified reference to
@@ -34554,14 +34632,14 @@ internal sealed record SourceRow(
         if (coalesced is { Length: 1 })
         {
             var output = coalesced[0];
-            var value = Values[output.Index];
+            value = Values[output.Index];
             if (value.Kind != SqlValueKind.Null)
-                return value;
+                return true;
             if (output.CoalesceIndex is { } coalesceIndex)
             {
                 value = Values[coalesceIndex];
                 if (value.Kind != SqlValueKind.Null)
-                    return value;
+                    return true;
             }
             if (output.AdditionalCoalesceIndices is not null)
             {
@@ -34569,26 +34647,34 @@ internal sealed record SourceRow(
                 {
                     value = Values[additionalIndex];
                     if (value.Kind != SqlValueKind.Null)
-                        return value;
+                        return true;
                 }
             }
 
-            return SqlValue.Null;
+            value = SqlValue.Null;
+            return true;
         }
 
         if (FindUnqualifiedColumnIndex(name) is { } index)
-            return Values[index];
+        {
+            value = Values[index];
+            return true;
+        }
 
         // rowid/_rowid_/oid resolve to the hidden rowid only after real columns are
         // consulted, so a user column that happens to be named "oid" shadows the alias,
         // exactly as SQLite does.
         if (RowId is { } rowid && EmbeddedTable.IsRowidAliasName(name))
-            return SqlValue.Integer(rowid);
+        {
+            value = SqlValue.Integer(rowid);
+            return true;
+        }
 
         if (Parent is not null)
-            return Parent.GetValue(name, allowQualifiedLookup);
+            return Parent.TryGetValue(name, allowQualifiedLookup, out value);
 
-        throw new EmbeddedSqlException($"no such column: {name}");
+        value = default;
+        return false;
     }
 
     private int? FindUnqualifiedColumnIndex(string name)

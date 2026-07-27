@@ -27,7 +27,6 @@ agg-functions/avg-large-integers.sqltest::avg_infinite_cancellation_returns_null
 agg-functions/avg-text-types.sqltest::avg_partial_integer_text_rounds_like_sqlite | expected 1 row(s), got 1 row(s); row 0 expected 'real/1.0' but was 'real/0.0'
 agg-functions/avg-text-types.sqltest::avg_partial_integer_text_grouped | expected 2 row(s), got 2 row(s); row 0 expected '1/real/1.0' but was '1/real/0.0'
 agg-functions/group-concat-types.sqltest::group-concat-zero-real-and-text | expected 1 row(s), got 1 row(s); row 0 expected '0.0,zero' but was '0,zero'
-agg-functions/is-true.sqltest::sum-is-true-ungrouped-and-join | expected success but got error: no such column: true
 agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_integer_label | expected success but got error: no such function: JSONB_GROUP_OBJECT
 agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_real_label | expected success but got error: no such function: JSONB_GROUP_OBJECT
 agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_text_numeric_label_unchanged | expected success but got error: no such function: JSONB_GROUP_OBJECT
@@ -110,7 +109,6 @@ alter_table.sqltest::alter-add-column-invalid-collation | expected an error but 
 alter_table.sqltest::alter-table-drop-column-expr-index-unreferenced | expected success but got error: non-deterministic functions are prohibited in index expressions
 alter_table.sqltest::alter-table-drop-column-preserves-expression-index-sentinel | expected success but got error: non-deterministic functions are prohibited in index expressions
 alter_table.sqltest::alter-table-rename-column-updates-unique-sets | expected success but got error: Expected keyword TO. At SQL offset 21.
-alter_table.sqltest::alter-add-column-default-boolean | expected success but got error: default value of column is not constant: TRUE
 alter_table.sqltest::alter-table-rename-trigger-fires-after-rename | expected success but got error: error in trigger trig1 after rename table: no such table: t1
 alter_table.sqltest::alter-table-rename-trigger-body-update | expected success but got error: error in trigger trig1 after rename table: no such table: t1
 alter_table.sqltest::alter-table-rename-trigger-body-delete | expected success but got error: error in trigger trig1 after rename table: no such table: t2
@@ -259,8 +257,6 @@ create_index.sqltest::create-index-mixed-string-literal-column | expected an err
 create_index.sqltest::create-index-parenthesized-string-no-such-column | expected an error but the statement succeeded
 create_table.sqltest::create_table_multiple_column_primary_keys | expected an error but the statement succeeded
 create_table.sqltest::create_table_duplicate_primary_key_clause | expected an error but the statement succeeded
-create_table.sqltest::col-default-true | expected success but got error: default value of column is not constant: true
-create_table.sqltest::col-default-false | expected success but got error: default value of column is not constant: false
 create_table.sqltest::create_table_trailing_named_column_constraint | expected success but got error: Expected a constraint after CONSTRAINT e. At SQL offset 99.
 create_table.sqltest::create_table_trailing_named_column_constraint_primary_key_enforced | expected success but got error: Expected a constraint after CONSTRAINT d. At SQL offset 87.
 create_table_as_select.sqltest::ctas_column_names | expected success but got error: Managed table-valued source 'pragma_table_info' is not supported: no module registration, planner, or execution contract is avai
@@ -446,10 +442,6 @@ groupby/memory.sqltest::group-by-out-of-range | expected an error but the statem
 groupby/memory.sqltest::group-by-negative | expected an error but the statement succeeded
 in-index-seek.sqltest::in-index-update-or-replace | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 in-index-seek.sqltest::in-index-update-or-replace-multirow | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-in-null-or.sqltest::not-in-self-or-true-counts-all-rows | expected success but got error: no such column: TRUE
-in-null-or.sqltest::not-in-self-or-true-is-true-for-all-rows | expected success but got error: no such column: TRUE
-in-null-or.sqltest::not-in-self-or-false-filters-all-rows | expected success but got error: no such column: FALSE
-in-null-or.sqltest::not-in-self-or-false-preserves-null-result | expected success but got error: no such column: FALSE
 index-cursor-record-after-overflow-update.sqltest::rowid-after-overflow-update | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
 index-cursor-record-after-overflow-update.sqltest::update-indexed-by-overflow-keys | expected success but got error: Expected Comma. At SQL offset 109.
 index-cursor-record-after-overflow-update.sqltest::select-via-index-after-overflow-update | expected success but got error: Expected Comma. At SQL offset 145.
@@ -463,10 +455,6 @@ indexed_by.sqltest::indexed-by-attached-update-delete | expected success but got
 insert.sqltest::insert-explicit-rowid-with-rowidalias | expected 6 row(s), got 6 row(s); row 0 expected '-12/-10/-12/-9' but was '4/2/4/1'
 insert.sqltest::uniq_constraint | error 'UNIQUE constraint failed: test.id' does not match pattern 'UNIQUE constraint failed: test.id \(19\)'
 insert.sqltest::insert-explicit-rowid-conflict | error 'UNIQUE constraint failed: t.rowid' does not match pattern 'UNIQUE constraint failed: t.rowid \(19\)'
-insert.sqltest::returning-true-literal | expected success but got error: no such column: true
-insert.sqltest::returning-false-literal | expected success but got error: no such column: false
-insert.sqltest::boolean-literal-edgecase | expected success but got error: no such column: true
-insert.sqltest::boolean-literal-edgecase-false | expected success but got error: no such column: false
 insert.sqltest::collate-unique-index-upsert | expected success but got error: Managed UPSERT DO UPDATE requires a parenthesized PRIMARY KEY or UNIQUE conflict target. At SQL offset 58.
 insert.sqltest::insert-integer-pk-i64-min-float-error | expected an error but the statement succeeded
 insert.sqltest::insert-or-replace-unique-index-no-corruption | expected success but got error: Expected Comma. At SQL offset 66.
@@ -559,12 +547,7 @@ join/outer_hash_join.sqltest::right-then-right-join-chain-errors | expected an e
 join/outer_hash_join.sqltest::full-outer-then-right-join-errors | expected an error but the statement succeeded
 join/outer_hash_join.sqltest::full-outer-with-not-exists-subquery | expected an error but the statement succeeded
 join/outer_hash_join.sqltest::full-outer-with-where-equijoin | expected 4 row(s), got 2 row(s); row 0 expected '1/' but was '2/2'
-joins/derived_subquery_on_predicate.sqltest::issue-7367-boolean-test | expected success but got error: no such column: TRUE
 joins/derived_subquery_on_predicate.sqltest::issue-7372-text-range-join-after-analyze | setup 'issue-7372-schema' failed: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were cha
-json/json_subtype_strip.sqltest::json_quote_view_boundary_consistency | expected success but got error: no such column: TRUE
-json/json_subtype_strip.sqltest::json_quote_view_boundary_where_consistent_with_select | expected success but got error: no such column: TRUE
-json/json_subtype_strip.sqltest::json_subtype_plain_table_no_subtype | expected success but got error: no such column: TRUE
-json/json_subtype_strip.sqltest::json_subtype_view_where_clause_strips_subtype | expected success but got error: no such column: TRUE
 json/json_tree.sqltest::json-tree-correlated-subquery-stale-cursor | expected success but got error: Managed table-valued source 'json_tree' is not supported: no module registration, planner, or execution contract is available. A
 last_insert_rowid.sqltest::last-insert-rowid-after-insert-returning | expected 5 row(s), got 5 row(s); row 1 expected '20' but was '10'
 last_insert_rowid.sqltest::last-insert-rowid-unchanged-by-cdc-internal-inserts | expected success but got error: Unsupported PRAGMA capture_data_changes_conn. At SQL offset 33.
@@ -597,8 +580,6 @@ not_between.sqltest::not-between-subquery-bound-orderby-offset | expected succes
 null/default.sqltest::isnull | expected success but got error: Expected End. At SQL offset 12.
 null/default.sqltest::notnull | expected success but got error: Expected End. At SQL offset 12.
 null/default.sqltest::not-null | expected success but got error: Expected BETWEEN, IN, LIKE, GLOB, REGEXP, or MATCH after NOT. At SQL offset 16.
-null/default.sqltest::sel-true | expected success but got error: no such column: true
-null/default.sqltest::sel-false | expected success but got error: no such column: false
 nulls-first-last.sqltest::window-two-different-nulls-orderings | expected 5 row(s), got 5 row(s); row 1 expected '4//2/5' but was '2/3/5/3'
 numeric-text-overflow.sqltest::ceil-text-i64-max-stays-integer | expected 1 row(s), got 1 row(s); row 0 expected '9223372036854775807/integer' but was '9.22337203685478e+18/real'
 on_conflict.sqltest::update-or-ignore-notnull | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
@@ -772,20 +753,6 @@ scalar-functions-printf.sqltest::printf-sigdigits-f-20 | expected 1 row(s), got 
 scalar-functions-printf.sqltest::printf-sigdigits-e-20 | expected 1 row(s), got 1 row(s); row 0 expected '3.33333333333333300000e-01' but was '3.33333333333333314830e-01'
 scalar-functions-printf.sqltest::printf-sigdigits-g-20 | expected 1 row(s), got 1 row(s); row 0 expected '0.3333333333333333' but was '0.33333333333333331483'
 scalar-functions-printf.sqltest::printf-sigdigits-f-15 | expected 1 row(s), got 1 row(s); row 0 expected '1234567890.123457000000000' but was '1234567890.123456716537476'
-select/memory.sqltest::is-true-integer | expected success but got error: no such column: TRUE
-select/memory.sqltest::is-true-float | expected success but got error: no such column: TRUE
-select/memory.sqltest::is-true-text | expected success but got error: no such column: TRUE
-select/memory.sqltest::is-true-null | expected success but got error: no such column: TRUE
-select/memory.sqltest::is-false-integer | expected success but got error: no such column: FALSE
-select/memory.sqltest::is-false-float | expected success but got error: no such column: FALSE
-select/memory.sqltest::is-false-text | expected success but got error: no such column: FALSE
-select/memory.sqltest::is-false-null | expected success but got error: no such column: FALSE
-select/memory.sqltest::is-not-true-integer | expected success but got error: no such column: TRUE
-select/memory.sqltest::is-not-true-null | expected success but got error: no such column: TRUE
-select/memory.sqltest::is-not-false-integer | expected success but got error: no such column: FALSE
-select/memory.sqltest::is-not-false-null | expected success but got error: no such column: FALSE
-select/memory.sqltest::is-true-where | expected success but got error: no such column: TRUE
-select/memory.sqltest::is-false-where | expected success but got error: no such column: FALSE
 select/memory.sqltest::select-intersect-union-with-limit | expected 3 row(s), got 3 row(s); row 0 expected 'a/a' but was 'z/z'
 select/memory.sqltest::select-except-union | expected 3 row(s), got 3 row(s); row 0 expected 'x/x' but was 'y/y'
 select/memory.sqltest::limit-underscore-literal | expected success but got error: Expected End. At SQL offset 16.
@@ -808,10 +775,6 @@ snapshot_tests/subqueries/subquery-sort-elision.sqltest::window-partial-not-elid
 snapshot_tests/subqueries/subquery-sort-elision.sqltest::window-no-cte-order-not-elided | expected 7 row(s), got 7 row(s); row 0 expected '1/50' but was '3/100'
 subquery/cte_materialization_adversarial.sqltest::range-scan-text-vs-int-affinity | expected 1 row(s), got 4 row(s); row 0 expected '3/30' but was '1/10'
 subquery/cte_materialization_adversarial.sqltest::internals-update-via-correlated-cte | expected success but got error: no such column: upd_t.id
-subquery/expressions.sqltest::subquery-empty-in-comparison | expected success but got error: no such column: FALSE
-subquery/expressions.sqltest::subquery-empty-aggregate-sum | expected success but got error: no such column: FALSE
-subquery/expressions.sqltest::subquery-empty-aggregate-count | expected success but got error: no such column: FALSE
-subquery/expressions.sqltest::subquery-empty-in-coalesce | expected success but got error: no such column: FALSE
 subquery/expressions.sqltest::subquery-join-two-subqueries | expected success but got error: Expected RightParen. At SQL offset 24.
 subquery/expressions.sqltest::subquery-left-join-two-subqueries | expected success but got error: Expected RightParen. At SQL offset 24.
 subquery/expressions.sqltest::subquery-cross-join-subqueries | expected success but got error: Expected RightParen. At SQL offset 24.
@@ -823,7 +786,6 @@ subquery/expressions.sqltest::subquery-from-except | expected success but got er
 subquery/expressions.sqltest::subquery-nested-compound-in-scalar | expected success but got error: Expected RightParen. At SQL offset 37.
 subquery/expressions.sqltest::subquery-group-by-inside | expected success but got error: Expected RightParen. At SQL offset 39.
 subquery/expressions.sqltest::subquery-having-inside | expected success but got error: Expected RightParen. At SQL offset 39.
-subquery/memory.sqltest::subquery-exists-basic | expected success but got error: no such column: false
 subquery/memory.sqltest::subquery-correlated-outer-ref-in-group-by-in-subquery | expected an error but the statement succeeded
 subquery/memory.sqltest::subquery-correlated-outer-ref-in-group-by-function-call | expected an error but the statement succeeded
 subquery/memory.sqltest::subquery-correlated-outer-ref-in-group-by-rowid-alias-oid | expected an error but the statement succeeded
@@ -832,7 +794,6 @@ subquery/memory.sqltest::subquery-correlated-outer-ref-in-nested-group-by-subque
 subquery/memory.sqltest::subquery-uncorrelated-in-having | expected success but got error: no such column: total
 subquery/memory.sqltest::subquery-correlated-in-having-grouped-scalar-null | expected success but got error: no such column: total
 subquery/memory.sqltest::subquery-uncorrelated-in-having-in | expected success but got error: no such column: total
-subquery/memory.sqltest::subquery-exists-false-in-aggregate | expected success but got error: no such column: false
 subquery/memory.sqltest::subquery-column-affinity-inheritance | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
 subquery/memory.sqltest::subquery-correlated-exists-in-select-with-aggregate-empty-table | expected success but got error: no such column: t6.id
 subquery/memory.sqltest::exists-in-ungrouped-aggregate-with-data | expected 1 row(s), got 1 row(s); row 0 expected '1/0.0' but was '1/0'
@@ -875,7 +836,6 @@ trigger-virtual-table-innocuous.sqltest::json-each-before-trigger | expected suc
 trigger.sqltest::trigger-update-old-reference | expected 2 row(s), got 2 row(s); row 0 expected '1/20/30' but was '1/20/0'
 trigger.sqltest::trigger-old-new-arithmetic | expected 1 row(s), got 1 row(s); row 0 expected '1/25/15' but was '1/25/0'
 trigger.sqltest::trigger-before-update-parent-expression-old-values | expected 1 row(s), got 1 row(s); row 0 expected '2/666/666' but was '2/1/1'
-trigger.sqltest::trigger-col-name-trigger-subquery | expected success but got error: no such column: TRUE
 trigger.sqltest::trigger-table-qualified-where-clause | expected success but got error: no such column: t1.c
 trigger.sqltest::trigger-when-rowid-alias-string-literal-affinity | expected 1 row(s), got 0 row(s)
 trigger.sqltest::trigger-raise-shorthand | error 'Expected ROLLBACK, ABORT, FAIL, or IGNORE in RAISE(). At SQL offset 81.' does not match pattern 'shorthand abort'
@@ -942,10 +902,6 @@ trigger_on_conflict.sqltest::update-or-ignore-notnull-multiple-rows | expected s
 trigger_on_conflict.sqltest::update-or-ignore-unique-fires-before-trigger | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
 trigger_on_conflict.sqltest::trigger-upsert-new-in-where-no-update | expected success but got error: no such table: NEW
 trigger_on_conflict.sqltest::outer-update-replace-overrides-trigger-ignore | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 7.
-unnest-exists.sqltest::exists-is-true-wrapper | expected success but got error: no such column: TRUE
-unnest-exists.sqltest::exists-is-false-wrapper | expected success but got error: no such column: FALSE
-unnest-exists.sqltest::not-exists-is-true-wrapper | expected success but got error: no such column: TRUE
-unnest-exists.sqltest::not-exists-is-false-wrapper | expected success but got error: no such column: FALSE
 update-from.sqltest::update-from-basic-equijoin | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 59.
 update-from.sqltest::update-from-multiple-columns | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 67.
 update-from.sqltest::update-from-expression-mixing-sides | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 58.
@@ -1158,7 +1114,6 @@ virtual-table-left-join.sqltest::left-join-virtual-table-on-left-null | expected
 where/memory.sqltest::where_alias_precedence_2 | expected success but got error: Expected Comma. At SQL offset 62.
 where/memory.sqltest::where_alias_precedence_3 | expected success but got error: Expected Comma. At SQL offset 62.
 window/filter-over.sqltest::filter-over-grouped-result | expected success but got error: window function arguments cannot contain aggregate or window functions
-window/filter-over.sqltest::filter-over-count-star-is-true-false | expected success but got error: no such column: TRUE
 window/filter-over.sqltest::filter-over-grouped-filter-aggregate-predicate | expected success but got error: window function arguments cannot contain aggregate or window functions
 window/filter-over.sqltest::filter-over-nested-window-in-filter-rejected | error 'FILTER clause cannot contain aggregate or window functions' does not match pattern 'misuse of window function'
 window/filter-over.sqltest::filter-over-scalar-function-rejected | error 'ABS is not a supported window function' does not match pattern 'may not be used as a window function'
