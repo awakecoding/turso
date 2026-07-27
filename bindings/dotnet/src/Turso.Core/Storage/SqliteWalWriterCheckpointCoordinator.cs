@@ -61,6 +61,9 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
     [field: ThreadStatic]
     internal static Action? BeforeDetachedTailRepairForTesting { get; set; }
 
+    [field: ThreadStatic]
+    internal static Action? AfterDetachedWalFrameAppendForTesting { get; set; }
+
     /// <summary>
     /// Creates a coordinator over caller-owned storage, WAL, index, and lock
     /// primitives. All artifacts must describe the same SQLite database.
@@ -186,40 +189,67 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
         lock (_gate)
         {
             ThrowIfUnavailable();
-            using var writer = _locks.AcquireExclusive(WriteLockOffset, length: 1, timeout);
-            cancellationToken.ThrowIfCancellationRequested();
-
-            var prior = _index.ReadValidatedHeader(_wal);
-            ValidateAppendableWal(prior.Header);
-            var appended = new List<SqliteWalFrame>(pages.Count);
+            var writer = AcquireRecoveryLock(
+                WriteLockOffset,
+                length: 1,
+                timeout,
+                cancellationToken);
             try
             {
-                for (var index = 0; index < pages.Count; index++)
-                {
-                    var page = pages[index];
-                    var frameNumber = _wal.AppendFrame(
-                        page.PageNumber,
-                        page.PageData.Span,
-                        index == pages.Count - 1 ? databasePageCount : 0);
-                    appended.Add(_wal.ReadFrame(frameNumber));
-                }
+                cancellationToken.ThrowIfCancellationRequested();
 
-                // The header publication is the visibility point. Reaching it
-                // without a durable WAL commit would expose non-recoverable data.
-                _wal.Flush();
-                var committedFrame = appended[^1].Header;
-                var committedHeader = prior.Header.WithCommittedFrames(
-                    checked(prior.Header.MaximumFrame + (uint)appended.Count),
-                    databasePageCount,
-                    committedFrame.Checksum1,
-                    committedFrame.Checksum2);
-                _index.PublishCommittedFrames(prior.Header, appended, committedHeader, _wal);
-                return new SqliteWalWriteResult(committedHeader.MaximumFrame, databasePageCount);
+                var prior = _index.ReadValidatedHeader(_wal);
+                ValidateAppendableWal(prior.Header);
+                var appended = new List<SqliteWalFrame>(pages.Count);
+                try
+                {
+                    for (var index = 0; index < pages.Count; index++)
+                    {
+                        var page = pages[index];
+                        var frameNumber = _wal.AppendFrame(
+                            page.PageNumber,
+                            page.PageData.Span,
+                            index == pages.Count - 1 ? databasePageCount : 0);
+                        appended.Add(_wal.ReadFrame(frameNumber));
+                        AfterDetachedWalFrameAppendForTesting?.Invoke();
+                    }
+
+                    // The header publication is the visibility point. Reaching it
+                    // without a durable WAL commit would expose non-recoverable data.
+                    _wal.Flush();
+                    var committedFrame = appended[^1].Header;
+                    var committedHeader = prior.Header.WithCommittedFrames(
+                        checked(prior.Header.MaximumFrame + (uint)appended.Count),
+                        databasePageCount,
+                        committedFrame.Checksum1,
+                        committedFrame.Checksum2);
+                    _index.PublishCommittedFrames(prior.Header, appended, committedHeader, _wal);
+                    return new SqliteWalWriteResult(committedHeader.MaximumFrame, databasePageCount);
+                }
+                catch (Exception exception)
+                {
+                    // Recovery takes checkpoint before writer. Release this lease
+                    // before it obtains the complete ordered recovery lock set.
+                    try
+                    {
+                        writer.Dispose();
+                    }
+                    catch (Exception releaseException)
+                    {
+                        _fault = new AggregateException(
+                            "SQLite WAL writing failed and its writer lease could not be released for safe recovery.",
+                            exception,
+                            releaseException);
+                        throw _fault;
+                    }
+
+                    FaultAfterWriteFailure(prior.Header.MaximumFrame, exception);
+                    throw;
+                }
             }
-            catch (Exception exception)
+            finally
             {
-                FaultAfterWriteFailure(prior.Header.MaximumFrame, exception);
-                throw;
+                writer.Dispose();
             }
         }
     }
@@ -629,8 +659,9 @@ public sealed class SqliteWalWriterCheckpointCoordinator : IDisposable
             var recovery = _wal.ScanRecovery();
             if (recovery.LastCommittedFrameNumber == priorMaximumFrame)
             {
-                _wal.RecoverToLastCommittedFrame();
-                return;
+                var repaired = RecoverAndRebuild(TimeSpan.Zero, CancellationToken.None);
+                if (repaired.LastCommittedFrameNumber == priorMaximumFrame)
+                    return;
             }
         }
         catch (Exception recoveryException)
