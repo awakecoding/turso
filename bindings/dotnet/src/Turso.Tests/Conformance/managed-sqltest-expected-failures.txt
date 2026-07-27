@@ -33,27 +33,15 @@ alter-rename-column-qualified-trigger-error.sqltest::rename-column-trigger-when-
 alter-table-quoted-trigger-target.sqltest::drop-column-with-unrelated-quoted-trigger-target | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t2 (id INTEGER PRIMARY KEY, keep_col TEXT)' but was 'CREATE TABLE "t2" ("id" INTEGER PRIMARY KEY, 
 alter-table-quoted-trigger-target.sqltest::rename-column-with-unrelated-quoted-trigger-target | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t2 (id INTEGER PRIMARY KEY, d TEXT)' but was 'CREATE TABLE "t2" ("id" INTEGER PRIMARY KEY, "d" TEX
 alter_rename_column_partial_idx.sqltest::rename-column-updates-partial-index-where-clause-sql | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-alter_rename_column_partial_idx.sqltest::rename-column-partial-index-delete-no-panic | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-alter_rename_column_partial_idx.sqltest::rename-column-partial-index-delete-with-data | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-alter_rename_column_partial_idx.sqltest::rename-column-partial-index-update-integrity | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 alter_rename_column_partial_idx.sqltest::rename-column-partial-index-complex-where | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 alter_rename_column_partial_idx.sqltest::rename-column-partial-index-rename-where-col-only | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-alter_rename_column_partial_idx.sqltest::rename-column-partial-index-insert-after-rename | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 alter_rename_column_partial_idx.sqltest::rename-column-updates-expression-index-key | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 alter_rename_column_partial_idx.sqltest::rename-column-updates-expression-index-multi-column | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 alter_rename_column_partial_idx.sqltest::rename-column-expression-index-other-col-unchanged | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-alter_rename_column_partial_idx.sqltest::rename-column-expression-index-quoted-ident | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 alter_rename_column_partial_idx.sqltest::rename-column-expression-index-then-rename-again | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 alter_table.sqltest::alter-table-rename-column | expected success but got error: Expected keyword TO. At SQL offset 21.
-alter_table.sqltest::alter-table-rename-column-view | expected success but got error: error in view v after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-column-view-qualified | expected success but got error: error in view v after rename column: no such column: t.b
 alter_table.sqltest::alter-table-rename-column-view-star | expected 2 row(s), got 0 row(s)
 alter_table.sqltest::alter-table-rename-column-view-on-view | expected success but got error: error in view v1 after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-column-view-subquery | expected success but got error: error in view v after rename column: no such column: t.b
-alter_table.sqltest::alter-table-rename-column-view-correlated-subquery | expected success but got error: error in view v after rename column: no such column: t.b
-alter_table.sqltest::alter-table-rename-column-view-correlated-outer-shadow | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE c = 1)' but was 'CREATE VIEW v AS SELECT
-alter_table.sqltest::alter-table-rename-column-view-correlated-outer-shadow-nested | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE VIEW v AS SELECT u.b FROM u WHERE EXISTS (SELECT 1 FROM t WHERE EXISTS (SELECT 1 WHERE c = 1))' but was 
-alter_table.sqltest::alter-table-rename-column-view-select-branch | expected success but got error: error in view v after rename column: no such column: b
 alter_table.sqltest::alter-table-rename-column-view-tablecall-branch | expected success but got error: Managed table-valued source 'json_each' is not supported: no module registration, planner, or execution contract is available. A
 alter_table.sqltest::alter-table-rename-column-view-attached-db-qualified | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'cannot reference'
 alter_table.sqltest::alter-table-rename-column-trigger-attached-db-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
@@ -72,10 +60,6 @@ alter_table.sqltest::alter-table-drop-column-unique-special-name-schema-sql | ou
 alter_table.sqltest::alter-table-rename-to-quoted-identifier | expected 11 row(s), got 11 row(s); row 0 expected 'CREATE TABLE "t t" (a)' but was 'CREATE TABLE "t t" ("a")'
 alter_table.sqltest::alter-table-add-notnull-col | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (a, b NOT NULL)' but was 'CREATE TABLE "t" ("a", "b" NOT NULL)'
 alter_table.sqltest::alter-tbl-regression | expected success but got error: no such table: main.p_ren1
-alter_table.sqltest::alter-table-rename-column-updates-sibling-fk-table-level | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
-alter_table.sqltest::alter-table-rename-column-updates-sibling-fk-inline | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
-alter_table.sqltest::alter-table-rename-column-sibling-fk-still-enforced | expected success but got error: foreign key mismatch - "c" referencing "p"
-alter_table.sqltest::alter-table-rename-parent-col-then-drop-on-child-keeps-renamed-fk | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
 alter_table.sqltest::strict-alter-add-column-default-type-mismatch | error 'cannot store TEXT value in INTEGER column t1.id' does not match pattern 'type mismatch on DEFAULT'
 alter_table.sqltest::strict-alter-add-column-default-integer-fractional | error 'cannot store REAL value in INTEGER column t.b' does not match pattern 'type mismatch on DEFAULT'
 alter_table.sqltest::strict-alter-add-column-default-real-nonnumeric | error 'cannot store TEXT value in REAL column t.b' does not match pattern 'type mismatch on DEFAULT'
@@ -93,28 +77,6 @@ alter_table.sqltest::alter-table-rename-trigger-schema-tbl-name | expected succe
 alter_table.sqltest::alter-table-rename-trigger-self-insert-sql-rewritten | expected success but got error: error in trigger tr after rename table: no such table: t1
 alter_table.sqltest::alter-table-rename-trigger-self-insert-blob-text-binding | expected success but got error: error in trigger tr after rename table: no such table: t1
 alter_table.sqltest::alter-table-rename-trigger-self-insert-wide-row | expected success but got error: error in trigger tr after rename table: no such table: wide
-alter_table.sqltest::alter-table-rename-column-trigger-fires | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
-alter_table.sqltest::alter-table-rename-column-trigger-update-of | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
-alter_table.sqltest::alter-table-rename-column-trigger-body-update-refs | expected success but got error: error in trigger trig1 after rename column: table has no column named b
-alter_table.sqltest::alter-table-rename-column-trigger-when-clause | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
-alter_table.sqltest::alter-table-rename-column-trigger-insert-other-table | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
-alter_table.sqltest::alter-table-rename-column-subquery | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-trigger-exists-subquery | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-then-rename-column-trigger | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
-alter_table.sqltest::alter-table-rename-column-case-expr-trigger | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
-alter_table.sqltest::alter-table-rename-column-union-trigger | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
-alter_table.sqltest::alter-table-rename-column-old-ref-trigger | expected success but got error: error in trigger trig1 after rename column: no such column: old.b
-alter_table.sqltest::alter-table-rename-column-multiple-triggers | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
-alter_table.sqltest::alter-table-rename-column-cross-table-insert | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-column-trigger-order-by-not-alias | expected success but got error: error in trigger trig after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-column-trigger-order-by-implicit-alias | expected success but got error: error in trigger trig after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-column-trigger-order-by-implicit-alias-stored-sql | expected success but got error: error in trigger trig after rename column: no such column: b
-alter_table.sqltest::alter-table-rename-column-trigger-order-by-qualified-result-col | expected success but got error: error in trigger trig after rename column: no such column: src.b
-alter_table.sqltest::alter-table-rename-column-trigger-round-trip-stored-sql | expected success but got error: error in trigger core_ai after rename column: no such column: NEW.row_rank
-alter_table.sqltest::alter-table-rename-column-trigger-round-trip-when-clause | expected success but got error: error in trigger trig1 after rename column: no such column: NEW.b
-alter_table.sqltest::alter-table-rename-column-trigger-round-trip-update-of | expected success but got error: error in trigger trig1 after rename column: no such column: NEW.b
-alter_table.sqltest::alter-table-rename-column-trigger-round-trip-fires | expected success but got error: error in trigger core_ai after rename column: no such column: NEW.row_rank
-alter_table.sqltest::alter-table-rename-column-trigger-multi-hop-rename | expected success but got error: error in trigger trig1 after rename column: no such column: NEW.b
 alter_table.sqltest::alter-table-rename-column-temp-trigger-main-cross-table | expected success but got error: no such table: src_temp_main
 alter_table.sqltest::alter-table-rename-column-temp-table-trigger-main-delete-target | expected success but got error: error in trigger trig_temp_delete after rename column: no such table: main_delete_log
 alter_table.sqltest::alter-table-rename-column-temp-trigger-main-alias-cross-table | expected success but got error: no such table: src_temp_main_alias
@@ -125,31 +87,11 @@ alter_table.sqltest::alter-table-rename-column-temp-trigger-result-scalar-subque
 alter_table.sqltest::alter-table-rename-column-temp-table-rejects-invalid-trigger-rewrite | error 'error in trigger tr after rename column: no such column: new.b' does not match pattern 'error in trigger tr.*no such column: new.c'
 alter_table.sqltest::alter-table-rename-column-temp-trigger-attached-cross-table | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 alter_table.sqltest::temp-trigger-attached-read-cross-table | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
-alter_table.sqltest::alter-rename-col-cross-table-aggregate | expected success but got error: error in trigger trig1 after rename column: no such column: b
 alter_table.sqltest::alter-table-drop-column-temp-trigger-invalid | expected an error but the statement succeeded
 alter_table.sqltest::alter-table-drop-column-invalid-temp-trigger-missing-main-table | expected an error but the statement succeeded
 alter_table.sqltest::alter-table-drop-column-trigger-bare-owning-column-in-when-invalid | error 'error in trigger trig_when_invalid after drop column: no such column: y' does not match pattern 'error in trigger trig_when_invalid: no such column: y'
 alter_table.sqltest::alter-table-drop-column-trigger-bare-owning-column-in-update-invalid | error 'error in trigger trig_update_invalid after drop column: no such column: y' does not match pattern 'error in trigger trig_update_invalid: no such column: 
-alter_table.sqltest::alter-rename-col-cross-table-qualified-ref | expected success but got error: error in trigger trig1 after rename column: no such column: src.b
-alter_table.sqltest::alter-rename-col-cross-table-multi-from | expected success but got error: error in trigger trig1 after rename column: no such column: src.b
-alter_table.sqltest::alter-rename-col-cross-table-join-on | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-cross-table-nested-subquery | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-cross-table-update-cmd | expected success but got error: error in trigger trig1 after rename column: table has no column named b
-alter_table.sqltest::alter-rename-col-cross-table-delete-where | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-cross-table-insert-col-list | expected success but got error: error in trigger trig1 after rename column: table has no column named b
-alter_table.sqltest::alter-rename-col-verify-schema-rewritten | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-cross-table-group-by | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-schema-aggregate | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-schema-qualified-ref | expected success but got error: error in trigger trig1 after rename column: no such column: src.b
-alter_table.sqltest::alter-rename-col-schema-multi-from | expected success but got error: error in trigger trig1 after rename column: no such column: src.b
-alter_table.sqltest::alter-rename-col-schema-join-on | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-schema-update-cmd | expected success but got error: error in trigger trig1 after rename column: table has no column named b
 alter_table.sqltest::alter-rename-col-schema-update-cmd-from | expected success but got error: Managed UPDATE FROM is not supported. At SQL offset 80.
-alter_table.sqltest::alter-rename-col-schema-delete-where | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-schema-insert-col-list | expected success but got error: error in trigger trig1 after rename column: table has no column named b
-alter_table.sqltest::alter-rename-col-schema-nested-subquery | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-schema-group-by | expected success but got error: error in trigger trig1 after rename column: no such column: b
-alter_table.sqltest::alter-rename-col-schema-same-table-trigger | expected success but got error: error in trigger trig1 after rename column: no such column: new.b
 alter_table.sqltest::fail-drop-column-cross-table-trigger-update-where-expr | error 'error in trigger trg after drop column: table has no column named m' does not match pattern 'error in trigger trg after drop column: no such column: m'
 alter_table.sqltest::drop-column-cross-table-trigger-insert-col-list-deferred | expected success but got error: error in trigger trg after drop column: table has no column named m
 alter_table.sqltest::drop-column-cross-table-trigger-set-target-deferred | expected success but got error: error in trigger trg after drop column: table has no column named m
@@ -189,15 +131,8 @@ check_constraint.sqltest::check_constraint_pragma_ignore | expected success but 
 check_constraint.sqltest::check_constraint_upsert_do_update_violation | expected an error but the statement succeeded
 check_constraint.sqltest::check_constraint_update_or_ignore_single_row | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 70.
 check_constraint.sqltest::check_constraint_update_or_ignore_all_rows | expected success but got error: Managed UPDATE conflict algorithms are not supported. At SQL offset 69.
-check_constraint.sqltest::check_constraint_rename_column_inline | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-check_constraint.sqltest::check_constraint_rename_column_table_level | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-check_constraint.sqltest::check_constraint_rename_column_qualified_ref | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 check_constraint.sqltest::check_constraint_rename_table_qualified_ref | expected success but got error: ALTER TABLE RENAME cannot rewrite table-qualified CHECK expressions until managed schema token rewriting is implemented.
 check_constraint.sqltest::check_constraint_ddl_column_level_preserved | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
-check_constraint.sqltest::check_constraint_rename_column_to_keyword_ddl | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-check_constraint.sqltest::check_constraint_rename_column_to_keyword_still_works | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-check_constraint.sqltest::check_constraint_rename_then_drop_keeps_renamed_ref | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-check_constraint.sqltest::check_constraint_rename_then_add_keeps_renamed_ref | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 check_constraint.sqltest::check_constraint_inline_rename_then_drop_keeps_renamed_ref | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 check_constraint.sqltest::check_constraint_update_only_checks_changed_columns | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
 check_constraint.sqltest::check_constraint_update_table_level_multi_column | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
@@ -332,12 +267,6 @@ gencol.sqltest::gencol_alter_add_virtual_insert_after | expected 2 row(s), got 2
 gencol.sqltest::gencol_alter_add_virtual_after_add_default_notnull | expected success but got error: Cannot add a NOT NULL column without a default value.
 gencol.sqltest::gencol_alter_add_stored_rejected | expected an error but the statement succeeded
 gencol.sqltest::gencol_rename_column_updates_expression | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-gencol.sqltest::gencol_rename_column_chain | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-gencol.sqltest::gencol_rename_column_middle | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-gencol.sqltest::gencol_rename_column_complex_expr | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-gencol.sqltest::gencol_rename_column_multiple_refs | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-gencol.sqltest::gencol_rename_column_case_insensitive | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
-gencol.sqltest::gencol_rename_column_with_index_on_generated | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 gencol.sqltest::gencol_rename_column_other_table_unaffected | expected success but got error: Expected keyword TO. At SQL offset 22.
 gencol.sqltest::gencol_rename_column_other_table_matching_name_unaffected | expected success but got error: Expected keyword TO. At SQL offset 22.
 gencol.sqltest::rename_then_drop_keeps_renamed_column | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
@@ -652,7 +581,6 @@ pragma_vdbe_trace.sqltest::pragma-vdbe-trace | expected success but got error: U
 reindex.sqltest::reindex-table-with-multiple-index-types | expected success but got error: non-deterministic functions are prohibited in index expressions
 reindex.sqltest::reindex-attached-qualified-targets | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
 reindex.sqltest::reindex-view-is-noop | expected success but got error: unable to identify the object to be reindexed
-reindex.sqltest::reindex-expression-index-after-rename-column | expected success but got error: ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, index-expression, partial-index, or foreign-key s
 reindex.sqltest::reindex-expression-index-outer-collate-target | expected 2 row(s), got 2 row(s); row 0 expected '0/0/a/0/RTRIM/1' but was '0/-2//0/RTRIM/1'
 reindex.sqltest::reindex-non-ascii-identifiers-use-ascii-case-folding | error 'Unexpected SQL character 'é' at offset 16.' does not match pattern 'unable to identify the object to be reindexed'
 reindex.sqltest::reindex-unquoted-compound-keyword-target-rejected | expected an error but the statement succeeded

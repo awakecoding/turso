@@ -3238,24 +3238,233 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (!tables.TryGetValue(statement.TableName, out var table))
             throw new EmbeddedSqlException($"no such table: {statement.TableName}");
 
-        var candidateTables = new Dictionary<string, EmbeddedTable>(
-            tables,
-            StringComparer.OrdinalIgnoreCase);
-        var candidateTable = table.Clone();
-        candidateTable.RenameColumn(statement.ColumnName, statement.NewName);
-        candidateTables[statement.TableName] = candidateTable;
+        var oldName = table.Columns[table.GetColumnIndex(statement.ColumnName)];
+        var newName = statement.NewName;
+        var quoteNewName = statement.QuoteNewName;
+        var replacement = table.CreateWithRenamedColumn(
+            statement.ColumnName,
+            newName,
+            quoteNewName,
+            context.CancellationToken);
+
+        var candidateTables = new Dictionary<string, EmbeddedTable>(tables, StringComparer.OrdinalIgnoreCase)
+        {
+            [statement.TableName] = replacement,
+        };
+
+        // A foreign key in another table names the parent column by its old spelling, so the
+        // REFERENCES clause follows the rename the way SQLite rewrites it.
+        foreach (var entry in tables)
+        {
+            if (string.Equals(entry.Key, statement.TableName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (CreateWithRenamedForeignKeyParentColumn(entry.Value, table.Name, oldName, newName) is { } rewritten)
+                candidateTables[entry.Key] = rewritten;
+        }
+
+        var renameSchema = CreateRenameColumnSchema(
+            candidateTables,
+            catalog.Views,
+            table.Name,
+            table.Columns.ToArray());
+        Dictionary<string, ViewDefinition>? candidateViews = null;
+        Dictionary<string, TriggerDefinition>? candidateTriggers = null;
+        try
+        {
+            foreach (var view in catalog.Views.Values)
+            {
+                context.CheckInterrupt();
+                var rewritten = RenameColumnRewriter.RewriteSchemaObject(
+                    view.Sql,
+                    oldName,
+                    newName,
+                    quoteNewName,
+                    renameSchema);
+                if (rewritten is null)
+                    continue;
+
+                candidateViews ??= new Dictionary<string, ViewDefinition>(
+                    catalog.Views,
+                    StringComparer.OrdinalIgnoreCase);
+                var parsed = (CreateViewStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+                candidateViews[view.Name] = view with { Query = parsed.Query, Sql = parsed.Sql };
+            }
+
+            foreach (var trigger in catalog.Triggers.Values)
+            {
+                context.CheckInterrupt();
+                var rewritten = RenameColumnRewriter.RewriteSchemaObject(
+                    trigger.Sql,
+                    oldName,
+                    newName,
+                    quoteNewName,
+                    renameSchema);
+                if (rewritten is null)
+                    continue;
+
+                candidateTriggers ??= new Dictionary<string, TriggerDefinition>(
+                    catalog.Triggers,
+                    StringComparer.OrdinalIgnoreCase);
+                var parsed = (CreateTriggerStatement)SqlParser.Parse(rewritten, SqlParameterMap.Parse(rewritten));
+                candidateTriggers[trigger.Name] = trigger with
+                {
+                    UpdateOfColumns = parsed.UpdateOfColumns,
+                    When = parsed.When,
+                    Body = parsed.Body,
+                    Sql = parsed.Sql,
+                };
+            }
+        }
+        catch (RenameColumnRewriteException exception)
+        {
+            throw new EmbeddedSqlException(exception.Message, exception);
+        }
+
+        var candidateCatalog = candidateViews is null && candidateTriggers is null
+            ? catalog
+            : new SchemaCatalog(
+                candidateTables,
+                candidateViews ?? catalog.Views,
+                candidateTriggers ?? catalog.Triggers);
+
         ValidateDependentSchema(
-            catalog,
+            candidateCatalog,
             context with
             {
                 Tables = candidateTables,
+                Views = candidateCatalog.Views,
+                Triggers = candidateCatalog.Triggers,
                 SchemaValidation = true,
             },
             context.CancellationToken,
             "rename column");
 
-        table.RenameColumn(statement.ColumnName, statement.NewName);
+        foreach (var entry in candidateTables)
+            tables[entry.Key] = entry.Value;
+
+        if (candidateViews is not null)
+        {
+            foreach (var entry in candidateViews)
+                catalog.Views[entry.Key] = entry.Value;
+        }
+
+        if (candidateTriggers is not null)
+        {
+            foreach (var entry in candidateTriggers)
+                catalog.Triggers[entry.Key] = entry.Value;
+        }
+
         return new ExecutionResult([], [], 0, true);
+    }
+
+    private static RenameColumnSchema CreateRenameColumnSchema(
+        IReadOnlyDictionary<string, EmbeddedTable> tables,
+        IReadOnlyDictionary<string, ViewDefinition> views,
+        string renamedTable,
+        IReadOnlyList<string> renamedTableColumns)
+    {
+        return new RenameColumnSchema(ResolveColumns, IsRenameTarget);
+
+        IReadOnlyList<string>? ResolveColumns(string name)
+        {
+            var key = UnqualifiedCatalogName(name);
+            // References resolve against the pre-rename shape of the altered table so the old
+            // spelling is still recognized while the stored SQL is being edited.
+            if (string.Equals(key, renamedTable, StringComparison.OrdinalIgnoreCase))
+                return renamedTableColumns;
+            if (tables.TryGetValue(key, out var found))
+                return found.Columns;
+
+            return views.TryGetValue(key, out var view) ? view.Columns : null;
+        }
+
+        bool IsRenameTarget(string name)
+            => string.Equals(UnqualifiedCatalogName(name), renamedTable, StringComparison.OrdinalIgnoreCase);
+
+        static string UnqualifiedCatalogName(string name)
+            => ManagedSchemaName.TrySplit(name, out _, out var bare) ? bare : name;
+    }
+
+    /// <summary>
+    /// Rewrites the parent column list of every foreign key in <paramref name="table"/> that
+    /// points at the renamed column, returning <see langword="null"/> when nothing referenced it.
+    /// </summary>
+    private static EmbeddedTable? CreateWithRenamedForeignKeyParentColumn(
+        EmbeddedTable table,
+        string parentTable,
+        string oldName,
+        string newName)
+    {
+        var changed = false;
+        var columns = table.ColumnDefinitions.Select(column =>
+        {
+            var foreignKey = column.ForeignKey is null ? null : Rewrite(column.ForeignKey);
+            var additional = column.AdditionalForeignKeys is { Count: > 0 } keys
+                && keys.Any(key => Rewrite(key) is not null)
+                    ? keys.Select(key => Rewrite(key) ?? key).ToArray()
+                    : null;
+            if (foreignKey is null && additional is null)
+                return column;
+
+            changed = true;
+            return column.WithConstraints(
+                column.Checks,
+                foreignKey ?? column.ForeignKey,
+                additional ?? column.AdditionalForeignKeys);
+        }).ToArray();
+
+        var tableForeignKeys = table.TableForeignKeys.Select(key =>
+        {
+            if (Rewrite(key) is not { } replacementKey)
+                return key;
+
+            changed = true;
+            return replacementKey;
+        }).ToArray();
+
+        if (!changed)
+            return null;
+
+        var replacement = new EmbeddedTable(
+            table.Name,
+            columns,
+            table.WithoutRowid,
+            table.TableLevelPrimaryKey,
+            table.TableUniqueConstraints,
+            table.CheckConstraints,
+            table.TablePrimaryKeyConflictAlgorithm,
+            table.TablePrimaryKeyConstraintName,
+            table.TablePrimaryKeyDeclarationOrder,
+            tableForeignKeys,
+            table.Strict);
+        foreach (var row in table.Rows)
+            replacement.Rows.Add(row.ToArray());
+
+        replacement.RowIds.AddRange(table.RowIds);
+        replacement.Indexes.RemoveAll(index => index.Origin == EmbeddedIndexOrigin.Explicit);
+        replacement.Indexes.AddRange(table.Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit));
+        return replacement;
+
+        ForeignKeyDefinition? Rewrite(ForeignKeyDefinition foreignKey)
+        {
+            if (!string.Equals(foreignKey.ParentTable, parentTable, StringComparison.OrdinalIgnoreCase))
+                return null;
+            if (!foreignKey.ParentColumns.Any(column =>
+                    string.Equals(column, oldName, StringComparison.OrdinalIgnoreCase)))
+            {
+                return null;
+            }
+
+            return foreignKey with
+            {
+                ParentColumns = foreignKey.ParentColumns
+                    .Select(column => string.Equals(column, oldName, StringComparison.OrdinalIgnoreCase)
+                        ? newName
+                        : column)
+                    .ToArray(),
+            };
+        }
     }
 
     private ExecutionResult ExecuteAlterTableDropColumn(
@@ -34829,42 +35038,190 @@ internal sealed class EmbeddedTable
             .ToArray();
     }
 
-    public void RenameColumn(string name, string newName)
+    /// <summary>
+    /// Builds a replacement table with <paramref name="name"/> renamed to
+    /// <paramref name="newName"/>. Every stored expression the table owns — CHECK bodies,
+    /// generated-column expressions, table-level key column lists, foreign-key column lists,
+    /// index keys, and partial-index predicates — is reparsed and rewritten so no reference to
+    /// the old spelling survives and no unrelated text is disturbed.
+    /// </summary>
+    public EmbeddedTable CreateWithRenamedColumn(
+        string name,
+        string newName,
+        bool quoteNewName,
+        CancellationToken cancellationToken)
     {
-        var index = GetColumnIndex(name);
-        if (_columnIndices.ContainsKey(newName))
+        var renamedIndex = GetColumnIndex(name);
+        var oldName = Columns[renamedIndex];
+        if (!string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase)
+            && _columnIndices.ContainsKey(newName))
+        {
             throw new EmbeddedSqlException($"duplicate column name: {newName}");
-        if (HasCheckConstraints
-            || HasGeneratedColumns
-            || TableLevelPrimaryKey is not null
-            || TableUniqueConstraints.Count > 0
-            || Indexes.Any(definition =>
-                definition.IsPartial || definition.Columns.Any(column => column.IsExpression))
-            || ForeignKeys.Any(foreignKey =>
-                foreignKey.ChildColumns.Contains(name, StringComparer.OrdinalIgnoreCase)))
+        }
+
+        var previousColumns = Columns.ToArray();
+        var rewrittenColumns = new EmbeddedColumn[ColumnDefinitions.Length];
+        for (var position = 0; position < ColumnDefinitions.Length; position++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var column = ColumnDefinitions[position];
+            if (column.GenerationExpression is not null)
+            {
+                if (column.GenerationSql is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Generated column '{column.Name}' of table '{Name}' has no stored expression text.");
+                }
+
+                if (RewriteFragment(column.GenerationSql) is { } generationSql)
+                {
+                    column = column with
+                    {
+                        GenerationSql = generationSql,
+                        GenerationExpression = SqlParser.ParseExpressionWithSpans(generationSql, out _),
+                    };
+                }
+            }
+
+            if (column.CheckConstraints.Count > 0
+                || column.ForeignKey is not null
+                || column.AdditionalForeignKeys is { Count: > 0 })
+            {
+                column = column.WithConstraints(
+                    column.CheckConstraints.Count > 0 ? RewriteChecks(column.CheckConstraints) : column.Checks,
+                    column.ForeignKey is null ? null : RewriteForeignKey(column.ForeignKey),
+                    column.AdditionalForeignKeys?.Select(RewriteForeignKey).ToArray());
+            }
+
+            if (position == renamedIndex)
+                column = column with { Name = newName };
+
+            rewrittenColumns[position] = column;
+        }
+
+        EmbeddedTable replacement;
+        try
+        {
+            replacement = new EmbeddedTable(
+                Name,
+                rewrittenColumns,
+                WithoutRowid,
+                TableLevelPrimaryKey?.Select(RewriteKeyColumn).ToArray(),
+                TableUniqueConstraints
+                    .Select(constraint => constraint with
+                    {
+                        Columns = constraint.Columns.Select(RewriteKeyColumn).ToArray(),
+                    })
+                    .ToArray(),
+                RewriteChecks(CheckConstraints),
+                TablePrimaryKeyConflictAlgorithm,
+                TablePrimaryKeyConstraintName,
+                TablePrimaryKeyDeclarationOrder,
+                TableForeignKeys.Select(RewriteForeignKey).ToArray(),
+                Strict);
+        }
+        catch (EmbeddedSqlException exception)
         {
             throw new EmbeddedSqlException(
-                "ALTER TABLE RENAME COLUMN cannot rewrite retained CHECK, generated, table-key, "
-                + "index-expression, partial-index, or foreign-key schema expressions until managed "
-                + "schema token rewriting is implemented.");
+                $"error in table {Name} after rename column: {exception.Message}",
+                exception);
         }
 
-        Columns[index] = newName;
-        ColumnDefinitions[index] = ColumnDefinitions[index] with { Name = newName };
-        _columnIndices.Remove(name);
-        _columnIndices.Add(newName, index);
-
-        for (var indexPosition = 0; indexPosition < Indexes.Count; indexPosition++)
+        foreach (var index in Indexes.Where(index => index.Origin == EmbeddedIndexOrigin.Explicit))
         {
-            var definition = Indexes[indexPosition];
-            if (definition.Columns.All(column => column.ColumnIndex != index))
-                continue;
+            cancellationToken.ThrowIfCancellationRequested();
+            var rewritten = index with
+            {
+                Columns = index.Columns.Select(RewriteIndexColumn).ToArray(),
+            };
+            if (index.WhereSql is { } whereSql && RewriteFragment(whereSql) is { } rewrittenWhere)
+            {
+                rewritten = rewritten with
+                {
+                    WhereSql = rewrittenWhere,
+                    Where = SqlParser.ParseExpressionWithSpans(rewrittenWhere, out _),
+                };
+            }
 
-            var updatedColumns = definition.Columns
-                .Select(column => column.ColumnIndex == index ? column with { Name = newName } : column)
-                .ToArray();
-            Indexes[indexPosition] = definition with { Columns = updatedColumns };
+            try
+            {
+                IndexExpressionSemantics.ValidateDefinition(Name, replacement, rewritten);
+                IndexExpressionSemantics.ValidateRoundTrip(Name, replacement, rewritten);
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                throw new EmbeddedSqlException(
+                    $"error in index {index.Name} after rename column: {exception.Message}",
+                    exception);
+            }
+
+            replacement.Indexes.Add(rewritten);
         }
+
+        if (RowIds.Count != Rows.Count)
+            throw new InvalidOperationException($"Table '{Name}' has inconsistent row identity metadata.");
+        foreach (var row in Rows)
+            replacement.Rows.Add(row.ToArray());
+
+        replacement.RowIds.AddRange(RowIds);
+        return replacement;
+
+        string? RewriteFragment(string sql)
+            => RenameColumnRewriter.RewriteTableExpression(
+                sql,
+                Name,
+                previousColumns,
+                oldName,
+                newName,
+                quoteNewName);
+
+        IReadOnlyList<CheckConstraint> RewriteChecks(IReadOnlyList<CheckConstraint> checks)
+            => checks
+                .Select(check => RewriteFragment(check.Sql) is { } sql
+                    ? check with { Sql = sql, Expression = SqlParser.ParseExpressionWithSpans(sql, out _) }
+                    : check)
+                .ToArray();
+
+        TablePrimaryKeyColumn RewriteKeyColumn(TablePrimaryKeyColumn column)
+            => string.Equals(column.Name, oldName, StringComparison.OrdinalIgnoreCase)
+                ? column with { Name = newName }
+                : column;
+
+        EmbeddedIndexColumn RewriteIndexColumn(EmbeddedIndexColumn column)
+        {
+            if (column.ExpressionSql is { } expressionSql)
+            {
+                return RewriteFragment(expressionSql) is { } rewritten
+                    ? column with
+                    {
+                        ExpressionSql = rewritten,
+                        Expression = SqlParser.ParseExpressionWithSpans(rewritten, out _),
+                    }
+                    : column;
+            }
+
+            return string.Equals(column.Name, oldName, StringComparison.OrdinalIgnoreCase)
+                ? column with { Name = newName }
+                : column;
+        }
+
+        // A self-referencing foreign key names this table's columns on both sides of the
+        // REFERENCES clause, so both lists follow the rename.
+        ForeignKeyDefinition RewriteForeignKey(ForeignKeyDefinition foreignKey)
+        {
+            var rewritten = foreignKey with { ChildColumns = RenameAll(foreignKey.ChildColumns) };
+            if (string.Equals(foreignKey.ParentTable, Name, StringComparison.OrdinalIgnoreCase))
+                rewritten = rewritten with { ParentColumns = RenameAll(foreignKey.ParentColumns) };
+
+            return rewritten;
+        }
+
+        string[] RenameAll(IReadOnlyList<string> columns)
+            => columns
+                .Select(column => string.Equals(column, oldName, StringComparison.OrdinalIgnoreCase)
+                    ? newName
+                    : column)
+                .ToArray();
     }
 
     public EmbeddedTable Clone()
