@@ -199,8 +199,13 @@ interruption, torn and uncommitted tails, and carrier replacement.
 The ordinary pager and commit path has no fsync-failure, disk-full, torn-write,
 or power-loss injection, and there is no fuzzing or property-based testing, so
 managed durability rests on targeted deterministic tests rather than randomized
-validation. Managed CI runs Ubuntu on `net10.0`; Windows and macOS behavior is
-validated locally and through the release gates rather than on every commit.
+validation. Managed CI runs the whole suite on Linux, Windows, and macOS against
+`net8.0`, `net9.0`, and `net10.0`, and every leg fails if it executes fewer tests
+than a real run does, so a silently empty run cannot pass. Physical WAL
+coordination is implemented for Windows and 64-bit Linux only, so the
+process-isolated WAL harness must pass on those legs; on macOS the port has no
+byte-range-lock or `-shm` implementation and the harness reports as skipped
+rather than being removed from the matrix.
 
 ## Dynamic native compatibility
 

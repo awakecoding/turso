@@ -1,7 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFramework>net10.0</TargetFramework>
+        <!-- The libraries under test ship every framework in $(TursoTargetFrameworks), so the
+             suite is compiled and executed against each of them rather than only the newest. -->
+        <TargetFrameworks>$(TursoTargetFrameworks)</TargetFrameworks>
         <LangVersion>latest</LangVersion>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>

@@ -18,10 +18,17 @@ env:
   working-directory: bindings/dotnet
 
 jobs:
-  managed:
+  # Formatting is invariant across operating system and target framework, so this runs
+  # once instead of nine times. It is a separate job rather than a step inside the matrix
+  # because a formatting violation and a platform test failure are different signals and
+  # both are worth seeing in the same run; making one a prerequisite of the other would
+  # hide the second until the first was fixed.
+  #
+  # `make format-check` is used verbatim so the Makefile stays the single definition of
+  # what "formatted" means. That is safe here because this leg is Ubuntu-only; the test
+  # matrix cannot use make, since it is absent from the base Windows runner image.
+  managed-format:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     defaults:
       run:
         working-directory: ${{ env.working-directory }}
@@ -42,7 +49,100 @@ jobs:
         shell: bash
         run: make format-check
 
-      - name: Run managed-only tests without Rust
+  # The managed lane is the only coverage the C# port has for platform-specific file
+  # locking, memory mapping, and -shm carrier behaviour, so it runs the whole
+  # {ubuntu, windows, macos} x {net8.0, net9.0, net10.0} cross product.
+  #
+  # Scope: every leg runs the *full* suite rather than a per-platform subset. A subset
+  # would be a hand-maintained allow-list that silently rots, which is the same class of
+  # failure as the job that used to pass while running no tests at all. The legs run in
+  # parallel, so the wall-clock cost is roughly one leg, and this workflow only triggers
+  # on pushes to main and pull requests targeting main. If the billed macOS minutes ever
+  # become a problem, the honest lever is to remove legs from this matrix - which stays
+  # visible in the checks list - not to quietly narrow what a leg executes.
+  #
+  # `make` is deliberately not used here: it is not part of the base GitHub Windows
+  # runner image, and the managed Makefile recipes rely on bash builtins. The legs call
+  # the same pwsh runner the Makefile calls, so local and CI behaviour stay identical.
+  managed:
+    name: managed (${{ matrix.os }}, ${{ matrix.framework }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        framework: [net8.0, net9.0, net10.0]
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      # The physical WAL coordinator is implemented for Windows and 64-bit Linux only, so
+      # SqliteWalProcessIsolationHarnessTests must really pass there. On macOS the port has
+      # no byte-range-lock or -shm implementation yet and every case guards itself away, so
+      # the leg only requires the class to still be discovered. That keeps the macOS gap
+      # reported instead of letting it disappear silently.
+      - name: Run managed test suite
+        shell: pwsh
+        run: |
+          $arguments = @{
+            Framework            = '${{ matrix.framework }}'
+            MinimumExecutedTests = 2500
+            DenyNativeToolchain  = $true
+          }
+          if ($IsMacOS) {
+            $arguments.RequireDiscoveredClass = 'SqliteWalProcessIsolationHarnessTests'
+          }
+          else {
+            $arguments.RequirePassingClass = 'SqliteWalProcessIsolationHarnessTests'
+          }
+          ./scripts/Invoke-ManagedTestSuite.ps1 @arguments
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-test-results-${{ matrix.os }}-${{ matrix.framework }}
+          path: ${{ env.working-directory }}/artifacts/test-results/**/*.trx
+          if-no-files-found: error
+
+  # Packaging closure validation is platform independent and expensive, so it stays on a
+  # single Linux job instead of being repeated on all nine test legs.
+  managed-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Validate managed package closure without Rust
         shell: bash
         run: |
           set -euo pipefail
@@ -53,7 +153,7 @@ jobs:
             printf '#!/usr/bin/env bash\necho "managed .NET validation must not invoke %s" >&2\nexit 97\n' "$tool" > "$deny_directory/$tool"
             chmod +x "$deny_directory/$tool"
           done
-          PATH="$deny_directory:$PATH" CARGO="$deny_directory/cargo" RUSTC="$deny_directory/rustc" make test-managed
+          PATH="$deny_directory:$PATH" CARGO="$deny_directory/cargo" RUSTC="$deny_directory/rustc" make validate-managed-package
 
   managed-nativeaot:
     runs-on: ubuntu-latest

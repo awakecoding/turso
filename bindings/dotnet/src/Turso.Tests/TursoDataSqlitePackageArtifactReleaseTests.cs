@@ -12,6 +12,13 @@ namespace Turso.Tests;
 public class TursoDataSqlitePackageArtifactReleaseTests
 {
     private const string RawPackageTargetFrameworks = "net8.0;net9.0;net10.0";
+
+    // The in-process package validation loads packed lib assets into this test host, so it can
+    // only bind assemblies built for a framework the host runtime actually satisfies. The suite
+    // multi-targets, so the framework follows the host instead of being pinned to one TFM.
+    private static readonly string HostTargetFramework =
+        $"net{Environment.Version.Major}.{Environment.Version.Minor}";
+
     private const string ManagedPackageDescription =
         "Managed ADO.NET package for Turso: TursoConnection supports managed local and remote Hrana databases, while Turso.Data.Sqlite is a local-only Microsoft.Data.Sqlite-compatible facade. Native local and embedded replica modes use optional companion packages.";
     private const string NativePackageDescription =
@@ -39,10 +46,10 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 "..",
                 "Turso.EntityFrameworkCore.Sqlite",
                 "Turso.EntityFrameworkCore.Sqlite.csproj");
-            BuildForPackage(projectPath, "net9.0");
-            BuildForPackage(efProjectPath, "net9.0");
-            Pack(projectPath, packageDirectory, packageVersion);
-            Pack(efProjectPath, packageDirectory, packageVersion);
+            BuildForPackage(projectPath, HostTargetFramework);
+            BuildForPackage(efProjectPath, HostTargetFramework);
+            Pack(projectPath, packageDirectory, packageVersion, HostTargetFramework);
+            Pack(efProjectPath, packageDirectory, packageVersion, HostTargetFramework);
 
             var packagePath = Path.Combine(packageDirectory, $"Turso.Data.Sqlite.{packageVersion}.nupkg");
             File.Exists(packagePath).Should().BeTrue();
@@ -55,7 +62,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
             var extractionDirectory = Path.Combine(packageDirectory, "extracted");
             ZipFile.ExtractToDirectory(packagePath, extractionDirectory);
-            var libraryDirectory = Path.Combine(extractionDirectory, "lib", "net9.0");
+            var libraryDirectory = Path.Combine(extractionDirectory, "lib", HostTargetFramework);
             using (var archive = ZipFile.OpenRead(packagePath))
             {
                 archive.Entries
@@ -99,10 +106,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             EnsureUnloaded(LoadManagedConnection(libraryDirectory));
             RunManagedPackageConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -118,10 +128,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             Pack(projectPath, packageDirectory, packageVersion);
             RunManagedReplicaOptionsConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -151,10 +164,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
                 NativePackageDescription);
             RunNativePackageConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -206,10 +222,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
             RunSyncPackageConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -258,10 +277,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
             dependencyGroups.Should().OnlyContain(group =>
                 !group.Elements().Any(element => element.Name.LocalName == "dependency"));
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     [Test]
@@ -319,10 +341,13 @@ public class TursoDataSqlitePackageArtifactReleaseTests
 
             RestoreNativeAotPackageConsumer(packageDirectory, packageVersion);
         }
-        finally
+        catch
         {
-            DeletePackageDirectory(packageDirectory);
+            DeletePackageDirectoryWithoutMaskingFailure(packageDirectory);
+            throw;
         }
+
+        DeletePackageDirectory(packageDirectory);
     }
 
     private static WeakReference LoadManagedConnection(string libraryDirectory)
@@ -661,7 +686,7 @@ public class TursoDataSqlitePackageArtifactReleaseTests
               <Project Sdk="Microsoft.NET.Sdk">
                 <PropertyGroup>
                   <OutputType>Exe</OutputType>
-                  <TargetFramework>net9.0</TargetFramework>
+                  <TargetFramework>{{HostTargetFramework}}</TargetFramework>
                   <ImplicitUsings>enable</ImplicitUsings>
                 </PropertyGroup>
                 <ItemGroup>
@@ -926,6 +951,23 @@ public class TursoDataSqlitePackageArtifactReleaseTests
         process.WaitForExit();
         Task.WaitAll(output, error);
         Assert.That(process.ExitCode, Is.EqualTo(0), output.Result + Environment.NewLine + error.Result);
+    }
+
+    // Cleanup on the failure path must never replace the real assertion failure with a Windows
+    // sharing violation: when a test throws, a leaked handle is a symptom of that failure, not
+    // the failure itself, and masking it hides the actual defect.
+    private static void DeletePackageDirectoryWithoutMaskingFailure(string packageDirectory)
+    {
+        try
+        {
+            DeletePackageDirectory(packageDirectory);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private static void DeletePackageDirectory(string packageDirectory)
