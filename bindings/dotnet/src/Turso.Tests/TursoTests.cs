@@ -397,11 +397,12 @@ public class TursoTests
         var tempPath = Path.Combine(Path.GetTempPath(), $"turso_test_encrypted_{Guid.NewGuid()}.db");
         var hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
         var wrongKey = "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        NativeProviderTestFixture.EnsureRegistered();
 
         try
         {
             // Create encrypted database
-            using (var connection = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={hexkey}"))
+            using (var connection = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={hexkey};Local Provider=Native"))
             {
                 connection.Open();
 
@@ -422,7 +423,7 @@ public class TursoTests
             contentStr.Should().NotContain("secret");
 
             // Verify we can re-open with the same key
-            using (var connection2 = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={hexkey}"))
+            using (var connection2 = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={hexkey};Local Provider=Native"))
             {
                 connection2.Open();
 
@@ -435,7 +436,7 @@ public class TursoTests
             // Verify opening with wrong key fails
             Action openWithWrongKey = () =>
             {
-                using var conn = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={wrongKey}");
+                using var conn = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={wrongKey};Local Provider=Native");
                 conn.Open();
                 using var select = new TursoCommand(conn, "SELECT * FROM t");
                 using var reader = select.ExecuteReader();
@@ -446,7 +447,7 @@ public class TursoTests
             // Verify opening without encryption fails
             Action openWithoutEncryption = () =>
             {
-                using var conn = new TursoConnection($"Data Source={tempPath}");
+                using var conn = new TursoConnection($"Data Source={tempPath};Local Provider=Native");
                 conn.Open();
                 using var select = new TursoCommand(conn, "SELECT * FROM t");
                 using var reader = select.ExecuteReader();

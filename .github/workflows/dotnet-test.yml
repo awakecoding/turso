@@ -9,6 +9,7 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -16,13 +17,213 @@ concurrency:
 
 env:
   working-directory: bindings/dotnet
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: 10
 
 jobs:
+  # Formatting is invariant across operating system and target framework, so this runs
+  # once instead of nine times. It is a separate job rather than a step inside the matrix
+  # because a formatting violation and a platform test failure are different signals and
+  # both are worth seeing in the same run; making one a prerequisite of the other would
+  # hide the second until the first was fixed.
+  #
+  # `make format-check` is used verbatim so the Makefile stays the single definition of
+  # what "formatted" means. That is safe here because this leg is Ubuntu-only; the test
+  # matrix cannot use make, since it is absent from the base Windows runner image.
+  managed-format:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Verify formatting
+        shell: bash
+        run: make format-check
+
+  # The managed lane is the only coverage the C# port has for platform-specific file
+  # locking, memory mapping, and -shm carrier behaviour, so it runs the whole
+  # {ubuntu, windows, macos} x {net8.0, net9.0, net10.0} cross product.
+  #
+  # Scope: every leg runs the *full* suite rather than a per-platform subset. A subset
+  # would be a hand-maintained allow-list that silently rots, which is the same class of
+  # failure as the job that used to pass while running no tests at all. That is not a
+  # theoretical worry: expanding this matrix found a net8.0-only packaging defect in
+  # TursoDataSqlitePackageArtifactReleaseTests, which no "platform-focused" subset would
+  # have contained, because nothing about it looks platform-specific until you run it.
+  #
+  # Cost: one leg is roughly 19 minutes of test time on a developer machine, but hosted
+  # runners are far slower - run 30283745949 had all six Linux and Windows legs killed by
+  # a 45-minute timeout while still inside the test step. The timeout below is therefore
+  # sized against measured runner speed, not local speed. The suite runs serially (NUnit
+  # has no assembly-level Parallelizable attribute here), so there is no cheap
+  # concurrency win to take without changing test isolation semantics. The legs run in
+  # parallel with each other, so wall-clock is about one leg, and this workflow only
+  # triggers on pushes to main and pull requests targeting main. If that ever becomes too
+  # expensive, the honest lever is to remove legs from this matrix - which stays visible
+  # in the checks list - not to quietly narrow what a leg executes.
+  #
+  # `make` is deliberately not used here: it is not part of the base GitHub Windows
+  # runner image, and the managed Makefile recipes rely on bash builtins. The legs call
+  # the same pwsh runner the Makefile calls, so local and CI behaviour stay identical.
+  managed:
+    name: managed (${{ matrix.os }}, ${{ matrix.framework }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        framework: [net8.0, net9.0, net10.0]
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      # The physical WAL coordinator is implemented for Windows and 64-bit Linux only, so
+      # SqliteWalProcessIsolationHarnessTests must really pass there.
+      #
+      # macOS is a different story, and the matrix is what surfaced it: the managed engine
+      # cannot open a file-backed database on macOS *at all*. SqliteWalByteRangeLock builds
+      # its "closing an unrelated descriptor cannot release a lease" guarantee on Linux OFD
+      # locks (F_OFD_SETLK), which Darwin does not implement, so SqliteManagedFileOwnership
+      # throws PlatformNotSupportedException for every physical open. Run 30281042716 failed
+      # 236 macOS tests, all of them from that one primitive.
+      #
+      # Rather than skip macOS - which would recreate the empty-green-job problem - the legs
+      # run the full suite and allow failures *only* when they carry that exact documented
+      # message. Any other macOS failure is a real regression and fails the leg, the ~3,200
+      # tests that do pass on macOS are protected from that point on, and the allowance
+      # cannot outlive the gap: the runner reports when nothing matches it any more.
+      - name: Run managed test suite
+        shell: pwsh
+        run: |
+          $arguments = @{
+            Framework            = '${{ matrix.framework }}'
+            MinimumExecutedTests = 2500
+            DenyNativeToolchain  = $true
+            HangTimeoutMinutes   = 10
+          }
+          if ($IsMacOS) {
+            $arguments.RequireDiscoveredClass = 'SqliteWalProcessIsolationHarnessTests'
+            $arguments.KnownGapFailurePattern = 'Managed physical databases require SQLite main-file byte-range locks'
+            $arguments.KnownGapReason = 'the managed engine has no macOS byte-range lock implementation, so no file-backed database can be opened there (Linux uses F_OFD_SETLK, which Darwin lacks)'
+          }
+          else {
+            $arguments.RequirePassingClass = 'SqliteWalProcessIsolationHarnessTests'
+          }
+          ./scripts/Invoke-ManagedTestSuite.ps1 @arguments
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-test-results-${{ matrix.os }}-${{ matrix.framework }}
+          path: |
+            ${{ env.working-directory }}/artifacts/test-results/**/*.trx
+            ${{ env.working-directory }}/artifacts/test-results/**/Sequence*.xml
+          if-no-files-found: error
+
+  # Packaging closure validation is platform independent and expensive, so it stays on a
+  # single Linux job instead of being repeated on all nine test legs.
+  managed-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Validate managed package closure without Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          deny_directory="$PWD/.managed-toolchain-deny"
+          mkdir -p "$deny_directory"
+          trap 'rm -rf "$deny_directory"' EXIT
+          for tool in cargo rustc; do
+            printf '#!/usr/bin/env bash\necho "managed .NET validation must not invoke %s" >&2\nexit 97\n' "$tool" > "$deny_directory/$tool"
+            chmod +x "$deny_directory/$tool"
+          done
+          PATH="$deny_directory:$PATH" CARGO="$deny_directory/cargo" RUSTC="$deny_directory/rustc" make validate-managed-package
+
+  managed-nativeaot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Verify NativeAOT prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang --version
+          test -f /usr/include/zlib.h
+
+      - name: Validate managed NativeAOT closure without Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          deny_directory="$PWD/.managed-toolchain-deny"
+          mkdir -p "$deny_directory"
+          trap 'rm -rf "$deny_directory"' EXIT
+          for tool in cargo rustc; do
+            printf '#!/usr/bin/env bash\necho "managed NativeAOT validation must not invoke %s" >&2\nexit 97\n' "$tool" > "$deny_directory/$tool"
+            chmod +x "$deny_directory/$tool"
+          done
+          PATH="$deny_directory:$PATH" CARGO="$deny_directory/cargo" RUSTC="$deny_directory/rustc" make validate-managed-nativeaot
+
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: 10
 
     defaults:
       run:
@@ -45,10 +246,13 @@ jobs:
           cache-on-failure: true
 
 
-      - name: Install dotnet sdk 9.0
+      - name: Install dotnet SDKs
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
 
-      - name: Run tests
-        run: make test
+      - name: Run native-inclusive tests
+        run: make test-native

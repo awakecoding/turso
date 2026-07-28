@@ -22,6 +22,16 @@ public static class Resources
 
     public static string SqlBlobRequiresOpenConnection => "SqliteBlob requires an open connection.";
 
+    public static string ManagedExtensionsNotSupported => "SQLite extension loading is not supported when Local Provider=Managed because extensions require the native SQLite loader.";
+
+    public static string ManagedSharedCacheNotSupported => ManagedSharedCacheContract.UnsupportedConfigurationMessage;
+
+    public static string ManagedSharedCacheReadUncommittedNotSupported => ManagedSharedCacheContract.ReadUncommittedNotSupportedMessage;
+
+    public static string ManagedSharedCacheCallbacksNotSupported => "Managed shared-memory databases do not support connection-local functions, aggregates, or collations because the managed catalog is shared across connections.";
+
+    public static string ManagedMemoryEncryptionNotSupported => "Encryption is supported only for file-backed databases when Local Provider=Managed.";
+
     public static string InvalidOffsetAndCount => "Offset and count were out of bounds for the array.";
 
     public static string SqliteNativeError(object? errorCode, object? message) => $"SQLite Error {errorCode}: '{message}'.";
@@ -67,6 +77,30 @@ public static class Resources
     public static string UDFCalledWithNull(object? function, object? ordinal) => $"Function {function} was called with a NULL value at ordinal {ordinal}.";
 
     public static string ParallelTransactionsNotSupported => "Parallel transactions are not supported.";
+
+    public static string ManagedBackupMixedProvidersNotSupported => "BackupDatabase does not support copying between managed and native providers.";
+
+    public static string ManagedBackupAttachedDatabasesNotSupported => "BackupDatabase supports only the main database when Local Provider=Managed.";
+
+    public static string ManagedBackupSameConnectionNotSupported => "BackupDatabase requires distinct source and destination connections when Local Provider=Managed.";
+
+    public static string ManagedBackupDestinationMustBeEmpty => "BackupDatabase requires an empty destination when Local Provider=Managed.";
+
+    public static string ManagedBackupPhysicalFileIdentityNotSupported => "BackupDatabase cannot safely copy between file systems with unknown identity semantics when Local Provider=Managed.";
+
+    public static string ManagedBackupSchemaObjectNotSupported(object? type) => $"BackupDatabase does not support schema object type '{type}' when Local Provider=Managed.";
+
+    public static string ManagedBackupRowidNotAccessible(object? table) => $"BackupDatabase cannot preserve rowids for table '{table}' when Local Provider=Managed because all rowid aliases are declared columns.";
+
+    public static string ManagedBackupColumnCountMismatch(object? table) => $"BackupDatabase could not read all columns for table '{table}' when Local Provider=Managed.";
+
+    public static string ManagedVfsNotSupported => "Vfs is not supported when Local Provider=Managed because the managed engine does not use native SQLite VFS implementations.";
+
+    public static string HooksRequireManagedProvider => "Update, commit, rollback, authorizer, trace, and progress callbacks are implemented only by the managed engine; open the connection with Local Provider=Managed.";
+
+    public static string ManagedSharedCacheHooksNotSupported => "Managed shared-memory databases do not support update, commit, rollback, authorizer, trace, or progress callbacks because the managed catalog is shared across connections.";
+
+    public static string ProgressIntervalOutOfRange => "The progress handler step interval must be greater than zero.";
 
     public static string AmbiguousColumnName(object? name, object? column1, object? column2) => $"Column name {name} is ambiguous between {column1} and {column2}.";
 

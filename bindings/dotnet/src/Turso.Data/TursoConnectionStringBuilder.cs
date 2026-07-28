@@ -2,7 +2,6 @@ using System.Collections.ObjectModel;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
-using Turso.Raw.Public.Value;
 
 namespace Turso;
 
@@ -42,6 +41,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["SyncInterval"] = "Sync Interval",
         ["Tls"] = "Tls",
         ["TLS"] = "Tls",
+        ["Local Provider"] = "Local Provider",
+        ["LocalProvider"] = "Local Provider",
     };
 
     public TursoConnectionStringBuilder()
@@ -141,6 +142,13 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         set => this["Read Your Writes"] = value;
     }
 
+    /// <summary>
+    /// Gets or sets the reserved automatic synchronization interval.
+    /// </summary>
+    /// <remarks>
+    /// Only zero is supported. Positive values are preserved for connection-string
+    /// compatibility but are rejected when the connection opens.
+    /// </remarks>
     public int SyncInterval
     {
         get => GetInt("Sync Interval", 0);
@@ -156,6 +164,14 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         get => GetNullableBool("Tls");
         set => SetNullable("Tls", value);
     }
+
+    public TursoLocalProvider LocalProvider
+    {
+        get => GetEnum("Local Provider", TursoLocalProvider.Native);
+        set => this["Local Provider"] = value;
+    }
+
+    internal bool IsLocalProviderConfigured => base.ContainsKey("Local Provider");
 
     [AllowNull]
     public override object this[string keyword]
@@ -250,6 +266,25 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         return TryGetValue(keyword, out var value)
             ? Convert.ToInt32(value, CultureInfo.InvariantCulture)
             : defaultValue;
+    }
+
+    private TEnum GetEnum<TEnum>(string keyword, TEnum defaultValue)
+        where TEnum : struct, Enum
+    {
+        if (!TryGetValue(keyword, out var value))
+            return defaultValue;
+
+        if (value is TEnum typedValue && Enum.IsDefined(typedValue))
+            return typedValue;
+
+        if (value is string stringValue
+            && Enum.TryParse<TEnum>(stringValue, ignoreCase: true, out var parsedValue)
+            && Enum.IsDefined(parsedValue))
+        {
+            return parsedValue;
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(value), value, $"Invalid {keyword} value.");
     }
 
     private void SetNullable<T>(string keyword, T? value)

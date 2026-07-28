@@ -60,6 +60,7 @@ testing/*.log
 limbostress.log
 simulator.log
 **/*.txt
+!bindings/dotnet/src/Turso.Tests/Conformance/*.txt
 profile.json.gz
 simulator-output/
 tests/*.sql

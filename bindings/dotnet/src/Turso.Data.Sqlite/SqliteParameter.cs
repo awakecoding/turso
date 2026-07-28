@@ -2,7 +2,8 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
-using Turso.Raw.Public.Value;
+using Turso.Core;
+using Turso;
 
 namespace Turso.Data.Sqlite;
 
@@ -115,6 +116,14 @@ public class SqliteParameter : DbParameter
 
     public override bool SourceColumnNullMapping { get; set; }
 
+    /// <summary>
+    /// Gets or sets the <see cref="DataRowVersion"/> read when the parameter is filled from
+    /// a <see cref="DataRow"/>. The base implementation discards the value, which would make
+    /// <see cref="Turso.TursoCommandBuilder"/>'s optimistic-concurrency predicates compare
+    /// current instead of original values.
+    /// </summary>
+    public override DataRowVersion SourceVersion { get; set; } = DataRowVersion.Current;
+
     public override int Size
     {
         get => _size
@@ -143,7 +152,9 @@ public class SqliteParameter : DbParameter
 
     internal bool HasValue => _hasValue;
 
-    internal TursoValue ToTursoValue()
+    internal bool HasSize => _size.HasValue;
+
+    internal TursoValue ToNativeValue()
     {
         if (Value is null || Value == DBNull.Value)
             return TursoValue.Null();
@@ -154,6 +165,21 @@ public class SqliteParameter : DbParameter
             SqliteType.Real => TursoValue.Real(ToDouble(Value)),
             SqliteType.Blob => TursoValue.Blob(ToBytes(Value)),
             SqliteType.Text => TursoValue.String(ApplySize(ToInvariantString(Value))),
+            _ => throw new ArgumentOutOfRangeException()
+        };
+    }
+
+    internal SqlValue ToSqlValue()
+    {
+        if (Value is null or DBNull)
+            return SqlValue.Null;
+
+        return SqliteType switch
+        {
+            SqliteType.Integer => SqlValue.Integer(ToInt64(Value)),
+            SqliteType.Real => SqlValue.Real(ToDouble(Value)),
+            SqliteType.Blob => SqlValue.Blob(ToBytes(Value)),
+            SqliteType.Text => SqlValue.Text(ApplySize(ToInvariantString(Value))),
             _ => throw new ArgumentOutOfRangeException()
         };
     }

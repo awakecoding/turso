@@ -1,6 +1,6 @@
 using Turso.Data.Sqlite;
 
-using var connection = new SqliteConnection("Data Source=:memory:");
+using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Native");
 connection.Open();
 
 using (var command = connection.CreateCommand())

@@ -10,5 +10,18 @@ public sealed class TursoSqliteQueryableMethodTranslatingExpressionVisitorFactor
         => new TursoSqliteQueryableMethodTranslatingExpressionVisitor(
             dependencies,
             relationalDependencies,
-            (RelationalQueryCompilationContext)queryCompilationContext);
+            (RelationalQueryCompilationContext)queryCompilationContext,
+            areJsonEachFunctionsSupported: true);
+}
+
+public sealed class TursoManagedSqliteQueryableMethodTranslatingExpressionVisitorFactory(
+    QueryableMethodTranslatingExpressionVisitorDependencies dependencies,
+    RelationalQueryableMethodTranslatingExpressionVisitorDependencies relationalDependencies) : IQueryableMethodTranslatingExpressionVisitorFactory
+{
+    public QueryableMethodTranslatingExpressionVisitor Create(QueryCompilationContext queryCompilationContext)
+        => new TursoSqliteQueryableMethodTranslatingExpressionVisitor(
+            dependencies,
+            relationalDependencies,
+            (RelationalQueryCompilationContext)queryCompilationContext,
+            areJsonEachFunctionsSupported: false);
 }

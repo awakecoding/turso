@@ -7,16 +7,16 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
-using Turso.Raw.Public;
-using Turso.Raw.Public.Handles;
-using Turso.Raw.Public.Value;
+using Turso;
+using Turso.Core;
 
 namespace Turso.Data.Sqlite;
 
-public class SqliteDataReader : DbDataReader
+public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 {
     private readonly SqliteCommand _command;
-    private TursoStatementHandle? _statement;
+    private readonly SqliteConnection _connection;
+    private SqliteStatementAdapter? _statement;
     private string _currentSql = string.Empty;
     private readonly List<string> _remainingSql = new();
     private readonly CommandBehavior _behavior;
@@ -26,26 +26,123 @@ public class SqliteDataReader : DbDataReader
     private bool _hasCurrentRow;
     private bool _hasPrefetchedRow;
     private bool _hadResultSet;
+    private bool _hadRecordsAffectedStatement;
     private bool _currentStatementRowsAffectedCounted;
 
-    internal SqliteDataReader(SqliteCommand command, TursoStatementHandle statement, string currentSql, List<string> remainingSql, int recordsAffected, CommandBehavior behavior, Action closeCallback)
+    private enum ReaderValueKind
+    {
+        Empty,
+        Null,
+        Integer,
+        Real,
+        Text,
+        Blob,
+    }
+
+    private readonly struct ReaderValue
+    {
+        private readonly TursoValue _nativeValue;
+        private readonly ManagedResultValue _managedValue;
+        private readonly bool _isManaged;
+
+        private ReaderValue(TursoValue nativeValue)
+        {
+            _nativeValue = nativeValue;
+        }
+
+        private ReaderValue(ManagedResultValue managedValue)
+        {
+            _managedValue = managedValue;
+            _isManaged = true;
+        }
+
+        public ReaderValueKind Kind => _isManaged
+            ? _managedValue.Kind switch
+            {
+                ManagedResultValueKind.Null => ReaderValueKind.Null,
+                ManagedResultValueKind.Integer => ReaderValueKind.Integer,
+                ManagedResultValueKind.Real => ReaderValueKind.Real,
+                ManagedResultValueKind.Text => ReaderValueKind.Text,
+                ManagedResultValueKind.Blob => ReaderValueKind.Blob,
+                _ => throw new InvalidOperationException($"Unknown managed result value kind {_managedValue.Kind}."),
+            }
+            : _nativeValue.ValueType switch
+            {
+                TursoValueType.Empty => ReaderValueKind.Empty,
+                TursoValueType.Null => ReaderValueKind.Null,
+                TursoValueType.Integer => ReaderValueKind.Integer,
+                TursoValueType.Real => ReaderValueKind.Real,
+                TursoValueType.Text => ReaderValueKind.Text,
+                TursoValueType.Blob => ReaderValueKind.Blob,
+                _ => throw new InvalidOperationException($"Unknown native result value type {_nativeValue.ValueType}."),
+            };
+
+        public long Integer => _isManaged ? _managedValue.AsInteger() : _nativeValue.IntValue;
+
+        public double Real => _isManaged ? _managedValue.AsReal() : _nativeValue.RealValue;
+
+        public string Text => _isManaged ? _managedValue.AsText() : _nativeValue.StringValue;
+
+        public byte[] Blob => _isManaged ? _managedValue.AsBlob().ToArray() : _nativeValue.BlobValue;
+
+        public static ReaderValue FromNative(TursoValue value) => new(value);
+
+        public static ReaderValue FromManaged(ManagedResultValue value) => new(value);
+    }
+
+    internal SqliteDataReader(
+        SqliteCommand command,
+        SqliteStatementAdapter statement,
+        string currentSql,
+        List<string> remainingSql,
+        int recordsAffected,
+        CommandBehavior behavior,
+        Action closeCallback)
+        : this(
+            command,
+            statement,
+            currentSql,
+            remainingSql,
+            recordsAffected,
+            hadRecordsAffectedStatement: false,
+            behavior,
+            closeCallback)
+    {
+    }
+
+    internal SqliteDataReader(
+        SqliteCommand command,
+        SqliteStatementAdapter statement,
+        string currentSql,
+        List<string> remainingSql,
+        int recordsAffected,
+        bool hadRecordsAffectedStatement,
+        CommandBehavior behavior,
+        Action closeCallback)
     {
         _command = command;
+        _connection = command.Connection
+            ?? throw new InvalidOperationException("A data reader requires an associated connection.");
         _statement = statement;
         _currentSql = currentSql;
         _hadResultSet = true;
         _remainingSql = remainingSql;
         _recordsAffected = recordsAffected;
+        _hadRecordsAffectedStatement = hadRecordsAffectedStatement;
         _behavior = behavior;
         _closeCallback = closeCallback;
+        ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
     internal SqliteDataReader(SqliteCommand command, int recordsAffected, CommandBehavior behavior, Action closeCallback)
     {
         _command = command;
+        _connection = command.Connection
+            ?? throw new InvalidOperationException("A data reader requires an associated connection.");
         _recordsAffected = recordsAffected;
         _behavior = behavior;
         _closeCallback = closeCallback;
+        ((ILocalReaderConnection)_connection).ReaderOpened(this);
     }
 
     public override int Depth => 0;
@@ -55,7 +152,13 @@ public class SqliteDataReader : DbDataReader
         get
         {
             EnsureOpen();
-            return _statement is null ? 0 : TursoBindings.GetFieldCount(_statement);
+            if (_statement is null)
+                return 0;
+
+            var statement = GetStatement();
+            return statement.UsesManagedResults
+                ? statement.ManagedResultMetadata.ColumnCount
+                : statement.ColumnCount;
         }
     }
 
@@ -64,17 +167,24 @@ public class SqliteDataReader : DbDataReader
         get
         {
             EnsureOpen();
-            return _statement is not null && !Regex.IsMatch(_currentSql, @"\bWHERE\b\s+0\s*=\s*1\b", RegexOptions.IgnoreCase);
+            if (_statement is null)
+                return false;
+
+            return _command.Connection?.UsesManagedDatabase == true
+                ? GetStatement().HasRows()
+                : !Regex.IsMatch(_currentSql, @"\bWHERE\b\s+0\s*=\s*1\b", RegexOptions.IgnoreCase);
         }
     }
 
-    public override bool IsClosed => _isClosed || (_statement?.IsInvalid ?? false);
+    public override bool IsClosed => _isClosed
+        || _command.Connection?.State != ConnectionState.Open
+        || (_statement?.IsInvalid ?? false);
 
     public override int RecordsAffected
     {
         get
         {
-            if (_recordsAffected > 0)
+            if (_recordsAffected > 0 || _hadRecordsAffectedStatement)
                 return _recordsAffected;
 
             return _statement is null ? _hadResultSet ? -1 : _recordsAffected : -1;
@@ -89,7 +199,7 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        if (value.ValueType == TursoValueType.Text && bool.TryParse(value.StringValue, out var boolValue))
+        if (value.Kind == ReaderValueKind.Text && bool.TryParse(value.Text, out var boolValue))
             return boolValue;
 
         return GetInt64(ordinal) != 0;
@@ -104,67 +214,41 @@ public class SqliteDataReader : DbDataReader
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
         EnsureOpen();
-        var statement = GetStatement();
-        var bytes = ToBytes(GetTypedValue(ordinal));
-        if (buffer is null)
-            return bytes.Length;
-
-        if (dataOffset >= bytes.Length)
-            return 0;
-
-        var bytesToCopy = Math.Min(length, bytes.Length - (int)dataOffset);
-        bytesToCopy = Math.Min(bytesToCopy, buffer.Length - bufferOffset);
-        Array.Copy(bytes, (int)dataOffset, buffer, bufferOffset, bytesToCopy);
-        return bytesToCopy;
+        return CopyValue(GetBlobValue(ordinal), dataOffset, buffer, bufferOffset, length);
     }
 
     public override char GetChar(int ordinal)
     {
         EnsureOpen();
-        var statement = GetStatement();
         var value = GetTypedValue(ordinal);
-        if (value.ValueType == TursoValueType.Text && value.StringValue.Length == 1)
-            return value.StringValue[0];
+        if (value.Kind == ReaderValueKind.Text && value.Text.Length == 1)
+            return value.Text[0];
 
-        return (char)value.IntValue;
+        return (char)value.Integer;
     }
 
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
     {
         EnsureOpen();
-        var chars = GetString(ordinal).ToCharArray();
-        if (buffer is null)
-            return chars.Length;
-
-        if (dataOffset > chars.Length)
-            throw new ArgumentOutOfRangeException(nameof(dataOffset));
-
-        if (dataOffset >= chars.Length)
-            return 0;
-
-        var charsToCopy = Math.Min(length, chars.Length - (int)dataOffset);
-        charsToCopy = Math.Min(charsToCopy, buffer.Length - bufferOffset);
-        Array.Copy(chars, (int)dataOffset, buffer, bufferOffset, charsToCopy);
-        return charsToCopy;
+        return CopyValue(GetTextValue(ordinal).ToCharArray(), dataOffset, buffer, bufferOffset, length);
     }
 
     public override string GetDataTypeName(int ordinal)
     {
         EnsureOpen();
-        var statement = GetStatement();
         ValidateOrdinal(ordinal);
         var declaredType = GetDeclaredTypeName(ordinal);
         if (!string.IsNullOrEmpty(declaredType))
             return declaredType;
 
-        return TursoBindings.GetValue(statement, ordinal).ValueType switch
+        return CurrentValueKind(ordinal) switch
         {
-            TursoValueType.Null => "BLOB",
-            TursoValueType.Integer => "INTEGER",
-            TursoValueType.Real => "REAL",
-            TursoValueType.Text => "TEXT",
-            TursoValueType.Blob => "BLOB",
-            TursoValueType.Empty => InferDataTypeName(GetName(ordinal)),
+            ReaderValueKind.Null => "BLOB",
+            ReaderValueKind.Integer => "INTEGER",
+            ReaderValueKind.Real => "REAL",
+            ReaderValueKind.Text => "TEXT",
+            ReaderValueKind.Blob => "BLOB",
+            ReaderValueKind.Empty => InferDataTypeName(GetName(ordinal)),
             _ => throw new InvalidEnumArgumentException()
         };
     }
@@ -173,11 +257,11 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        return value.ValueType switch
+        return value.Kind switch
         {
-            TursoValueType.Text => ParseDateTime(value.StringValue),
-            TursoValueType.Real => DateTime.FromOADate(value.RealValue - 2415018.5),
-            TursoValueType.Integer => DateTime.FromOADate(value.IntValue - 2415018.5),
+            ReaderValueKind.Text => ParseDateTime(value.Text),
+            ReaderValueKind.Real => DateTime.FromOADate(value.Real - 2415018.5),
+            ReaderValueKind.Integer => DateTime.FromOADate(value.Integer - 2415018.5),
             _ => DateTime.Parse(GetString(ordinal), CultureInfo.InvariantCulture)
         };
     }
@@ -186,11 +270,11 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        return value.ValueType switch
+        return value.Kind switch
         {
-            TursoValueType.Text => ParseDateTimeOffset(value.StringValue),
-            TursoValueType.Real => new DateTimeOffset(DateTime.SpecifyKind(DateTime.FromOADate(value.RealValue - 2415018.5), DateTimeKind.Unspecified), TimeSpan.Zero),
-            TursoValueType.Integer => new DateTimeOffset(DateTime.SpecifyKind(DateTime.FromOADate(value.IntValue - 2415018.5), DateTimeKind.Unspecified), TimeSpan.Zero),
+            ReaderValueKind.Text => ParseDateTimeOffset(value.Text),
+            ReaderValueKind.Real => new DateTimeOffset(DateTime.SpecifyKind(DateTime.FromOADate(value.Real - 2415018.5), DateTimeKind.Unspecified), TimeSpan.Zero),
+            ReaderValueKind.Integer => new DateTimeOffset(DateTime.SpecifyKind(DateTime.FromOADate(value.Integer - 2415018.5), DateTimeKind.Unspecified), TimeSpan.Zero),
             _ => ParseDateTimeOffset(GetString(ordinal))
         };
     }
@@ -199,11 +283,11 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        return value.ValueType switch
+        return value.Kind switch
         {
-            TursoValueType.Text => decimal.Parse(value.StringValue, NumberStyles.Float, CultureInfo.InvariantCulture),
-            TursoValueType.Real => Convert.ToDecimal(value.RealValue, CultureInfo.InvariantCulture),
-            TursoValueType.Integer => value.IntValue,
+            ReaderValueKind.Text => decimal.Parse(value.Text, NumberStyles.Float, CultureInfo.InvariantCulture),
+            ReaderValueKind.Real => Convert.ToDecimal(value.Real, CultureInfo.InvariantCulture),
+            ReaderValueKind.Integer => value.Integer,
             _ => Convert.ToDecimal(GetValue(ordinal), CultureInfo.InvariantCulture)
         };
     }
@@ -212,11 +296,11 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        return value.ValueType switch
+        return value.Kind switch
         {
-            TursoValueType.Integer => value.IntValue,
-            TursoValueType.Text => double.Parse(value.StringValue, NumberStyles.Float, CultureInfo.InvariantCulture),
-            _ => value.RealValue
+            ReaderValueKind.Integer => value.Integer,
+            ReaderValueKind.Text => double.Parse(value.Text, NumberStyles.Float, CultureInfo.InvariantCulture),
+            _ => value.Real
         };
     }
 
@@ -226,9 +310,8 @@ public class SqliteDataReader : DbDataReader
     public override Type GetFieldType(int ordinal)
     {
         EnsureOpen();
-        var statement = GetStatement();
         ValidateOrdinal(ordinal);
-        var valueType = TursoBindings.GetValue(statement, ordinal).ValueType;
+        var valueType = CurrentValueKind(ordinal);
         var declaredType = GetDeclaredTypeName(ordinal);
         if (!string.IsNullOrEmpty(declaredType))
             return GetClrTypeFromSqliteType(declaredType, valueType);
@@ -318,11 +401,11 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        return value.ValueType switch
+        return value.Kind switch
         {
-            TursoValueType.Integer => value.IntValue,
-            TursoValueType.Real => (long)value.RealValue,
-            TursoValueType.Text => long.Parse(value.StringValue, NumberStyles.Integer, CultureInfo.InvariantCulture),
+            ReaderValueKind.Integer => value.Integer,
+            ReaderValueKind.Real => (long)value.Real,
+            ReaderValueKind.Text => long.Parse(value.Text, NumberStyles.Integer, CultureInfo.InvariantCulture),
             _ => Convert.ToInt64(GetValue(ordinal), CultureInfo.InvariantCulture)
         };
     }
@@ -332,31 +415,21 @@ public class SqliteDataReader : DbDataReader
         EnsureOpen();
         var statement = GetStatement();
         ValidateOrdinal(ordinal);
-        return TursoBindings.GetName(statement, ordinal);
+        return statement.UsesManagedResults
+            ? statement.ManagedResultMetadata.GetColumn(ordinal).Name
+            : statement.GetName(ordinal);
     }
 
     public override Stream GetStream(int ordinal)
     {
         EnsureOpen();
-        var value = GetTypedValue(ordinal);
-        var bytes = ToBytes(value);
-        if (ShouldReturnBlobStream(ordinal, value))
-            return new SqliteBlob(bytes);
-
-        return new MemoryStream(bytes, writable: false);
+        return new MemoryStream(GetBlobValue(ordinal).ToArray(), writable: false);
     }
 
     public override TextReader GetTextReader(int ordinal)
     {
         EnsureOpen();
-        if (IsDBNull(ordinal))
-            return new StringReader(string.Empty);
-
-        var bytes = Encoding.UTF8.GetBytes(GetString(ordinal));
-        Stream stream = ShouldReturnBlobStream(ordinal, TursoValue.String(GetString(ordinal)))
-            ? new SqliteBlob(bytes)
-            : new MemoryStream(bytes, writable: false);
-        return new StreamReader(stream, Encoding.UTF8);
+        return new StringReader(GetTextValue(ordinal));
     }
 
     public override int GetOrdinal(string name)
@@ -393,7 +466,6 @@ public class SqliteDataReader : DbDataReader
     public override DataTable GetSchemaTable()
     {
         EnsureOpen();
-        var statement = GetStatement();
         var schema = new DataTable("SchemaTable");
         schema.Columns.Add(SchemaTableColumn.ColumnName, typeof(string));
         schema.Columns.Add(SchemaTableColumn.ColumnOrdinal, typeof(int));
@@ -426,13 +498,14 @@ public class SqliteDataReader : DbDataReader
             var baseColumnName = ResolveBaseColumnName(selection, columnName, tableColumns);
             SchemaColumnInfo? columnInfo = null;
             var hasBaseColumn = baseColumnName is not null && tableName is not null && tableColumns.TryGetValue(baseColumnName, out columnInfo);
-            var valueType = TursoBindings.GetValue(statement, i).ValueType;
-            if (valueType is TursoValueType.Empty or TursoValueType.Null)
-                valueType = GetSampleValueType(i);
-
             var info = hasBaseColumn
                 ? columnInfo ?? throw new InvalidOperationException(Properties.Resources.NoData)
                 : null;
+            var valueType = _hasCurrentRow ? ReadValue(i).Kind : ReaderValueKind.Empty;
+            if (valueType == ReaderValueKind.Empty && !string.IsNullOrEmpty(info?.TypeName))
+                valueType = GetValueKindFromTypeName(info.TypeName);
+            else if (valueType is ReaderValueKind.Empty or ReaderValueKind.Null)
+                valueType = GetSampleValueType(i);
             var dataTypeName = info is not null
                 ? StripTypeLength(info.TypeName)
                 : GetDataTypeNameFromValueType(valueType, selection);
@@ -440,13 +513,15 @@ public class SqliteDataReader : DbDataReader
                 ? GetClrTypeFromSqliteType(info.TypeName, valueType)
                 : GetClrTypeFromValueType(valueType);
             var isExpression = info is null;
+            var isAliased = info is null
+                || !string.Equals(info.Name, columnName, StringComparison.Ordinal);
             var row = schema.NewRow();
             row[SchemaTableColumn.ColumnName] = columnName;
             row[SchemaTableColumn.ColumnOrdinal] = i;
             row[SchemaTableColumn.ColumnSize] = -1;
             row[SchemaTableColumn.NumericPrecision] = DBNull.Value;
             row[SchemaTableColumn.NumericScale] = DBNull.Value;
-            row[SchemaTableColumn.IsUnique] = info is not null ? info.IsUnique : DBNull.Value;
+            row[SchemaTableColumn.IsUnique] = info is not null ? !isAliased && info.IsUnique : DBNull.Value;
             row[SchemaTableColumn.IsKey] = info is not null ? info.IsKey : DBNull.Value;
             row["BaseServerName"] = "";
             row["BaseCatalogName"] = info is not null ? "main" : DBNull.Value;
@@ -455,8 +530,8 @@ public class SqliteDataReader : DbDataReader
             row[SchemaTableColumn.BaseTableName] = info is not null ? tableName : DBNull.Value;
             row[SchemaTableColumn.DataType] = dataType;
             row["DataTypeName"] = dataTypeName;
-            row[SchemaTableColumn.AllowDBNull] = info is not null ? info.AllowNull : DBNull.Value;
-            row[SchemaTableColumn.IsAliased] = isExpression;
+            row[SchemaTableColumn.AllowDBNull] = info is not null ? isAliased || info.AllowNull : DBNull.Value;
+            row[SchemaTableColumn.IsAliased] = isAliased;
             row[SchemaTableColumn.IsExpression] = isExpression;
             row[SchemaTableOptionalColumn.IsAutoIncrement] = hasBaseColumn ? false : DBNull.Value;
             row[SchemaTableColumn.IsLong] = DBNull.Value;
@@ -471,12 +546,12 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        return value.ValueType switch
+        return value.Kind switch
         {
-            TursoValueType.Text => value.StringValue,
-            TursoValueType.Integer => value.IntValue.ToString(CultureInfo.InvariantCulture),
-            TursoValueType.Real => value.RealValue.ToString(CultureInfo.InvariantCulture),
-            TursoValueType.Blob => Encoding.UTF8.GetString(value.BlobValue),
+            ReaderValueKind.Text => value.Text,
+            ReaderValueKind.Integer => value.Integer.ToString(CultureInfo.InvariantCulture),
+            ReaderValueKind.Real => value.Real.ToString(CultureInfo.InvariantCulture),
+            ReaderValueKind.Blob => Encoding.UTF8.GetString(value.Blob),
             _ => Convert.ToString(GetValue(ordinal), CultureInfo.InvariantCulture) ?? string.Empty
         };
     }
@@ -485,10 +560,10 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         var value = GetTypedValue(ordinal);
-        return value.ValueType switch
+        return value.Kind switch
         {
-            TursoValueType.Real => TimeSpan.FromDays(value.RealValue),
-            TursoValueType.Integer => TimeSpan.FromDays(value.IntValue),
+            ReaderValueKind.Real => TimeSpan.FromDays(value.Real),
+            ReaderValueKind.Integer => TimeSpan.FromDays(value.Integer),
             _ => TimeSpan.Parse(GetString(ordinal), CultureInfo.InvariantCulture)
         };
     }
@@ -497,18 +572,17 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         EnsureHasCurrentRow();
-        var statement = GetStatement();
-        var value = TursoBindings.GetValue(statement, ordinal);
-        if (IsGuidType(GetDeclaredTypeName(ordinal)) && value.ValueType is TursoValueType.Blob or TursoValueType.Text)
+        var value = ReadValue(ordinal);
+        if (IsGuidType(GetDeclaredTypeName(ordinal)) && value.Kind is ReaderValueKind.Blob or ReaderValueKind.Text)
             return ToGuid(value);
 
-        return value.ValueType switch
+        return value.Kind switch
         {
-            TursoValueType.Null or TursoValueType.Empty => DBNull.Value,
-            TursoValueType.Integer => value.IntValue,
-            TursoValueType.Real => value.RealValue,
-            TursoValueType.Text => value.StringValue,
-            TursoValueType.Blob => value.BlobValue,
+            ReaderValueKind.Null or ReaderValueKind.Empty => DBNull.Value,
+            ReaderValueKind.Integer => value.Integer,
+            ReaderValueKind.Real => value.Real,
+            ReaderValueKind.Text => value.Text,
+            ReaderValueKind.Blob => value.Blob,
             _ => throw new ArgumentOutOfRangeException()
         };
     }
@@ -519,10 +593,8 @@ public class SqliteDataReader : DbDataReader
         _ = GetStatement();
         EnsureHasCurrentRow();
         ArgumentNullException.ThrowIfNull(values);
-        if (values.Length < FieldCount)
-            throw new IndexOutOfRangeException();
 
-        var count = FieldCount;
+        var count = Math.Min(values.Length, FieldCount);
         for (var i = 0; i < count; i++)
             values[i] = GetValue(i);
 
@@ -533,17 +605,19 @@ public class SqliteDataReader : DbDataReader
     {
         EnsureOpen();
         EnsureHasCurrentRow();
-        var statement = GetStatement();
-        var valueType = TursoBindings.GetValue(statement, ordinal).ValueType;
-        return valueType is TursoValueType.Null or TursoValueType.Empty;
+        var valueType = ReadValue(ordinal).Kind;
+        return valueType is ReaderValueKind.Null or ReaderValueKind.Empty;
     }
 
     public override bool NextResult()
+        => _command.RunOperation(NextResultCore);
+
+    private bool NextResultCore(CancellationToken cancellationToken)
     {
         EnsureOpen();
         if (_statement is null)
             return false;
-        while (TursoBindings.Read(_statement))
+        while (GetStatement().Read(cancellationToken))
         {
         }
 
@@ -564,27 +638,37 @@ public class SqliteDataReader : DbDataReader
                 if (_command.TryHandleFacadeStatement(sql, out var rewrittenSql))
                     continue;
 
+                cancellationToken.ThrowIfCancellationRequested();
                 var statement = _command.PrepareSingleStatement(rewrittenSql);
-                if (TursoBindings.GetFieldCount(statement) > 0)
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    statement.Dispose();
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                if (statement.ColumnCount > 0)
                 {
                     _statement = statement;
                     _currentSql = rewrittenSql;
                     _hadResultSet = true;
                     _currentStatementRowsAffectedCounted = false;
-                    _hasPrefetchedRow = TursoBindings.Read(statement);
+                    _hasPrefetchedRow = statement.Read(cancellationToken);
                     return true;
                 }
 
-                while (TursoBindings.Read(statement))
+                while (statement.Read(cancellationToken))
                 {
                 }
 
                 if (SqliteCommand.CountsRowsAffected(sql))
-                    _recordsAffected += TursoBindings.RowsAffected(statement);
+                {
+                    _hadRecordsAffectedStatement = true;
+                    _recordsAffected += statement.RowsAffected;
+                }
+                _command.MarkTransactionCompletedExternally(sql);
                 statement.Dispose();
             }
         }
-        catch (TursoException ex)
+        catch (Exception ex) when (ex is TursoException or EmbeddedSqlException)
         {
             _statement?.Dispose();
             _statement = null;
@@ -597,6 +681,9 @@ public class SqliteDataReader : DbDataReader
     }
 
     public override bool Read()
+        => _command.RunOperation(ReadCore);
+
+    private bool ReadCore(CancellationToken cancellationToken)
     {
         EnsureOpen();
         if (_statement is null)
@@ -610,39 +697,46 @@ public class SqliteDataReader : DbDataReader
 
         try
         {
-            _hasCurrentRow = TursoBindings.Read(_statement);
+            _hasCurrentRow = GetStatement().Read(cancellationToken);
             if (!_hasCurrentRow)
                 CountCurrentStatementRowsAffected();
             return _hasCurrentRow;
         }
-        catch (TursoException ex)
+        catch (Exception ex) when (ex is TursoException or EmbeddedSqlException)
         {
             throw SqliteCommand.ToSqliteException(ex);
         }
     }
 
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(Read());
-    }
+        => _command.RunOperationAsync(ReadCore, cancellationToken);
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(NextResult());
-    }
+        => _command.RunOperationAsync(NextResultCore, cancellationToken);
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(IsDBNull(ordinal));
-    }
+        => CompleteAsync(() => IsDBNull(ordinal), cancellationToken);
 
     public override Task<T> GetFieldValueAsync<T>(int ordinal, CancellationToken cancellationToken)
+        => CompleteAsync(() => GetFieldValue<T>(ordinal), cancellationToken);
+
+    private static Task<T> CompleteAsync<T>(Func<T> operation, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(GetFieldValue<T>(ordinal));
+        return cancellationToken.IsCancellationRequested
+            ? Task.FromCanceled<T>(cancellationToken)
+            : Complete(operation);
+    }
+
+    private static Task<T> Complete<T>(Func<T> operation)
+    {
+        try
+        {
+            return Task.FromResult(operation());
+        }
+        catch (Exception exception)
+        {
+            return Task.FromException<T>(exception);
+        }
     }
 
     protected override void Dispose(bool disposing)
@@ -655,6 +749,19 @@ public class SqliteDataReader : DbDataReader
 
     public override void Close() => CloseCore();
 
+    void IConnectionOwnedReader.CloseFromConnection()
+    {
+        if (_isClosed)
+            return;
+
+        _statement?.Dispose();
+        _statement = null;
+        _remainingSql.Clear();
+        _hasPrefetchedRow = false;
+        _hasCurrentRow = false;
+        FinishClose(closeConnection: false);
+    }
+
     private void CloseCore(bool throwOnError = true)
     {
         if (_isClosed)
@@ -664,7 +771,7 @@ public class SqliteDataReader : DbDataReader
         {
             if (_statement is not null)
             {
-                while (TursoBindings.Read(_statement))
+                while (GetStatement().Read())
                 {
                 }
 
@@ -678,7 +785,7 @@ public class SqliteDataReader : DbDataReader
 
             DrainRemainingStatements();
         }
-        catch (TursoException ex)
+        catch (Exception ex) when (ex is TursoException or EmbeddedSqlException)
         {
             _statement?.Dispose();
             _statement = null;
@@ -702,14 +809,15 @@ public class SqliteDataReader : DbDataReader
         FinishClose();
     }
 
-    private void FinishClose()
+    private void FinishClose(bool closeConnection = true)
     {
         if (_isClosed)
             return;
 
         _closeCallback();
-        if ((_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-            _command.Connection?.Close();
+        ((ILocalReaderConnection)_connection).ReaderClosed(this);
+        if (closeConnection && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+            _connection.Close();
 
         _isClosed = true;
     }
@@ -725,7 +833,7 @@ public class SqliteDataReader : DbDataReader
             ? operation[4..]
             : operation;
 
-    private TursoStatementHandle GetStatement()
+    private SqliteStatementAdapter GetStatement()
     {
         if (_statement is null)
             throw new InvalidOperationException(Properties.Resources.NoData);
@@ -751,7 +859,8 @@ public class SqliteDataReader : DbDataReader
             && !_currentStatementRowsAffectedCounted
             && SqliteCommand.CountsRowsAffected(_currentSql))
         {
-            _recordsAffected += TursoBindings.RowsAffected(_statement);
+            _hadRecordsAffectedStatement = true;
+            _recordsAffected += GetStatement().RowsAffected;
             _currentStatementRowsAffectedCounted = true;
         }
     }
@@ -777,6 +886,7 @@ public class SqliteDataReader : DbDataReader
             return string.Empty;
 
         var table = UnquoteIdentifier(match.Groups["table"].Value);
+        using var suspension = _command.Connection.SuspendHooks();
         using var command = _command.Connection.CreateCommand();
         command.CommandText = $"PRAGMA table_info({QuoteIdentifier(table)});";
         using var reader = command.ExecuteReader();
@@ -874,6 +984,7 @@ public class SqliteDataReader : DbDataReader
         if (_command.Connection is null)
             return columns;
 
+        using var suspension = _command.Connection.SuspendHooks();
         using (var command = _command.Connection.CreateCommand())
         {
             command.CommandText = $"PRAGMA table_info({QuoteIdentifier(tableName)});";
@@ -896,7 +1007,7 @@ public class SqliteDataReader : DbDataReader
             using var indexes = indexCommand.ExecuteReader();
             while (indexes.Read())
             {
-                if (indexes.GetInt64(2) == 0)
+                if (indexes.GetInt64(2) == 0 || indexes.GetInt64(4) != 0)
                     continue;
 
                 var indexName = indexes.GetString(1);
@@ -905,7 +1016,10 @@ public class SqliteDataReader : DbDataReader
                 using var indexInfo = infoCommand.ExecuteReader();
                 var indexedColumns = new List<string>();
                 while (indexInfo.Read())
-                    indexedColumns.Add(indexInfo.GetString(2));
+                {
+                    if (!indexInfo.IsDBNull(2))
+                        indexedColumns.Add(indexInfo.GetString(2));
+                }
 
                 if (indexedColumns.Count == 1 && columns.TryGetValue(indexedColumns[0], out var column))
                     columns[indexedColumns[0]] = column with { IsUnique = true };
@@ -929,35 +1043,50 @@ public class SqliteDataReader : DbDataReader
             : null;
     }
 
-    private TursoValueType GetSampleValueType(int ordinal)
+    private static string GetDataTypeNameFromValueType(ReaderValueKind valueType, string selection)
     {
-        using var statement = _command.PrepareSingleStatement(_currentSql);
-        while (TursoBindings.Read(statement))
-        {
-            var valueType = TursoBindings.GetValue(statement, ordinal).ValueType;
-            if (valueType is not TursoValueType.Null and not TursoValueType.Empty)
-                return valueType;
-        }
-
-        return TursoValueType.Blob;
-    }
-
-    private static string GetDataTypeNameFromValueType(TursoValueType valueType, string selection)
-    {
-        if (valueType == TursoValueType.Blob && Regex.IsMatch(selection, @"[+\-*/]"))
+        if (valueType == ReaderValueKind.Blob && Regex.IsMatch(selection, @"[+\-*/]"))
             return "INTEGER";
 
         return valueType switch
         {
-            TursoValueType.Integer => "INTEGER",
-            TursoValueType.Real => "REAL",
-            TursoValueType.Text => "TEXT",
+            ReaderValueKind.Integer => "INTEGER",
+            ReaderValueKind.Real => "REAL",
+            ReaderValueKind.Text => "TEXT",
             _ => "BLOB"
         };
     }
 
+    private ReaderValueKind GetSampleValueType(int ordinal)
+    {
+        using var statement = _command.PrepareSingleStatement(_currentSql);
+        while (statement.Read())
+        {
+            var value = statement.UsesManagedResults
+                ? ReaderValue.FromManaged(statement.ManagedCurrentRow.GetValue(ordinal))
+                : ReaderValue.FromNative(statement.GetNativeValue(ordinal));
+            if (value.Kind is not ReaderValueKind.Null and not ReaderValueKind.Empty)
+                return value.Kind;
+        }
+
+        return ReaderValueKind.Blob;
+    }
+
+    private static ReaderValueKind GetValueKindFromTypeName(string typeName)
+    {
+        var normalized = StripTypeLength(typeName).ToUpperInvariant();
+        if (normalized.Contains("INT"))
+            return ReaderValueKind.Integer;
+        if (normalized.Contains("CHAR") || normalized.Contains("CLOB") || normalized.Contains("TEXT"))
+            return ReaderValueKind.Text;
+        if (normalized.Contains("REAL") || normalized.Contains("FLOA") || normalized.Contains("DOUB"))
+            return ReaderValueKind.Real;
+
+        return ReaderValueKind.Blob;
+    }
+
     [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
-    private static Type GetClrTypeFromSqliteType(string typeName, TursoValueType fallback)
+    private static Type GetClrTypeFromSqliteType(string typeName, ReaderValueKind fallback)
     {
         if (IsGuidType(typeName))
             return typeof(Guid);
@@ -978,12 +1107,12 @@ public class SqliteDataReader : DbDataReader
     }
 
     [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicFields | DynamicallyAccessedMemberTypes.PublicProperties)]
-    private static Type GetClrTypeFromValueType(TursoValueType valueType)
+    private static Type GetClrTypeFromValueType(ReaderValueKind valueType)
         => valueType switch
         {
-            TursoValueType.Integer => typeof(long),
-            TursoValueType.Real => typeof(double),
-            TursoValueType.Text => typeof(string),
+            ReaderValueKind.Integer => typeof(long),
+            ReaderValueKind.Real => typeof(double),
+            ReaderValueKind.Text => typeof(string),
             _ => typeof(byte[])
         };
 
@@ -996,29 +1125,15 @@ public class SqliteDataReader : DbDataReader
 
     private sealed record SchemaColumnInfo(string Name, string TypeName, bool AllowNull, bool IsKey, bool IsUnique);
 
-    private TursoValue GetTypedValue(int ordinal)
+    private ReaderValue GetTypedValue(int ordinal)
     {
         EnsureHasCurrentRow();
         ValidateOrdinal(ordinal);
-        var value = TursoBindings.GetValue(GetStatement(), ordinal);
-        if (value.ValueType is TursoValueType.Null or TursoValueType.Empty)
+        var value = ReadValue(ordinal);
+        if (value.Kind is ReaderValueKind.Null or ReaderValueKind.Empty)
             throw new InvalidOperationException(Properties.Resources.CalledOnNullValue(ordinal));
 
         return value;
-    }
-
-    private bool ShouldReturnBlobStream(int ordinal, TursoValue value)
-    {
-        if (value.ValueType == TursoValueType.Blob && ordinal == 1)
-            return true;
-
-        for (var i = 0; i < ordinal; i++)
-        {
-            if (string.Equals(GetName(i), "rowid", StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
     }
 
     private static DateTime ParseDateTime(string value)
@@ -1047,25 +1162,48 @@ public class SqliteDataReader : DbDataReader
                    || value.LastIndexOf('-') > timeSeparator);
     }
 
-    private static byte[] ToBytes(TursoValue value)
+    private static long CopyValue<T>(T[] source, long dataOffset, T[]? buffer, int bufferOffset, int length)
     {
-        return value.ValueType switch
-        {
-            TursoValueType.Blob => value.BlobValue,
-            TursoValueType.Text => Encoding.UTF8.GetBytes(value.StringValue),
-            TursoValueType.Integer => Encoding.UTF8.GetBytes(value.IntValue.ToString(CultureInfo.InvariantCulture)),
-            TursoValueType.Real => Encoding.UTF8.GetBytes(value.RealValue.ToString(CultureInfo.InvariantCulture)),
-            TursoValueType.Null or TursoValueType.Empty => [],
-            _ => throw new ArgumentOutOfRangeException()
-        };
+        if (dataOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(dataOffset), dataOffset, message: null);
+        if (buffer is null)
+            return source.LongLength;
+        if (bufferOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(bufferOffset), bufferOffset, message: null);
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length), length, message: null);
+        if (bufferOffset > buffer.Length - length)
+            throw new ArgumentException(Properties.Resources.InvalidOffsetAndCount);
+        if (dataOffset >= source.LongLength)
+            return 0;
+
+        var count = (int)Math.Min(length, source.LongLength - dataOffset);
+        Array.Copy(source, (int)dataOffset, buffer, bufferOffset, count);
+        return count;
     }
 
-    private static Guid ToGuid(TursoValue value)
-        => value.ValueType == TursoValueType.Blob
-            ? value.BlobValue.Length == 16
-                ? new Guid(value.BlobValue)
-                : Guid.Parse(Encoding.UTF8.GetString(value.BlobValue))
-            : Guid.Parse(value.StringValue);
+    private byte[] GetBlobValue(int ordinal)
+    {
+        var value = GetTypedValue(ordinal);
+        return value.Kind == ReaderValueKind.Blob
+            ? value.Blob
+            : throw new InvalidCastException("The requested value is not a BLOB.");
+    }
+
+    private string GetTextValue(int ordinal)
+    {
+        var value = GetTypedValue(ordinal);
+        return value.Kind == ReaderValueKind.Text
+            ? value.Text
+            : throw new InvalidCastException("The requested value is not TEXT.");
+    }
+
+    private static Guid ToGuid(ReaderValue value)
+        => value.Kind == ReaderValueKind.Blob
+            ? value.Blob.Length == 16
+                ? new Guid(value.Blob)
+                : Guid.Parse(Encoding.UTF8.GetString(value.Blob))
+            : Guid.Parse(value.Text);
 
     private void DrainRemainingStatements()
     {
@@ -1077,12 +1215,16 @@ public class SqliteDataReader : DbDataReader
                     continue;
 
                 using var statement = _command.PrepareSingleStatement(rewrittenSql);
-                while (TursoBindings.Read(statement))
+                while (statement.Read())
                 {
                 }
 
                 if (SqliteCommand.CountsRowsAffected(rewrittenSql))
-                    _recordsAffected += TursoBindings.RowsAffected(statement);
+                {
+                    _hadRecordsAffectedStatement = true;
+                    _recordsAffected += statement.RowsAffected;
+                }
+                _command.MarkTransactionCompletedExternally(sql);
             }
         }
         finally
@@ -1091,14 +1233,31 @@ public class SqliteDataReader : DbDataReader
         }
     }
 
-    private static SqliteType GetSqliteType(TursoValueType valueType)
+    private static SqliteType GetSqliteType(ReaderValueKind valueType)
     {
         return valueType switch
         {
-            TursoValueType.Integer => SqliteType.Integer,
-            TursoValueType.Real => SqliteType.Real,
-            TursoValueType.Blob => SqliteType.Blob,
+            ReaderValueKind.Integer => SqliteType.Integer,
+            ReaderValueKind.Real => SqliteType.Real,
+            ReaderValueKind.Blob => SqliteType.Blob,
             _ => SqliteType.Text,
         };
     }
+
+    private ReaderValue ReadValue(int ordinal)
+    {
+        var statement = GetStatement();
+        return statement.UsesManagedResults
+            ? ReaderValue.FromManaged(statement.ManagedCurrentRow.GetValue(ordinal))
+            : ReaderValue.FromNative(statement.GetNativeValue(ordinal));
+    }
+
+    /// <summary>
+    /// Returns the value kind of the current row, or <see cref="ReaderValueKind.Empty"/> when the
+    /// reader is not positioned on a row. Type metadata has to stay readable before the first
+    /// <c>Read</c> because <see cref="System.Data.Common.DbDataAdapter"/> maps the result schema
+    /// before it fetches any rows.
+    /// </summary>
+    private ReaderValueKind CurrentValueKind(int ordinal)
+        => _hasCurrentRow ? ReadValue(ordinal).Kind : ReaderValueKind.Empty;
 }

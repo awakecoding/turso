@@ -3,8 +3,6 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Turso.Raw.Public;
-using Turso.Raw.Public.Value;
 
 namespace Turso;
 
@@ -73,7 +71,8 @@ internal sealed class TursoRemoteClient : IDisposable
         int commandTimeout,
         bool wantRows,
         bool closeAfter,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<int>? stepSucceeded = null)
     {
         ArgumentNullException.ThrowIfNull(commands);
         if (commands.Count == 0)
@@ -97,7 +96,7 @@ internal sealed class TursoRemoteClient : IDisposable
 
         var response = await SendPipelineAsync(request, commandTimeout, cancellationToken).ConfigureAwait(false);
         UpdateSession(response, closeAfter);
-        return ExtractBatchResults(response, commands.Count);
+        return ExtractBatchResults(response, commands.Count, stepSucceeded);
     }
 
     public async Task CloseAsync(int commandTimeout, CancellationToken cancellationToken)
@@ -241,7 +240,10 @@ internal sealed class TursoRemoteClient : IDisposable
         return statementResult;
     }
 
-    private static IReadOnlyList<RemoteStatementResult> ExtractBatchResults(RemotePipelineResponse response, int expectedCount)
+    private static IReadOnlyList<RemoteStatementResult> ExtractBatchResults(
+        RemotePipelineResponse response,
+        int expectedCount,
+        Action<int>? stepSucceeded)
     {
         if (response.Results.Count == 0)
             throw new TursoException("Remote batch returned no results.");
@@ -257,7 +259,7 @@ internal sealed class TursoRemoteClient : IDisposable
                     throw new TursoException($"Remote batch returned unexpected response type: {result.Response.Type}");
 
                 var batch = result.Response.DeserializeResult<RemoteBatchResult>();
-                statementResults = ExtractBatchStepResults(batch, expectedCount);
+                statementResults = ExtractBatchStepResults(batch, expectedCount, stepSucceeded);
                 break;
 
             case "error":
@@ -294,12 +296,21 @@ internal sealed class TursoRemoteClient : IDisposable
         }
     }
 
-    private static List<RemoteStatementResult> ExtractBatchStepResults(RemoteBatchResult batch, int expectedCount)
+    private static List<RemoteStatementResult> ExtractBatchStepResults(
+        RemoteBatchResult batch,
+        int expectedCount,
+        Action<int>? stepSucceeded)
     {
         if (batch.StepErrors.Count != expectedCount || batch.StepResults.Count != expectedCount)
         {
             throw new TursoException(
                 $"Remote batch returned an unexpected result shape: {batch.StepResults.Count} results, {batch.StepErrors.Count} errors, expected {expectedCount}.");
+        }
+
+        for (var i = 0; i < batch.StepErrors.Count; i++)
+        {
+            if (batch.StepErrors[i] is null && batch.StepResults[i] is not null)
+                stepSucceeded?.Invoke(i);
         }
 
         for (var i = 0; i < batch.StepErrors.Count; i++)

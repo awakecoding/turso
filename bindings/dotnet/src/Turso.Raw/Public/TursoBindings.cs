@@ -1,7 +1,11 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using Turso.Core;
 using Turso.Raw.Public.Handles;
 using Turso.Raw.Public.Value;
+using TursoEncryptionCipher = Turso.Raw.Public.Value.TursoEncryptionCipher;
+using TursoValue = Turso.Raw.Public.Value.TursoValue;
+using TursoValueType = Turso.Raw.Public.Value.TursoValueType;
 
 namespace Turso.Raw.Public;
 
@@ -13,6 +17,30 @@ public static class TursoBindings
         return OpenDatabase(path, cipher: null, hexkey: null);
     }
 
+    public static TursoDatabaseHandle OpenManagedDatabase(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        IManagedDatabaseAdapter? database = null;
+        try
+        {
+            database = ManagedDatabaseAdapter.Open(path);
+            database.Connect();
+            var handle = TursoDatabaseHandle.FromManaged(database);
+            database = null;
+            return handle;
+        }
+        catch (EmbeddedSqlException exception)
+        {
+            database?.Dispose();
+            throw new global::Turso.TursoException(exception.Message);
+        }
+        catch
+        {
+            database?.Dispose();
+            throw;
+        }
+    }
+
     /// <summary>
     /// Opens a database with local encryption.
     /// </summary>
@@ -20,23 +48,50 @@ public static class TursoBindings
     /// <param name="cipher">The encryption cipher to use.</param>
     /// <param name="hexkey">The hex-encoded encryption key.</param>
     /// <returns>A handle to the opened database.</returns>
-    public static TursoDatabaseHandle OpenDatabaseWithEncryption(string path, TursoEncryptionCipher cipher, string hexkey)
+    public static TursoDatabaseHandle OpenDatabaseWithEncryption(
+        string path,
+        global::Turso.Raw.Public.Value.TursoEncryptionCipher cipher,
+        string hexkey)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(hexkey);
 
-        return OpenDatabase(path, cipher.ToRustString(), hexkey);
+        return OpenDatabase(path, TursoEncryptionCipherExtensions.ToRustString(cipher), hexkey);
     }
 
     public static TursoStatementHandle PrepareStatement(TursoDatabaseHandle db, string sql)
     {
         db.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(sql);
+        if (db.IsManaged)
+        {
+            var connection = db.ManagedConnection;
+            return TursoStatementHandle.FromManaged(ExecuteManaged(() => connection.Prepare(sql)));
+        }
 
         var status = TursoInterop.ConnectionPrepareSingle(db, sql, out var statementPtr, out var errorPtr);
         ThrowIfError(status, errorPtr, "Unable to prepare statement: ");
 
         return TursoStatementHandle.FromPtr(statementPtr);
+    }
+
+    public static void Interrupt(TursoDatabaseHandle db)
+    {
+        db.ThrowIfInvalid();
+        if (db.IsManaged)
+            throw new InvalidOperationException("Native interruption requires a native database.");
+
+        TursoInterop.ConnectionInterrupt(db);
+    }
+
+    public static void SetBusyTimeout(TursoDatabaseHandle db, TimeSpan timeout)
+    {
+        db.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
+        if (db.IsManaged)
+            throw new InvalidOperationException("Native busy timeout requires a native database.");
+
+        TursoInterop.ConnectionSetBusyTimeout(db, checked((long)timeout.TotalMilliseconds));
     }
 
     public static void RegisterScalarFunction(
@@ -54,6 +109,7 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(callback);
         ArgumentNullException.ThrowIfNull(contextDestructor);
         ArgumentNullException.ThrowIfNull(valueDestructor);
+        ThrowIfManaged(db);
 
         var status = TursoInterop.RegisterScalarFunction(
             db,
@@ -66,6 +122,66 @@ public static class TursoBindings
             valueDestructor,
             out var errorPtr);
         ThrowIfError(status, errorPtr);
+    }
+
+    public static void RegisterManagedScalarFunction(
+        TursoDatabaseHandle database,
+        string name,
+        int arity,
+        Func<IReadOnlyList<TursoValue>, TursoValue> function)
+    {
+        database.ThrowIfInvalid();
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        if (arity < -1)
+            throw new ArgumentOutOfRangeException(nameof(arity));
+        ArgumentNullException.ThrowIfNull(function);
+        if (!database.IsManaged)
+            throw new InvalidOperationException("Managed scalar functions require a managed database.");
+
+        database.ManagedConnection.RegisterScalarFunction(
+            name,
+            arity,
+            arguments => ToManagedValue(function(arguments.Select(ToRawValue).ToArray())));
+    }
+
+    public static void RegisterManagedAggregateFunction(
+        TursoDatabaseHandle database,
+        string name,
+        int arity,
+        TursoValue seed,
+        Func<TursoValue, IReadOnlyList<TursoValue>, TursoValue> step,
+        Func<TursoValue, TursoValue> finalize)
+    {
+        database.ThrowIfInvalid();
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        if (arity < -1)
+            throw new ArgumentOutOfRangeException(nameof(arity));
+        ArgumentNullException.ThrowIfNull(step);
+        ArgumentNullException.ThrowIfNull(finalize);
+        if (!database.IsManaged)
+            throw new InvalidOperationException("Managed aggregate functions require a managed database.");
+
+        database.ManagedConnection.RegisterAggregateFunction(
+            name,
+            arity,
+            ToManagedValue(seed),
+            (accumulator, arguments) => ToManagedValue(
+                step(ToRawValue(accumulator), arguments.Select(ToRawValue).ToArray())),
+            accumulator => ToManagedValue(finalize(ToRawValue(accumulator))));
+    }
+
+    public static void RegisterManagedCollation(
+        TursoDatabaseHandle database,
+        string name,
+        Func<string, string, int> compare)
+    {
+        database.ThrowIfInvalid();
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(compare);
+        if (!database.IsManaged)
+            throw new InvalidOperationException("Managed collations require a managed database.");
+
+        database.ManagedConnection.RegisterCollation(name, compare);
     }
 
     public static void RegisterAggregateFunction(
@@ -89,6 +205,7 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(contextDestructor);
         ArgumentNullException.ThrowIfNull(aggregateDestructor);
         ArgumentNullException.ThrowIfNull(valueDestructor);
+        ThrowIfManaged(db);
         _ = deterministic;
 
         var status = TursoInterop.RegisterAggregateFunction(
@@ -110,6 +227,12 @@ public static class TursoBindings
     {
         db.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(name);
+        if (db.IsManaged)
+        {
+            db.ManagedConnection.UnregisterScalarFunctions(name);
+            db.ManagedConnection.UnregisterAggregateFunctions(name);
+            return;
+        }
 
         var status = TursoInterop.UnregisterFunction(db, name, out var errorPtr);
         ThrowIfError(status, errorPtr);
@@ -126,6 +249,7 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(callback);
         ArgumentNullException.ThrowIfNull(contextDestructor);
+        ThrowIfManaged(db);
 
         var status = TursoInterop.RegisterCollation(db, name, context, callback, contextDestructor, out var errorPtr);
         ThrowIfError(status, errorPtr);
@@ -135,6 +259,11 @@ public static class TursoBindings
     {
         db.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(name);
+        if (db.IsManaged)
+        {
+            db.ManagedConnection.UnregisterCollation(name);
+            return;
+        }
 
         var status = TursoInterop.UnregisterCollation(db, name, out var errorPtr);
         ThrowIfError(status, errorPtr);
@@ -143,6 +272,7 @@ public static class TursoBindings
     public static void EnableLoadExtension(TursoDatabaseHandle db, bool enabled)
     {
         db.ThrowIfInvalid();
+        ThrowIfManaged(db);
         var status = TursoInterop.EnableLoadExtension(db, enabled, out var errorPtr);
         ThrowIfError(status, errorPtr);
     }
@@ -151,6 +281,7 @@ public static class TursoBindings
     {
         db.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(path);
+        ThrowIfManaged(db);
 
         var status = TursoInterop.LoadExtension(db, path, out var errorPtr);
         ThrowIfError(status, errorPtr);
@@ -160,6 +291,20 @@ public static class TursoBindings
     {
         statement.ThrowIfInvalid();
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(index);
+        if (statement.IsManaged)
+        {
+            try
+            {
+                ExecuteManaged(() => statement.ManagedStatement.Bind(index, ToManagedValue(parameter)));
+            }
+            catch (ArgumentOutOfRangeException ex) when (ex.ParamName == "index")
+            {
+                throw new global::Turso.TursoException(
+                    $"Turso native call failed with status {TursoStatusCode.Misuse}.");
+            }
+
+            return;
+        }
 
         BindParameterAt(statement, index, parameter);
     }
@@ -168,6 +313,18 @@ public static class TursoBindings
     {
         statement.ThrowIfInvalid();
         ArgumentNullException.ThrowIfNull(name);
+        if (statement.IsManaged)
+        {
+            return ExecuteManaged(() =>
+            {
+                var index = statement.ManagedStatement.GetParameterIndex(name);
+                if (index == 0)
+                    return 0;
+
+                statement.ManagedStatement.Bind(index, ToManagedValue(parameter));
+                return index;
+            });
+        }
 
         var index = TursoInterop.StatementNamedPosition(statement, name);
         if (index < 1)
@@ -182,6 +339,8 @@ public static class TursoBindings
     public static bool Read(TursoStatementHandle statement)
     {
         statement.ThrowIfInvalid();
+        if (statement.IsManaged)
+            return ExecuteManaged(statement.ManagedStatement.Step) == StatementStepResult.Row;
 
         while (true)
         {
@@ -201,10 +360,38 @@ public static class TursoBindings
         }
     }
 
+    public static void Reset(TursoStatementHandle statement)
+    {
+        statement.ThrowIfInvalid();
+        if (statement.IsManaged)
+        {
+            ExecuteManaged(statement.ManagedStatement.Reset);
+            return;
+        }
+
+        var status = TursoInterop.StatementReset(statement, out var errorPtr);
+        ThrowIfError(status, errorPtr);
+    }
+
+    public static void ClearBindings(TursoStatementHandle statement)
+    {
+        statement.ThrowIfInvalid();
+        if (statement.IsManaged)
+        {
+            ExecuteManaged(statement.ManagedStatement.ClearBindings);
+            return;
+        }
+
+        throw new NotSupportedException(
+            "Clearing native statement bindings is not supported by the current Turso native ABI.");
+    }
+
     public static TursoValue GetValue(TursoStatementHandle statement, int columnIndex)
     {
         statement.ThrowIfInvalid();
         ArgumentOutOfRangeException.ThrowIfNegative(columnIndex);
+        if (statement.IsManaged)
+            return ExecuteManaged(() => ToRawValue(statement.ManagedStatement.GetValue(columnIndex)));
 
         var index = ToNativeIndex(columnIndex);
         return TursoInterop.StatementRowValueKind(statement, index) switch
@@ -223,6 +410,8 @@ public static class TursoBindings
     {
         statement.ThrowIfInvalid();
         ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
+        if (statement.IsManaged)
+            return ExecuteManaged(() => statement.ManagedStatement.GetColumnName(ordinal));
 
         var cname = TursoInterop.StatementColumnName(statement, ToNativeIndex(ordinal));
         if (cname == IntPtr.Zero)
@@ -241,6 +430,8 @@ public static class TursoBindings
     public static int GetFieldCount(TursoStatementHandle statement)
     {
         statement.ThrowIfInvalid();
+        if (statement.IsManaged)
+            return ExecuteManaged(statement.ManagedStatement.GetColumnCount);
 
         return checked((int)TursoInterop.StatementColumnCount(statement));
     }
@@ -248,6 +439,8 @@ public static class TursoBindings
     public static int RowsAffected(TursoStatementHandle statement)
     {
         statement.ThrowIfInvalid();
+        if (statement.IsManaged)
+            return ExecuteManaged(() => statement.ManagedStatement.RowsAffected);
 
         return checked((int)TursoInterop.StatementRowsAffected(statement));
     }
@@ -255,6 +448,8 @@ public static class TursoBindings
     public static bool HasRows(TursoStatementHandle statement)
     {
         statement.ThrowIfInvalid();
+        if (statement.IsManaged)
+            return ExecuteManaged(statement.ManagedStatement.HasRows);
 
         return GetFieldCount(statement) > 0
                && TursoInterop.StatementRowValueKind(statement, UIntPtr.Zero) != TursoNativeValueType.Unknown;
@@ -263,6 +458,8 @@ public static class TursoBindings
     public static int GetParameterCount(TursoStatementHandle statement)
     {
         statement.ThrowIfInvalid();
+        if (statement.IsManaged)
+            return ExecuteManaged(() => statement.ManagedStatement.ParameterCount);
 
         return checked((int)TursoInterop.StatementParameterCount(statement));
     }
@@ -271,6 +468,8 @@ public static class TursoBindings
     {
         statement.ThrowIfInvalid();
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(index);
+        if (statement.IsManaged)
+            return ExecuteManaged(() => statement.ManagedStatement.GetParameterName(index));
 
         var name = TursoInterop.StatementParameterName(statement, index);
         if (name == IntPtr.Zero)
@@ -329,6 +528,12 @@ public static class TursoBindings
 
     private static void BindParameterAt(TursoStatementHandle statement, int index, TursoValue value)
     {
+        if (statement.IsManaged)
+        {
+            ExecuteManaged(() => statement.ManagedStatement.Bind(index, ToManagedValue(value)));
+            return;
+        }
+
         var position = ToNativeIndex(index);
         var status = value.ValueType switch
         {
@@ -396,6 +601,65 @@ public static class TursoBindings
     private static UIntPtr ToNativeIndex(int index) => checked((UIntPtr)(ulong)index);
 
     private static UIntPtr ToNativeLength(int length) => checked((UIntPtr)(ulong)length);
+
+    private static T ExecuteManaged<T>(Func<T> operation)
+    {
+        try
+        {
+            return operation();
+        }
+        catch (EmbeddedSqlException ex)
+        {
+            throw new global::Turso.TursoException(ex.Message);
+        }
+    }
+
+    private static void ExecuteManaged(Action operation)
+    {
+        try
+        {
+            operation();
+        }
+        catch (EmbeddedSqlException ex)
+        {
+            throw new global::Turso.TursoException(ex.Message);
+        }
+    }
+
+    private static void ThrowIfManaged(TursoDatabaseHandle database)
+    {
+        if (database.IsManaged)
+        {
+            throw new NotSupportedException(
+                "Managed function, collation, and extension registration is not available yet for the managed engine.");
+        }
+    }
+
+    private static SqlValue ToManagedValue(TursoValue value)
+    {
+        return value.ValueType switch
+        {
+            TursoValueType.Empty or TursoValueType.Null => SqlValue.Null,
+            TursoValueType.Integer => SqlValue.Integer(value.IntValue),
+            TursoValueType.Real => SqlValue.Real(value.RealValue),
+            TursoValueType.Text => SqlValue.Text(value.StringValue),
+            TursoValueType.Blob => SqlValue.Blob(value.BlobValue),
+            _ => throw new ArgumentOutOfRangeException(nameof(value)),
+        };
+    }
+
+    private static TursoValue ToRawValue(SqlValue value)
+    {
+        return value.Kind switch
+        {
+            SqlValueKind.Null => TursoValue.Null(),
+            SqlValueKind.Integer => TursoValue.Int(value.AsInteger()),
+            SqlValueKind.Real => TursoValue.Real(value.AsReal()),
+            SqlValueKind.Text => TursoValue.String(value.AsText()),
+            SqlValueKind.Blob => TursoValue.Blob(value.AsBlob().ToArray()),
+            _ => throw new ArgumentOutOfRangeException(nameof(value)),
+        };
+    }
 
     private static void ThrowIfError(TursoStatusCode status, IntPtr errorPtr, string? messagePrefix = null)
     {

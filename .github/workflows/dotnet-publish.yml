@@ -11,6 +11,7 @@ on:
       - "Cargo.lock"
       - "core/**"
       - "sdk-kit/**"
+      - "sync/**"
   # Manual trigger with dry-run / publish controls
   workflow_dispatch:
     inputs:
@@ -95,6 +96,12 @@ jobs:
           make-target: build-rust-iossimulatorarm64
           target: aarch64-apple-ios-sim
           artifact-name: native-iossimulator-arm64
+          ios-deployment-target: "12.2"
+
+        - os: macos-26
+          make-target: build-rust-iossimulator64
+          target: x86_64-apple-ios
+          artifact-name: native-iossimulator-x64
           ios-deployment-target: "12.2"
 
         - os: blacksmith-4vcpu-windows-2025
@@ -189,6 +196,7 @@ jobs:
         if: contains(matrix.target, 'apple-ios')
         env:
           IPHONEOS_DEPLOYMENT_TARGET: ${{ matrix.ios-deployment-target }}
+          IPHONESIMULATOR_DEPLOYMENT_TARGET: ${{ matrix.ios-deployment-target }}
         run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
 
       - name: Build rust native library
@@ -237,33 +245,87 @@ jobs:
             $library.LastWriteTimeUtc = $now
           }
 
-      # Code-sign the Windows native DLL with Azure Artifact Signing (formerly
-      # Trusted Signing). Runs only for the windows-msvc targets, only when
-      # the AZURE_SIGNING_ENABLED repo variable is set to "true", and only on
-      # main pushes or manual dispatch: the Entra federated credential matches
-      # the exact ref (refs/heads/main), so OIDC login fails on any other
-      # branch, and dev-branch artifacts don't need signing anyway. The action
-      # only works on Windows runners, which is why signing happens here in
-      # the native build job rather than in the Linux pack/publish job.
+      - name: Require Windows signing configuration for native publication
+        if: ${{ contains(matrix.target, 'pc-windows-msvc') && github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
+        shell: pwsh
+        env:
+          AZURE_SIGNING_ENABLED: ${{ vars.AZURE_SIGNING_ENABLED }}
+        run: |
+          if ("${{ github.ref }}" -ne "refs/heads/main") {
+            throw "Native package publication is restricted to refs/heads/main so the signing OIDC trust matches."
+          }
+          if ($env:AZURE_SIGNING_ENABLED -ne "true") {
+            throw "Native package publication requires AZURE_SIGNING_ENABLED=true."
+          }
+
+      # Windows release DLLs are Authenticode-signed before upload. Pull-request
+      # and dry-run artifacts may remain unsigned, but any present signature is
+      # still validated by the artifact contract step below.
       - name: Azure login (OIDC) for code signing
-        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
+        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Code sign Windows native library
-        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
+      - name: Code sign Windows native libraries
+        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && github.ref == 'refs/heads/main' }}
         uses: azure/trusted-signing-action@v0
         with:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
-          files: ${{ github.workspace }}/bindings/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sdk_kit.dll
+          files: |
+            ${{ github.workspace }}/bindings/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sdk_kit.dll
+            ${{ github.workspace }}/bindings/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sync_sdk_kit.dll
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+
+      - name: Validate native architecture, dependencies, and signatures
+        shell: pwsh
+        env:
+          REQUIRE_WINDOWS_SIGNATURE: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
+        run: |
+          $profile = "rs_compiled/${{ matrix.target }}/release-official"
+          if ("${{ matrix.target }}" -match "pc-windows-msvc$") {
+            $dynamic = @(
+              "$profile/turso_sdk_kit.dll",
+              "$profile/turso_sync_sdk_kit.dll"
+            )
+            $static = @("$profile/turso_sdk_kit.lib")
+          } elseif ("${{ matrix.target }}" -match "(unknown-linux-gnu|linux-android)$") {
+            $dynamic = @(
+              "$profile/libturso_sdk_kit.so",
+              "$profile/libturso_sync_sdk_kit.so"
+            )
+            $static = if ("${{ matrix.target }}" -match "unknown-linux-gnu$") {
+              @("$profile/libturso_sdk_kit.a")
+            } else {
+              @()
+            }
+          } else {
+            $dynamic = @(
+              "$profile/libturso_sdk_kit.dylib",
+              "$profile/libturso_sync_sdk_kit.dylib"
+            )
+            $static = if ("${{ matrix.target }}" -match "apple-darwin$") {
+              @("$profile/libturso_sdk_kit.a")
+            } else {
+              @()
+            }
+          }
+
+          $arguments = @{
+            Target = "${{ matrix.target }}"
+            DynamicArtifacts = $dynamic
+            StaticArtifacts = $static
+          }
+          if ($env:REQUIRE_WINDOWS_SIGNATURE -eq "true" -and "${{ matrix.target }}" -match "pc-windows-msvc$") {
+            $arguments.RequireWindowsSignature = $true
+          }
+          ./scripts/Validate-NativeArtifact.ps1 @arguments
 
       - name: Upload rust native library
         uses: actions/upload-artifact@v6
@@ -276,6 +338,9 @@ jobs:
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.so
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.dylib
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.a
+            ${{ env.working-directory }}/rs_compiled/**/turso_sync_sdk_kit.dll
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sync_sdk_kit.so
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sync_sdk_kit.dylib
 
           retention-days: 1
 
@@ -301,17 +366,180 @@ jobs:
           merge-multiple: true
 
       - name: Package iOS XCFramework
-        run: make package-rust-iosframework RUST_PROFILE_DIR=release-official
+        run: |
+          make package-rust-iosframework RUST_PROFILE_DIR=release-official
+          make package-rust-ios-syncframework RUST_PROFILE_DIR=release-official
+
+      - name: Validate iOS XCFramework architecture and dependencies
+        shell: pwsh
+        run: |
+          ./scripts/Validate-NativeArtifact.ps1 `
+            -Target aarch64-apple-ios `
+            -DynamicArtifacts @(
+              "rs_compiled/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/libturso_sdk_kit",
+              "rs_compiled/ios-sync-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64/libturso_sync_sdk_kit.framework/libturso_sync_sdk_kit"
+            )
+          ./scripts/Validate-NativeArtifact.ps1 `
+            -Target ios-simulator-universal `
+            -DynamicArtifacts @(
+              "rs_compiled/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sdk_kit.framework/libturso_sdk_kit",
+              "rs_compiled/ios-sync-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sync_sdk_kit.framework/libturso_sync_sdk_kit"
+            )
 
       - name: Upload iOS XCFramework
         uses: actions/upload-artifact@v6
         with:
           name: native-ios-universal
-          path: ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.xcframework/**
+          path: |
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.xcframework/**
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sync_sdk_kit.xcframework/**
           retention-days: 1
 
-  # Create NuGet packages; publish is opt-in
-  publish:
+  # This validates the managed-only package without restoring Rust or downloading native artifacts.
+  package-managed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dotnet SDKs
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Validate managed provider artifacts without Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          deny_directory="$PWD/.managed-toolchain-deny"
+          mkdir -p "$deny_directory"
+          trap 'rm -rf "$deny_directory"' EXIT
+          for tool in cargo rustc; do
+            printf '#!/usr/bin/env bash\necho "managed .NET validation must not invoke %s" >&2\nexit 97\n' "$tool" > "$deny_directory/$tool"
+            chmod +x "$deny_directory/$tool"
+          done
+          PATH="$deny_directory:$PATH" CARGO="$deny_directory/cargo" RUSTC="$deny_directory/rustc" make validate-managed-package
+
+      # Validation packages deliberately use a local prerelease version so the
+      # sample cannot accidentally restore an already-published package. Build
+      # a second, release-versioned artifact for later publishing.
+      - name: Pack release-versioned managed provider artifacts
+        run: make pack-managed MANAGED_PACKAGE_OUTPUT=./artifacts/managed-release-packages
+
+      - name: Verify source-free managed packages and documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          managed_packages=(
+            artifacts/managed-release-packages/Turso.Data.Sqlite.*.nupkg
+            artifacts/managed-release-packages/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+            artifacts/managed-release-packages/Turso.Platform.Client.*.nupkg
+            artifacts/managed-release-packages/Turso.Serverless.Client.*.nupkg
+          )
+          for package in "${managed_packages[@]}"; do
+            if [ ! -f "$package" ]; then
+              echo "No managed NuGet package found at $package"
+              exit 1
+            fi
+
+            case "$package" in
+              *Turso.Data.Sqlite.*)
+                required_files=(
+                  "README.md"
+                  "lib/net8.0/Turso.Data.Sqlite.dll"
+                  "lib/net9.0/Turso.Data.Sqlite.dll"
+                  "lib/net10.0/Turso.Data.Sqlite.dll"
+                )
+                ;;
+              *Turso.EntityFrameworkCore.Sqlite.*)
+                required_files=(
+                  "README.md"
+                  "lib/net8.0/Turso.EntityFrameworkCore.Sqlite.dll"
+                  "lib/net9.0/Turso.EntityFrameworkCore.Sqlite.dll"
+                  "lib/net10.0/Turso.EntityFrameworkCore.Sqlite.dll"
+                )
+                ;;
+              *Turso.Platform.Client.*)
+                required_files=(
+                  "README.md"
+                  "lib/net8.0/Turso.Platform.Client.dll"
+                  "lib/net9.0/Turso.Platform.Client.dll"
+                  "lib/net10.0/Turso.Platform.Client.dll"
+                )
+                ;;
+              *Turso.Serverless.Client.*)
+                required_files=(
+                  "README.md"
+                  "lib/net8.0/Turso.Serverless.Client.dll"
+                  "lib/net9.0/Turso.Serverless.Client.dll"
+                  "lib/net10.0/Turso.Serverless.Client.dll"
+                )
+                ;;
+            esac
+            for required_file in "${required_files[@]}"; do
+              if ! unzip -Z1 "$package" | grep -Fxq "$required_file"; then
+                echo "Missing $required_file in $package"
+                exit 1
+              fi
+            done
+
+            if unzip -Z1 "$package" | grep -Eq '(^runtimes/|^buildTransitive/|turso(_sync)?_sdk_kit|Turso\.(Raw|Data\.(Native|Sync))\.|\.(cs|fs|vb)$)'; then
+              echo "$package must remain source-free and managed-only"
+              exit 1
+            fi
+            if unzip -p "$package" '*.nuspec' | grep -Eq 'id="Turso\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native|Sync))"'; then
+              echo "$package must not declare an optional-native package dependency"
+              exit 1
+            fi
+            case "$package" in
+              *Turso.Data.Sqlite.*)
+                if ! unzip -p "$package" README.md | grep -Fq 'managed-only'; then
+                  echo "$package README must document the managed-only distribution"
+                  exit 1
+                fi
+                if ! unzip -p "$package" README.md | grep -Fq 'Turso.Data.Sqlite.Native'; then
+                  echo "$package README must document the optional native companion"
+                  exit 1
+                fi
+                ;;
+              *Turso.EntityFrameworkCore.Sqlite.*)
+                if ! unzip -p "$package" README.md | grep -Fq 'supports EF Core 9.x'; then
+                  echo "$package README must document the supported EF Core major version"
+                  exit 1
+                fi
+                if ! unzip -p "$package" README.md | grep -Fq 'rejects those data sources during options configuration'; then
+                  echo "$package README must document the remote UseTurso contract"
+                  exit 1
+                fi
+                ;;
+            esac
+          done
+
+      - name: Upload managed .NET packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: managed-nuget-packages
+          path: |
+            ${{ env.working-directory }}/artifacts/managed-release-packages/Turso.Data.Sqlite.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-release-packages/Turso.EntityFrameworkCore.Sqlite.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-release-packages/Turso.Platform.Client.*.nupkg
+            ${{ env.working-directory }}/artifacts/managed-release-packages/Turso.Serverless.Client.*.nupkg
+          if-no-files-found: error
+          retention-days: 7
+
+  # Build only packages that intentionally contain or configure native assets.
+  package-native-companions:
     needs: [build-natives, package-ios-framework]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -341,46 +569,126 @@ jobs:
           path: ${{ env.working-directory }}/rs_compiled
           merge-multiple: true
 
-      - name: Build and pack 
-        run:
-          make pack
+      - name: Pack native companions
+        run: |
+          make pack-native
+          make pack-nativeaot-static
 
-      - name: Verify NuGet native assets
+      - name: Verify optional-native package contents
         shell: bash
         run: |
           set -euo pipefail
-          package=$(find src/Turso.Data.Sqlite/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.*.nupkg' | head -n 1)
-          if [ -z "$package" ]; then
-            echo "No Turso.Data.Sqlite NuGet package found"
+          native_package=$(find src/Turso.Data.Native/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.Native.*.nupkg' | head -n 1)
+          if [ -z "$native_package" ]; then
+            echo "No Turso.Data.Sqlite.Native NuGet package found"
             exit 1
           fi
-          unzip -Z1 "$package" > package-files.txt
-          required_files=(
-            "buildTransitive/Turso.Data.Sqlite.targets"
+          unzip -Z1 "$native_package" > native-package-files.txt
+          native_required_files=(
+            "lib/net8.0/Turso.Data.Native.dll"
+            "lib/net9.0/Turso.Data.Native.dll"
+            "lib/net10.0/Turso.Data.Native.dll"
+          )
+          for required_file in "${native_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" native-package-files.txt; then
+              echo "Missing $required_file in $native_package"
+              exit 1
+            fi
+          done
+
+          if ! unzip -p "$native_package" '*.nuspec' | grep -Fq 'id="Turso.Raw"'; then
+            echo "$native_package must declare its intentional Turso.Raw dependency"
+            exit 1
+          fi
+
+          sync_package=$(find src/Turso.Data.Sync/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.Sync.*.nupkg' | head -n 1)
+          if [ -z "$sync_package" ]; then
+            echo "No Turso.Data.Sqlite.Sync NuGet package found"
+            exit 1
+          fi
+          unzip -Z1 "$sync_package" > sync-package-files.txt
+          sync_required_files=(
+            "lib/net8.0/Turso.Data.Sync.dll"
+            "lib/net9.0/Turso.Data.Sync.dll"
+            "lib/net10.0/Turso.Data.Sync.dll"
+            "runtimes/win-x64/native/turso_sync_sdk_kit.dll"
+            "runtimes/win-arm64/native/turso_sync_sdk_kit.dll"
+            "runtimes/linux-x64/native/libturso_sync_sdk_kit.so"
+            "runtimes/linux-arm64/native/libturso_sync_sdk_kit.so"
+            "runtimes/osx-x64/native/libturso_sync_sdk_kit.dylib"
+            "runtimes/osx-arm64/native/libturso_sync_sdk_kit.dylib"
+            "runtimes/android-arm64/native/libturso_sync_sdk_kit.so"
+            "runtimes/android-arm/native/libturso_sync_sdk_kit.so"
+            "runtimes/android-x64/native/libturso_sync_sdk_kit.so"
+            "runtimes/android-x86/native/libturso_sync_sdk_kit.so"
+            "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/Info.plist"
+            "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64/libturso_sync_sdk_kit.framework/libturso_sync_sdk_kit"
+            "buildTransitive/Turso.Data.Sqlite.Sync.targets"
+            "runtimes/ios-universal/native/libturso_sync_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sync_sdk_kit.framework/libturso_sync_sdk_kit"
+          )
+          for required_file in "${sync_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" sync-package-files.txt; then
+              echo "Missing $required_file in $sync_package"
+              exit 1
+            fi
+          done
+
+          sync_mobile_targets=$(unzip -p "$sync_package" buildTransitive/Turso.Data.Sqlite.Sync.targets)
+          for required_target_value in \
+            "AndroidNativeLibrary" \
+            "runtimes\\android-arm\\native\\libturso_sync_sdk_kit.so" \
+            "runtimes\\android-arm64\\native\\libturso_sync_sdk_kit.so" \
+            "runtimes\\android-x86\\native\\libturso_sync_sdk_kit.so" \
+            "runtimes\\android-x64\\native\\libturso_sync_sdk_kit.so" \
+            "NativeReference" \
+            "runtimes\\ios-universal\\native\\libturso_sync_sdk_kit.xcframework"; do
+            if ! grep -Fq "$required_target_value" <<< "$sync_mobile_targets"; then
+              echo "Sync mobile build target does not select $required_target_value"
+              exit 1
+            fi
+          done
+
+          raw_package=$(find src/Turso.Raw/bin/Release -maxdepth 1 -name 'Turso.Raw.*.nupkg' | head -n 1)
+          if [ -z "$raw_package" ]; then
+            echo "No Turso.Raw NuGet package found"
+            exit 1
+          fi
+          unzip -Z1 "$raw_package" > raw-package-files.txt
+          raw_required_files=(
+            "buildTransitive/Turso.Raw.targets"
+            "lib/net8.0/Turso.Raw.dll"
+            "lib/net9.0/Turso.Raw.dll"
+            "lib/net10.0/Turso.Raw.dll"
+            "runtimes/win-x64/native/turso_sdk_kit.dll"
+            "runtimes/win-arm64/native/turso_sdk_kit.dll"
+            "runtimes/linux-x64/native/libturso_sdk_kit.so"
+            "runtimes/linux-arm64/native/libturso_sdk_kit.so"
+            "runtimes/osx-x64/native/libturso_sdk_kit.dylib"
+            "runtimes/osx-arm64/native/libturso_sdk_kit.dylib"
             "runtimes/android-arm64/native/libturso_sdk_kit.so"
             "runtimes/android-arm/native/libturso_sdk_kit.so"
             "runtimes/android-x64/native/libturso_sdk_kit.so"
             "runtimes/android-x86/native/libturso_sdk_kit.so"
             "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/Info.plist"
             "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/libturso_sdk_kit"
-            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/libturso_sdk_kit"
+            "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64_x86_64-simulator/libturso_sdk_kit.framework/libturso_sdk_kit"
           )
-          for required_file in "${required_files[@]}"; do
-            if ! grep -Fxq "$required_file" package-files.txt; then
-              echo "Missing $required_file in $package"
+          for required_file in "${raw_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" raw-package-files.txt; then
+              echo "Missing $required_file in $raw_package"
               exit 1
             fi
           done
 
           max_package_bytes=250000000
-          package_size=$(stat -c%s "$package")
+          package_size=$(stat -c%s "$raw_package")
           if [ "$package_size" -gt "$max_package_bytes" ]; then
-            echo "$package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+            echo "$raw_package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
             exit 1
           fi
 
-          if grep -Eq '^buildTransitive/native/(win|linux|osx)-' package-files.txt; then
-            echo "Static NativeAOT assets must stay in RID-specific companion packages, not $package"
+          if grep -Eq '^buildTransitive/native/(win|linux|osx)-' raw-package-files.txt; then
+            echo "Static NativeAOT assets must stay in RID-specific companion packages, not $raw_package"
             exit 1
           fi
 
@@ -411,6 +719,7 @@ jobs:
             required_static_files=(
               "buildTransitive/Turso.Data.Sqlite.NativeAot.${rid}.targets"
               "buildTransitive/native/${rid}/${library}"
+              "lib/net8.0/Turso.Data.Native.dll"
             )
             for required_static_file in "${required_static_files[@]}"; do
               if ! grep -Fxq "$required_static_file" "package-files-${rid}.txt"; then
@@ -418,6 +727,21 @@ jobs:
                 exit 1
               fi
             done
+
+            if ! unzip -p "$static_package" '*.nuspec' | grep -Fq 'id="Turso.Raw"'; then
+              echo "$static_package must resolve Turso.Raw for its carried native provider assembly"
+              exit 1
+            fi
+
+            if unzip -p "$static_package" '*.nuspec' | grep -Fq 'id="Turso.Data.Sqlite.Native"'; then
+              echo "$static_package must carry Turso.Data.Native rather than depend on the dynamic companion package"
+              exit 1
+            fi
+
+            if grep -Eq '^(runtimes/|lib/.*/Turso\.Raw\.dll)' "package-files-${rid}.txt"; then
+              echo "$static_package must not carry dynamic Raw runtime assets"
+              exit 1
+            fi
 
             if [[ "$rid" == win-* ]] && ! grep -Eq "^buildTransitive/native/${rid}/windows.*\\.lib$" "package-files-${rid}.txt"; then
               echo "Missing Windows static dependency libraries in $static_package"
@@ -429,56 +753,50 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          rm -rf artifacts/nuget-packages
-          mkdir -p artifacts/nuget-packages
+          rm -rf artifacts/native-nuget-packages
+          mkdir -p artifacts/native-nuget-packages
           files=(
-            src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
+            src/Turso.Data.Native/bin/Release/Turso.Data.Sqlite.Native.*.nupkg
+            src/Turso.Data.Sync/bin/Release/Turso.Data.Sqlite.Sync.*.nupkg
+            src/Turso.Raw/bin/Release/Turso.Raw.*.nupkg
             src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
-            src/Turso.Platform.Client/bin/Release/Turso.Platform.Client.*.nupkg
-            src/Turso.Serverless.Client/bin/Release/Turso.Serverless.Client.*.nupkg
           )
           if [ ${#files[@]} -eq 0 ]; then
             echo "No NuGet packages found to upload"
             exit 1
           fi
-          cp "${files[@]}" artifacts/nuget-packages/
+          cp "${files[@]}" artifacts/native-nuget-packages/
 
-      - name: Upload NuGet packages to artifacts
+      - name: Upload optional-native packages
         uses: actions/upload-artifact@v6
         with:
-          name: nuget-packages
-          path: ${{ env.working-directory }}/artifacts/nuget-packages/*.nupkg
+          name: native-companion-nuget-packages
+          path: ${{ env.working-directory }}/artifacts/native-nuget-packages/*.nupkg
           retention-days: 7
 
-  validate-nativeaot-static-package:
-    needs: publish
+  validate-dynamic-native-packages:
+    needs: [package-managed, package-native-companions]
     strategy:
       fail-fast: false
       matrix:
         include:
         - os: blacksmith-4vcpu-windows-2025
           rid: win-x64
-          executable: NativeAotSample.exe
 
         - os: windows-11-arm
           rid: win-arm64
-          executable: NativeAotSample.exe
 
         - os: ubuntu-latest
           rid: linux-x64
-          executable: NativeAotSample
 
         - os: ubuntu-24.04-arm
           rid: linux-arm64
-          executable: NativeAotSample
 
         - os: macos-26-intel
           rid: osx-x64
-          executable: NativeAotSample
 
         - os: macos-26
           rid: osx-arm64
-          executable: NativeAotSample
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -492,7 +810,126 @@ jobs:
       - name: Install dotnet SDK
         uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Download managed NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: managed-nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Download native companion NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: native-companion-nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Run dynamic native package smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sampleDirectory = "${{ env.working-directory }}/samples/DynamicNativePackageSmoke"
+          $sampleProject = Join-Path $sampleDirectory "DynamicNativePackageSmoke.csproj"
+          $packageSource = Resolve-Path "${{ env.working-directory }}/artifacts/nuget-packages"
+          $nugetConfig = Join-Path $sampleDirectory "NuGet.config"
+
+          @"
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$packageSource" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local">
+                <package pattern="Turso.*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          "@ | Set-Content -Path $nugetConfig -Encoding UTF8
+
+          foreach ($targetFramework in @("net8.0", "net9.0", "net10.0")) {
+            dotnet restore $sampleProject -r "${{ matrix.rid }}" --configfile $nugetConfig -p:TursoSampleTargetFramework=$targetFramework
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+
+            $assets = Get-Content (Join-Path $sampleDirectory "obj/project.assets.json") -Raw | ConvertFrom-Json
+            $libraries = $assets.libraries.PSObject.Properties.Name
+            foreach ($package in @(
+              "Turso.Data.Sqlite/",
+              "Turso.Raw/",
+              "Turso.Data.Sqlite.Native/",
+              "Turso.Data.Sqlite.Sync/"
+            )) {
+              if (-not ($libraries | Where-Object { $_.StartsWith($package, [StringComparison]::OrdinalIgnoreCase) })) {
+                throw "The $targetFramework dynamic package closure did not restore $package"
+              }
+            }
+
+            $output = dotnet run --project $sampleProject -c Release -r "${{ matrix.rid }}" --no-restore -p:TursoSampleTargetFramework=$targetFramework
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+            if ($output -notcontains "Dynamic native package smoke passed.") {
+              throw "Unexpected $targetFramework dynamic package smoke output: $output"
+            }
+          }
+
+  validate-nativeaot-static-package:
+    needs: [package-managed, package-native-companions]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: blacksmith-4vcpu-windows-2025
+          rid: win-x64
+          target: x86_64-pc-windows-msvc
+          executable: NativeAotSample.exe
+
+        - os: windows-11-arm
+          rid: win-arm64
+          target: aarch64-pc-windows-msvc
+          executable: NativeAotSample.exe
+
+        - os: ubuntu-latest
+          rid: linux-x64
+          target: x86_64-unknown-linux-gnu
+          executable: NativeAotSample
+
+        - os: ubuntu-24.04-arm
+          rid: linux-arm64
+          target: aarch64-unknown-linux-gnu
+          executable: NativeAotSample
+
+        - os: macos-26-intel
+          rid: osx-x64
+          target: x86_64-apple-darwin
+          executable: NativeAotSample
+
+        - os: macos-26
+          rid: osx-arm64
+          target: aarch64-apple-darwin
+          executable: NativeAotSample
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
 
       - name: Verify NativeAOT prerequisites
         if: startsWith(matrix.rid, 'linux-')
@@ -504,10 +941,16 @@ jobs:
             exit 1
           fi
 
-      - name: Download NuGet packages
+      - name: Download managed NuGet packages
         uses: actions/download-artifact@v7
         with:
-          name: nuget-packages
+          name: managed-nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Download native companion NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: native-companion-nuget-packages
           path: ${{ env.working-directory }}/artifacts/nuget-packages
 
       - name: Publish NativeAOT sample from package
@@ -516,7 +959,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           $sampleProject = "${{ env.working-directory }}/samples/NativeAot/NativeAotSample.csproj"
           $packageSource = Resolve-Path "${{ env.working-directory }}/artifacts/nuget-packages"
-          $publishDirectory = "${{ runner.temp }}/nativeaot-${{ matrix.rid }}"
           $nugetConfig = "${{ env.working-directory }}/samples/NativeAot/NuGet.config"
 
           @"
@@ -530,6 +972,7 @@ jobs:
               <packageSource key="local">
                 <package pattern="Turso.Data.Sqlite" />
                 <package pattern="Turso.Data.Sqlite.NativeAot.*" />
+                <package pattern="Turso.Raw" />
               </packageSource>
               <packageSource key="nuget.org">
                 <package pattern="*" />
@@ -538,41 +981,47 @@ jobs:
           </configuration>
           "@ | Set-Content -Path $nugetConfig -Encoding UTF8
 
-          dotnet restore $sampleProject -r "${{ matrix.rid }}" --configfile $nugetConfig
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
+          foreach ($targetFramework in @("net8.0", "net9.0", "net10.0")) {
+            $publishDirectory = "${{ runner.temp }}/nativeaot-${{ matrix.rid }}-$targetFramework"
+            dotnet restore $sampleProject -r "${{ matrix.rid }}" --configfile $nugetConfig -p:TursoSampleTargetFramework=$targetFramework
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+
+            dotnet publish $sampleProject -c Release -r "${{ matrix.rid }}" -o $publishDirectory --no-restore -p:TursoSampleTargetFramework=$targetFramework
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+
+            $sidecars = Get-ChildItem -Path $publishDirectory -Recurse -File |
+              Where-Object { $_.Name -in @("turso_sdk_kit.dll", "libturso_sdk_kit.so", "libturso_sdk_kit.dylib") }
+            if ($sidecars) {
+              throw "$targetFramework NativeAOT publish produced a Turso dynamic sidecar: $($sidecars.FullName -join ', ')"
+            }
+
+            $executable = Join-Path $publishDirectory "${{ matrix.executable }}"
+            if (-not (Test-Path $executable)) {
+              throw "$targetFramework NativeAOT executable was not produced at $executable"
+            }
+
+            if (-not $IsWindows) {
+              chmod +x $executable
+            }
+
+            & "${{ env.working-directory }}/scripts/Validate-NativeArtifact.ps1" -Target "${{ matrix.target }}" -DynamicArtifacts $executable
+            $output = & $executable
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+            if ($output -notcontains "Rows: 3") {
+              throw "Unexpected $targetFramework NativeAOT sample output: $output"
+            }
           }
 
-          dotnet publish $sampleProject -c Release -r "${{ matrix.rid }}" -o $publishDirectory --no-restore
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-          $sidecars = Get-ChildItem -Path $publishDirectory -Recurse -File |
-            Where-Object { $_.Name -in @("turso_sdk_kit.dll", "libturso_sdk_kit.so", "libturso_sdk_kit.dylib") }
-          if ($sidecars) {
-            throw "NativeAOT publish produced a Turso dynamic sidecar: $($sidecars.FullName -join ', ')"
-          }
-
-          $executable = Join-Path $publishDirectory "${{ matrix.executable }}"
-          if (-not (Test-Path $executable)) {
-            throw "NativeAOT executable was not produced at $executable"
-          }
-
-          if (-not $IsWindows) {
-            chmod +x $executable
-          }
-
-          $output = & $executable
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-          if ($output -notcontains "Rows: 3") {
-            throw "Unexpected NativeAOT sample output: $output"
-          }
-
-  publish-to-nuget:
-    needs: validate-nativeaot-static-package
+  publish-managed-to-nuget:
+    # The primary package must remain releasable even when an explicitly
+    # optional native companion cannot be built or validated.
+    needs: package-managed
     if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -585,15 +1034,42 @@ jobs:
         with:
           dotnet-version: 9.0.x
 
-      - name: Download NuGet packages
+      - name: Download managed NuGet packages
         uses: actions/download-artifact@v7
         with:
-          name: nuget-packages
-          path: nuget-packages
+          name: managed-nuget-packages
+          path: managed-nuget-packages
 
       # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
-      - name: Publish to nuget
+      - name: Publish managed packages to nuget
         run: |
-          for package in nuget-packages/*.nupkg; do
+          for package in managed-nuget-packages/*.nupkg; do
+            dotnet nuget push "$package" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done
+
+  publish-native-companions-to-nuget:
+    needs: [publish-managed-to-nuget, validate-dynamic-native-packages, validate-nativeaot-static-package]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run && needs.publish-managed-to-nuget.result == 'success' && needs.validate-dynamic-native-packages.result == 'success' && needs.validate-nativeaot-static-package.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Download native companion NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: native-companion-nuget-packages
+          path: native-companion-nuget-packages
+
+      # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
+      - name: Publish native companion packages to nuget
+        run: |
+          for package in native-companion-nuget-packages/*.nupkg; do
             dotnet nuget push "$package" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
           done

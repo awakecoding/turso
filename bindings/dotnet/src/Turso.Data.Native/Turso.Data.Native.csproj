@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>$(TursoTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Turso.Data.Native</RootNamespace>
+
+    <PackageId>Turso.Data.Sqlite.Native</PackageId>
+    <Title>Turso native local-provider companion</Title>
+    <Description>Optional dynamic native local-provider companion for Turso.Data.Sqlite. Select Local Provider=Native; Turso.Raw supplies the desktop and mobile runtime assets.</Description>
+    <Authors>Turso authors</Authors>
+    <PackageTags>turso;sqlite;database;native;interop</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591;CA2255</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
+    <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
+    <None Include="..\..\Readme.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+</Project>

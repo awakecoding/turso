@@ -3,6 +3,7 @@ using System.Collections.ObjectModel;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using Turso.Core.Storage;
 
 namespace Turso.Data.Sqlite;
 
@@ -14,6 +15,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Mode",
         "Cache",
         "Password",
+        "Encryption Cipher",
+        "Encryption Key",
         "Foreign Keys",
         "Recursive Triggers",
         "Default Timeout",
@@ -23,6 +26,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "DateTimeFormat",
         "BinaryGUID",
         "Version",
+        "Local Provider",
     ];
 
     private static readonly Dictionary<string, string> KeywordMap = new(StringComparer.OrdinalIgnoreCase)
@@ -33,6 +37,10 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["Mode"] = "Mode",
         ["Cache"] = "Cache",
         ["Password"] = "Password",
+        ["Encryption Cipher"] = "Encryption Cipher",
+        ["EncryptionCipher"] = "Encryption Cipher",
+        ["Encryption Key"] = "Encryption Key",
+        ["EncryptionKey"] = "Encryption Key",
         ["Foreign Keys"] = "Foreign Keys",
         ["ForeignKeys"] = "Foreign Keys",
         ["Recursive Triggers"] = "Recursive Triggers",
@@ -51,6 +59,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["BinaryGuid"] = "BinaryGUID",
         ["Binary GUID"] = "BinaryGUID",
         ["Version"] = "Version",
+        ["Local Provider"] = "Local Provider",
+        ["LocalProvider"] = "Local Provider",
     };
 
     public SqliteConnectionStringBuilder()
@@ -84,6 +94,18 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetString("Password");
         set => SetString("Password", value);
+    }
+
+    public string EncryptionCipher
+    {
+        get => GetString("Encryption Cipher");
+        set => SetString("Encryption Cipher", value);
+    }
+
+    public string EncryptionKey
+    {
+        get => GetString("Encryption Key");
+        set => SetString("Encryption Key", value);
     }
 
     public bool? ForeignKeys
@@ -147,6 +169,18 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             this["Version"] = value;
         }
     }
+
+    public TursoLocalProvider LocalProvider
+    {
+        get => GetEnum("Local Provider", TursoLocalProvider.Native);
+        set => this["Local Provider"] = value;
+    }
+
+    public bool IsLocalProviderConfigured => base.ContainsKey("Local Provider");
+
+    internal TursoLocalProvider EffectiveLocalProvider => IsLocalProviderConfigured
+        ? LocalProvider
+        : TursoLocalProvider.Managed;
 
     public override ICollection Keys => new ReadOnlyCollection<string>(CanonicalKeywords);
 
@@ -212,6 +246,38 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
 
         return builder.ConnectionString;
     }
+
+    internal TursoEncryptionOptions? CreateManagedEncryptionOptions()
+    {
+        var cipher = GetString("Encryption Cipher");
+        var keyConfigured = base.TryGetValue("Encryption Key", out var keyValue);
+        var key = keyConfigured
+            ? Convert.ToString(keyValue, CultureInfo.InvariantCulture)
+            : null;
+
+        if (string.IsNullOrWhiteSpace(cipher))
+        {
+            if (keyConfigured)
+                throw new InvalidOperationException("Encryption Cipher is required when Encryption Key is specified.");
+
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(key))
+            throw new InvalidOperationException("Encryption Key is required when Encryption Cipher is specified.");
+
+        return cipher.ToLowerInvariant() switch
+        {
+            "aes128gcm" => TursoEncryptionOptions.FromHex(Turso.Core.Storage.TursoEncryptionCipher.Aes128Gcm, key),
+            "aes256gcm" => TursoEncryptionOptions.FromHex(Turso.Core.Storage.TursoEncryptionCipher.Aes256Gcm, key),
+            _ => throw new NotSupportedException(
+                "Local Provider=Managed supports only Turso encrypted format version 0 with "
+                + "AES128GCM (cipher ID 1) or AES256GCM (cipher ID 2); cipher fallback is not permitted."),
+        };
+    }
+
+    internal bool HasEncryptionOptions
+        => base.ContainsKey("Encryption Cipher") || base.ContainsKey("Encryption Key");
 
     private static string NormalizeKeyword(string keyword)
     {
@@ -297,6 +363,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Recursive Triggers" or "Pooling" or "BinaryGUID" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
             "Default Timeout" or "Version" => Convert.ToInt32(value, CultureInfo.InvariantCulture),
             "DateTimeKind" => ConvertDateTimeKind(value),
+            "Local Provider" => ConvertLocalProvider(value),
             _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty,
         };
     }
@@ -309,6 +376,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Cache" => ConvertCacheMode(value),
             "Foreign Keys" => ConvertToNullableBoolean(value)!,
             "DateTimeKind" => ConvertDateTimeKind(value),
+            "Local Provider" => ConvertLocalProvider(value),
             _ => value,
         };
     }
@@ -321,6 +389,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Mode" => SqliteOpenMode.ReadWriteCreate,
             "Cache" => SqliteCacheMode.Default,
             "Password" => string.Empty,
+            "Encryption Cipher" => string.Empty,
+            "Encryption Key" => string.Empty,
             "Foreign Keys" => null!,
             "Recursive Triggers" => false,
             "Default Timeout" => 30,
@@ -330,6 +400,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "DateTimeFormat" => string.Empty,
             "BinaryGUID" => true,
             "Version" => 3,
+            "Local Provider" => TursoLocalProvider.Native,
             _ => throw new ArgumentException(Properties.Resources.KeywordNotSupported(keyword)),
         };
     }
@@ -383,5 +454,17 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             throw new ArgumentOutOfRangeException(nameof(value), value, Properties.Resources.InvalidEnumValue(typeof(DateTimeKind), kind));
 
         return kind;
+    }
+
+    private static TursoLocalProvider ConvertLocalProvider(object value)
+    {
+        var provider = ConvertEnum<TursoLocalProvider>(value);
+        if (!Enum.IsDefined(provider))
+            throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                Properties.Resources.InvalidEnumValue(typeof(TursoLocalProvider), provider));
+
+        return provider;
     }
 }
