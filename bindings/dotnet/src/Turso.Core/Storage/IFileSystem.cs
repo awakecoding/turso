@@ -29,6 +29,14 @@ public enum FileSystemOperation
 }
 
 /// <summary>
+/// A cheap content-activity signal for a file: its length plus the last time a
+/// writer modified it. Foreign read-only pagers compare stamps across statement
+/// boundaries to detect owner commits that leave no header metadata change
+/// (a checkpoint that rewrites pages in place without touching the header).
+/// </summary>
+public readonly record struct FileWriteStamp(long Length, DateTimeOffset LastWriteTimeUtc);
+
+/// <summary>
 /// Minimal, correctness-first storage abstraction. Backends provide durable,
 /// positional (offset addressed) access to files. This mirrors the split
 /// between the Rust <c>IO</c> and <c>File</c> traits used by the core engine:
@@ -48,6 +56,14 @@ public interface IFileSystem
 
     /// <summary>Deletes the file at <paramref name="path"/> if it exists.</summary>
     void DeleteFile(string path);
+
+    /// <summary>
+    /// The current write stamp of a file, or <see langword="null"/> when the
+    /// file does not exist or this backend cannot observe write activity.
+    /// Foreign read-only change detection degrades to header metadata when a
+    /// backend returns <see langword="null"/> here.
+    /// </summary>
+    FileWriteStamp? GetWriteStamp(string path) => null;
 }
 
 /// <summary>

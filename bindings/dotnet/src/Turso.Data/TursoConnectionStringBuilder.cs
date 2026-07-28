@@ -43,6 +43,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["TLS"] = "Tls",
         ["Local Provider"] = "Local Provider",
         ["LocalProvider"] = "Local Provider",
+        ["Foreign Read Only"] = "Foreign Read Only",
+        ["ForeignReadOnly"] = "Foreign Read Only",
     };
 
     public TursoConnectionStringBuilder()
@@ -169,6 +171,17 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetEnum("Local Provider", TursoLocalProvider.Native);
         set => this["Local Provider"] = value;
+    }
+
+    /// <summary>
+    /// Opens a database file owned by another engine without claiming ownership
+    /// locks or requiring the shared-memory file. Requires Local Provider=Managed,
+    /// Mode=ReadOnly, and Pooling=False.
+    /// </summary>
+    public bool ForeignReadOnly
+    {
+        get => GetBool("Foreign Read Only");
+        set => this["Foreign Read Only"] = value;
     }
 
     internal bool IsLocalProviderConfigured => base.ContainsKey("Local Provider");

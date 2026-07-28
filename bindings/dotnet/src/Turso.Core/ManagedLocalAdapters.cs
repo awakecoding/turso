@@ -251,11 +251,15 @@ public sealed class ManagedDatabaseAdapter : IManagedDatabaseAdapter
             : new ManagedDatabaseAdapter(EmbeddedDatabase.OpenFile(path));
     }
 
-    public static ManagedDatabaseAdapter OpenFile(string path, IFileSystem fileSystem, bool readOnly = false)
+    public static ManagedDatabaseAdapter OpenFile(
+        string path,
+        IFileSystem fileSystem,
+        bool readOnly = false,
+        bool foreignReadOnly = false)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(fileSystem);
-        return new ManagedDatabaseAdapter(EmbeddedDatabase.OpenFile(path, fileSystem, readOnly));
+        return new ManagedDatabaseAdapter(EmbeddedDatabase.OpenFile(path, fileSystem, readOnly, foreignReadOnly));
     }
 
     public static ManagedDatabaseAdapter FromConnection(EmbeddedConnection connection)

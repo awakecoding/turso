@@ -32,6 +32,8 @@ public static class Resources
 
     public static string ManagedMemoryEncryptionNotSupported => "Encryption is supported only for file-backed databases when Local Provider=Managed.";
 
+    public static string ManagedForeignReadOnlyNotSupported => "Foreign Read Only requires Local Provider=Managed, Mode=ReadOnly, Pooling=False, a file-backed Data Source, and no shared cache or encryption options.";
+
     public static string InvalidOffsetAndCount => "Offset and count were out of bounds for the array.";
 
     public static string SqliteNativeError(object? errorCode, object? message) => $"SQLite Error {errorCode}: '{message}'.";

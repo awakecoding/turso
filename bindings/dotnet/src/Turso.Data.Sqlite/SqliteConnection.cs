@@ -118,6 +118,7 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
                 "Turso.Data.Sqlite supports only local database connections. Use TursoConnection for remote Hrana or embedded replica connections.");
         }
         ValidateManagedSharedCacheOptions();
+        ValidateForeignReadOnlyOptions();
         if (!string.IsNullOrEmpty(_connectionOptions.Password))
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
 
@@ -158,7 +159,8 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
                         filename,
                         readOnly,
                         managedEncryption,
-                        out var managedEncryptionFileSystem);
+                        out var managedEncryptionFileSystem,
+                        _connectionOptions.ForeignReadOnly);
                     _managedEncryptionFileSystem = managedEncryptionFileSystem;
                 }
             }
@@ -696,7 +698,8 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         string filename,
         bool readOnly,
         TursoEncryptionOptions? encryption,
-        out TursoEncryptionFileSystem? managedEncryptionFileSystem)
+        out TursoEncryptionFileSystem? managedEncryptionFileSystem,
+        bool foreignReadOnly = false)
     {
         managedEncryptionFileSystem = null;
         IManagedDatabaseAdapter? database = null;
@@ -722,7 +725,8 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
             database = ManagedDatabaseAdapter.OpenFile(
                 filename,
                 fileSystem,
-                readOnly: readOnly);
+                readOnly: readOnly,
+                foreignReadOnly: foreignReadOnly);
             _ = database.Connect();
             return database;
         }
@@ -878,8 +882,15 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         => options.EffectiveLocalProvider == TursoLocalProvider.Managed
            && options.Mode == SqliteOpenMode.Memory
            && options.Cache == SqliteCacheMode.Shared
-           && !string.IsNullOrWhiteSpace(options.DataSource)
-           && !options.DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase);
+           && !string.IsNullOrWhiteSpace(options.DataSource);
+
+    // Anonymous in-memory databases stay connection-private under shared-cache mode:
+    // Microsoft.Data.Sqlite only promotes them to a named shared cache when Mode=Memory
+    // routes the open through the shared-cache URI form.
+    private static bool IsAnonymousMemorySharedCacheConfiguration(SqliteConnectionStringBuilder options)
+        => options.DataSource.Length == 0
+           || (options.Mode != SqliteOpenMode.Memory
+               && options.DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase));
 
     private static bool IsNativeSharedMemory(SqliteConnectionStringBuilder options)
         => options.EffectiveLocalProvider != TursoLocalProvider.Managed
@@ -896,15 +907,39 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         }
 
         if (!IsManagedSharedMemoryConfiguration(_connectionOptions))
-            throw new NotSupportedException(Properties.Resources.ManagedSharedCacheNotSupported);
+        {
+            if (!IsAnonymousMemorySharedCacheConfiguration(_connectionOptions))
+                throw new NotSupportedException(Properties.Resources.ManagedSharedCacheNotSupported);
+            return;
+        }
+
         if (HasManagedCallbacks)
             throw new NotSupportedException(Properties.Resources.ManagedSharedCacheCallbacksNotSupported);
+    }
+
+    private void ValidateForeignReadOnlyOptions()
+    {
+        if (!_connectionOptions.ForeignReadOnly)
+            return;
+
+        if (_connectionOptions.EffectiveLocalProvider != TursoLocalProvider.Managed
+            || _connectionOptions.Mode != SqliteOpenMode.ReadOnly
+            || _connectionOptions.Pooling
+            || _connectionOptions.Cache == SqliteCacheMode.Shared
+            || _connectionOptions.HasEncryptionOptions
+            || !string.IsNullOrEmpty(_connectionOptions.Password)
+            || string.IsNullOrWhiteSpace(_connectionOptions.DataSource)
+            || _connectionOptions.DataSource.Equals(":memory:", StringComparison.Ordinal))
+        {
+            throw new NotSupportedException(Properties.Resources.ManagedForeignReadOnlyNotSupported);
+        }
     }
 
     private bool CanUseManagedPooling(string filename, TursoEncryptionOptions? encryption)
         => _connectionOptions.Pooling
            && encryption is null
            && !HasManagedCallbacks
+           && !_connectionOptions.ForeignReadOnly
            && _connectionOptions.Mode != SqliteOpenMode.Memory
            && !filename.Equals(":memory:", StringComparison.Ordinal);
 

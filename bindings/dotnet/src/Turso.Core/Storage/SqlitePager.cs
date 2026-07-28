@@ -82,6 +82,7 @@ public sealed class SqlitePager : IDisposable
     private SqliteJournalMode _journalMode;
     private SqlitePagerState _state;
     private TimeSpan _busyTimeout;
+    private readonly bool _foreignReadOnly;
 
     private SqlitePager(
         IFileSystem fileSystem,
@@ -91,9 +92,11 @@ public sealed class SqlitePager : IDisposable
         SqliteWalFile? wal,
         SqliteJournalMode journalMode,
         SqlitePagerLockManager lockManager,
-        int pageCacheCapacity)
+        int pageCacheCapacity,
+        bool foreignReadOnly = false)
     {
         _fileSystem = fileSystem;
+        _foreignReadOnly = foreignReadOnly;
         _databasePath = databasePath;
         _walPath = walPath;
         _journalPath = databasePath + "-journal";
@@ -364,6 +367,13 @@ public sealed class SqlitePager : IDisposable
     /// <remarks>
     /// Writable opens physically discard a corrupt, partial, or uncommitted WAL
     /// tail. Read-only opens expose the same recovered view but retain that tail.
+    /// A foreign read-only open (<paramref name="foreignReadOnly"/>) additionally
+    /// skips ownership acquisition and the shared-memory lock coordinator entirely,
+    /// so the database may be owned by another engine and its directory may be
+    /// read-only. Foreign pagers rebuild their committed view from durable storage
+    /// before every read and tolerate uncommitted WAL tails written by the owner;
+    /// any structural inconsistency (hot rollback journal, torn or
+    /// checksum-invalid pages) still faults the pager closed.
     /// </remarks>
     public static SqlitePager Open(
         IFileSystem fileSystem,
@@ -373,27 +383,37 @@ public sealed class SqlitePager : IDisposable
         SqlitePagerLockManager? lockManager = null,
         TimeSpan? busyTimeout = null,
         TursoEncryptionOptions? encryption = null,
-        int pageCacheCapacity = DefaultPageCacheCapacity)
+        int pageCacheCapacity = DefaultPageCacheCapacity,
+        bool foreignReadOnly = false)
     {
         ArgumentNullException.ThrowIfNull(fileSystem);
         ArgumentException.ThrowIfNullOrEmpty(databasePath);
         ArgumentException.ThrowIfNullOrEmpty(walPath);
         ValidateBusyTimeout(busyTimeout, nameof(busyTimeout));
         ValidatePageCacheCapacity(pageCacheCapacity, nameof(pageCacheCapacity));
+        if (foreignReadOnly && !readOnly)
+            throw new ArgumentException("A foreign open is always read-only.", nameof(foreignReadOnly));
+        if (foreignReadOnly && encryption is not null)
+            throw new ArgumentException("A foreign open cannot combine with managed encryption.", nameof(foreignReadOnly));
         encryption ??= GetFileSystemEncryption(fileSystem);
 
         var configuredBusyTimeout = busyTimeout ?? TimeSpan.Zero;
-        var effectiveLockManager = lockManager ?? SqlitePagerLockRegistry.Get(fileSystem, databasePath, walPath);
+        var effectiveLockManager = lockManager
+            ?? (foreignReadOnly
+                ? SqlitePagerLockRegistry.GetProcessLocal(fileSystem, databasePath, walPath)
+                : SqlitePagerLockRegistry.Get(fileSystem, databasePath, walPath));
         var storageFileSystem = CreateStorageFileSystem(fileSystem);
         var lockStopwatch = configuredBusyTimeout == Timeout.InfiniteTimeSpan
             ? null
             : Stopwatch.StartNew();
-        var clientOwnership = SqliteManagedFileOwnershipRegistry.Acquire(
-            fileSystem,
-            databasePath,
-            createNew: false,
-            readOnly,
-            configuredBusyTimeout);
+        var clientOwnership = foreignReadOnly
+            ? null
+            : SqliteManagedFileOwnershipRegistry.Acquire(
+                fileSystem,
+                databasePath,
+                createNew: false,
+                readOnly,
+                configuredBusyTimeout);
         try
         {
             var openOperation = readOnly
@@ -465,7 +485,8 @@ public sealed class SqlitePager : IDisposable
                         wal,
                         journalMode,
                         effectiveLockManager,
-                        pageCacheCapacity);
+                        pageCacheCapacity,
+                        foreignReadOnly);
                     if (journalMode == SqliteJournalMode.Wal && wal is not null)
                     {
                         var recovery = wal.ScanRecovery();
@@ -1388,7 +1409,34 @@ public sealed class SqlitePager : IDisposable
     /// without that ownership carrier has no such proof and must rescan.
     /// </remarks>
     private bool RequiresSharedStorageRescan
-        => _lockManager.UsesFileBackedWalLocks && _clientOwnership is null;
+        => _foreignReadOnly || (_lockManager.UsesFileBackedWalLocks && _clientOwnership is null);
+
+    /// <summary>
+    /// Captures a token identifying the pager's current committed view after a
+    /// fresh rescan. Foreign read-only callers compare tokens across statement
+    /// boundaries to detect durable changes made by the database owner. WAL
+    /// commits change the frame count or salts, but a checkpoint can rewrite
+    /// the main file in place without touching any header field, so the token
+    /// also carries the on-disk write stamps of both files.
+    /// </summary>
+    internal SqlitePagerViewToken CaptureCommittedViewToken()
+    {
+        lock (_gate)
+        {
+            SynchronizeCommittedView();
+            var pageOne = new byte[_pageStore.PageSize];
+            ReadCommittedPageCore(1, pageOne);
+            var header = SqliteDatabaseHeader.Parse(pageOne);
+            return new SqlitePagerViewToken(
+                header.ChangeCounter,
+                _committedFrameCount,
+                _wal?.Header.Salt1 ?? 0,
+                _wal?.Header.Salt2 ?? 0,
+                _committedPageCount,
+                _fileSystem.GetWriteStamp(_databasePath),
+                _fileSystem.GetWriteStamp(_walPath));
+        }
+    }
 
     /// <summary>
     /// The number of times this pager rebuilt its committed view from durable
@@ -1424,6 +1472,9 @@ public sealed class SqlitePager : IDisposable
                 _lockGeneration = generation;
                 return;
             }
+            if (_foreignReadOnly)
+                ReconcileForeignWalIncarnation();
+
             if (_wal is null)
             {
                 _pageStore.RefreshHeader();
@@ -1433,7 +1484,8 @@ public sealed class SqlitePager : IDisposable
             }
 
             var recovery = RequireWal().ScanRecovery();
-            if (!_lockManager.UsesFileBackedWalLocks
+            if (!_foreignReadOnly
+                && !_lockManager.UsesFileBackedWalLocks
                 && HasUncommittedOrInvalidTail(recovery))
             {
                 throw new InvalidDataException(
@@ -1490,6 +1542,51 @@ public sealed class SqlitePager : IDisposable
             throw new InvalidDataException(
                 "SQLite WAL storage changed while this pager was open; dispose and reopen it.");
         }
+    }
+
+    /// <summary>
+    /// A foreign reader shares no lock state with the database owner, so the owner
+    /// may legitimately recycle (checkpoint and reset) or remove the WAL between
+    /// rescans. Rather than faulting like <see cref="ValidateWalIncarnation"/>,
+    /// adopt the current WAL incarnation — or the fully checkpointed main file
+    /// when the WAL is gone — exactly as a freshly opened SQLite read-only
+    /// connection would.
+    /// </summary>
+    private void ReconcileForeignWalIncarnation()
+    {
+        if (!_fileSystem.FileExists(_walPath))
+        {
+            if (_wal is not null)
+            {
+                _wal.Dispose();
+                _wal = null;
+            }
+
+            return;
+        }
+
+        if (_wal is not null)
+        {
+            using var currentWal = SqliteWalFile.Open(
+                _fileSystem,
+                _walPath,
+                readOnly: true,
+                GetFileSystemEncryption(_fileSystem));
+            if (currentWal.Header.Salt1 == _wal.Header.Salt1
+                && currentWal.Header.Salt2 == _wal.Header.Salt2)
+            {
+                return;
+            }
+
+            _wal.Dispose();
+            _wal = null;
+        }
+
+        _wal = SqliteWalFile.Open(
+            _fileSystem,
+            _walPath,
+            readOnly: true,
+            GetFileSystemEncryption(_fileSystem));
     }
 
     private void RecoverUncommittedTailUnderWriterLock(SqlitePagerLockLease writerLock)
@@ -2268,3 +2365,16 @@ public sealed class SqlitePagerTransaction : IDisposable
             throw new InvalidOperationException($"SQLite pager transaction is {_state}.");
     }
 }
+
+/// <summary>
+/// Identifies one committed pager view for change detection. See
+/// <see cref="SqlitePager.CaptureCommittedViewToken"/>.
+/// </summary>
+internal readonly record struct SqlitePagerViewToken(
+    uint ChangeCounter,
+    long CommittedFrameCount,
+    uint WalSalt1,
+    uint WalSalt2,
+    uint CommittedPageCount,
+    FileWriteStamp? DatabaseStamp,
+    FileWriteStamp? WalStamp);

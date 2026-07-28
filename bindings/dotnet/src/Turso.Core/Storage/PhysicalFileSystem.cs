@@ -25,6 +25,15 @@ public sealed partial class PhysicalFileSystem :
         return File.Exists(path);
     }
 
+    public FileWriteStamp? GetWriteStamp(string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        var info = new FileInfo(path);
+        return info.Exists
+            ? new FileWriteStamp(info.Length, info.LastWriteTimeUtc)
+            : null;
+    }
+
     public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
         => OpenFile(path, mode, readOnly, FileShare.Read);
 
@@ -153,6 +162,8 @@ public sealed partial class PhysicalFileSystem :
 internal sealed class SqlitePagerPhysicalFileSystem(PhysicalFileSystem fileSystem) : IFileSystem, IAtomicFileSystem
 {
     public bool FileExists(string path) => fileSystem.FileExists(path);
+
+    public FileWriteStamp? GetWriteStamp(string path) => fileSystem.GetWriteStamp(path);
 
     public IFile OpenFile(string path, FileOpenMode mode, bool readOnly = false)
         => fileSystem.OpenPagerFile(path, mode, readOnly);

@@ -816,6 +816,13 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
 
     private void OpenCore()
     {
+        if (_connectionOptions.ForeignReadOnly
+            && (_connectionOptions.IsRemote || _connectionOptions.LocalProvider != TursoLocalProvider.Managed))
+        {
+            throw new NotSupportedException(
+                "Foreign Read Only requires Local Provider=Managed and a file-backed local Data Source.");
+        }
+
         if (_connectionOptions.IsRemote)
         {
             OpenRemote();
@@ -871,6 +878,7 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
         }
         else if (_connectionOptions.Pooling
             && options.Encryption is null
+            && !options.ForeignReadOnly
             && !options.DataSource.Equals(":memory:", StringComparison.Ordinal))
         {
             var poolKey = ManagedConnectionPoolKey.Create(options.DataSource, options.ReadOnly);
@@ -913,7 +921,8 @@ public class TursoConnection : DbConnection, ILocalReaderConnection
                 managedDatabase = ManagedDatabaseAdapter.OpenFile(
                     options.DataSource,
                     fileSystem,
-                    readOnly: options.ReadOnly);
+                    readOnly: options.ReadOnly,
+                    foreignReadOnly: options.ForeignReadOnly);
                 try
                 {
                     _ = managedDatabase.Connect();

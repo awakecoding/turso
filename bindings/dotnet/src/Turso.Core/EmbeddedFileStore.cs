@@ -84,7 +84,8 @@ internal sealed class EmbeddedFileStore : IDisposable
         TursoEncryptionOptions? encryption = null,
         bool readOnly = false,
         int? initialPageSize = null,
-        SqliteTextEncoding? initialTextEncoding = null)
+        SqliteTextEncoding? initialTextEncoding = null,
+        bool foreignReadOnly = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(fileSystem);
@@ -122,7 +123,13 @@ internal sealed class EmbeddedFileStore : IDisposable
                 throw new InvalidOperationException(
                     "Initial page size and text encoding can be specified only when creating a database.");
             }
-            pager = SqlitePager.Open(fileSystem, path, walPath, readOnly, encryption: encryption);
+            pager = SqlitePager.Open(
+                fileSystem,
+                path,
+                walPath,
+                readOnly,
+                encryption: encryption,
+                foreignReadOnly: foreignReadOnly);
         }
         else
         {
@@ -143,6 +150,13 @@ internal sealed class EmbeddedFileStore : IDisposable
             throw;
         }
     }
+
+    /// <summary>
+    /// Forces a committed-view rescan and captures the token identifying the
+    /// durable view this store currently sees. Used by foreign read-only
+    /// connections to detect owner commits between statements.
+    /// </summary>
+    internal SqlitePagerViewToken CaptureCommittedViewToken() => _pager.CaptureCommittedViewToken();
 
     private EmbeddedFileCatalog Load()
     {
@@ -7747,22 +7761,16 @@ internal sealed class EmbeddedFileStore : IDisposable
         if (primaryKeyCount > 1)
         {
             throw new EmbeddedSqlException(
-                $"The managed file engine cannot persist table '{name}' because it has a composite PRIMARY KEY, which requires an on-disk index b-tree.");
+                $"The managed file engine cannot persist table '{name}' because its catalog marks multiple columns as PRIMARY KEY, which is an inconsistent table definition.");
         }
 
-        if (primaryKeyCount == 1)
+        // A single non-rowid-alias PRIMARY KEY (TEXT, composite-capable, or INTEGER ...
+        // DESC) is persisted through the implicit sqlite_autoindex index that the
+        // catalog already materializes in table.Indexes; the generic index validation
+        // below covers it. Only a rowid-alias INTEGER PRIMARY KEY, which has no backing
+        // index, needs its values checked directly here.
+        if (primaryKeyCount == 1 && table.RowidAliasColumnIndex >= 0)
         {
-            // Only a single-column INTEGER PRIMARY KEY that aliases the rowid can be
-            // persisted without an index b-tree. A non-integer PRIMARY KEY or an
-            // INTEGER PRIMARY KEY DESC (which SQLite backs with a separate unique index)
-            // is rejected here rather than written as an invalid database.
-            if (table.RowidAliasColumnIndex < 0)
-            {
-                ValidatePrimaryKeyIndexPrerequisites(name, table, "a non-rowid-alias PRIMARY KEY");
-                throw new EmbeddedSqlException(
-                    $"The managed file engine cannot persist table '{name}' because its PRIMARY KEY column '{columns[primaryKeyIndex].Name}' is not an INTEGER PRIMARY KEY rowid alias; such a PRIMARY KEY requires an on-disk index b-tree.");
-            }
-
             var seen = new HashSet<long>();
             foreach (var row in table.Rows)
             {

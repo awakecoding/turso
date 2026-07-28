@@ -2,9 +2,12 @@
 
 Status: **Stage 0 — process-exclusive ownership.** Managed physical databases are
 *not* concurrently interoperable with ordinary SQLite clients or with other
-managed processes. This document is the normative description of what the managed
-pager does today, why each guard exists, and the staged work required before any
-form of SQLite-compatible multi-process WAL access can be claimed.
+managed processes, with one read-only exception: an explicit `Foreign Read
+Only=True` connection may read a database owned by an ordinary SQLite client
+without claiming ownership (§1.9). This document is the normative description of
+what the managed pager does today, why each guard exists, and the staged work
+required before any form of SQLite-compatible multi-process WAL access can be
+claimed.
 
 Nothing here describes behavior that is unimplemented, and nothing here authorizes
 relaxing a guard ahead of the stage that replaces it.
@@ -203,6 +206,50 @@ and is only refreshed on pooling reset.
 - **SQLite → managed handoff.** SQLite may delete or replace `-wal` and `-shm`, so
   reopen writable with the managed provider first and let managed WAL or
   rollback-journal recovery complete before resuming normal use.
+
+### 1.9 Foreign read-only opens
+
+A managed connection opened with `Foreign Read Only=True` reads a database that is
+*not* managed-owned — typically one created and still owned by an ordinary SQLite
+client (for example `winget`'s `index.db`). It is an explicit opt-out of the
+ownership boundary, not a relaxation of it: the managed engine acts as a
+well-behaved *read-only SQLite client* that never claims the file.
+
+| Property | Behavior |
+| --- | --- |
+| Ownership | `SqliteManagedFileOwnership` is never acquired; a foreign open does not block the owner, and a live owner does not block the foreign open |
+| Lock manager | A coordinator-less process-local `SqlitePagerLockManager` keyed with a `foreign` prefix, so byte locks on `-shm` are never placed |
+| `-shm` | Never required, never created, never probed |
+| Writes | Rejected the same way as any read-only connection |
+| Journal modes | `DELETE`/`TRUNCATE`/`PERSIST` and `WAL` databases open cleanly, with or without live companion files |
+| Hot files | An unreadable hot rollback journal faults the pager (fails closed); a missing or mid-incarnation `-wal` is adopted, never repaired |
+
+**Snapshot and freshness.** The foreign pager scans the WAL (if any) on open and
+captures a *view token*: the header change counter, committed WAL frame count and
+salts, plus the file-system write stamps (length and last-write time) of the main
+file and `-wal`. Every autocommit statement re-captures the token; if it changed,
+the heap-materialized catalog is reloaded from the store, so a foreign reader
+observes commits the owner makes between statements. An explicit `BEGIN`
+transaction pins the snapshot for its duration — commits the owner makes
+mid-transaction are invisible until the transaction ends, matching SQLite's
+read-transaction semantics.
+
+**Constraints enforced at open.** Foreign read-only requires `Local
+Provider=Managed`, `Mode=ReadOnly`, a file-backed physical data source, and
+`Pooling=False`. Shared
+cache, encryption, and custom file systems are rejected, because the token's
+write stamps and the lock bypass are only meaningful for a real on-disk file.
+Pooling is refused because a pooled connection would hand back a live catalog
+whose view token can no longer be refreshed reliably.
+
+**What this is not.** Foreign read-only is not interoperability in the Stage 1–6
+sense: the managed engine still does not place SQLite-compatible locks, so the
+owner is unaware of the foreign reader. The owner may checkpoint, reset, or
+delete the WAL at any time; the foreign reader copes by re-scanning and
+re-adopting on the next statement boundary, and a statement racing the owner's
+mutation may observe the new incarnation rather than failing. That tradeoff is
+acceptable for a read-only guest, and it is strictly safer than claiming shared
+state that does not exist.
 
 ## 2. Required staged transition to SQLite-compatible multi-process WAL
 
@@ -464,6 +511,20 @@ the Stage 0 boundary:
 | `ManagedRolesNeverClaimSqliteCheckpointLockByteAlone` | §1.3 — byte 121 is unused by managed roles |
 | `ManagedRolesStayInsideSqliteReservedSharedMemoryLockArea` | §1.2 — no locks outside bytes 120–127 |
 | `ManagedReadOnlyOpenRefusesToCreateAMissingSharedMemoryLockCarrier` | §1.2, §3 — read-only opens never create `-shm` |
+
+`bindings/dotnet/src/Turso.Tests/ForeignReadOnlyOpenTests.cs` pins the §1.9
+foreign read-only boundary against `Microsoft.Data.Sqlite` as the owner:
+
+| Test | Contract clause |
+| --- | --- |
+| `CleanlyClosedWalDatabaseOpensAndMatchesSqlite` / `CleanlyClosedDeleteJournalDatabaseOpensAndMatchesSqlite` | §1.9 — foreign open of owner-free files matches the oracle |
+| `WalDatabaseOwnedByLiveSqliteProcessOpensAndTracksCommittedState` / `DeleteJournalDatabaseOwnedByLiveSqliteProcessOpensAndTracksCommits` | §1.9 — live-owner commits surface at statement boundaries |
+| `OwnerRecreatingWalBetweenStatementsIsAdoptedByForeignReader` | §1.9 — a replaced WAL incarnation is re-adopted |
+| `HotRollbackJournalFailsClosed` | §1.9, §3 — an unreadable hot journal faults instead of guessing |
+| `ExplicitReadTransactionPinsSnapshotWhileOwnerCommits` | §1.9 — explicit transactions pin their snapshot |
+| `ForeignReadOnlyRejectsWrites` | §1.9 — writes are rejected |
+| `ForeignReadOnlyWorksThroughTursoConnection` | §1.9 — both ADO surfaces expose the mode |
+| `FacadeRejectsInvalidForeignReadOnlyCombinations` / `TursoConnectionRejectsInvalidForeignReadOnlyCombinations` | §1.9 — pooling, shared cache, encryption, and remote/native providers are refused |
 
 Related existing coverage:
 

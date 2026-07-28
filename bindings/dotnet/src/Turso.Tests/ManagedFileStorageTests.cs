@@ -149,14 +149,26 @@ public class ManagedFileStorageTests
     }
 
     [Test]
-    public void RejectsNonIntegerPrimaryKey()
+    public void PersistsNonIntegerPrimaryKeyThroughImplicitIndex()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var database = EmbeddedDatabase.OpenFile("reject-pk.db", fileSystem);
-        using var connection = database.Connect();
+        using (var database = EmbeddedDatabase.OpenFile("persist-pk.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(name TEXT PRIMARY KEY);");
+            Execute(connection, "INSERT INTO t VALUES ('alpha'), ('beta');");
 
-        var act = () => Execute(connection, "CREATE TABLE t(name TEXT PRIMARY KEY);");
-        act.Should().Throw<EmbeddedSqlException>().WithMessage("*PRIMARY KEY*");
+            var duplicate = () => Execute(connection, "INSERT INTO t VALUES ('alpha');");
+            duplicate.Should().Throw<EmbeddedSqlException>().WithMessage("*UNIQUE constraint failed*");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile("persist-pk.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Query(reopenedConnection, "SELECT name FROM t ORDER BY name;")
+            .Select(row => row[0].AsText())
+            .Should().Equal("alpha", "beta");
+        var duplicateAfterReopen = () => Execute(reopenedConnection, "INSERT INTO t VALUES ('beta');");
+        duplicateAfterReopen.Should().Throw<EmbeddedSqlException>().WithMessage("*UNIQUE constraint failed*");
     }
 
     [Test]
@@ -494,16 +506,27 @@ public class ManagedFileStorageTests
     }
 
     [Test]
-    public void RejectsIntegerPrimaryKeyDescendingBeforeAnyBytesArePersisted()
+    public void PersistsIntegerPrimaryKeyDescendingThroughImplicitIndex()
     {
         var fileSystem = new InMemoryFileSystem();
-        using var database = EmbeddedDatabase.OpenFile("reject-desc-pk.db", fileSystem);
-        using var connection = database.Connect();
 
-        // INTEGER PRIMARY KEY DESC is not a rowid alias in SQLite; it needs a separate
-        // index b-tree, which the file engine cannot persist, so it is rejected.
-        var act = () => Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY DESC, a TEXT);");
-        act.Should().Throw<EmbeddedSqlException>().WithMessage("*PRIMARY KEY*");
+        // INTEGER PRIMARY KEY DESC is not a rowid alias in SQLite; it is backed by a
+        // separate sqlite_autoindex unique index, which the file engine now persists.
+        using (var database = EmbeddedDatabase.OpenFile("persist-desc-pk.db", fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY DESC, a TEXT);");
+            Execute(connection, "INSERT INTO t VALUES (3, 'c'), (1, 'a'), (2, 'b');");
+
+            var duplicate = () => Execute(connection, "INSERT INTO t VALUES (2, 'dupe');");
+            duplicate.Should().Throw<EmbeddedSqlException>().WithMessage("*UNIQUE constraint failed*");
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile("persist-desc-pk.db", fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Query(reopenedConnection, "SELECT a FROM t ORDER BY id DESC;")
+            .Select(row => row[0].AsText())
+            .Should().Equal("c", "b", "a");
     }
 
     private static void Execute(EmbeddedConnection connection, string sql)

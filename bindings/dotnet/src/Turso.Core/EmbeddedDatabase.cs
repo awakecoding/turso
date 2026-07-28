@@ -223,6 +223,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
     private readonly IFileSystem? _fileSystem;
     private readonly object? _fileCatalogWriteLock;
     private readonly bool _readOnly;
+    private readonly bool _foreignReadOnly;
+    private SqlitePagerViewToken _foreignViewToken;
     private FileCatalogVersion _fileCatalogVersion;
     private PragmaHeaderMetadata _inMemoryPragmaHeader;
     private long _version;
@@ -245,7 +247,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
         IFileSystem fileSystem,
         FileCatalogVersion fileCatalogVersion,
         object fileCatalogWriteLock,
-        bool readOnly)
+        bool readOnly,
+        bool foreignReadOnly = false)
     {
         _fileStore = fileStore;
         _databasePath = databasePath;
@@ -253,6 +256,10 @@ public sealed partial class EmbeddedDatabase : IDisposable
         _fileCatalogVersion = fileCatalogVersion;
         _fileCatalogWriteLock = fileCatalogWriteLock;
         _readOnly = readOnly;
+        _foreignReadOnly = foreignReadOnly;
+        _foreignViewToken = foreignReadOnly
+            ? fileStore.CaptureCommittedViewToken()
+            : default;
         _tables = catalog.Tables;
         _views = catalog.Views;
         _triggers = catalog.Triggers;
@@ -267,9 +274,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
     public static EmbeddedDatabase OpenFile(
         string path,
         IFileSystem? fileSystem = null,
-        bool readOnly = false)
+        bool readOnly = false,
+        bool foreignReadOnly = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
+        if (foreignReadOnly && !readOnly)
+            throw new ArgumentException("A foreign open is always read-only.", nameof(foreignReadOnly));
         var effectiveFileSystem = fileSystem ?? PhysicalFileSystem.Instance;
         var fileCatalogWriteLock = GetFileCatalogWriteLock(effectiveFileSystem, path);
         lock (fileCatalogWriteLock)
@@ -281,12 +291,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 path,
                 effectiveFileSystem,
                 out var catalog,
-                readOnly: readOnly);
+                readOnly: readOnly,
+                foreignReadOnly: foreignReadOnly);
             try
             {
                 // The store now owns the physical database before this second pager
                 // reads the durable version, so no foreign client can race catalog load.
-                var catalogVersion = ReadFileCatalogVersion(effectiveFileSystem, path);
+                // A foreign read-only open holds no ownership, but the version read
+                // is a self-contained snapshot and only feeds catalog-cache reuse.
+                var catalogVersion = ReadFileCatalogVersion(effectiveFileSystem, path, foreignReadOnly);
                 return new EmbeddedDatabase(
                     store,
                     catalog,
@@ -294,7 +307,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     effectiveFileSystem,
                     catalogVersion,
                     fileCatalogWriteLock,
-                    readOnly);
+                    readOnly,
+                    foreignReadOnly);
             }
             catch
             {
@@ -1219,7 +1233,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
 
                 lock (_fileCatalogWriteLock)
-                    EnsureFileCatalogVersionCurrent();
+                {
+                    if (_foreignReadOnly)
+                        RefreshForeignCatalogIfChangedLocked();
+                    else
+                        EnsureFileCatalogVersionCurrent();
+                }
             }
 
             var pragmaHeader = _fileStore is null
@@ -1838,6 +1857,63 @@ public sealed partial class EmbeddedDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// A foreign read-only connection holds no ownership and no catalog write
+    /// lease, so the owner may commit between its statements. When the durable
+    /// view token changed, reload the heap-materialized catalog from the current
+    /// committed view — the same adoption a freshly opened SQLite read-only
+    /// connection would observe. Caller must hold <see cref="_fileCatalogWriteLock"/>.
+    /// </summary>
+    private void RefreshForeignCatalogIfChangedLocked()
+    {
+        if (_fileStore is null || _fileSystem is null)
+            return;
+
+        var token = _fileStore.CaptureCommittedViewToken();
+        if (token == _foreignViewToken)
+            return;
+
+        var replacement = EmbeddedFileStore.Open(
+            _databasePath,
+            _fileSystem,
+            out var catalog,
+            readOnly: true,
+            foreignReadOnly: true);
+        try
+        {
+            var previous = _fileStore;
+            _fileStore = replacement;
+            replacement = null;
+            _fileCatalogVersion = ReadFileCatalogVersion(_fileSystem, _databasePath, foreignReadOnly: true);
+            PublishCatalog(new SchemaCatalog(catalog.Tables, catalog.Views, catalog.Triggers));
+            _foreignViewToken = _fileStore.CaptureCommittedViewToken();
+            previous.Dispose();
+        }
+        finally
+        {
+            replacement?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Statement-boundary adoption for foreign read-only connections. Callers
+    /// skip this while an explicit transaction is active on their connection:
+    /// the transaction's catalog snapshot stays pinned for its lifetime.
+    /// </summary>
+    internal void RefreshForeignCatalogForStatementIfNeeded()
+    {
+        if (!_foreignReadOnly || _fileStore is null)
+            return;
+
+        lock (_gate)
+        {
+            if (_fileCatalogWriteLock is null)
+                throw new InvalidOperationException("The managed file catalog persistence state is not initialized.");
+            lock (_fileCatalogWriteLock)
+                RefreshForeignCatalogIfChangedLocked();
+        }
+    }
+
     internal void RefreshFileCatalogForPooling()
     {
         lock (_gate)
@@ -1894,9 +1970,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
         _version++;
     }
 
-    private static FileCatalogVersion ReadFileCatalogVersion(IFileSystem fileSystem, string path)
+    private static FileCatalogVersion ReadFileCatalogVersion(
+        IFileSystem fileSystem,
+        string path,
+        bool foreignReadOnly = false)
     {
-        using var pager = SqlitePager.Open(fileSystem, path, path + "-wal", readOnly: true);
+        using var pager = SqlitePager.Open(
+            fileSystem,
+            path,
+            path + "-wal",
+            readOnly: true,
+            foreignReadOnly: foreignReadOnly);
         var header = SqliteDatabaseHeader.Parse(pager.ReadCommittedPage(1));
         if (header.VersionValidFor != header.ChangeCounter
             || header.DatabaseSizeInPages != pager.CommittedPageCount)
@@ -31286,6 +31370,9 @@ public sealed class EmbeddedConnection : IDisposable
             throw new EmbeddedSqlException(
                 "Managed SQL callbacks cannot change transaction or attachment state during a write.");
         }
+
+        if (_transactionDatabases is null)
+            _database.RefreshForeignCatalogForStatementIfNeeded();
 
         switch (statement)
         {

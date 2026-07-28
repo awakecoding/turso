@@ -542,6 +542,24 @@ internal static class SqlitePagerLockRegistry
                 : new SqlitePagerLockManager());
     }
 
+    /// <summary>
+    /// A process-local lock scope for foreign read-only pagers. These never touch
+    /// the shared-memory file, so their coordinator only serializes other foreign
+    /// readers (and their rescan state) inside this process. The key is prefixed so
+    /// a foreign pager never shares its coordinator with an owned pager on the same
+    /// database: an owned pager may legitimately write the file while foreign
+    /// readers rescan it.
+    /// </summary>
+    internal static SqlitePagerLockManager GetProcessLocal(IFileSystem fileSystem, string databasePath, string walPath)
+    {
+        fileSystem = TursoEncryptionFileSystem.Unwrap(fileSystem);
+        var key = "foreign\0" + CreateKey(fileSystem, databasePath, walPath);
+        var scope = fileSystem is PhysicalFileSystem
+            ? PhysicalFileSystemScope
+            : FileSystemScopes.GetValue(fileSystem, static _ => new LockScope());
+        return scope.GetOrAdd(key, static () => new SqlitePagerLockManager());
+    }
+
     private static string CreateKey(IFileSystem fileSystem, string databasePath, string walPath)
     {
         if (fileSystem is PhysicalFileSystem)

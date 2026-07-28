@@ -27,6 +27,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "BinaryGUID",
         "Version",
         "Local Provider",
+        "Foreign Read Only",
     ];
 
     private static readonly Dictionary<string, string> KeywordMap = new(StringComparer.OrdinalIgnoreCase)
@@ -61,6 +62,8 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["Version"] = "Version",
         ["Local Provider"] = "Local Provider",
         ["LocalProvider"] = "Local Provider",
+        ["Foreign Read Only"] = "Foreign Read Only",
+        ["ForeignReadOnly"] = "Foreign Read Only",
     };
 
     public SqliteConnectionStringBuilder()
@@ -181,6 +184,18 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
     internal TursoLocalProvider EffectiveLocalProvider => IsLocalProviderConfigured
         ? LocalProvider
         : TursoLocalProvider.Managed;
+
+    /// <summary>
+    /// Opens a database file owned by another engine without claiming ownership
+    /// locks or requiring the shared-memory file. Requires <see cref="Mode"/>
+    /// <see cref="SqliteOpenMode.ReadOnly"/>, the managed local provider, and
+    /// <see cref="Pooling"/> disabled.
+    /// </summary>
+    public bool ForeignReadOnly
+    {
+        get => GetBool("Foreign Read Only");
+        set => this["Foreign Read Only"] = value;
+    }
 
     public override ICollection Keys => new ReadOnlyCollection<string>(CanonicalKeywords);
 
@@ -360,7 +375,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Mode" => ConvertOpenMode(value),
             "Cache" => ConvertCacheMode(value),
             "Foreign Keys" => ConvertToNullableBoolean(value),
-            "Recursive Triggers" or "Pooling" or "BinaryGUID" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
+            "Recursive Triggers" or "Pooling" or "BinaryGUID" or "Foreign Read Only" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
             "Default Timeout" or "Version" => Convert.ToInt32(value, CultureInfo.InvariantCulture),
             "DateTimeKind" => ConvertDateTimeKind(value),
             "Local Provider" => ConvertLocalProvider(value),
@@ -401,6 +416,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "BinaryGUID" => true,
             "Version" => 3,
             "Local Provider" => TursoLocalProvider.Native,
+            "Foreign Read Only" => false,
             _ => throw new ArgumentException(Properties.Resources.KeywordNotSupported(keyword)),
         };
     }

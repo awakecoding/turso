@@ -36,6 +36,8 @@ public class TursoConnectionOptions
 
     public bool Pooling => _builder.Pooling;
 
+    public bool ForeignReadOnly => _builder.ForeignReadOnly;
+
     public int SyncInterval => _builder.SyncInterval;
 
     public bool? Tls => _builder.Tls;
@@ -64,14 +66,20 @@ public class TursoConnectionOptions
         {
             if (cache.Equals("Shared", StringComparison.OrdinalIgnoreCase))
             {
-                if (mode != ManagedLocalOpenMode.Memory
-                    || string.IsNullOrWhiteSpace(DataSource)
-                    || DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
+                if (mode == ManagedLocalOpenMode.Memory && !string.IsNullOrWhiteSpace(DataSource))
+                {
+                    // Microsoft.Data.Sqlite routes Mode=Memory + Cache=Shared through the
+                    // shared-cache URI form, so any named Data Source (including a literal
+                    // ":memory:") becomes one in-memory database shared per process.
+                    sharedMemoryName = DataSource;
+                }
+                else if (!dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
                 {
                     throw new NotSupportedException(ManagedSharedCacheContract.UnsupportedConfigurationMessage);
                 }
 
-                sharedMemoryName = DataSource;
+                // Every remaining shape resolves to an anonymous :memory: database, which
+                // SQLite always keeps connection-private even under shared-cache mode.
             }
             else
             {
@@ -105,11 +113,21 @@ public class TursoConnectionOptions
             throw new ArgumentOutOfRangeException(nameof(DefaultTimeout), timeout, "Default Timeout cannot be negative.");
 
         var managedDataSource = mode == ManagedLocalOpenMode.Memory ? ":memory:" : dataSource;
+        var encryption = CreateManagedEncryptionOptions(mode, managedDataSource);
+        if (ForeignReadOnly
+            && (mode != ManagedLocalOpenMode.ReadOnly || Pooling || encryption is not null || sharedMemoryName is not null))
+        {
+            encryption?.Dispose();
+            throw new NotSupportedException(
+                "Foreign Read Only requires Local Provider=Managed, Mode=ReadOnly, Pooling=False, a file-backed Data Source, and no shared cache or encryption options.");
+        }
+
         return new ManagedLocalOpenOptions(
             managedDataSource,
             mode == ManagedLocalOpenMode.ReadOnly,
-            CreateManagedEncryptionOptions(mode, managedDataSource),
-            sharedMemoryName);
+            encryption,
+            sharedMemoryName,
+            ForeignReadOnly);
     }
 
     public Uri GetRemoteUri()
@@ -280,7 +298,8 @@ internal readonly record struct ManagedLocalOpenOptions(
     string DataSource,
     bool ReadOnly,
     ManagedEncryptionOptions? Encryption,
-    string? SharedMemoryName) : IDisposable
+    string? SharedMemoryName,
+    bool ForeignReadOnly = false) : IDisposable
 {
     public void Dispose() => Encryption?.Dispose();
 }
@@ -288,7 +307,7 @@ internal readonly record struct ManagedLocalOpenOptions(
 internal static class ManagedSharedCacheContract
 {
     public const string UnsupportedConfigurationMessage =
-        "Cache=Shared with Local Provider=Managed is supported only for named in-memory databases using Mode=Memory and a non-empty Data Source other than :memory:; file-backed and anonymous in-memory shared caches are not supported.";
+        "Cache=Shared with Local Provider=Managed is supported only for in-memory databases: use Mode=Memory with a non-empty Data Source for a named shared cache, or an anonymous :memory: Data Source for a connection-private cache; file-backed shared caches are not supported.";
 
     public const string ReadUncommittedNotSupportedMessage =
         "PRAGMA read_uncommitted and IsolationLevel.ReadUncommitted are not supported for managed shared-memory databases because the managed engine preserves transaction isolation and does not expose dirty reads.";

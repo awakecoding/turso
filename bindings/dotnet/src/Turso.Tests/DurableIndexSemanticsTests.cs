@@ -164,6 +164,249 @@ public sealed class DurableIndexSemanticsTests
     }
 
     [Test]
+    public void ColumnLevelTextPrimaryKeyPersistsAndRoundTripsThroughSqlite()
+    {
+        var path = CreateDatabasePath("column-text-pk");
+        const string schema = "CREATE TABLE accounts(id TEXT PRIMARY KEY, balance INTEGER NOT NULL DEFAULT 0);";
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, schema);
+                Execute(connection, "INSERT INTO accounts VALUES ('alpha', 1), ('beta', 2), ('gamma', 3);");
+
+                Action duplicate = () => Execute(connection, "INSERT INTO accounts VALUES ('beta', 9);");
+                duplicate.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed*");
+
+                Execute(connection, "INSERT OR REPLACE INTO accounts VALUES ('beta', 20);");
+                Query(connection, "SELECT balance FROM accounts WHERE id = 'beta';")
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(20);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                Query(connection, "PRAGMA index_list(accounts);")
+                    .Select(row => (Name: row[1].AsText(), Origin: row[3].AsText()))
+                    .Should().BeEquivalentTo([("sqlite_autoindex_accounts_1", "pk")]);
+                Query(connection, "SELECT id FROM accounts ORDER BY id;")
+                    .Select(row => row[0].AsText())
+                    .Should().Equal("alpha", "beta", "gamma");
+                Action duplicate = () => Execute(connection, "INSERT INTO accounts VALUES ('alpha', 5);");
+                duplicate.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed*");
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            QueryIntegers(
+                    sqlite,
+                    "SELECT balance FROM accounts INDEXED BY sqlite_autoindex_accounts_1 WHERE id = 'beta';")
+                .Should().Equal(20);
+
+            using (var violation = sqlite.CreateCommand())
+            {
+                violation.CommandText = "INSERT INTO accounts VALUES ('gamma', 30);";
+                Action sqliteDuplicate = () => violation.ExecuteNonQuery();
+                sqliteDuplicate.Should().Throw<MsData.SqliteException>()
+                    .WithMessage("*UNIQUE constraint failed*");
+            }
+
+            using (var metadata = sqlite.CreateCommand())
+            {
+                metadata.CommandText = "PRAGMA index_xinfo('sqlite_autoindex_accounts_1');";
+                using var reader = metadata.ExecuteReader();
+                var terms = new List<(string? Name, long Descending, string Collation, long Key)>();
+                while (reader.Read())
+                {
+                    terms.Add((
+                        reader.IsDBNull(2) ? null : reader.GetString(2),
+                        reader.GetInt64(3),
+                        reader.GetString(4),
+                        reader.GetInt64(5)));
+                }
+
+                terms.Should().Equal(
+                    ("id", 0, "BINARY", 1),
+                    (null, 0, "BINARY", 0));
+            }
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void ColumnLevelIntegerPrimaryKeyDescPersistsAsImplicitUniqueIndex()
+    {
+        var path = CreateDatabasePath("integer-pk-desc");
+        const string schema = "CREATE TABLE events(id INTEGER PRIMARY KEY DESC, payload TEXT);";
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, schema);
+                Execute(connection, "INSERT INTO events VALUES (3, 'c'), (1, 'a'), (2, 'b');");
+
+                Action duplicate = () => Execute(connection, "INSERT INTO events VALUES (2, 'dupe');");
+                duplicate.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed*");
+
+                Query(connection, "SELECT payload FROM events ORDER BY id DESC;")
+                    .Select(row => row[0].AsText())
+                    .Should().Equal("c", "b", "a");
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            using (var list = sqlite.CreateCommand())
+            {
+                list.CommandText = "SELECT name || '|' || origin FROM pragma_index_list('events');";
+                using var reader = list.ExecuteReader();
+                var indexes = new List<string>();
+                while (reader.Read())
+                    indexes.Add(reader.GetString(0));
+                indexes.Should().Equal("sqlite_autoindex_events_1|pk");
+            }
+
+            QueryIntegers(sqlite, "SELECT id FROM events INDEXED BY sqlite_autoindex_events_1 ORDER BY id DESC;")
+                .Should().Equal(3, 2, 1);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void ColumnLevelPrimaryKeyAndUniqueConstraintNumberingMatchesSqlite()
+    {
+        var path = CreateDatabasePath("column-constraint-numbering");
+        const string schema =
+            """
+            CREATE TABLE mixed(
+                a TEXT UNIQUE,
+                id TEXT PRIMARY KEY,
+                b TEXT UNIQUE,
+                c INTEGER
+            );
+            CREATE TABLE wrapped(d TEXT UNIQUE PRIMARY KEY, e INTEGER);
+            """;
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, schema);
+                Execute(connection, "INSERT INTO mixed VALUES ('x', 'k1', 'p', 1), ('y', 'k2', 'q', 2);");
+                Execute(connection, "INSERT INTO wrapped VALUES ('w', 1);");
+
+                Action duplicateUnique = () => Execute(connection, "INSERT INTO mixed VALUES ('x', 'k3', 'r', 3);");
+                duplicateUnique.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed*");
+                Action duplicatePrimaryKey = () => Execute(connection, "INSERT INTO mixed VALUES ('z', 'k1', 'r', 3);");
+                duplicatePrimaryKey.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed*");
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            using (var list = sqlite.CreateCommand())
+            {
+                list.CommandText =
+                    "SELECT name || '|' || origin FROM pragma_index_list('mixed') ORDER BY name;";
+                using var reader = list.ExecuteReader();
+                var indexes = new List<string>();
+                while (reader.Read())
+                    indexes.Add(reader.GetString(0));
+                indexes.Should().Equal(
+                    "sqlite_autoindex_mixed_1|u",
+                    "sqlite_autoindex_mixed_2|pk",
+                    "sqlite_autoindex_mixed_3|u");
+            }
+
+            using (var list = sqlite.CreateCommand())
+            {
+                list.CommandText =
+                    "SELECT name || '|' || origin FROM pragma_index_list('wrapped') ORDER BY name;";
+                using var reader = list.ExecuteReader();
+                var indexes = new List<string>();
+                while (reader.Read())
+                    indexes.Add(reader.GetString(0));
+                indexes.Should().Equal("sqlite_autoindex_wrapped_1|pk");
+            }
+
+            QueryIntegers(sqlite, "SELECT c FROM mixed INDEXED BY sqlite_autoindex_mixed_2 WHERE id = 'k2';")
+                .Should().Equal(2);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void SqliteCreatedColumnLevelPrimaryKeysOpenAndStayWritable()
+    {
+        var path = CreateDatabasePath("sqlite-created-column-pk");
+        try
+        {
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False"))
+            {
+                sqlite.Open();
+                Execute(sqlite, "CREATE TABLE accounts(id TEXT PRIMARY KEY, balance INTEGER);");
+                Execute(sqlite, "INSERT INTO accounts VALUES ('alpha', 1), ('beta', 2);");
+                Execute(sqlite, "CREATE TABLE events(id INTEGER PRIMARY KEY DESC, payload TEXT);");
+                Execute(sqlite, "INSERT INTO events VALUES (3, 'c'), (1, 'a');");
+            }
+
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Query(connection, "SELECT balance FROM accounts WHERE id = 'beta';")
+                    .Select(row => row[0].AsInteger())
+                    .Should().Equal(2);
+                Query(connection, "SELECT payload FROM events ORDER BY id DESC;")
+                    .Select(row => row[0].AsText())
+                    .Should().Equal("c", "a");
+
+                Action duplicate = () => Execute(connection, "INSERT INTO accounts VALUES ('alpha', 9);");
+                duplicate.Should().Throw<EmbeddedSqlException>()
+                    .WithMessage("*UNIQUE constraint failed*");
+
+                Execute(connection, "INSERT INTO accounts VALUES ('gamma', 3);");
+                Execute(connection, "INSERT INTO events VALUES (2, 'b');");
+            }
+
+            using (var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False"))
+            {
+                sqlite.Open();
+                ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+                QueryIntegers(sqlite, "SELECT balance FROM accounts ORDER BY id;")
+                    .Should().Equal(1, 2, 3);
+                QueryIntegers(sqlite, "SELECT id FROM events ORDER BY id;")
+                    .Should().Equal(1, 2, 3);
+            }
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void PartialExpressionAffinityCollationAndNullSemanticsMatchSqlite()
     {
         const string setup =
