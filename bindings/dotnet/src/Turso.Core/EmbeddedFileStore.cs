@@ -1150,7 +1150,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         var storedColumnCount = table.ColumnDefinitions.Count(
             column => !column.IsGenerated || column.GeneratedStored);
-        if (storedValues.Count != storedColumnCount)
+        if (storedValues.Count > storedColumnCount)
         {
             throw new EmbeddedSqlException(
                 $"Managed file database row for table has {storedValues.Count} stored column(s), "
@@ -1162,9 +1162,19 @@ internal sealed class EmbeddedFileStore : IDisposable
         for (var columnIndex = 0; columnIndex < row.Length; columnIndex++)
         {
             var column = table.ColumnDefinitions[columnIndex];
-            row[columnIndex] = column.IsGenerated && !column.GeneratedStored
-                ? SqlValue.Null
-                : storedValues[source++];
+            if (column.IsGenerated && !column.GeneratedStored)
+            {
+                row[columnIndex] = SqlValue.Null;
+                continue;
+            }
+
+            // ALTER TABLE ADD COLUMN does not rewrite existing records, so a stored
+            // row can be shorter than the schema. SQLite reads each missing trailing
+            // column as its declared default, which ADD COLUMN constrains to a constant.
+            row[columnIndex] = source < storedValues.Count
+                ? storedValues[source]
+                : column.DefaultValue ?? SqlValue.Null;
+            source++;
         }
 
         return row;
@@ -9726,7 +9736,7 @@ internal sealed class EmbeddedFileStore : IDisposable
     {
         var storedColumnCount = table.ColumnDefinitions.Count(
             column => !column.IsGenerated || column.GeneratedStored);
-        if (storedValues.Count != storedColumnCount)
+        if (storedValues.Count > storedColumnCount)
         {
             throw new InvalidDataException(
                 $"Stored WITHOUT ROWID table '{tableName}' record has {storedValues.Count} stored column(s), but the schema requires {storedColumnCount}.");
@@ -9743,6 +9753,13 @@ internal sealed class EmbeddedFileStore : IDisposable
                     $"Stored WITHOUT ROWID table '{tableName}' has inconsistent primary-key metadata.");
             }
 
+            // Key columns lead the record, so a short row can never truncate one.
+            if (source >= storedValues.Count)
+            {
+                throw new InvalidDataException(
+                    $"Stored WITHOUT ROWID table '{tableName}' record is missing primary-key value(s).");
+            }
+
             primaryKeyColumns[term.ColumnIndex] = true;
             row[term.ColumnIndex] = storedValues[source++];
         }
@@ -9751,12 +9768,21 @@ internal sealed class EmbeddedFileStore : IDisposable
         {
             var column = table.ColumnDefinitions[columnIndex];
             if (column.IsGenerated && !column.GeneratedStored)
+            {
                 row[columnIndex] = SqlValue.Null;
+            }
             else if (!primaryKeyColumns[columnIndex])
-                row[columnIndex] = storedValues[source++];
+            {
+                // ADD COLUMN appends past the key columns without rewriting existing
+                // records, so missing trailing columns read as their declared default.
+                row[columnIndex] = source < storedValues.Count
+                    ? storedValues[source]
+                    : column.DefaultValue ?? SqlValue.Null;
+                source++;
+            }
         }
 
-        if (source != storedValues.Count)
+        if (source < storedValues.Count)
             throw new InvalidDataException($"Stored WITHOUT ROWID table '{tableName}' record has trailing values.");
 
         return row;
