@@ -603,7 +603,7 @@ public static class CompoundProgramBuilder
             OpenReadCursorInstruction x => new OpenReadCursorInstruction(Cur(x.Cursor), x.TableName, x.ColumnCount),
             OpenWriteCursorInstruction x => new OpenWriteCursorInstruction(Cur(x.Cursor), x.TableName, x.ColumnCount),
             CloseCursorInstruction x => new CloseCursorInstruction(Cur(x.Cursor)),
-            OpenSorterInstruction x => new OpenSorterInstruction(Sort(x.Sorter), x.Comparer, x.ColumnCount),
+            OpenSorterInstruction x => new OpenSorterInstruction(Sort(x.Sorter), x.Comparer, x.ColumnCount, x.BufferRowCapacity),
             SorterInsertInstruction x => new SorterInsertInstruction(Sort(x.Sorter), Range(x.Record)),
             SorterSortInstruction x => new SorterSortInstruction(Sort(x.Sorter), Pc(x.EmptyTarget)),
             SorterDataInstruction x => new SorterDataInstruction(Sort(x.Sorter), Range(x.Destination)),

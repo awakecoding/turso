@@ -194,4 +194,18 @@ public sealed class ManagedProviderIndexSchemaMetadataTests
         schema.Rows[0][SchemaTableColumn.DataType].Should().Be(typeof(string));
         schema.Rows[0][SchemaTableColumn.ProviderType].Should().Be((int)SqliteType.Text);
     }
+
+    [Test]
+    public void SqliteTypeEnumValuesMatchTheSqliteTypeCodesUsedByMicrosoftDataSqlite()
+    {
+        // Microsoft.Data.Sqlite assigns its SqliteType members the SQLitePCL.raw
+        // SQLITE_* constants: Integer=SQLITE_INTEGER(1), Real=SQLITE_FLOAT(2),
+        // Text=SQLITE_TEXT(3), Blob=SQLITE_BLOB(4). Matching those values keeps this
+        // provider drop-in compatible (schema-table ProviderType and int casts such
+        // as PowerShell enum coercion observe the same numbers under both providers).
+        ((int)SqliteType.Integer).Should().Be(1);
+        ((int)SqliteType.Real).Should().Be(2);
+        ((int)SqliteType.Text).Should().Be(3);
+        ((int)SqliteType.Blob).Should().Be(4);
+    }
 }

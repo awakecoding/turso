@@ -120,6 +120,7 @@ Known divergences from SQLite:
 | Trace | Reports the prepared SQL text without expanding parameters, matching `sqlite3_trace_v2`'s `SQLITE_TRACE_STMT` rather than the legacy `sqlite3_trace`. The provider's own column-metadata probes are excluded, because native SQLite answers those through `sqlite3_column_decltype` without preparing a statement. |
 | Progress handler | Counts managed row-execution steps rather than VDBE opcodes, so the interval is not comparable to SQLite's. The interrupt semantics are: a `true` return fails the statement with `SQLITE_INTERRUPT` (9). |
 | Provider and cache scope | Callbacks require `Local Provider=Managed`, and are rejected on managed shared-memory databases for the same reason connection-local functions are: the catalog is shared across connections. |
+| Double-quoted tokens in value context | Resolved strictly as column identifiers; an unresolved name throws `no such column` rather than falling back to a string literal. Stock SQLite with `SQLITE_DQS` (the default, including `e_sqlite3`) reinterprets the token as a string literal when no column matches. Use single-quoted literals for portable string comparisons. |
 
 `sqlite3_profile` and `sqlite3_trace_v2`'s row and close events have no managed
 equivalent and are not published, because the managed engine has no per-statement
@@ -191,7 +192,8 @@ Deliberate limits:
 - File-backed databases on macOS and on 32-bit Linux. Managed lock leases require
   Linux OFD locks (`F_OFD_SETLK`) or Windows `LockFileEx`, so opening any
   on-disk database elsewhere throws `PlatformNotSupportedException`. In-memory
-  connections work on every platform.
+  connections work on every platform. (macOS file-backed support is deferred,
+  not ruled out — see Testing scope below.)
 
 ### Testing scope
 
@@ -209,18 +211,20 @@ validation. Managed CI runs the whole suite on Linux, Windows, and macOS against
 `net8.0`, `net9.0`, and `net10.0`, and every leg fails if it executes or passes
 fewer tests than a real run does, so a silently empty run cannot pass.
 
-**macOS is not a supported target for file-backed databases.** The managed engine
-builds its lock leases on Linux OFD locks (`F_OFD_SETLK`), which Darwin does not
-implement, so `SqliteManagedFileOwnership` throws `PlatformNotSupportedException`
-for every physical open and 236 of 3,689 tests fail on macOS. In-memory
-databases, the parser, the planner, and the conformance corpus are unaffected and
-roughly 3,250 tests still pass there. The macOS legs run the full suite and
-tolerate failures only when they carry that one documented message; any other
-macOS failure fails the leg, so the platform is covered for regressions even
-though the gap is open. Physical WAL coordination is likewise implemented for
-Windows and 64-bit Linux only, so the process-isolated WAL harness must pass on
-those legs and is required to stay discovered on macOS rather than being removed
-from the matrix.
+**macOS file-backed databases are not yet implemented.** The managed engine builds its
+lock leases on Linux OFD locks (`F_OFD_SETLK`), which Darwin does not implement, so
+`SqliteManagedFileOwnership` throws `PlatformNotSupportedException` for every physical
+open. The 236 tests that open a physical file fail on macOS with that one message.
+In-memory databases, the parser, the planner, and the conformance corpus are unaffected,
+and the remaining tests (over 3,700) still pass there. The macOS legs run the full suite
+and tolerate failures only when they carry that one documented message; any other macOS
+failure fails the leg, so the platform is covered for regressions even though the gap is
+open. Physical WAL coordination is likewise implemented for Windows and 64-bit Linux
+only, so the process-isolated WAL harness must pass on those legs and is required to
+stay discovered on macOS rather than being removed from the matrix. macOS file-backed
+support is deferred until it can be implemented and validated on macOS hardware, since
+the available lock primitive there has different (process-scoped) semantics that need
+hands-on verification.
 
 **Opening a WAL database races against other processes on Linux.**
 `SqliteWalWriterCheckpointCoordinator.Open` rebuilds the WAL index before it

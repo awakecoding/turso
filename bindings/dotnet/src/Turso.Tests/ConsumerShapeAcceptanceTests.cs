@@ -1,3 +1,4 @@
+using System.Data;
 using System.Data.Common;
 using AwesomeAssertions;
 using MsData = Microsoft.Data.Sqlite;
@@ -178,6 +179,93 @@ public sealed class ConsumerShapeAcceptanceTests
     }
 
     [Test]
+    public void PingetWingetIndexForeignReadOnlyMatchesSqliteAndTracksLiveOwner()
+    {
+        // pinget opens winget-owned databases read-only while stock SQLite may still own
+        // them (Repository.cs / PinStore.cs use Mode=ReadOnly;Pooling=False). The foreign
+        // reader must serve the winget search SQL, adopt the owner's commits on the next
+        // autocommit statement, and pin its snapshot during an explicit read transaction
+        // — matching a real Microsoft.Data.Sqlite read-only oracle on the same file.
+        var path = CreateDatabasePath("winget-foreign");
+        const string fixture =
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE ids (rowid INTEGER PRIMARY KEY, id TEXT NOT NULL);
+            CREATE TABLE names (rowid INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE monikers (rowid INTEGER PRIMARY KEY, moniker TEXT NOT NULL);
+            CREATE TABLE versions (rowid INTEGER PRIMARY KEY, version TEXT NOT NULL);
+            CREATE TABLE channels (rowid INTEGER PRIMARY KEY, channel TEXT NOT NULL);
+            CREATE TABLE manifest (rowid INTEGER PRIMARY KEY, id INT64 NOT NULL, name INT64 NOT NULL,
+                moniker INT64, version INT64 NOT NULL, channel INT64 NOT NULL);
+            INSERT INTO ids VALUES (1, 'Git.Git'), (2, 'Microsoft.VisualStudioCode');
+            INSERT INTO names VALUES (1, 'Git'), (2, 'Visual Studio Code');
+            INSERT INTO monikers VALUES (1, 'git'), (2, 'vscode');
+            INSERT INTO versions VALUES (1, '2.47.0'), (2, '1.99.0');
+            INSERT INTO channels VALUES (1, ''), (2, 'stable');
+            INSERT INTO manifest VALUES (10, 1, 1, 1, 1, 1), (11, 2, 2, 2, 2, 2);
+            """;
+        const string search =
+            """
+            SELECT manifest.rowid, manifest.id, versions.version, channels.channel,
+                   names.name, monikers.moniker
+            FROM manifest
+            JOIN ids ON manifest.id = ids.rowid
+            JOIN names ON manifest.name = names.rowid
+            LEFT JOIN monikers ON manifest.moniker = monikers.rowid
+            JOIN versions ON manifest.version = versions.rowid
+            JOIN channels ON manifest.channel = channels.rowid
+            WHERE names.name LIKE @p0
+            LIMIT 25;
+            """;
+        try
+        {
+            // Create + close so the main file carries a valid, checkpointed schema header;
+            // the foreign reader bootstraps from the main file and then scans the WAL for
+            // the live owner's subsequent commits (mirrors a winget-written index.db that
+            // has been released to disk before pinget opens it read-only).
+            using (var setup = OpenSqlite(path))
+                ExecuteNonQuery(setup, fixture);
+
+            using var owner = OpenSqlite(path);
+            using var foreign = OpenForeignReadOnly(path);
+            using var oracle = OpenSqliteReadOnly(path);
+            RunWingetSearch(foreign, search).Should().Equal(RunWingetSearch(oracle, search));
+
+            // The live owner commits a new Git.Git manifest row on a fresh version. A
+            // committed owner write is adopted on the foreign reader's next autocommit
+            // statement, matching the read-only oracle.
+            ExecuteNonQuery(owner, "INSERT INTO versions VALUES (3, '2.47.1');");
+            ExecuteNonQuery(owner, "INSERT INTO manifest VALUES (12, 1, 1, 1, 3, 1);");
+            RunWingetSearch(foreign, search).Should().Equal(RunWingetSearch(oracle, search));
+            RunWingetSearch(foreign, search).Should().HaveCount(2);
+
+            // An explicit read transaction pins the snapshot: the owner's next commit is
+            // not visible until the transaction commits, matching the oracle.
+            using (var foreignTransaction = foreign.BeginTransaction())
+            using (var oracleTransaction = oracle.BeginTransaction())
+            {
+                WingetSearchCount(foreign, foreignTransaction, search).Should().Be(2);
+                WingetSearchCount(oracle, oracleTransaction, search).Should().Be(2);
+                ExecuteNonQuery(owner, "INSERT INTO versions VALUES (4, '2.47.2');");
+                ExecuteNonQuery(owner, "INSERT INTO manifest VALUES (13, 1, 1, 1, 4, 1);");
+                WingetSearchCount(foreign, foreignTransaction, search).Should().Be(2);
+                WingetSearchCount(oracle, oracleTransaction, search).Should().Be(2);
+                foreignTransaction.Commit();
+                oracleTransaction.Commit();
+            }
+
+            RunWingetSearch(foreign, search).Should().Equal(RunWingetSearch(oracle, search));
+            RunWingetSearch(foreign, search).Should().HaveCount(3);
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
     public void PSSqliteDefaultConnectionStringSupportsMetadataLifecycle()
     {
         // The exact default connection string New-PSSqliteConnection produces.
@@ -265,6 +353,175 @@ public sealed class ConsumerShapeAcceptanceTests
         SelectServers(managed).Should().Equal(SelectServers(sqlite));
     }
 
+    [Test]
+    public void PSSqliteInsertReturningStarMatchesSqlite()
+    {
+        // New-PSSqliteRow.ps1 appends 'RETURNING *;' to inserts (New-PSSqliteRow.ps1:103).
+        // The managed engine must return the same columns — names, values, and order —
+        // as Microsoft.Data.Sqlite for both an AUTOINCREMENT primary key and a
+        // composite PRIMARY KEY table.
+        const string connectionString = "Data Source=:memory:;Cache=Shared;";
+        using var managed = new SqliteConnection(connectionString + "Local Provider=Managed");
+        using var sqlite = new MsData.SqliteConnection(connectionString);
+        managed.Open();
+        sqlite.Open();
+
+        const string createTables =
+            """
+            CREATE TABLE IF NOT EXISTS servers (
+                name TEXT NOT NULL,
+                os TEXT NOT NULL DEFAULT 'linux',
+                CONSTRAINT servers_pk PRIMARY KEY (name, os)
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message TEXT NOT NULL
+            );
+            """;
+        ExecuteNonQuery(managed, createTables);
+        ExecuteNonQuery(sqlite, createTables);
+
+        const string insertLog = "INSERT INTO audit_log (message) VALUES (@m) RETURNING *;";
+        InsertReturning(managed, insertLog, ("@m", "created"))
+            .Should().Equal(InsertReturning(sqlite, insertLog, ("@m", "created")));
+        InsertReturning(managed, insertLog, ("@m", "updated"))
+            .Should().Equal(InsertReturning(sqlite, insertLog, ("@m", "updated")));
+
+        const string insertServer = "INSERT INTO servers (name, os) VALUES (@name, @os) RETURNING *;";
+        InsertReturning(managed, insertServer, ("@name", "web01"), ("@os", "windows"))
+            .Should().Equal(InsertReturning(sqlite, insertServer, ("@name", "web01"), ("@os", "windows")));
+
+        SelectLogIds(managed).Should().Equal(SelectLogIds(sqlite));
+        SelectServers(managed).Should().Equal(SelectServers(sqlite));
+    }
+
+    [Test]
+    public void PSSqliteDataTableLoadMatchesSqliteWithNullableJoinColumn()
+    {
+        // Invoke-PSSqliteQuery.ps1 default -As DataTable calls DataTable.Load(IDataReader).
+        // The managed reader must load a multi-column result set — including a nullable
+        // LEFT JOIN column — into a DataTable with the same columns, rows, and cell values
+        // (incl. DBNull) as Microsoft.Data.Sqlite.
+        const string connectionString = "Data Source=:memory:;Cache=Shared;";
+        using var managed = new SqliteConnection(connectionString + "Local Provider=Managed");
+        using var sqlite = new MsData.SqliteConnection(connectionString);
+        managed.Open();
+        sqlite.Open();
+
+        const string schema =
+            """
+            CREATE TABLE servers (
+                name TEXT NOT NULL,
+                os TEXT NOT NULL DEFAULT 'linux',
+                CONSTRAINT servers_pk PRIMARY KEY (name, os)
+            );
+            CREATE TABLE os_info (
+                os TEXT NOT NULL,
+                vendor TEXT,
+                PRIMARY KEY (os)
+            );
+            INSERT INTO servers (name, os) VALUES ('web01', 'windows'), ('web02', 'linux'), ('web03', 'macos');
+            INSERT INTO os_info (os, vendor) VALUES ('linux', 'Debian'), ('windows', 'Microsoft');
+            """;
+        ExecuteNonQuery(managed, schema);
+        ExecuteNonQuery(sqlite, schema);
+
+        const string select =
+            """
+            SELECT s.name AS server_name, s.os, oi.vendor AS vendor
+            FROM servers s
+            LEFT JOIN os_info oi ON oi.os = s.os
+            ORDER BY s.name;
+            """;
+
+        LoadDataTable(managed, select).Should().Equal(LoadDataTable(sqlite, select));
+    }
+
+    [Test]
+    public void PSSqliteOverwriteRecreatesAfterClearingPoolsAndDeletingSidecars()
+    {
+        // Initialize-PSSqliteDatabase.ps1 OVERWRITE: Close-PSSqliteConnection ->
+        // ClearAllPools() -> delete .db (+ -wal/-shm/-journal) -> recreate. The managed
+        // engine must reopen a fresh file-backed database at the same path with no stale
+        // ownership or orphan lock errors after the previous connection released its
+        // locks.
+        var path = CreateDatabasePath("pssqlite-overwrite");
+        try
+        {
+            using (var connection = OpenManaged(path))
+            {
+                ExecuteNonQuery(connection, "PRAGMA journal_mode=WAL;");
+                ExecuteNonQuery(connection, "CREATE TABLE _metadata (key TEXT PRIMARY KEY, value TEXT);");
+                ExecuteNonQuery(connection, "INSERT INTO _metadata (key, value) VALUES ('version', '1.2.3');");
+            }
+
+            File.Exists(path).Should().BeTrue();
+            SqliteConnection.ClearAllPools();
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm", "-journal" })
+            {
+                var candidate = path + suffix;
+                if (File.Exists(candidate))
+                    File.Delete(candidate);
+            }
+
+            File.Exists(path).Should().BeFalse("OVERWRITE deletes the database and its sidecars");
+
+            using (var recreated = OpenManaged(path))
+            {
+                ExecuteNonQuery(recreated, "CREATE TABLE _metadata (key TEXT PRIMARY KEY, value TEXT);");
+                SelectMetadata(recreated).Should().BeEmpty("the recreated database is empty");
+                ExecuteNonQuery(recreated, "INSERT INTO _metadata (key, value) VALUES ('version', '2.0.0');");
+                SelectMetadata(recreated).Should().HaveCount(1);
+            }
+
+            // The recreated file round-trips through real SQLite, because synedgy mixes
+            // engines across upgrades.
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            using (var command = sqlite.CreateCommand())
+            {
+                command.CommandText = "PRAGMA integrity_check;";
+                command.ExecuteScalar().Should().Be("ok");
+            }
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void PSSqliteCreateViewWithColumnListMatchesSqlite()
+    {
+        // SqliteView.ps1 (09.SqliteView.ps1:181) emits 'CREATE VIEW <name> (<cols>) AS
+        // <select>;', a parenthesized column list. The managed engine must parse the
+        // column list and expose the renamed columns exactly as Microsoft.Data.Sqlite.
+        const string connectionString = "Data Source=:memory:;Cache=Shared;";
+        using var managed = new SqliteConnection(connectionString + "Local Provider=Managed");
+        using var sqlite = new MsData.SqliteConnection(connectionString);
+        managed.Open();
+        sqlite.Open();
+
+        const string schema =
+            """
+            CREATE TABLE servers (
+                name TEXT NOT NULL,
+                os TEXT NOT NULL DEFAULT 'linux',
+                CONSTRAINT servers_pk PRIMARY KEY (name, os)
+            );
+            INSERT INTO servers (name, os) VALUES ('web01', 'windows'), ('web02', 'linux');
+            CREATE VIEW IF NOT EXISTS v_servers (server_name, os_name) AS
+                SELECT name, os FROM servers ORDER BY name;
+            """;
+        ExecuteNonQuery(managed, schema);
+        ExecuteNonQuery(sqlite, schema);
+
+        SelectView(managed).Should().Equal(SelectView(sqlite));
+        ViewColumnNames(managed).Should().Equal(ViewColumnNames(sqlite));
+    }
+
     private static SqliteConnection OpenManaged(string path)
     {
         // Pooling=False so disposing hands the file back to other engines cleanly; the
@@ -277,6 +534,21 @@ public sealed class ConsumerShapeAcceptanceTests
     private static MsData.SqliteConnection OpenSqlite(string path)
     {
         var connection = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+        connection.Open();
+        return connection;
+    }
+
+    private static SqliteConnection OpenForeignReadOnly(string path)
+    {
+        var connection = new SqliteConnection(
+            $"Data Source={path};Mode=ReadOnly;Foreign Read Only=True;Pooling=False;Local Provider=Managed");
+        connection.Open();
+        return connection;
+    }
+
+    private static MsData.SqliteConnection OpenSqliteReadOnly(string path)
+    {
+        var connection = new MsData.SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
         connection.Open();
         return connection;
     }
@@ -362,6 +634,19 @@ public sealed class ConsumerShapeAcceptanceTests
         }
 
         return rows;
+    }
+
+    private static long WingetSearchCount(DbConnection connection, DbTransaction? transaction, string search)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = search;
+        command.Transaction = transaction;
+        AddParameter(command, "@p0", "%it%");
+        using var reader = command.ExecuteReader();
+        var count = 0L;
+        while (reader.Read())
+            count++;
+        return count;
     }
 
     private static List<string> ResolvePathParts(DbConnection connection)
@@ -478,6 +763,26 @@ public sealed class ConsumerShapeAcceptanceTests
         command.ExecuteNonQuery();
     }
 
+    private static List<(string Column, object Value)> InsertReturning(
+        DbConnection connection,
+        string sql,
+        params (string Name, object Value)[] parameters)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var (name, value) in parameters)
+            AddParameter(command, name, value);
+        using var reader = command.ExecuteReader();
+        var columns = new List<(string, object)>();
+        if (reader.Read())
+        {
+            for (var index = 0; index < reader.FieldCount; index++)
+                columns.Add((reader.GetName(index), reader.GetValue(index)));
+        }
+
+        return columns;
+    }
+
     private static List<long> SelectLogIds(DbConnection connection)
     {
         using var command = connection.CreateCommand();
@@ -489,11 +794,55 @@ public sealed class ConsumerShapeAcceptanceTests
         return ids;
     }
 
+    private static List<string> LoadDataTable(DbConnection connection, string select)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = select;
+        using var reader = command.ExecuteReader();
+        var table = new DataTable();
+        table.Load(reader);
+        var snapshot = new List<string>
+        {
+            $"columns={table.Columns.Count};rows={table.Rows.Count}",
+        };
+        foreach (DataColumn column in table.Columns)
+            snapshot.Add($"{column.ColumnName}:{column.DataType.Name}:{column.AllowDBNull}");
+        foreach (DataRow row in table.Rows)
+        {
+            foreach (var item in row.ItemArray)
+                snapshot.Add(item is DBNull ? "<NULL>" : (item?.ToString() ?? "<empty>"));
+        }
+
+        return snapshot;
+    }
+
     private static void ExecuteNonQuery(DbConnection connection, string sql)
     {
         using var command = connection.CreateCommand();
         command.CommandText = sql;
         command.ExecuteNonQuery();
+    }
+
+    private static List<(string Name, string Os)> SelectView(DbConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT server_name, os_name FROM v_servers ORDER BY server_name;";
+        var rows = new List<(string Name, string Os)>();
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+            rows.Add((reader.GetString(0), reader.GetString(1)));
+        return rows;
+    }
+
+    private static List<string> ViewColumnNames(DbConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT server_name, os_name FROM v_servers;";
+        using var reader = command.ExecuteReader();
+        var names = new List<string>();
+        for (var i = 0; i < reader.FieldCount; i++)
+            names.Add(reader.GetName(i));
+        return names;
     }
 
     private static void AddParameter(DbCommand command, string name, object value)

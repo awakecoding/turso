@@ -363,7 +363,7 @@ public class ScalarFunctionSqlRoutingTests
             .Should().Equal(SqlValue.Integer(3));
 
         Opcodes(ReadRows(connection, "EXPLAIN SELECT abs(x) FROM t WHERE rowid = 1;"))
-            .Should().Contain("FilterRowId").And.Contain("Function");
+            .Should().Contain("SeekRowid").And.Contain("Function");
     }
 
     [Test]

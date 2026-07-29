@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- This is a vendoring helper project, not a shipping app; no assembly output is consumed directly. -->
+    <OutputType>Library</OutputType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- Class libraries don't copy referenced package assemblies to the output dir by default; force it so the vendor target has something to copy. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <TursoPackageVersion>0.8.0-pre.2</TursoPackageVersion>
+    <TursoVendorLibDir>$(MSBuildThisFileDirectory)source\lib\net8.0</TursoVendorLibDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Turso.Data.Sqlite" Version="$(TursoPackageVersion)" />
+  </ItemGroup>
+
+  <!--
+    Vendors the managed Turso assemblies into source/lib/net8.0 so the PowerShell
+    module can load them directly via Assembly.LoadFrom without requiring consumers
+    to run `dotnet restore` or have a .NET SDK installed at module-import time.
+  -->
+  <Target Name="VendorTursoManagedAssemblies" AfterTargets="Build">
+    <ItemGroup>
+      <TursoManagedAssembly Include="$(OutDir)Turso.Core.dll" />
+      <TursoManagedAssembly Include="$(OutDir)Turso.Data.dll" />
+      <TursoManagedAssembly Include="$(OutDir)Turso.Data.Sqlite.dll" />
+    </ItemGroup>
+    <MakeDir Directories="$(TursoVendorLibDir)" />
+    <Copy SourceFiles="@(TursoManagedAssembly)" DestinationFolder="$(TursoVendorLibDir)" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="Vendored Turso managed assemblies to $(TursoVendorLibDir)" />
+  </Target>
+
+</Project>

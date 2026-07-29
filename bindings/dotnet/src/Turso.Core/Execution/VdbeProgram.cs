@@ -226,6 +226,11 @@ public enum VdbeOpcode
     Compare = 66,
     JumpIfNotTrue = 67,
     Cast = 68,
+    SeekRowid = 69,
+    SeekRowidRange = 70,
+    RowCount = 71,
+    Last = 72,
+    Prev = 73,
 }
 
 /// <summary>
@@ -276,7 +281,7 @@ public delegate bool VdbeRowPredicate(SqlValue[] row);
 /// </summary>
 public delegate bool VdbeRowIdPredicate(SqlValue[] row, long rowId);
 
-internal enum VdbeComparisonOperator
+public enum VdbeComparisonOperator
 {
     Is,
     IsNot,
@@ -699,6 +704,13 @@ public abstract class VdbeJoinPlanNode
     public int SourceCount { get; }
 
     internal abstract IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows);
+
+    /// <summary>
+    /// Lazily enumerates the joined rows. The runtime join cursor streams this instead of
+    /// materializing, so a cross/outer join of two large tables never buffers the full L*R
+    /// output before the first row is consumed.
+    /// </summary>
+    internal abstract IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows);
 }
 
 /// <summary>A base-table leaf in a materializing join plan.</summary>
@@ -717,7 +729,9 @@ public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode
 
     public VdbeCursorSource Source { get; }
 
-    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows)
+    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows) => Enumerate(maximumRows).ToList();
+
+    internal override IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows)
     {
         if (Source.RowIds is not null && Source.RowIds.Count != Source.Rows.Count)
         {
@@ -728,7 +742,6 @@ public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode
         var count = maximumRows is { } maximum
             ? Math.Min(Source.Rows.Count, maximum)
             : Source.Rows.Count;
-        var rows = new List<VdbeJoinRow>(count);
         for (var index = 0; index < count; index++)
         {
             var values = Source.Rows[index];
@@ -738,12 +751,10 @@ public sealed class VdbeJoinScanPlan : VdbeJoinPlanNode
                     $"Join source '{TableName}' declares {ColumnCount} columns but row {index} has {values.Length}.");
             }
 
-            rows.Add(new VdbeJoinRow(
+            yield return new VdbeJoinRow(
                 [.. values],
-                [Source.RowIds is null ? null : Source.RowIds[index]]));
+                [Source.RowIds is null ? null : Source.RowIds[index]]);
         }
-
-        return rows;
     }
 }
 
@@ -777,14 +788,22 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
 
     public VdbeJoinCondition? Condition { get; }
 
-    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows)
-    {
-        var leftRows = Left.Materialize(maximumRows: null);
-        var rightRows = Right.Materialize(maximumRows: null);
-        var rows = new List<VdbeJoinRow>();
-        var rightMatched = new bool[rightRows.Count];
+    internal override IReadOnlyList<VdbeJoinRow> Materialize(int? maximumRows) => Enumerate(maximumRows).ToList();
 
-        foreach (var left in leftRows)
+    internal override IEnumerable<VdbeJoinRow> Enumerate(int? maximumRows)
+    {
+        // The right side is materialized once (bounded by table size); the left side streams so
+        // the join output is never fully buffered before the first row is consumed. This is the
+        // OOM fix: a cross/outer join of two large tables produces L*R rows, and materializing
+        // both inputs plus the output up front is the blowup. Only the right (inner) side is
+        // re-scanned per left row, so it is the side worth buffering.
+        var rightRows = Right.Enumerate(maximumRows: null).ToList();
+        var rightMatched = Kind is VdbeJoinKind.Right or VdbeJoinKind.Full
+            ? new bool[rightRows.Count]
+            : null;
+        var emitted = 0;
+
+        foreach (var left in Left.Enumerate(maximumRows: null))
         {
             var matched = false;
             for (var rightIndex = 0; rightIndex < rightRows.Count; rightIndex++)
@@ -795,17 +814,18 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
                     continue;
 
                 matched = true;
-                rightMatched[rightIndex] = true;
-                rows.Add(combined);
-                if (ReachedMaximum(rows, maximumRows))
-                    return rows;
+                if (rightMatched is not null)
+                    rightMatched[rightIndex] = true;
+                yield return combined;
+                if (maximumRows is { } maximum && ++emitted >= maximum)
+                    yield break;
             }
 
             if (!matched && Kind is VdbeJoinKind.Left or VdbeJoinKind.Full)
             {
-                rows.Add(Combine(left, NullRow(Right)));
-                if (ReachedMaximum(rows, maximumRows))
-                    return rows;
+                yield return Combine(left, NullRow(Right));
+                if (maximumRows is { } maximum && ++emitted >= maximum)
+                    yield break;
             }
         }
 
@@ -814,20 +834,15 @@ public sealed class VdbeJoinOperatorPlan : VdbeJoinPlanNode
             var nullLeft = NullRow(Left);
             for (var rightIndex = 0; rightIndex < rightRows.Count; rightIndex++)
             {
-                if (rightMatched[rightIndex])
+                if (rightMatched![rightIndex])
                     continue;
 
-                rows.Add(Combine(nullLeft, rightRows[rightIndex]));
-                if (ReachedMaximum(rows, maximumRows))
-                    return rows;
+                yield return Combine(nullLeft, rightRows[rightIndex]);
+                if (maximumRows is { } maximum && ++emitted >= maximum)
+                    yield break;
             }
         }
-
-        return rows;
     }
-
-    private static bool ReachedMaximum(IReadOnlyCollection<VdbeJoinRow> rows, int? maximumRows)
-        => maximumRows is { } maximum && rows.Count >= maximum;
 
     private static VdbeJoinRow Combine(VdbeJoinRow left, VdbeJoinRow right)
         => new(
@@ -890,44 +905,36 @@ public sealed class VdbeJoinPlan
 
     public int RecordColumnCount => checked(ColumnCount + SourceCount + (GroupKey is null ? 0 : 1));
 
-    internal IReadOnlyList<SqlValue[]> Materialize()
+    internal IReadOnlyList<SqlValue[]> Materialize() => Enumerate().ToList();
+
+    /// <summary>
+    /// Lazily enumerates the joined, filtered, group-keyed records as <see cref="SqlValue"/> arrays.
+    /// The runtime join cursor streams this so the full result is never buffered before the first
+    /// row is consumed; the group-key ordinal map is built as rows arrive.
+    /// </summary>
+    internal IEnumerable<SqlValue[]> Enumerate()
     {
-        var joined = Root.Materialize(MaximumRows);
-        IReadOnlyList<VdbeJoinRow> selected;
-        if (Filter is null)
-        {
-            selected = joined;
-        }
-        else
-        {
-            var filtered = new List<VdbeJoinRow>(joined.Count);
-            foreach (var row in joined)
-            {
-                if (Filter(row))
-                    filtered.Add(row);
-            }
-
-            selected = filtered;
-        }
-
-        Dictionary<string, long>? groupOrdinals = GroupKey is null
+        var groupOrdinals = GroupKey is null
             ? null
             : new Dictionary<string, long>(StringComparer.Ordinal);
-        var rows = new List<SqlValue[]>(selected.Count);
-        foreach (var row in selected)
+
+        foreach (var raw in Root.Enumerate(MaximumRows))
         {
+            if (Filter is not null && !Filter(raw))
+                continue;
+
             var record = new SqlValue[RecordColumnCount];
-            Array.Copy(row.Values, record, row.Values.Length);
-            for (var index = 0; index < row.RowIds.Length; index++)
+            Array.Copy(raw.Values, record, raw.Values.Length);
+            for (var index = 0; index < raw.RowIds.Length; index++)
             {
-                record[ColumnCount + index] = row.RowIds[index] is { } rowId
+                record[ColumnCount + index] = raw.RowIds[index] is { } rowId
                     ? SqlValue.Integer(rowId)
                     : SqlValue.Null;
             }
 
             if (GroupKey is not null)
             {
-                var key = GroupKey(row);
+                var key = GroupKey(raw);
                 if (!groupOrdinals!.TryGetValue(key, out var ordinal))
                 {
                     ordinal = groupOrdinals.Count;
@@ -937,10 +944,8 @@ public sealed class VdbeJoinPlan
                 record[^1] = SqlValue.Integer(ordinal);
             }
 
-            rows.Add(record);
+            yield return record;
         }
-
-        return rows;
     }
 }
 
@@ -1137,10 +1142,19 @@ public sealed record CloseCursorInstruction(Cursor Cursor) : VdbeInstruction
     public override VdbeOpcode Opcode => VdbeOpcode.CloseCursor;
 }
 
-/// <summary>Opens an in-memory sorter that materializes rows and orders them with
+/// <summary>Opens a sorter that materializes rows and orders them with
 /// <paramref name="Comparer"/> when <c>SorterSort</c> runs. <paramref name="ColumnCount"/>
-/// is the fixed width of every record the sorter stores.</summary>
-public sealed record OpenSorterInstruction(Sorter Sorter, VdbeRowComparer Comparer, int ColumnCount)
+/// is the fixed width of every record the sorter stores. When the buffered row count
+/// exceeds <paramref name="BufferRowCapacity"/> (if positive), the sorter spills to a
+/// temp file and drains via a k-way merge so large <c>ORDER BY</c>/<c>DISTINCT</c>/
+/// <c>GROUP BY</c> result sets do not OOM — mirroring SQLite's external merge sort.
+/// The default <c>0</c> means no spill (in-memory only), preserving the historical
+/// behavior for every existing call site.</summary>
+public sealed record OpenSorterInstruction(
+    Sorter Sorter,
+    VdbeRowComparer Comparer,
+    int ColumnCount,
+    int BufferRowCapacity = 0)
     : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.OpenSorter;
@@ -1251,6 +1265,20 @@ public sealed record RewindCursorInstruction(Cursor Cursor, ProgramCounter Empty
     public override VdbeOpcode Opcode => VdbeOpcode.Rewind;
 }
 
+/// <summary>
+/// Positions <paramref name="Cursor"/> on its last row, jumping to <paramref name="EmptyTarget"/>
+/// when the cursor has no rows. It is the reverse-scan counterpart to
+/// <see cref="RewindCursorInstruction"/>: the compiler emits it for a single-table
+/// <c>ORDER BY rowid DESC</c> scan so rows are visited in descending rowid order without a
+/// sorter. The cursor must be a plain table scan — backward iteration over a forward-only
+/// streaming join enumerator is not defined, and the compiler never emits this opcode for
+/// joins.
+/// </summary>
+public sealed record LastCursorInstruction(Cursor Cursor, ProgramCounter EmptyTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Last;
+}
+
 public sealed record ColumnInstruction(Cursor Cursor, int ColumnIndex, Register Destination) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.Column;
@@ -1259,6 +1287,31 @@ public sealed record ColumnInstruction(Cursor Cursor, int ColumnIndex, Register 
 public sealed record RowIdInstruction(Cursor Cursor, Register Destination) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.RowId;
+}
+
+/// <summary>
+/// Loads the total number of rows bound to <paramref name="Cursor"/> into <paramref name="Destination"/>.
+/// It is the O(1) fast path for <c>SELECT COUNT(*) FROM &lt;source&gt;</c> with no WHERE/GROUP BY/HAVING/
+/// ORDER BY/DISTINCT/LIMIT/OFFSET and no FILTER/OVER on the COUNT(*): instead of scanning and
+/// accumulating, the cursor reads its bound row source's <see cref="VdbeCursorSource.Rows"/> count
+/// directly. The cursor is never iterated, so a tracking row source records no index access. The
+/// <see cref="HaltInstruction"/> handler disposes any cursor left open, so the emitted shortcut program
+/// needs no explicit <see cref="CloseCursorInstruction"/>.
+/// </summary>
+/// <remarks>
+/// <see cref="DriveProgress"/>, when non-null, is invoked once per counted row before the result is
+/// written. This keeps a registered progress handler firing at the same cadence as the scan+accumulator
+/// path the shortcut replaces (once per row), so an interruptible <c>SELECT count(*) FROM t</c> still
+/// raises <c>SQLITE_INTERRUPT</c> instead of completing in O(1) and never ticking the handler. It is
+/// null when no progress handler is registered, so the common case stays O(1) with no per-row work;
+/// cooperative cancellation is still honored per opcode by the interpreter loop.
+/// </remarks>
+public sealed record RowCountInstruction(
+    Cursor Cursor,
+    Register Destination,
+    Action? DriveProgress = null) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.RowCount;
 }
 
 public sealed record DeleteInstruction(Cursor Cursor) : VdbeInstruction
@@ -1302,6 +1355,50 @@ public sealed record FilterRowIdInstruction(
     string Description) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.FilterRowId;
+}
+
+/// <summary>
+/// Positions <paramref name="Cursor"/> directly on the row whose hidden rowid equals the
+/// value held in <paramref name="RowIdRegister"/>, jumping to <paramref name="NotFoundTarget"/>
+/// when no such row exists. It is the seek counterpart to a <see cref="RewindCursorInstruction"/>
+/// + <see cref="FilterRowIdInstruction"/> scan for rowid-equality point lookups: instead of
+/// iterating every row and post-filtering, the cursor lands on the single matching position.
+/// The compiler is responsible for evaluating the sought rowid expression into the register
+/// before emitting this instruction (Step 3 emission wiring; the scaffolding here is not yet
+/// emitted by <c>SelectStatementCompiler</c>).
+/// </summary>
+public sealed record SeekRowidInstruction(
+    Cursor Cursor,
+    Register RowIdRegister,
+    ProgramCounter NotFoundTarget,
+    string Description) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SeekRowid;
+}
+
+/// <summary>
+/// Positions <paramref name="Cursor"/> on the first row whose hidden rowid satisfies the
+/// <paramref name="StartOp"/> comparison against the value held in <paramref name="StartRowIdRegister"/>,
+/// jumping to <paramref name="NotFoundTarget"/> when no such row exists. When
+/// <paramref name="EndRowIdRegister"/> is supplied, iteration continues while the rowid satisfies
+/// <paramref name="EndOp"/>; the emitted <see cref="FilterRowIdInstruction"/> immediately after
+/// the seek enforces that upper bound and jumps out when exceeded.
+/// It is the seek counterpart to a <see cref="RewindCursorInstruction"/> + <see cref="FilterRowIdInstruction"/>
+/// scan for rowid-range predicates (<c>rowid &gt; N</c>, <c>rowid BETWEEN A AND B</c>): instead of
+/// iterating every row and post-filtering, the cursor lands on the first matching position and only
+/// walks the matching range. The compiler is responsible for evaluating the bound expressions into
+/// the registers before emitting this instruction.
+/// </summary>
+public sealed record SeekRowidRangeInstruction(
+    Cursor Cursor,
+    Register StartRowIdRegister,
+    VdbeComparisonOperator StartOp,
+    Register? EndRowIdRegister,
+    VdbeComparisonOperator? EndOp,
+    ProgramCounter NotFoundTarget,
+    string Description) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.SeekRowidRange;
 }
 
 /// <summary>
@@ -1362,6 +1459,17 @@ public sealed record DistinctFilterInstruction(
 public sealed record NextInstruction(Cursor Cursor, ProgramCounter LoopTarget) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.Next;
+}
+
+/// <summary>
+/// Advances <paramref name="Cursor"/> to the previous row, looping back to
+/// <paramref name="LoopTarget"/> while a previous row exists and falling through otherwise.
+/// It is the reverse-scan counterpart to <see cref="NextInstruction"/> and pairs with
+/// <see cref="LastCursorInstruction"/> to walk a table cursor backward.
+/// </summary>
+public sealed record PrevInstruction(Cursor Cursor, ProgramCounter LoopTarget) : VdbeInstruction
+{
+    public override VdbeOpcode Opcode => VdbeOpcode.Prev;
 }
 
 public sealed record YieldInstruction : VdbeInstruction
@@ -2105,6 +2213,10 @@ public sealed class VdbeProgram
                     ValidateOpenCursor(rewind.Cursor, openCursors, instructionIndex);
                     ValidateJumpTarget(rewind.EmptyTarget, instructionIndex);
                     break;
+                case LastCursorInstruction last:
+                    ValidateOpenCursor(last.Cursor, openCursors, instructionIndex);
+                    ValidateJumpTarget(last.EmptyTarget, instructionIndex);
+                    break;
                 case ColumnInstruction column:
                     ValidateOpenCursor(column.Cursor, openCursors, instructionIndex);
                     ValidateRegister(column.Destination, instructionIndex);
@@ -2113,6 +2225,10 @@ public sealed class VdbeProgram
                 case RowIdInstruction rowId:
                     ValidateOpenCursor(rowId.Cursor, openCursors, instructionIndex);
                     ValidateRegister(rowId.Destination, instructionIndex);
+                    break;
+                case RowCountInstruction rowCount:
+                    ValidateOpenCursor(rowCount.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(rowCount.Destination, instructionIndex);
                     break;
                 case DeleteInstruction delete:
                     ValidateOpenCursor(delete.Cursor, openCursors, instructionIndex);
@@ -2145,6 +2261,21 @@ public sealed class VdbeProgram
                     }
 
                     ValidateJumpTarget(filterRowId.FalseTarget, instructionIndex);
+                    break;
+                case SeekRowidInstruction seekRowid:
+                    ValidateOpenCursor(seekRowid.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(seekRowid.RowIdRegister, instructionIndex);
+                    ValidateJumpTarget(seekRowid.NotFoundTarget, instructionIndex);
+                    break;
+                case SeekRowidRangeInstruction seekRowidRange:
+                    ValidateOpenCursor(seekRowidRange.Cursor, openCursors, instructionIndex);
+                    ValidateRegister(seekRowidRange.StartRowIdRegister, instructionIndex);
+                    if (seekRowidRange.EndRowIdRegister is not null)
+                    {
+                        ValidateRegister(seekRowidRange.EndRowIdRegister.Value, instructionIndex);
+                    }
+
+                    ValidateJumpTarget(seekRowidRange.NotFoundTarget, instructionIndex);
                     break;
                 case FilterRegistersInstruction filterRegisters:
                     if (filterRegisters.Predicate is null)
@@ -2203,6 +2334,10 @@ public sealed class VdbeProgram
                 case NextInstruction next:
                     ValidateOpenCursor(next.Cursor, openCursors, instructionIndex);
                     ValidateJumpTarget(next.LoopTarget, instructionIndex);
+                    break;
+                case PrevInstruction prev:
+                    ValidateOpenCursor(prev.Cursor, openCursors, instructionIndex);
+                    ValidateJumpTarget(prev.LoopTarget, instructionIndex);
                     break;
                 case OpenSorterInstruction openSorter:
                     ValidateSorter(openSorter.Sorter, instructionIndex);

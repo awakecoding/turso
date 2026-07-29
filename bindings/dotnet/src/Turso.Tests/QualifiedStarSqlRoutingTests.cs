@@ -86,7 +86,7 @@ public class QualifiedStarSqlRoutingTests
         Opcodes(ReadRows(connection, "EXPLAIN " + query)).Should().Equal(
             "LoadConstant", "LoadConstant",
             "OpenReadCursor", "OpenSorter", "Rewind", "Filter",
-            "Column", "Column", "Column", "SorterInsert", "Next", "CloseCursor",
+            "Column", "Column", "Column", "RowId", "SorterInsert", "Next", "CloseCursor",
             "SorterSort", "SorterData", "Copy", "Copy", "Copy",
             "OffsetGate", "LimitGate", "ResultRow", "SorterNext", "CloseSorter", "Halt");
     }

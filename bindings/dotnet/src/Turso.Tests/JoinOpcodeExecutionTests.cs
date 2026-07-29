@@ -278,6 +278,65 @@ public class JoinOpcodeExecutionTests
     }
 
     [Test]
+    public void StreamingJoinCursorDoesNotMaterializeTheLeftSideBeforeTheFirstOutputRow()
+    {
+        // P1-5 join OOM: the outer (left) side of a general join must stream, not materialize.
+        // The left source records the highest row index it has handed out. A materializing join
+        // copies every left row during OpenJoinCursor (before any output), so the max index
+        // reaches the last row. A streaming join reads the left side lazily: after the first
+        // output row is positioned, only the first left row has been read. The right side is
+        // materialized by design (re-scanned once per left row; bounded by table size, not by
+        // the join output), so only the left side's laziness is asserted here.
+        const int leftSize = 100;
+        var leftRows = new TrackingRows(
+            Enumerable.Range(0, leftSize).Select(i => new[] { SqlValue.Integer(i) }).ToArray());
+        var plan = new VdbeJoinPlan(
+            new VdbeJoinOperatorPlan(
+                new VdbeJoinScanPlan(
+                    "l",
+                    1,
+                    new VdbeCursorSource(
+                        leftRows,
+                        Enumerable.Range(1, leftSize).Select(i => (long)i).ToArray())),
+                new VdbeJoinScanPlan(
+                    "r",
+                    1,
+                    new VdbeCursorSource(
+                        new[] { new[] { SqlValue.Integer(1000) } },
+                        new[] { 1L })),
+                VdbeJoinKind.Inner,
+                condition: null),
+            "streaming INNER cross join");
+        VdbeInstruction[] instructions =
+        [
+            new OpenJoinCursorInstruction(new Cursor(0), plan),
+            new RewindCursorInstruction(new Cursor(0), new ProgramCounter(7)),
+            new ColumnInstruction(new Cursor(0), 0, new Register(0)),
+            new ColumnInstruction(new Cursor(0), 1, new Register(1)),
+            new YieldInstruction(),
+            new ResultRowInstruction(new RegisterRange(new Register(0), 2)),
+            new NextInstruction(new Cursor(0), new ProgramCounter(2)),
+            new CloseCursorInstruction(new Cursor(0)),
+            new HaltInstruction(),
+        ];
+        using var statement = new ResumableStatement(new VdbeProgram(2, cursorCount: 1, instructions));
+
+        // Step once: OpenJoinCursor -> Rewind -> Column -> Column -> Yield (pauses).
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Yielded);
+
+        // After the first output row is positioned, a streaming join has read only the first
+        // left row. A materializing join would have read all 100 left rows by now (max index 99).
+        leftRows.MaxIndexAccessed.Should().Be(0,
+            "the left side should stream lazily, not materialize before the first row");
+
+        // Drain the rest and assert correctness: 100 rows, each left value paired with 1000.
+        statement.Resume();
+        DrainYielding(statement).Select(row => (row[0].AsInteger(), row[1].AsInteger()))
+            .Should().HaveCount(leftSize)
+            .And.OnlyContain(pair => pair.Item2 == 1000);
+    }
+
+    [Test]
     public void ProjectRegistersPublishesNoPartialOutputWhenTheTransformFails()
     {
         var failure = new InvalidOperationException("projection failed");
@@ -420,5 +479,35 @@ public class JoinOpcodeExecutionTests
                     throw new InvalidOperationException("Unknown step result.");
             }
         }
+    }
+
+    // A read-only row list that records the highest index accessed so a test can prove a join
+    // cursor streams its left side (reads lazily) rather than materializing it up front.
+    private sealed class TrackingRows : IReadOnlyList<SqlValue[]>
+    {
+        private readonly SqlValue[][] _rows;
+
+        public TrackingRows(SqlValue[][] rows)
+        {
+            ArgumentNullException.ThrowIfNull(rows);
+            _rows = rows;
+        }
+
+        public int MaxIndexAccessed { get; private set; } = -1;
+
+        public SqlValue[] this[int index]
+        {
+            get
+            {
+                MaxIndexAccessed = Math.Max(MaxIndexAccessed, index);
+                return _rows[index];
+            }
+        }
+
+        public int Count => _rows.Length;
+
+        public IEnumerator<SqlValue[]> GetEnumerator() => ((IEnumerable<SqlValue[]>)_rows).GetEnumerator();
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => _rows.GetEnumerator();
     }
 }

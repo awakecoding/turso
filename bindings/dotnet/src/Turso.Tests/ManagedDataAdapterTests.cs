@@ -234,6 +234,99 @@ public sealed class ManagedDataAdapterTests
         updated.Should().BeEquivalentTo(updating);
     }
 
+    [Test]
+    public void ReturningReaderDoesNotReExecuteWhenDataTableLoadsSchema()
+    {
+        // Regression: GetSchemaTable used to re-execute the DML once per result column to sample
+        // value types (GetSampleValueType), so `INSERT ... RETURNING *` loaded via DataTable.Load
+        // inserted N+1 rows instead of 1. The schema must resolve declared types from the
+        // RETURNING target table without re-running the statement — Microsoft.Data.Sqlite does
+        // not re-execute on schema discovery.
+        using var connection = OpenManagedFacade();
+        SeedCars(connection);
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "INSERT INTO Cars (Make, Colour, Year) VALUES ('Ford', 'Blue', 2020) RETURNING *";
+            using var reader = command.ExecuteReader();
+            var table = new DataTable();
+            table.Load(reader);
+        }
+
+        Read(connection, "SELECT COUNT(*) FROM Cars").Should().Equal("1");
+    }
+
+    [Test]
+    public void UpdateReturningReaderDoesNotReExecuteWhenDataTableLoadsSchema()
+    {
+        // Same regression as the INSERT case, exercised through UPDATE ... RETURNING, which
+        // takes a different prefix in TryGetSelectSource.
+        using var connection = OpenManagedFacade();
+        SeedCars(connection);
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "INSERT INTO Cars (Make, Colour, Year) VALUES ('Ford', 'Blue', 2020)";
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            // `Year = Year + 1` makes a re-execution observable: each extra run advances Year
+            // again, so the correct (single-execution) result is the seed 2020 + 1 = 2021.
+            command.CommandText = "UPDATE Cars SET Year = Year + 1 RETURNING *";
+            using var reader = command.ExecuteReader();
+            var table = new DataTable();
+            table.Load(reader);
+        }
+
+        Read(connection, "SELECT Year FROM Cars").Should().Equal("2021");
+    }
+
+    [Test]
+    public void ReturningReaderPublishesDeclaredTypesBeforeTheFirstRead()
+    {
+        // Regression: before the first Read a RETURNING reader reported Byte[]/BLOB for every
+        // column because GetDeclaredTypeName/GetFieldType fell back to the empty current value
+        // kind. Microsoft.Data.Sqlite reports the target table's declared types here.
+        using var connection = OpenManagedFacade();
+        SeedCars(connection);
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO Cars (Make, Colour, Year) VALUES ('Ford', 'Blue', 2020) RETURNING *";
+        using var reader = command.ExecuteReader();
+
+        Enumerable.Range(0, reader.FieldCount).Select(reader.GetFieldType)
+            .Should().Equal(typeof(long), typeof(string), typeof(string), typeof(long));
+        Enumerable.Range(0, reader.FieldCount).Select(reader.GetDataTypeName)
+            .Should().Equal("INTEGER", "TEXT", "TEXT", "INTEGER");
+    }
+
+    [Test]
+    public void ReturningSubsetReaderPublishesDeclaredTypesBeforeTheFirstRead()
+    {
+        // RETURNING with an explicit column list (not `*`) must resolve each column's declared
+        // type from the target table by ordinal position in the RETURNING list.
+        using var connection = OpenManagedFacade();
+        SeedCars(connection);
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO Cars (Make, Colour, Year) VALUES ('Ford', 'Blue', 2020) RETURNING Make, Year";
+        using var reader = command.ExecuteReader();
+
+        reader.FieldCount.Should().Be(2);
+        Enumerable.Range(0, reader.FieldCount).Select(reader.GetFieldType)
+            .Should().Equal(typeof(string), typeof(long));
+        Enumerable.Range(0, reader.FieldCount).Select(reader.GetDataTypeName)
+            .Should().Equal("TEXT", "INTEGER");
+    }
+
+    private static void SeedCars(DbConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "CREATE TABLE Cars (Id INTEGER PRIMARY KEY, Make TEXT, Colour TEXT, Year INTEGER)";
+        command.ExecuteNonQuery();
+    }
+
     private static void RoundTrip(DbConnection connection)
     {
         using var adapter = new TursoDataAdapter("SELECT id, name, score FROM person ORDER BY id", connection);

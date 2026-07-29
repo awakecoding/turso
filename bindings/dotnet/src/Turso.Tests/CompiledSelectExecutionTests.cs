@@ -127,7 +127,7 @@ public class CompiledSelectExecutionTests
 
         var program = ReadRows(connection, "EXPLAIN SELECT value FROM t ORDER BY value;");
         Opcodes(program).Should().Equal(
-            "OpenReadCursor", "OpenSorter", "Rewind", "Column", "SorterInsert", "Next",
+            "OpenReadCursor", "OpenSorter", "Rewind", "Column", "RowId", "SorterInsert", "Next",
             "CloseCursor", "SorterSort", "SorterData", "Copy", "ResultRow", "SorterNext",
             "CloseSorter", "Halt");
 

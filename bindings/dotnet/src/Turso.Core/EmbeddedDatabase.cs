@@ -10641,6 +10641,15 @@ public sealed partial class EmbeddedDatabase : IDisposable
         if (TryCompileScanOrConstant(select, parameters, context, outerRow, out compiled))
             return true;
 
+        // The bare `SELECT COUNT(*) FROM <source>` shape (no WHERE/GROUP BY/HAVING/ORDER BY/
+        // DISTINCT/LIMIT/OFFSET) reads the bound row source's row count directly via RowCount
+        // instead of scanning. This runs only on the original select here at the top-level
+        // dispatch, so a COUNT(*) that carries LIMIT/OFFSET lowers through TryCompileLimitedSelect
+        // (which strips LIMIT/OFFSET before calling TryCompileAggregateSelect) and keeps its
+        // accumulator+gate EXPLAIN shape.
+        if (TryCompileCountStarShortcut(select, context, out compiled))
+            return true;
+
         // The unordered scan/constant compiler declines aggregation. Try the aggregate
         // route so whole-table and GROUP BY aggregations over a single base table lower to
         // the real AggReset/AggStep/AggFinalize opcode family instead of the evaluator,
@@ -12367,22 +12376,28 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
         // The comparer wraps each scanned row and defers to the evaluator's CompareRows so
         // direction (ASC/DESC), NULL ordering, collation, and multi-key precedence match the
-        // evaluator byte-for-byte; the sorter itself guarantees stable (scan-order) ties.
-        VdbeRowComparer comparer = (leftRow, rightRow) => CompareRows(
-            CreateScanSourceRow(target, leftRow, context, outerRow),
-            CreateScanSourceRow(target, rightRow, context, outerRow),
-            resolvedOrderBy,
-            parameters,
-            context);
-
+        // evaluator byte-for-byte. When the table carries a rowid, the builder appends it to the
+        // sorter record and we thread it into SourceRow.RowId so CompareRows can break ORDER BY
+        // ties by rowid ascending — matching SQLite/Microsoft.Data.Sqlite, which scans rows in
+        // rowid order and sorts stably. WITHOUT-ROWID tables keep their existing relative order.
         var columns = target.Columns;
+        var rowIdSlot = columns.Length;
+        VdbeRowComparer comparer = (leftRow, rightRow) =>
+            CompareRows(
+                CreateScanSourceRow(target, leftRow, context, outerRow, ExtractSortedScanRowId(leftRow, rowIdSlot)),
+                CreateScanSourceRow(target, rightRow, context, outerRow, ExtractSortedScanRowId(rightRow, rowIdSlot)),
+                resolvedOrderBy,
+                parameters,
+                context);
+
         var program = SortedScanProgramBuilder.Build(
             target.TableName,
             columns.Length,
             projections,
             comparer,
-            predicate);
-        compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows)]);
+            predicate,
+            carryRowId: target.HasRowId);
+        compiled = new CompiledSelect(program, [new VdbeCursorSource(target.Rows, target.RowIds)]);
         return true;
     }
 
@@ -13931,6 +13946,67 @@ public sealed partial class EmbeddedDatabase : IDisposable
         return true;
     }
 
+    private bool TryCompileCountStarShortcut(
+        SelectStatement select,
+        QueryContext context,
+        out CompiledSelect compiled)
+    {
+        compiled = null!;
+        if (!IsBareCountStarSelect(select))
+            return false;
+
+        var target = ResolveScanTarget(select.Source, context);
+        if (target is null)
+            return false;
+
+        // Pump the connection's progress handler once per counted row so an interruptible
+        // SELECT count(*) FROM t raises SQLITE_INTERRUPT at the same point the scan+accumulator
+        // path would. Null when no handler is registered keeps the shortcut O(1) in the common case.
+        Action? driveProgress = null;
+        if (context.Hooks?.Progress is not null)
+            driveProgress = () => context.CheckInterrupt();
+        compiled = new CompiledSelect(
+            AggregateProgramBuilder.BuildCountStar(target.TableName, target.Columns.Length, driveProgress),
+            [new VdbeCursorSource(target.Rows)]);
+        return true;
+    }
+
+    private static bool IsBareCountStarSelect(SelectStatement select)
+    {
+        // The exact shape `SELECT COUNT(*) FROM <source>` with no WHERE/GROUP BY/HAVING/
+        // ORDER BY/DISTINCT/LIMIT/OFFSET and no FILTER/OVER on the COUNT(*). Any deviation
+        // must keep the scan+accumulator path: a WHERE changes the counted rows, GROUP BY
+        // produces per-group rows, ORDER BY/DISTINCT/LIMIT/OFFSET change the output shape,
+        // and FILTER/OVER make COUNT(*) row-conditional or windowed. The gate fires only
+        // when COUNT(*) over the whole source equals the bound row source's row count, so
+        // the shortcut is semantically exact. Limit/Offset are already excluded upstream
+        // but are re-checked here so the helper stays self-contained.
+        if (select.Distinct
+            || select.Where is not null
+            || select.GroupBy.Count > 0
+            || select.Having is not null
+            || select.OrderBy.Count > 0
+            || select.Limit is not null
+            || select.Offset is not null
+            || select.Projections.Count != 1)
+        {
+            return false;
+        }
+
+        return IsCountStarFunction(select.Projections[0].Expression);
+    }
+
+    private static bool IsCountStarFunction(Expression expression)
+    {
+        return expression is FunctionExpression function
+            && string.Equals(function.Name, "COUNT", StringComparison.OrdinalIgnoreCase)
+            && function.CountStar
+            && function.Arguments.Count == 0
+            && !function.Distinct
+            && function.Filter is null
+            && function.Window is null;
+    }
+
     private static bool CanCompileAggregateExpression(Expression expression, ScanTarget target)
     {
         return expression switch
@@ -15300,6 +15376,21 @@ public sealed partial class EmbeddedDatabase : IDisposable
             context));
     }
 
+    /// <summary>
+    /// Extracts the trailing rowid that <see cref="Compilation.SortedScanProgramBuilder"/> appends
+    /// to the sorter record when <c>carryRowId</c> is set, so <see cref="CompareRows"/> can break
+    /// ORDER BY ties by rowid ascending. Returns null when the slot is absent (WITHOUT-ROWID
+    /// tables, or the builder did not carry a rowid) so tie order is left unchanged.
+    /// </summary>
+    private static long? ExtractSortedScanRowId(SqlValue[] row, int rowIdSlot)
+    {
+        if (rowIdSlot < 0 || rowIdSlot >= row.Length)
+            return null;
+
+        var value = row[rowIdSlot];
+        return value.Kind == SqlValueKind.Integer ? value.AsInteger() : null;
+    }
+
     private static SourceRow CreateScanSourceRow(
         ScanTarget target,
         SqlValue[] row,
@@ -16284,6 +16375,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 0,
                 null,
                 $"rewind cursor {rewind.Cursor.Index}, goto {rewind.EmptyTarget.Offset} if empty"),
+            LastCursorInstruction => VdbeExplain.Describe(instruction),
             ColumnInstruction column => (
                 column.Cursor.Index,
                 column.ColumnIndex,
@@ -16296,6 +16388,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 0,
                 null,
                 $"r[{rowId.Destination.Index}]=c{rowId.Cursor.Index}.rowid"),
+            RowCountInstruction => VdbeExplain.Describe(instruction),
             FilterInstruction filter => (
                 filter.Cursor.Index,
                 filter.FalseTarget.Offset,
@@ -16303,6 +16396,8 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 null,
                 filter.Description),
             FilterRowIdInstruction => VdbeExplain.Describe(instruction),
+            SeekRowidInstruction => VdbeExplain.Describe(instruction),
+            SeekRowidRangeInstruction => VdbeExplain.Describe(instruction),
             FilterRegistersInstruction filterRegisters => (
                 filterRegisters.Row.Start.Index,
                 filterRegisters.FalseTarget.Offset,
@@ -16318,6 +16413,7 @@ public sealed partial class EmbeddedDatabase : IDisposable
                 0,
                 null,
                 $"next cursor {next.Cursor.Index}, goto {next.LoopTarget.Offset} if more rows"),
+            PrevInstruction => VdbeExplain.Describe(instruction),
             OpenSorterInstruction openSorter => (
                 openSorter.Sorter.Index,
                 0,
@@ -17547,7 +17643,17 @@ public sealed partial class EmbeddedDatabase : IDisposable
                     right.Keys,
                     resolvedOrderBy,
                     orderCollations);
-                return comparison != 0 ? comparison : left.Position.CompareTo(right.Position);
+                if (comparison != 0)
+                    return comparison;
+
+                // ORDER BY ties resolve by rowid ascending, independent of ORDER BY direction
+                // (matches SQLite/Microsoft.Data.Sqlite, which scans rows in rowid order and
+                // sorts stably). WITHOUT-ROWID tables, views, CTEs, and table-valued functions
+                // carry a null RowId and keep their existing scan-order (Position) relative order.
+                if (left.Item.RowId is { } leftRowId && right.Item.RowId is { } rightRowId)
+                    return leftRowId.CompareTo(rightRowId);
+
+                return left.Position.CompareTo(right.Position);
             });
             selectedRows = orderedRows.Select(row => row.Item).ToList();
         }
@@ -27508,6 +27614,12 @@ public sealed partial class EmbeddedDatabase : IDisposable
 
             return comparison;
         }
+
+        // ORDER BY ties resolve by rowid ascending, independent of ORDER BY direction
+        // (matches SQLite/Microsoft.Data.Sqlite). Mirrors CompareManagedIndexEntries.
+        // WITHOUT-ROWID / null-rowid rows keep their existing relative order.
+        if (left.RowId is { } leftRowId && right.RowId is { } rightRowId)
+            return leftRowId.CompareTo(rightRowId);
 
         return 0;
     }

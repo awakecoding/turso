@@ -1,5 +1,9 @@
+using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.IO;
 using System.Runtime.ExceptionServices;
+using System.Text;
 
 namespace Turso.Core.Execution;
 
@@ -35,7 +39,7 @@ public sealed class ResumableStatement : IDisposable
     private readonly int[] _cursorPositions;
     private readonly SqlValue[]?[] _materializedRows;
     private readonly long[] _materializedRowIds;
-    private readonly IReadOnlyList<SqlValue[]>?[] _joinCursorRows;
+    private readonly JoinCursorState?[] _joinCursorStates;
     private readonly SorterRuntime?[] _sorters;
     private readonly object?[] _accumulatorContexts;
     private readonly bool[] _accumulatorInitialized;
@@ -83,7 +87,7 @@ public sealed class ResumableStatement : IDisposable
         _cursorPositions = new int[program.CursorCount];
         _materializedRows = new SqlValue[program.CursorCount][];
         _materializedRowIds = new long[program.CursorCount];
-        _joinCursorRows = new IReadOnlyList<SqlValue[]>?[program.CursorCount];
+        _joinCursorStates = new JoinCursorState?[program.CursorCount];
         _sorters = new SorterRuntime?[program.SorterCount];
         _accumulatorContexts = new object?[program.AccumulatorCount];
         _accumulatorInitialized = new bool[program.AccumulatorCount];
@@ -245,9 +249,10 @@ public sealed class ResumableStatement : IDisposable
                     break;
                 case OpenJoinCursorInstruction openJoin:
                     {
-                        var rows = openJoin.Plan.Materialize();
                         OpenCursor(openJoin.Cursor);
-                        _joinCursorRows[openJoin.Cursor.Index] = rows;
+                        var state = new JoinCursorState();
+                        state.Open(openJoin.Plan.Enumerate().GetEnumerator());
+                        _joinCursorStates[openJoin.Cursor.Index] = state;
                         _cursorPositions[openJoin.Cursor.Index] = -1;
                         _materializedRows[openJoin.Cursor.Index] = null;
                         AdvanceInstructionPointer();
@@ -261,19 +266,57 @@ public sealed class ResumableStatement : IDisposable
                     break;
                 case CloseCursorInstruction close:
                     CloseCursor(close.Cursor);
-                    _joinCursorRows[close.Cursor.Index] = null;
+                    _joinCursorStates[close.Cursor.Index]?.Close();
+                    _joinCursorStates[close.Cursor.Index] = null;
                     AdvanceInstructionPointer();
                     break;
                 case RewindCursorInstruction rewind:
                     {
                         _materializedRows[rewind.Cursor.Index] = null;
-                        if (CursorRowCount(rewind.Cursor) == 0)
+                        if (_joinCursorStates[rewind.Cursor.Index] is { } joinState)
+                        {
+                            // Streaming join cursor: the row count is not known up front, so
+                            // emptiness is decided by pulling the first row. A successful pull
+                            // also positions the cursor on that first row.
+                            if (joinState.MoveNext())
+                            {
+                                _cursorPositions[rewind.Cursor.Index] = 0;
+                                AdvanceInstructionPointer();
+                            }
+                            else
+                            {
+                                _instructionPointer = rewind.EmptyTarget;
+                            }
+                        }
+                        else if (CursorRowCount(rewind.Cursor) == 0)
                         {
                             _instructionPointer = rewind.EmptyTarget;
                         }
                         else
                         {
                             _cursorPositions[rewind.Cursor.Index] = 0;
+                            AdvanceInstructionPointer();
+                        }
+
+                        break;
+                    }
+                case LastCursorInstruction last:
+                    {
+                        _materializedRows[last.Cursor.Index] = null;
+                        if (_joinCursorStates[last.Cursor.Index] is not null)
+                        {
+                            throw new InvalidOperationException(
+                                $"Cursor {last.Cursor.Index} is a streaming join cursor; Last (reverse traversal) is not supported.");
+                        }
+
+                        var count = CursorRowCount(last.Cursor);
+                        if (count == 0)
+                        {
+                            _instructionPointer = last.EmptyTarget;
+                        }
+                        else
+                        {
+                            _cursorPositions[last.Cursor.Index] = count - 1;
                             AdvanceInstructionPointer();
                         }
 
@@ -289,6 +332,22 @@ public sealed class ResumableStatement : IDisposable
                 case RowIdInstruction rowId:
                     {
                         _registers[rowId.Destination.Index] = SqlValue.Integer(CurrentCursorRowId(rowId.Cursor));
+                        AdvanceInstructionPointer();
+                        break;
+                    }
+                case RowCountInstruction rowCount:
+                    {
+                        var rowCountValue = CursorRowCount(rowCount.Cursor);
+                        // When a progress handler is registered, pump it once per counted row so an
+                        // interruptible SELECT count(*) raises SQLITE_INTERRUPT at the same point the
+                        // scan+accumulator path would. Null in the common (no-handler) case keeps this O(1).
+                        if (rowCount.DriveProgress is { } driveProgress)
+                        {
+                            for (var i = 0; i < rowCountValue; i++)
+                                driveProgress();
+                        }
+
+                        _registers[rowCount.Destination.Index] = SqlValue.Integer(rowCountValue);
                         AdvanceInstructionPointer();
                         break;
                     }
@@ -310,6 +369,104 @@ public sealed class ResumableStatement : IDisposable
                             AdvanceInstructionPointer();
                         else
                             _instructionPointer = filterRowId.FalseTarget;
+
+                        break;
+                    }
+                case SeekRowidInstruction seekRowid:
+                    {
+                        // Position the cursor directly on the row whose rowid equals the value
+                        // held in RowIdRegister, jumping to NotFoundTarget when no such row
+                        // exists. The search is linear because the rowid sort invariant is not
+                        // maintained for explicit out-of-order rowid INSERTs (CommitInserts
+                        // appends in insert order, not rowid order); a BinarySearch over a sorted
+                        // projection is a later opt-in once the invariant is enforced on insert
+                        // or the cursor caches a sorted index per statement. Not yet emitted by
+                        // the compiler (Step 3); included now as additive, zero-regression-risk
+                        // scaffolding so EXPLAIN/Describe and the opcode enum are stable first.
+                        _materializedRows[seekRowid.Cursor.Index] = null;
+                        var source = RequireCursorSource(seekRowid.Cursor);
+                        var rowIds = source.RowIds;
+                        if (rowIds is null)
+                        {
+                            _instructionPointer = seekRowid.NotFoundTarget;
+                            break;
+                        }
+
+                        var sought = _registers[seekRowid.RowIdRegister.Index];
+                        if (sought.Kind != SqlValueKind.Integer)
+                        {
+                            _instructionPointer = seekRowid.NotFoundTarget;
+                            break;
+                        }
+
+                        var target = sought.AsInteger();
+                        var found = -1;
+                        for (var i = 0; i < rowIds.Count; i++)
+                        {
+                            if (rowIds[i] == target)
+                            {
+                                found = i;
+                                break;
+                            }
+                        }
+
+                        if (found >= 0)
+                        {
+                            _cursorPositions[seekRowid.Cursor.Index] = found;
+                            AdvanceInstructionPointer();
+                        }
+                        else
+                        {
+                            _instructionPointer = seekRowid.NotFoundTarget;
+                        }
+
+                        break;
+                    }
+                case SeekRowidRangeInstruction seekRowidRange:
+                    {
+                        // Position the cursor on the first row whose rowid satisfies StartOp relative
+                        // to StartRowIdRegister, jumping to NotFoundTarget when no such row exists.
+                        // The search is linear for the same reason as SeekRowid: the rowid sort
+                        // invariant is not maintained for explicit out-of-order rowid INSERTs
+                        // (CommitInserts appends in insert order). The upper bound (EndOp/EndRowIdRegister)
+                        // is enforced by a following FilterRowIdInstruction emitted by the compiler, not
+                        // here — this instruction only finds the starting position.
+                        _materializedRows[seekRowidRange.Cursor.Index] = null;
+                        var source = RequireCursorSource(seekRowidRange.Cursor);
+                        var rowIds = source.RowIds;
+                        if (rowIds is null)
+                        {
+                            _instructionPointer = seekRowidRange.NotFoundTarget;
+                            break;
+                        }
+
+                        var startBound = _registers[seekRowidRange.StartRowIdRegister.Index];
+                        if (startBound.Kind != SqlValueKind.Integer)
+                        {
+                            _instructionPointer = seekRowidRange.NotFoundTarget;
+                            break;
+                        }
+
+                        var startValue = startBound.AsInteger();
+                        var found = -1;
+                        for (var i = 0; i < rowIds.Count; i++)
+                        {
+                            if (Satisfies(rowIds[i], seekRowidRange.StartOp, startValue))
+                            {
+                                found = i;
+                                break;
+                            }
+                        }
+
+                        if (found >= 0)
+                        {
+                            _cursorPositions[seekRowidRange.Cursor.Index] = found;
+                            AdvanceInstructionPointer();
+                        }
+                        else
+                        {
+                            _instructionPointer = seekRowidRange.NotFoundTarget;
+                        }
 
                         break;
                     }
@@ -404,10 +561,40 @@ public sealed class ResumableStatement : IDisposable
                 case NextInstruction next:
                     {
                         _materializedRows[next.Cursor.Index] = null;
-                        var position = _cursorPositions[next.Cursor.Index] + 1;
-                        _cursorPositions[next.Cursor.Index] = position;
-                        if (position < CursorRowCount(next.Cursor))
-                            _instructionPointer = next.LoopTarget;
+                        if (_joinCursorStates[next.Cursor.Index] is { } joinState)
+                        {
+                            // Streaming join cursor: advance the enumerator and loop back while
+                            // another row exists; the count is not known up front.
+                            if (joinState.MoveNext())
+                                _instructionPointer = next.LoopTarget;
+                            else
+                                AdvanceInstructionPointer();
+                        }
+                        else
+                        {
+                            var position = _cursorPositions[next.Cursor.Index] + 1;
+                            _cursorPositions[next.Cursor.Index] = position;
+                            if (position < CursorRowCount(next.Cursor))
+                                _instructionPointer = next.LoopTarget;
+                            else
+                                AdvanceInstructionPointer();
+                        }
+
+                        break;
+                    }
+                case PrevInstruction prev:
+                    {
+                        _materializedRows[prev.Cursor.Index] = null;
+                        if (_joinCursorStates[prev.Cursor.Index] is not null)
+                        {
+                            throw new InvalidOperationException(
+                                $"Cursor {prev.Cursor.Index} is a streaming join cursor; Prev (reverse traversal) is not supported.");
+                        }
+
+                        var position = _cursorPositions[prev.Cursor.Index] - 1;
+                        _cursorPositions[prev.Cursor.Index] = position;
+                        if (position >= 0)
+                            _instructionPointer = prev.LoopTarget;
                         else
                             AdvanceInstructionPointer();
 
@@ -946,8 +1133,8 @@ public sealed class ResumableStatement : IDisposable
                     break;
                 case HaltInstruction:
                     Array.Clear(_openCursors);
-                    Array.Clear(_joinCursorRows);
-                    Array.Clear(_sorters);
+                    DisposeAllJoinCursors();
+                    DisposeAllSorters();
                     Array.Clear(_windowBuffers);
                     AdvanceInstructionPointer();
                     State = ResumableStatementState.Done;
@@ -979,8 +1166,8 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_cursorPositions);
         Array.Clear(_materializedRows);
         Array.Clear(_materializedRowIds);
-        Array.Clear(_joinCursorRows);
-        Array.Clear(_sorters);
+        DisposeAllJoinCursors();
+        DisposeAllSorters();
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
@@ -1046,8 +1233,8 @@ public sealed class ResumableStatement : IDisposable
         Array.Clear(_registers);
         Array.Clear(_openCursors);
         Array.Clear(_materializedRows);
-        Array.Clear(_joinCursorRows);
-        Array.Clear(_sorters);
+        DisposeAllJoinCursors();
+        DisposeAllSorters();
         Array.Clear(_accumulatorContexts);
         Array.Clear(_accumulatorInitialized);
         Array.Clear(_distinctSets);
@@ -1083,15 +1270,41 @@ public sealed class ResumableStatement : IDisposable
         if (_sorters[instruction.Sorter.Index] is not null)
             throw new InvalidOperationException($"Sorter {instruction.Sorter.Index} is already open.");
 
-        _sorters[instruction.Sorter.Index] = new SorterRuntime(instruction.Comparer, instruction.ColumnCount);
+        _sorters[instruction.Sorter.Index] = new SorterRuntime(
+            instruction.Comparer,
+            instruction.ColumnCount,
+            instruction.BufferRowCapacity);
     }
 
     private void CloseSorter(Sorter sorter)
     {
-        if (_sorters[sorter.Index] is null)
+        var runtime = _sorters[sorter.Index];
+        if (runtime is null)
             throw new InvalidOperationException($"Sorter {sorter.Index} is not open.");
 
+        runtime.Dispose();
         _sorters[sorter.Index] = null;
+    }
+
+    // Disposes every non-null sorter (releasing any spill temp files) and clears the
+    // slots. Called from Halt, Reset, and Dispose so a spilled sorter never leaks its
+    // temp file, even when the program ends mid-drain or is aborted.
+    private void DisposeAllSorters()
+    {
+        for (var index = 0; index < _sorters.Length; index++)
+        {
+            _sorters[index]?.Dispose();
+            _sorters[index] = null;
+        }
+    }
+
+    private void DisposeAllJoinCursors()
+    {
+        for (var index = 0; index < _joinCursorStates.Length; index++)
+        {
+            _joinCursorStates[index]?.Close();
+            _joinCursorStates[index] = null;
+        }
     }
 
     private SorterRuntime RequireOpenSorter(Sorter sorter)
@@ -1185,11 +1398,16 @@ public sealed class ResumableStatement : IDisposable
                 $"Cursor {cursor.Index} has no bound write target.");
 
     // A cursor's iteration length comes from its write target (INSERT value rows or
-    // scanned UPDATE/DELETE rows) or, failing that, its read source.
+    // scanned UPDATE/DELETE rows) or, failing that, its read source. Streaming join
+    // cursors never call this: Rewind/Next branch on a join state first and advance
+    // the enumerator directly, since the row count is not known up front.
     private int CursorRowCount(Cursor cursor)
     {
-        if (_joinCursorRows[cursor.Index] is { } joinedRows)
-            return joinedRows.Count;
+        if (_joinCursorStates[cursor.Index] is not null)
+        {
+            throw new InvalidOperationException(
+                $"Join cursor {cursor.Index} has no precomputed row count; it must be advanced via the streaming enumerator.");
+        }
 
         var writeTarget = WriteTargetOrNull(cursor);
         return writeTarget is not null
@@ -1218,6 +1436,12 @@ public sealed class ResumableStatement : IDisposable
         if (_materializedRows[cursor.Index] is { } materialized)
             return materialized;
 
+        // A streaming join cursor serves the row the enumerator currently rests on; it
+        // has no random-access row list and no precomputed count.
+        if (_joinCursorStates[cursor.Index] is { } joinState)
+            return joinState.CurrentRow
+                ?? throw new InvalidOperationException($"Cursor {cursor.Index} is not positioned on a row.");
+
         var position = _cursorPositions[cursor.Index];
         var count = CursorRowCount(cursor);
         if (position < 0 || position >= count)
@@ -1227,15 +1451,12 @@ public sealed class ResumableStatement : IDisposable
         if (writeTarget?.GetRow is { } getRow)
             return getRow(position);
 
-        if (_joinCursorRows[cursor.Index] is { } joinedRows)
-            return joinedRows[position];
-
         return RequireCursorSource(cursor).Rows[position];
     }
 
     private long CurrentCursorRowId(Cursor cursor)
     {
-        if (_joinCursorRows[cursor.Index] is not null)
+        if (_joinCursorStates[cursor.Index] is not null)
         {
             throw new InvalidOperationException(
                 $"Join cursor {cursor.Index} exposes source rowids as hidden columns, not as one cursor rowid.");
@@ -1267,6 +1488,24 @@ public sealed class ResumableStatement : IDisposable
         var values = new SqlValue[range.Count];
         Array.Copy(_registers, range.Start.Index, values, 0, range.Count);
         return values;
+    }
+
+    // Whether a long rowid satisfies the supplied comparison against a bound. Used by the
+    // SeekRowidRange handler to find the first rowid that satisfies the start predicate.
+    private static bool Satisfies(long rowId, VdbeComparisonOperator op, long bound)
+    {
+        return op switch
+        {
+            VdbeComparisonOperator.GreaterThan => rowId > bound,
+            VdbeComparisonOperator.GreaterThanOrEqual => rowId >= bound,
+            VdbeComparisonOperator.LessThan => rowId < bound,
+            VdbeComparisonOperator.LessThanOrEqual => rowId <= bound,
+            VdbeComparisonOperator.Equal => rowId == bound,
+            VdbeComparisonOperator.NotEqual => rowId != bound,
+            VdbeComparisonOperator.Is => rowId == bound,
+            VdbeComparisonOperator.IsNot => rowId != bound,
+            _ => false,
+        };
     }
 
     // Whether the candidate is present in the row set under the supplied equality. An unpopulated set
@@ -1344,18 +1583,34 @@ public sealed class ResumableStatement : IDisposable
     // Holds one sorter's buffered records and its drain cursor. Records are copied on
     // insert so overwriting the source registers between iterations cannot mutate rows
     // already stored. Sorting is stable: equal-key rows keep their insertion order.
-    private sealed class SorterRuntime
+    //
+    // When BufferRowCapacity is positive the sorter spills: once the in-memory buffer
+    // exceeds the capacity it is stably sorted and flushed to a temp-file run, and Sort
+    // drives a lazy k-way merge over all runs so the merged output is never materialized
+    // in memory (the OOM fix). The default capacity (0 -> int.MaxValue) never spills,
+    // preserving the historical in-memory behavior for every existing call site.
+    private sealed class SorterRuntime : IDisposable
     {
         private readonly VdbeRowComparer _comparer;
         private readonly int _columnCount;
+        private readonly int _bufferRowCapacity;
         private readonly List<SqlValue[]> _rows = [];
+        private SorterSpill? _spill;
         private bool _sorted;
         private int _position = -1;
+        private PriorityQueue<int, MergeKey>? _merge;
+        private SorterSpill.RunReader[]? _readers;
+        private SqlValue[]? _pending;
+        private int _pendingRunIndex;
 
-        public SorterRuntime(VdbeRowComparer comparer, int columnCount)
+        public SorterRuntime(VdbeRowComparer comparer, int columnCount, int bufferRowCapacity)
         {
             _comparer = comparer;
             _columnCount = columnCount;
+            // 0 means "no spill" (the historical in-memory default). Treat anything
+            // non-positive the same way so a stray negative capacity can never force a
+            // single-row spill loop.
+            _bufferRowCapacity = bufferRowCapacity > 0 ? bufferRowCapacity : int.MaxValue;
         }
 
         public void Insert(SqlValue[] record)
@@ -1369,6 +1624,15 @@ public sealed class ResumableStatement : IDisposable
             }
 
             _rows.Add(record);
+
+            // Spill when the in-memory buffer exceeds the capacity. Each run is stably
+            // sorted before flushing so the k-way merge over runs is globally stable.
+            if (_rows.Count > _bufferRowCapacity && _bufferRowCapacity != int.MaxValue)
+            {
+                _spill ??= new SorterSpill(_columnCount);
+                _spill.WriteRun(SortBufferedRows(CancellationToken.None), CancellationToken.None);
+                _rows.Clear();
+            }
         }
 
         // Sorts the buffered records and positions on the first one. Returns false (and
@@ -1376,6 +1640,29 @@ public sealed class ResumableStatement : IDisposable
         public bool Sort(CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // Flush the final partial buffer as one more run so Sort always drains from
+            // the spill when any runs exist. An empty tail is skipped (no zero-row run).
+            if (_spill is not null && _rows.Count > 0)
+            {
+                _spill.WriteRun(SortBufferedRows(cancellationToken), cancellationToken);
+                _rows.Clear();
+            }
+
+            if (_spill is not null)
+            {
+                _sorted = true;
+                if (_spill.RunCount == 0)
+                {
+                    _position = -1;
+                    return false;
+                }
+
+                StartMerge(cancellationToken);
+                _position = 0;
+                return true;
+            }
+
             if (_rows.Count == 0)
             {
                 _sorted = true;
@@ -1383,8 +1670,67 @@ public sealed class ResumableStatement : IDisposable
                 return false;
             }
 
-            // Stable order: decorate with insertion index and break ties on it so the
-            // underlying unstable sort cannot reorder equal-key rows.
+            var sorted = SortBufferedRows(cancellationToken);
+            _rows.Clear();
+            _rows.AddRange(sorted);
+            _sorted = true;
+            _position = 0;
+            return true;
+        }
+
+        public SqlValue[] Current()
+        {
+            if (!_sorted)
+                throw new InvalidOperationException("Sorter must be sorted before reading a record.");
+            if (_position < 0)
+                throw new InvalidOperationException("Sorter is not positioned on a record.");
+
+            // Spill path: the current record is the head of the merge heap, staged in
+            // _pending. MoveNext refills the heap and re-stages the next head.
+            if (_merge is not null)
+                return _pending ?? throw new InvalidOperationException("Sorter is not positioned on a record.");
+
+            if (_position >= _rows.Count)
+                throw new InvalidOperationException("Sorter is not positioned on a record.");
+
+            return _rows[_position];
+        }
+
+        // Advances to the next ordered record, returning whether one remains.
+        public bool MoveNext()
+        {
+            if (!_sorted)
+                throw new InvalidOperationException("Sorter must be sorted before advancing.");
+
+            // Spill path: refill the run whose head we just consumed, then pop the new
+            // heap head (if any) and stage it. The run index is tracked so the refill
+            // reads from the correct run — the bug this fixes is that a plain dequeue
+            // drops the run association and would emit at most one record per run.
+            if (_merge is not null)
+            {
+                if (_readers![_pendingRunIndex].TryReadNext(out var next))
+                    _merge.Enqueue(_pendingRunIndex, new MergeKey(next, _pendingRunIndex, _comparer));
+
+                if (!_merge.TryDequeue(out _pendingRunIndex, out var key))
+                {
+                    _pending = null;
+                    return false;
+                }
+
+                _pending = key.Record;
+                return true;
+            }
+
+            _position++;
+            return _position < _rows.Count;
+        }
+
+        // Stably sorts the in-memory buffer. Equal-key rows keep their insertion order
+        // via an insertion-index tiebreak so the underlying unstable Array.Sort cannot
+        // reorder them — the same invariant each spilled run preserves, which makes the
+        // k-way merge globally stable.
+        private List<SqlValue[]> SortBufferedRows(CancellationToken cancellationToken)
+        {
             var order = new int[_rows.Count];
             for (var index = 0; index < order.Length; index++)
                 order[index] = index;
@@ -1413,31 +1759,266 @@ public sealed class ResumableStatement : IDisposable
                 sorted.Add(_rows[index]);
             }
 
+            return sorted;
+        }
+
+        // Seeds the k-way merge heap with the first record of every run. The heap orders
+        // by the row comparer, breaking ties on RunIndex (lower = earlier insertion) so
+        // equal-key rows across runs keep their global insertion order — stability.
+        private void StartMerge(CancellationToken cancellationToken)
+        {
+            _merge = new PriorityQueue<int, MergeKey>(MergeKey.Comparer);
+            _readers = new SorterSpill.RunReader[_spill!.RunCount];
+
+            for (var runIndex = 0; runIndex < _spill.RunCount; runIndex++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var reader = _spill.OpenRunReader(runIndex);
+                _readers[runIndex] = reader;
+                if (reader.TryReadNext(out var first))
+                    _merge.Enqueue(runIndex, new MergeKey(first, runIndex, _comparer));
+            }
+
+            // Stage the first head so Current() can return it before the first MoveNext.
+            if (!_merge.TryDequeue(out _pendingRunIndex, out var key))
+            {
+                _pending = null;
+                return;
+            }
+
+            _pending = key.Record;
+        }
+
+        public void Dispose()
+        {
+            if (_readers is not null)
+            {
+                foreach (var reader in _readers)
+                    reader?.Dispose();
+                _readers = null;
+            }
+
+            _spill?.Dispose();
+            _spill = null;
             _rows.Clear();
-            _rows.AddRange(sorted);
-            _sorted = true;
-            _position = 0;
-            return true;
+            _merge = null;
+            _pending = null;
         }
 
-        public SqlValue[] Current()
+        // Heap priority: orders by the row comparer, then by RunIndex so equal-key rows
+        // across runs keep their global insertion order. The record is carried alongside
+        // so the heap never has to re-read a run to compare its head.
+        private readonly struct MergeKey
         {
-            if (!_sorted)
-                throw new InvalidOperationException("Sorter must be sorted before reading a record.");
-            if (_position < 0 || _position >= _rows.Count)
-                throw new InvalidOperationException("Sorter is not positioned on a record.");
+            public readonly SqlValue[] Record;
+            public readonly int RunIndex;
+            private readonly VdbeRowComparer _comparer;
 
-            return _rows[_position];
+            public MergeKey(SqlValue[] record, int runIndex, VdbeRowComparer comparer)
+            {
+                Record = record;
+                RunIndex = runIndex;
+                _comparer = comparer;
+            }
+
+            public static IComparer<MergeKey> Comparer { get; } =
+                Comparer<MergeKey>.Create((left, right) =>
+                {
+                    var comparison = left._comparer(left.Record, right.Record);
+                    return comparison != 0 ? comparison : left.RunIndex.CompareTo(right.RunIndex);
+                });
+        }
+    }
+
+    // Backing store for spilled sorter runs: one temp file holding any number of sorted
+    // runs concatenated end-to-end. DeleteOnClose makes the OS reclaim the file on
+    // dispose/close, so a sorter that is abandoned mid-drain cannot leak a temp file.
+    private sealed class SorterSpill : IDisposable
+    {
+        private readonly int _columnCount;
+        private readonly FileStream _stream;
+        private readonly List<(long Offset, int RowCount)> _runs = [];
+        private long _writePosition;
+
+        public SorterSpill(int columnCount)
+        {
+            _columnCount = columnCount;
+            var path = Path.Combine(Path.GetTempPath(), "turso-sorter-" + Path.GetRandomFileName());
+            _stream = new FileStream(
+                path,
+                FileMode.Create,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 8192,
+                FileOptions.DeleteOnClose);
         }
 
-        // Advances to the next ordered record, returning whether one remains.
-        public bool MoveNext()
-        {
-            if (!_sorted)
-                throw new InvalidOperationException("Sorter must be sorted before advancing.");
+        public int RunCount => _runs.Count;
 
-            _position++;
-            return _position < _rows.Count;
+        // Appends one stably-sorted run and remembers its descriptor. The caller hands
+        // in already-sorted rows; this store is format-only and does not re-sort.
+        public void WriteRun(List<SqlValue[]> sorted, CancellationToken cancellationToken)
+        {
+            var offset = _writePosition;
+            Span<byte> header = stackalloc byte[8];
+            foreach (var row in sorted)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                for (var column = 0; column < _columnCount; column++)
+                    WriteValue(_stream, row[column], header);
+            }
+
+            _stream.Flush();
+            _runs.Add((offset, sorted.Count));
+            _writePosition = _stream.Position;
+        }
+
+        public RunReader OpenRunReader(int runIndex)
+        {
+            var (offset, rowCount) = _runs[runIndex];
+            return new RunReader(_stream, offset, rowCount, _columnCount);
+        }
+
+        public void Dispose() => _stream.Dispose();
+
+        private static void WriteValue(FileStream stream, SqlValue value, Span<byte> header)
+        {
+            switch (value.Kind)
+            {
+                case SqlValueKind.Null:
+                    stream.WriteByte(0x00);
+                    break;
+                case SqlValueKind.Integer:
+                    stream.WriteByte(0x01);
+                    BinaryPrimitives.WriteInt64LittleEndian(header, value.AsInteger());
+                    stream.Write(header);
+                    break;
+                case SqlValueKind.Real:
+                    stream.WriteByte(0x02);
+                    BinaryPrimitives.WriteDoubleLittleEndian(header, value.AsReal());
+                    stream.Write(header);
+                    break;
+                case SqlValueKind.Text:
+                {
+                    var bytes = Encoding.UTF8.GetBytes(value.AsText());
+                    stream.WriteByte(value.IsJson ? (byte)0x83 : (byte)0x03);
+                    BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
+                    stream.Write(header[..4]);
+                    stream.Write(bytes);
+                    break;
+                }
+                case SqlValueKind.Blob:
+                {
+                    var bytes = value.AsBlob().ToArray();
+                    stream.WriteByte(0x04);
+                    BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
+                    stream.Write(header[..4]);
+                    stream.Write(bytes);
+                    break;
+                }
+                default:
+                    throw new InvalidOperationException($"Unknown SQL value kind {value.Kind}.");
+            }
+        }
+
+        // Reads one run's records back one at a time from a shared FileStream. Each read
+        // seeks to the run's cursor so multiple readers can share the stream without a
+        // BinaryReader buffering conflict.
+        public sealed class RunReader : IDisposable
+        {
+            private readonly FileStream _stream;
+            private readonly int _columnCount;
+            private long _position;
+            private int _rowsRead;
+
+            public RunReader(FileStream stream, long offset, int rowCount, int columnCount)
+            {
+                _stream = stream;
+                _columnCount = columnCount;
+                _position = offset;
+                RowsRemaining = rowCount;
+            }
+
+            public int RowsRemaining { get; private set; }
+
+            public bool TryReadNext(out SqlValue[] row)
+            {
+                if (RowsRemaining <= 0)
+                {
+                    row = Array.Empty<SqlValue>();
+                    return false;
+                }
+
+                _stream.Seek(_position, SeekOrigin.Begin);
+                row = new SqlValue[_columnCount];
+                Span<byte> header = stackalloc byte[8];
+
+                for (var column = 0; column < _columnCount; column++)
+                    ReadValue(_stream, header, out row[column]);
+
+                _position = _stream.Position;
+                _rowsRead++;
+                RowsRemaining--;
+                return true;
+            }
+
+            public void Dispose()
+            {
+                // The FileStream is shared (owned by SorterSpill); nothing to release here.
+            }
+
+            private static void ReadValue(FileStream stream, Span<byte> header, out SqlValue value)
+            {
+                var kindByte = stream.ReadByte();
+                if (kindByte < 0)
+                    throw new EndOfStreamException("Sorter spill stream ended mid-record.");
+
+                var isJson = (kindByte & 0x80) != 0;
+                var kind = (SqlValueKind)(kindByte & 0x0F);
+                switch (kind)
+                {
+                    case SqlValueKind.Null:
+                        value = SqlValue.Null;
+                        break;
+                    case SqlValueKind.Integer:
+                        ReadExact(stream, header[..8]);
+                        value = SqlValue.Integer(BinaryPrimitives.ReadInt64LittleEndian(header));
+                        break;
+                    case SqlValueKind.Real:
+                        ReadExact(stream, header[..8]);
+                        value = SqlValue.Real(BinaryPrimitives.ReadDoubleLittleEndian(header));
+                        break;
+                    case SqlValueKind.Text:
+                        ReadExact(stream, header[..4]);
+                        var textLength = BinaryPrimitives.ReadInt32LittleEndian(header);
+                        var textBytes = new byte[textLength];
+                        ReadExact(stream, textBytes);
+                        var text = Encoding.UTF8.GetString(textBytes);
+                        value = isJson ? SqlValue.JsonText(text) : SqlValue.Text(text);
+                        break;
+                    case SqlValueKind.Blob:
+                        ReadExact(stream, header[..4]);
+                        var blobLength = BinaryPrimitives.ReadInt32LittleEndian(header);
+                        var blob = new byte[blobLength];
+                        ReadExact(stream, blob);
+                        value = SqlValue.Blob(blob);
+                        break;
+                    default:
+                        throw new InvalidOperationException($"Unknown spilled value kind {kind}.");
+                }
+            }
+
+            private static void ReadExact(FileStream stream, Span<byte> buffer)
+            {
+                var total = 0;
+                while (total < buffer.Length)
+                {
+                    var read = stream.Read(buffer[total..]);
+                    if (read <= 0)
+                        throw new EndOfStreamException("Sorter spill stream ended mid-record.");
+                    total += read;
+                }
+            }
         }
     }
 
@@ -1719,6 +2300,46 @@ public sealed class ResumableStatement : IDisposable
                 throw new InvalidOperationException(
                     $"Work table stores {_columnCount}-column records but received {row.Length} values.");
             }
+        }
+    }
+
+    // A streaming join cursor does not materialize its (potentially unbounded) output. Instead it
+    // holds the lazy enumerator produced by VdbeJoinPlan.Enumerate and the row it currently rests on.
+    // The cursor access pattern is strictly sequential forward-only (Rewind -> Column* -> Next ->
+    // Close), so a single forward enumerator is sufficient: Rewind primes the first row (and
+    // detects emptiness), Next advances it, and CurrentCursorRow returns the cached current row.
+    private sealed class JoinCursorState
+    {
+        private IEnumerator<SqlValue[]>? _enumerator;
+
+        public SqlValue[]? CurrentRow { get; private set; }
+
+        public void Open(IEnumerator<SqlValue[]> enumerator)
+        {
+            _enumerator = enumerator;
+            CurrentRow = null;
+        }
+
+        public bool MoveNext()
+        {
+            if (_enumerator is null)
+                return false;
+
+            if (_enumerator.MoveNext())
+            {
+                CurrentRow = _enumerator.Current;
+                return true;
+            }
+
+            CurrentRow = null;
+            return false;
+        }
+
+        public void Close()
+        {
+            _enumerator?.Dispose();
+            _enumerator = null;
+            CurrentRow = null;
         }
     }
 }

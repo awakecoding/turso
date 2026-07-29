@@ -51,6 +51,40 @@ public class AggregateProgramBuilderTests
     }
 
     [Test]
+    public void BuildCountStarEmitsRowCountWithoutScanning()
+    {
+        var program = AggregateProgramBuilder.BuildCountStar("t", tableColumnCount: 1);
+
+        program.RegisterCount.Should().Be(1);
+        program.CursorCount.Should().Be(1);
+        program.SorterCount.Should().Be(0);
+        program.AccumulatorCount.Should().Be(0);
+
+        program.Instructions.Select(instruction => instruction.Opcode).Should().Equal(
+            VdbeOpcode.OpenReadCursor,
+            VdbeOpcode.RowCount,
+            VdbeOpcode.ResultRow,
+            VdbeOpcode.Halt);
+
+        ((RowCountInstruction)program.Instructions[1]).Cursor.Index.Should().Be(0);
+        ((RowCountInstruction)program.Instructions[1]).Destination.Index.Should().Be(0);
+        ((ResultRowInstruction)program.Instructions[2]).Values.Count.Should().Be(1);
+
+        var rows = new TrackingRows(
+        [
+            [SqlValue.Integer(1)],
+            [SqlValue.Integer(2)],
+            [SqlValue.Integer(3)],
+            [SqlValue.Integer(4)],
+            [SqlValue.Integer(5)],
+        ]);
+        var result = Run(program, new VdbeCursorSource(rows));
+
+        result.Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(5));
+        rows.MaxIndexAccessed.Should().Be(-1);
+    }
+
+    [Test]
     public void BuildScalarInsertsAFilterStageWhenGivenAPredicate()
     {
         var program = AggregateProgramBuilder.BuildScalar(
@@ -790,5 +824,35 @@ public class AggregateProgramBuilderTests
         }
 
         return rows;
+    }
+
+    // A read-only row list that records the highest index accessed so a test can prove the
+    // COUNT(*) shortcut reads the row count without iterating any row.
+    private sealed class TrackingRows : IReadOnlyList<SqlValue[]>
+    {
+        private readonly SqlValue[][] _rows;
+
+        public TrackingRows(SqlValue[][] rows)
+        {
+            ArgumentNullException.ThrowIfNull(rows);
+            _rows = rows;
+        }
+
+        public int MaxIndexAccessed { get; private set; } = -1;
+
+        public SqlValue[] this[int index]
+        {
+            get
+            {
+                MaxIndexAccessed = Math.Max(MaxIndexAccessed, index);
+                return _rows[index];
+            }
+        }
+
+        public int Count => _rows.Length;
+
+        public IEnumerator<SqlValue[]> GetEnumerator() => ((IEnumerable<SqlValue[]>)_rows).GetEnumerator();
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => _rows.GetEnumerator();
     }
 }

@@ -947,11 +947,37 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
             _currentSql,
             @"^\s*SELECT\s+(?<select>.*?)\s+FROM\s+(?<table>""(?:[^""]|"""")+""|\[[^\]]+\]|`[^`]+`|[\w]+)",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        if (!match.Success)
+        if (match.Success)
+        {
+            tableName = UnquoteIdentifier(match.Groups["table"].Value);
+            selections = SplitSelectList(match.Groups["select"].Value);
+            if (selections.Count == 1 && selections[0] == "*")
+                selections = Enumerable.Range(0, FieldCount).Select(GetName).ToList();
+
+            return true;
+        }
+
+        // DML ... RETURNING <cols>: the result columns come from the target table, so the
+        // declared column types resolve via PRAGMA table_info of that table. Without this,
+        // GetSchemaTable/GetDeclaredTypeName fall back to GetSampleValueType, which would
+        // RE-EXECUTE the DML once per column (INSERT...RETURNING -> N+1 inserts) and report
+        // Byte[]/BLOB for every column before the first Read.
+        var returningMatch = Regex.Match(
+            _currentSql,
+            @"\bRETURNING\s+(?<cols>.+?)\s*;?\s*$",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!returningMatch.Success)
             return false;
 
-        tableName = UnquoteIdentifier(match.Groups["table"].Value);
-        selections = SplitSelectList(match.Groups["select"].Value);
+        var tableMatch = Regex.Match(
+            _currentSql,
+            @"(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+(?<table>""(?:[^""]|"""")+""|\[[^\]]+\]|`[^`]+`|[\w]+)",
+            RegexOptions.IgnoreCase);
+        if (!tableMatch.Success)
+            return false;
+
+        tableName = UnquoteIdentifier(tableMatch.Groups["table"].Value);
+        selections = SplitSelectList(returningMatch.Groups["cols"].Value);
         if (selections.Count == 1 && selections[0] == "*")
             selections = Enumerable.Range(0, FieldCount).Select(GetName).ToList();
 
@@ -1059,6 +1085,15 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
     private ReaderValueKind GetSampleValueType(int ordinal)
     {
+        // Re-executing the statement to sample a value type is only safe for read-only SELECTs.
+        // DML (INSERT/UPDATE/DELETE/REPLACE, including ... RETURNING) would mutate the database
+        // again on each call — once per column — corrupting rows. Declared types for RETURNING
+        // are resolved via TryGetSelectSource; this fallback must stay read-only and otherwise
+        // report BLOB, matching Microsoft.Data.Sqlite (which exposes a NULL declared type for
+        // non-table expressions).
+        if (IsMutableStatement(_currentSql))
+            return ReaderValueKind.Blob;
+
         using var statement = _command.PrepareSingleStatement(_currentSql);
         while (statement.Read())
         {
@@ -1070,6 +1105,26 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         }
 
         return ReaderValueKind.Blob;
+    }
+
+    private static bool IsMutableStatement(string sql)
+    {
+        var trimmed = sql.AsSpan().TrimStart();
+        return StartsWithKeyword(trimmed, "INSERT")
+            || StartsWithKeyword(trimmed, "UPDATE")
+            || StartsWithKeyword(trimmed, "DELETE")
+            || StartsWithKeyword(trimmed, "REPLACE");
+    }
+
+    private static bool StartsWithKeyword(ReadOnlySpan<char> text, string keyword)
+    {
+        if (text.Length < keyword.Length)
+            return false;
+
+        if (!text[..keyword.Length].Equals(keyword, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return text.Length == keyword.Length || !char.IsLetterOrDigit(text[keyword.Length]);
     }
 
     private static ReaderValueKind GetValueKindFromTypeName(string typeName)

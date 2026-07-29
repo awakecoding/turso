@@ -211,6 +211,47 @@ public static class AggregateProgramBuilder
     }
 
     /// <summary>
+    /// Builds the O(1) fast path for <c>SELECT COUNT(*) FROM &lt;source&gt;</c> with no
+    /// WHERE/GROUP BY/HAVING/ORDER BY/DISTINCT/LIMIT/OFFSET and no FILTER/OVER on the
+    /// COUNT(*). The program opens a read cursor, loads the bound row source's row count
+    /// into the single output register, emits exactly one result row, and halts — no scan
+    /// loop, no accumulator. The cursor is never iterated, so the row source's indexer is
+    /// never touched: a tracking source records no index access. <see cref="HaltInstruction"/>
+    /// disposes the open cursor, so no explicit <see cref="CloseCursorInstruction"/> is
+    /// emitted. The output register (index 0) is also the single result column.
+    /// <code>
+    ///   0  OpenReadCursor
+    ///   1  RowCount      -> r[0] = c0.rowcount
+    ///   2  ResultRow     (r[0])
+    ///   3  Halt
+    /// </code>
+    /// <para>
+    /// <paramref name="driveProgress"/>, when non-null, is attached to the <see cref="RowCountInstruction"/>
+    /// so the interpreter pumps it once per counted row, keeping a registered progress handler firing at
+    /// the same cadence as the scan+accumulator path. Null (the default) keeps the program O(1).
+    /// </para>
+    /// </summary>
+    public static VdbeProgram BuildCountStar(string tableName, int tableColumnCount, Action? driveProgress = null)
+    {
+        var cursor = new Cursor(0);
+        var output = new Register(0);
+        var ins = new List<VdbeInstruction>
+        {
+            new OpenReadCursorInstruction(cursor, tableName, tableColumnCount),
+            new RowCountInstruction(cursor, output, driveProgress),
+            new ResultRowInstruction(new RegisterRange(output, 1)),
+            new HaltInstruction(),
+        };
+
+        return new VdbeProgram(
+            registerCount: 1,
+            cursorCount: 1,
+            ins,
+            sorterCount: 0,
+            accumulatorCount: 0);
+    }
+
+    /// <summary>
     /// Builds a <c>GROUP BY</c> aggregation. The program materializes every scanned row into
     /// a sorter ordered by <paramref name="groupOrderComparer"/> so rows of one group are
     /// contiguous, then walks the sorted rows once: it accumulates rows of the current group,

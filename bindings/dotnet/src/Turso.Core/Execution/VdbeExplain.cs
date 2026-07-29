@@ -127,6 +127,12 @@ public static class VdbeExplain
                 0,
                 null,
                 $"rewind cursor {rewind.Cursor.Index}, goto {rewind.EmptyTarget.Offset} if empty"),
+            LastCursorInstruction last => (
+                last.Cursor.Index,
+                last.EmptyTarget.Offset,
+                0,
+                null,
+                $"cursor {last.Cursor.Index} last, goto {last.EmptyTarget.Offset} if empty"),
             ColumnInstruction column => (
                 column.Cursor.Index,
                 column.ColumnIndex,
@@ -139,6 +145,12 @@ public static class VdbeExplain
                 0,
                 null,
                 $"r[{rowId.Destination.Index}]=c{rowId.Cursor.Index}.rowid"),
+            RowCountInstruction rowCount => (
+                rowCount.Cursor.Index,
+                rowCount.Destination.Index,
+                0,
+                null,
+                $"r[{rowCount.Destination.Index}]=c{rowCount.Cursor.Index}.rowcount"),
             FilterInstruction filter => (
                 filter.Cursor.Index,
                 filter.FalseTarget.Offset,
@@ -151,6 +163,20 @@ public static class VdbeExplain
                 0,
                 null,
                 filterRowId.Description),
+            SeekRowidInstruction seekRowid => (
+                seekRowid.Cursor.Index,
+                seekRowid.NotFoundTarget.Offset,
+                seekRowid.RowIdRegister.Index,
+                null,
+                seekRowid.Description),
+            SeekRowidRangeInstruction seekRowidRange => (
+                seekRowidRange.Cursor.Index,
+                seekRowidRange.NotFoundTarget.Offset,
+                seekRowidRange.StartRowIdRegister.Index,
+                seekRowidRange.EndRowIdRegister is null
+                    ? $"{seekRowidRange.StartOp}"
+                    : $"{seekRowidRange.StartOp}..{seekRowidRange.EndOp}",
+                seekRowidRange.Description),
             FilterRegistersInstruction filterRegisters => (
                 filterRegisters.Row.Start.Index,
                 filterRegisters.FalseTarget.Offset,
@@ -181,6 +207,12 @@ public static class VdbeExplain
                 0,
                 null,
                 $"next cursor {next.Cursor.Index}, goto {next.LoopTarget.Offset} if more rows"),
+            PrevInstruction prev => (
+                prev.Cursor.Index,
+                prev.LoopTarget.Offset,
+                0,
+                null,
+                $"cursor {prev.Cursor.Index} prev, goto {prev.LoopTarget.Offset} if more rows"),
             OpenSorterInstruction openSorter => (
                 openSorter.Sorter.Index,
                 0,

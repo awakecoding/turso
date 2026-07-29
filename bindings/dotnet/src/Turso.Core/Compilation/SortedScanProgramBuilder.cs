@@ -56,7 +56,8 @@ public readonly record struct SortedScanColumn
 ///   2            Rewind        -> sortAddr     (empty table)
 ///   loopStart    [Filter       -> nextAddr]    (WHERE)
 ///                Column c0.i -> r[i]           (materialize full row: i in 0..W-1)
-///                SorterInsert  r[0..W-1]
+///                [RowId        -> r[W]]        (only when carryRowId: trailing rowid slot)
+///                SorterInsert  r[0..W-1]       (r[0..W] when carryRowId carries the rowid)
 ///   nextAddr     Next          -> loopStart
 ///                CloseCursor
 ///   sortAddr     SorterSort    -> drainDone     (nothing to drain)
@@ -75,7 +76,8 @@ public static class SortedScanProgramBuilder
         int tableColumnCount,
         IReadOnlyList<SortedScanColumn> projections,
         VdbeRowComparer comparer,
-        VdbeRowPredicate? predicate = null)
+        VdbeRowPredicate? predicate = null,
+        bool carryRowId = false)
     {
         ArgumentNullException.ThrowIfNull(tableName);
         ArgumentNullException.ThrowIfNull(projections);
@@ -101,12 +103,21 @@ public static class SortedScanProgramBuilder
         var outputCount = projections.Count;
         var filterCount = predicate is null ? 0 : 1;
 
+        // When carryRowId is set, an extra trailing register holds the scanned row's rowid
+        // (populated by a RowId opcode) so the caller's comparer can break ORDER BY ties by
+        // rowid ascending — matching SQLite/Microsoft.Data.Sqlite, which scans rows in rowid
+        // order and sorts stably. The staging block grows from W to W+1 columns and the output
+        // block shifts past it. WITHOUT-ROWID tables pass carryRowId=false and keep their
+        // existing relative tie order.
+        var recordWidth = width + (carryRowId ? 1 : 0);
+
         // Fixed layout so jump targets can be computed up front. The staging block
-        // r[0..W-1] holds the current full row; the output block r[W..W+P-1] holds the
-        // projected result row.
+        // r[0..recordWidth-1] holds the current full row (plus the rowid slot when carried);
+        // the output block r[recordWidth..recordWidth+P-1] holds the projected result row.
         var loopStart = 3;
         var columnStart = loopStart + filterCount;
-        var sorterInsertAddr = columnStart + width;
+        var rowIdAddr = columnStart + width;
+        var sorterInsertAddr = rowIdAddr + (carryRowId ? 1 : 0);
         var nextAddr = sorterInsertAddr + 1;
         var closeReadAddr = nextAddr + 1;
         var sortAddr = closeReadAddr + 1;
@@ -116,13 +127,13 @@ public static class SortedScanProgramBuilder
         var sorterNextAddr = resultRowAddr + 1;
         var drainDone = sorterNextAddr + 1;
 
-        var stagingRange = new RegisterRange(new Register(0), width);
-        var outputRange = new RegisterRange(new Register(width), outputCount);
+        var stagingRange = new RegisterRange(new Register(0), recordWidth);
+        var outputRange = new RegisterRange(new Register(recordWidth), outputCount);
 
         var instructions = new List<VdbeInstruction>(drainDone + 2)
         {
             new OpenReadCursorInstruction(cursor, tableName, width),
-            new OpenSorterInstruction(sorter, comparer, width),
+            new OpenSorterInstruction(sorter, comparer, recordWidth),
             new RewindCursorInstruction(cursor, new ProgramCounter(sortAddr)),
         };
 
@@ -138,6 +149,9 @@ public static class SortedScanProgramBuilder
         for (var column = 0; column < width; column++)
             instructions.Add(new ColumnInstruction(cursor, column, new Register(column)));
 
+        if (carryRowId)
+            instructions.Add(new RowIdInstruction(cursor, new Register(width)));
+
         instructions.Add(new SorterInsertInstruction(sorter, stagingRange));
         instructions.Add(new NextInstruction(cursor, new ProgramCounter(loopStart)));
         instructions.Add(new CloseCursorInstruction(cursor));
@@ -147,7 +161,7 @@ public static class SortedScanProgramBuilder
         for (var output = 0; output < outputCount; output++)
         {
             var projection = projections[output];
-            var destination = new Register(width + output);
+            var destination = new Register(recordWidth + output);
             instructions.Add(projection.IsConstant
                 ? new LoadConstantInstruction(destination, projection.Constant)
                 : new CopyInstruction(new Register(projection.ColumnIndex), destination));
@@ -159,7 +173,7 @@ public static class SortedScanProgramBuilder
         instructions.Add(new HaltInstruction());
 
         return new VdbeProgram(
-            registerCount: width + outputCount,
+            registerCount: recordWidth + outputCount,
             cursorCount: 1,
             instructions,
             sorterCount: 1);

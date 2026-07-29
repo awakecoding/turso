@@ -191,14 +191,62 @@ public class AggregateSqlRoutingTests
     }
 
     [Test]
-    public void NullaryCountExplainDescribesAnEmptyArgumentRange()
+    public void NullaryCountExplainDescribesTheRowCountShortcut()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(value INTEGER);");
 
-        Comments(ReadRows(connection, "EXPLAIN SELECT count(*) FROM t;"))
-            .Should().Contain("accumulator 0=rows step r[0]")
-            .And.Contain("r[1]=count finalize accumulator 0");
+        var rows = ReadRows(connection, "EXPLAIN SELECT count(*) FROM t;");
+
+        // The bare `SELECT count(*) FROM t` shortcut emits a minimal O(1) program: open the
+        // cursor, read its row count, emit one result row, halt. No scan loop, no accumulator.
+        Opcodes(rows).Should().Equal(
+            "OpenReadCursor",
+            "RowCount",
+            "ResultRow",
+            "Halt");
+
+        Comments(rows).Should().Contain("r[0]=c0.rowcount");
+    }
+
+    [Test]
+    public void SelectCountStarReturnsTheRowCountWithoutScanning()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+
+        // Empty table → 0.
+        ReadRows(connection, "SELECT count(*) FROM t;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(0));
+
+        // Non-empty table → 3.
+        Execute(connection, "INSERT INTO t VALUES (1), (2), (3);");
+        ReadRows(connection, "SELECT count(*) FROM t;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(3));
+
+        // Differential: matches Microsoft.Data.Sqlite for empty and non-empty tables.
+        AssertMatchesSqlite(["CREATE TABLE t(value INTEGER);"], "SELECT count(*) FROM t;");
+        AssertMatchesSqlite(
+            ["CREATE TABLE t(value INTEGER);", "INSERT INTO t VALUES (1), (2), (3);"],
+            "SELECT count(*) FROM t;");
+    }
+
+    [Test]
+    public void CountStarWithWherePredicateStaysOnTheAccumulatorPath()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        Execute(connection, "CREATE TABLE t(value INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1), (2), (3);");
+
+        // A WHERE predicate changes the counted rows, so the shortcut must not fire — the
+        // statement must keep scanning and accumulating.
+        var rows = ReadRows(connection, "EXPLAIN SELECT count(*) FROM t WHERE value > 1;");
+        Opcodes(rows).Should().NotContain("RowCount");
+        Opcodes(rows).Should().Contain("AggReset").And.Contain("AggStep").And.Contain("AggFinalize");
+
+        // And the value is the filtered count, not the full row count.
+        ReadRows(connection, "SELECT count(*) FROM t WHERE value > 1;")
+            .Should().ContainSingle().Which.Should().Equal(SqlValue.Integer(2));
     }
 
     [Test]

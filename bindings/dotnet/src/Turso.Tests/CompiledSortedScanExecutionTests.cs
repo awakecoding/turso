@@ -27,6 +27,7 @@ public class CompiledSortedScanExecutionTests
             "OpenSorter",
             "Rewind",
             "Column",
+            "RowId",
             "SorterInsert",
             "Next",
             "CloseCursor",
@@ -42,28 +43,29 @@ public class CompiledSortedScanExecutionTests
         for (var index = 0; index < rows.Count; index++)
             rows[index][0].Should().Be(SqlValue.Integer(index));
 
-        // OpenSorter reports its materialized column width (the full 1-column row).
-        rows[1][4].Should().Be(SqlValue.Integer(1));
-        rows[1][6].Should().Be(SqlValue.Text("open sorter 0 (1 cols)"));
+        // OpenSorter reports its materialized record width (the 1-column row plus the carried rowid).
+        rows[1][4].Should().Be(SqlValue.Integer(2));
+        rows[1][6].Should().Be(SqlValue.Text("open sorter 0 (2 cols)"));
 
-        // Rewind jumps to SorterSort (addr 7) when the table is empty.
-        rows[2][3].Should().Be(SqlValue.Integer(7));
+        // Rewind jumps to SorterSort (addr 8) when the table is empty.
+        rows[2][3].Should().Be(SqlValue.Integer(8));
 
-        // SorterInsert stages the full scanned row r[0].
-        rows[4][6].Should().Be(SqlValue.Text("sorter 0 insert r[0]"));
+        // RowId loads the scanned row's rowid into the trailing staging slot, then SorterInsert
+        // stages the full record r[0..1] (value + rowid) so the comparer can break ties by rowid.
+        rows[5][6].Should().Be(SqlValue.Text("sorter 0 insert r[0..1]"));
 
-        // SorterSort drains from addr 8, or jumps to CloseSorter (addr 12) when empty.
-        rows[7][3].Should().Be(SqlValue.Integer(12));
-        rows[7][6].Should().Be(SqlValue.Text("sort sorter 0, goto 12 if empty"));
+        // SorterSort drains from addr 9, or jumps to CloseSorter (addr 13) when empty.
+        rows[8][3].Should().Be(SqlValue.Integer(13));
+        rows[8][6].Should().Be(SqlValue.Text("sort sorter 0, goto 13 if empty"));
 
-        // SorterData copies the sorted record back into the staging register.
-        rows[8][6].Should().Be(SqlValue.Text("r[0]=sorter 0 data"));
+        // SorterData copies the sorted record back into the staging registers.
+        rows[9][6].Should().Be(SqlValue.Text("r[0..1]=sorter 0 data"));
 
-        // SorterNext loops back to the drain start (addr 8) while rows remain.
-        rows[11][3].Should().Be(SqlValue.Integer(8));
-        rows[11][6].Should().Be(SqlValue.Text("next sorter 0, goto 8 if more rows"));
+        // SorterNext loops back to the drain start (addr 9) while rows remain.
+        rows[12][3].Should().Be(SqlValue.Integer(9));
+        rows[12][6].Should().Be(SqlValue.Text("next sorter 0, goto 9 if more rows"));
 
-        rows[12][6].Should().Be(SqlValue.Text("close sorter 0"));
+        rows[13][6].Should().Be(SqlValue.Text("close sorter 0"));
     }
 
     [Test]
@@ -80,6 +82,7 @@ public class CompiledSortedScanExecutionTests
             "Rewind",
             "Filter",
             "Column",
+            "RowId",
             "SorterInsert",
             "Next",
             "CloseCursor",
@@ -154,6 +157,33 @@ public class CompiledSortedScanExecutionTests
             SqlValue.Text("b"),
             SqlValue.Text("c"),
             SqlValue.Text("d"));
+    }
+
+    [Test]
+    public void TiedKeysBreakByRowidAscendingOnTheCompiledSorterRoute()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, tag TEXT);");
+        // Explicit out-of-order rowids: insertion/scan order is (10, 3, 7) but rowid
+        // order is (3, 7, 10). SQLite scans in rowid order and sorts stably, so the
+        // grp='a' tie must resolve to rowid-ascending order ('three','ten'), NOT the
+        // insertion order ('ten','three') a rowid-unaware stable sort would produce.
+        Execute(connection, "INSERT INTO t(rowid,grp,tag) VALUES (10,'a','ten'),(3,'a','three'),(7,'b','seven');");
+
+        RouteUsesSorter(connection, "SELECT tag FROM t ORDER BY grp;").Should().BeTrue();
+
+        ReadRows(connection, "SELECT tag FROM t ORDER BY grp;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Text("three"), SqlValue.Text("ten"), SqlValue.Text("seven"));
+
+        // The rowid-ascending tiebreak is independent of ORDER BY direction: DESC keeps
+        // 'three' before 'ten' within the grp='a' tie (matches SQLite/Microsoft.Data.Sqlite).
+        ReadRows(connection, "SELECT tag FROM t ORDER BY grp DESC;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Text("seven"), SqlValue.Text("three"), SqlValue.Text("ten"));
     }
 
     [Test]
@@ -318,6 +348,7 @@ public class CompiledSortedScanExecutionTests
             "OpenSorter",
             "Rewind",
             "Column",
+            "RowId",
             "SorterInsert",
             "Next",
             "CloseCursor",
@@ -330,8 +361,8 @@ public class CompiledSortedScanExecutionTests
             "SorterNext",
             "CloseSorter",
             "Halt");
-        program[12][6].Should().Be(SqlValue.Text("goto 15 and decrement r[2] while r[2]>0"));
-        program[13][6].Should().Be(SqlValue.Text("goto 17 when r[3]<=0, else decrement r[3]"));
+        program[13][6].Should().Be(SqlValue.Text("goto 16 and decrement r[3] while r[3]>0"));
+        program[14][6].Should().Be(SqlValue.Text("goto 18 when r[4]<=0, else decrement r[4]"));
 
         ReadRows(connection, "SELECT value FROM t ORDER BY value LIMIT 2;")
             .Select(row => row[0])
@@ -536,6 +567,145 @@ public class CompiledSortedScanExecutionTests
             .Should()
             .Equal(SqlValue.Text("alpha"), SqlValue.Text("beta"));
     }
+
+    // P1-21 reverse traversal: `ORDER BY rowid DESC` on a rowid table whose RowIds are
+    // ascending lowers to a backward table scan (Last/Prev) instead of the sorter. The
+    // EXPLAIN shape proves the route is genuinely used; the result tests prove descending
+    // semantics; the fallback tests prove excluded shapes (unsorted RowIds, non-rowid
+    // column, ASC, WHERE) keep the sorter and stay correct.
+
+    [Test]
+    public void ExplainEmitsReverseRowidScanForOrderByRowidDesc()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(v TEXT);");
+        Execute(connection, "INSERT INTO t VALUES ('a'),('b'),('c');");
+
+        var columns = ColumnNames(connection, "EXPLAIN SELECT v FROM t ORDER BY rowid DESC;");
+        columns.Should().Equal("addr", "opcode", "p1", "p2", "p3", "p4", "comment");
+
+        var rows = ReadRows(connection, "EXPLAIN SELECT v FROM t ORDER BY rowid DESC;");
+        Opcodes(rows).Should().Equal(
+            "OpenReadCursor",
+            "Last",
+            "Column",
+            "ResultRow",
+            "Prev",
+            "CloseCursor",
+            "Halt");
+
+        // addr counts up from zero.
+        for (var index = 0; index < rows.Count; index++)
+            rows[index][0].Should().Be(SqlValue.Integer(index));
+
+        // Last jumps to CloseCursor (addr 5) when the table is empty.
+        rows[1][3].Should().Be(SqlValue.Integer(5));
+        rows[1][6].AsText().Should().Be("cursor 0 last, goto 5 if empty");
+
+        // Prev loops back to the Column at addr 2 while another row remains.
+        rows[4][3].Should().Be(SqlValue.Integer(2));
+        rows[4][6].AsText().Should().Be("cursor 0 prev, goto 2 if more rows");
+    }
+
+    [Test]
+    public void OrderByRowidDescReturnsDescendingOrder()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(v TEXT);");
+        // Auto-rowid INSERTs keep RowIds ascending (1, 2, 3), so the reverse-scan gate fires.
+        Execute(connection, "INSERT INTO t VALUES ('a'),('b'),('c');");
+
+        ReadRows(connection, "SELECT v FROM t ORDER BY rowid DESC;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Text("c"), SqlValue.Text("b"), SqlValue.Text("a"));
+    }
+
+    [Test]
+    public void OrderByRowidDescFallsBackToSorterWhenRowIdsAreUnsorted()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);");
+        // Explicit out-of-order rowid INSERTs leave RowIds = [10, 3, 7] (CommitInserts
+        // appends in INSERT order for rowid tables), so the reverse-scan gate declines
+        // (RowIdsAreAscending == false). A bare `ORDER BY rowid` key also declines the
+        // sorter route (ReferencesUnbackedRowid), so the statement runs on the evaluator —
+        // which EXPLAIN cannot describe, proving no Last/Prev was emitted.
+        Execute(connection, "INSERT INTO t(rowid,v) VALUES (10,'x'),(3,'y'),(7,'z');");
+
+        AssertExplainUsesEvaluator(connection, "SELECT v FROM t ORDER BY rowid DESC;");
+
+        // Fallback is still correct: rowid-descending is 10, 7, 3 -> x, z, y.
+        ReadRows(connection, "SELECT v FROM t ORDER BY rowid DESC;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Text("x"), SqlValue.Text("z"), SqlValue.Text("y"));
+    }
+
+    [Test]
+    public void OrderByNonRowidColumnDescKeepsTheSorter()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(v TEXT);");
+        Execute(connection, "INSERT INTO t VALUES ('a'),('b'),('c');");
+
+        // A non-rowid column key is backed, so this stays on the sorter (EXPLAIN-able) and
+        // emits no Last/Prev.
+        RouteUsesSorter(connection, "SELECT v FROM t ORDER BY v DESC;").Should().BeTrue();
+        var rows = ReadRows(connection, "EXPLAIN SELECT v FROM t ORDER BY v DESC;");
+        Opcodes(rows).Should().NotContain("Last");
+        Opcodes(rows).Should().NotContain("Prev");
+    }
+
+    [Test]
+    public void OrderByRowidAscDoesNotEmitReverseScan()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(v TEXT);");
+        Execute(connection, "INSERT INTO t VALUES ('a'),('b'),('c');");
+
+        // ASC is not the reverse-scan gate (Descending only); a bare `ORDER BY rowid` key
+        // also declines the sorter route, so this runs on the evaluator (EXPLAIN throws),
+        // and ascending order is still correct.
+        AssertExplainUsesEvaluator(connection, "SELECT v FROM t ORDER BY rowid ASC;");
+
+        ReadRows(connection, "SELECT v FROM t ORDER BY rowid ASC;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Text("a"), SqlValue.Text("b"), SqlValue.Text("c"));
+    }
+
+    [Test]
+    public void OrderByRowidDescWithWhereDoesNotEmitReverseScan()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(v TEXT);");
+        Execute(connection, "INSERT INTO t VALUES ('a'),('b'),('c');");
+
+        // The reverse-scan gate excludes WHERE (no predicate is emitted on the Last/Prev
+        // path), and a bare rowid key declines the sorter too, so this runs on the
+        // evaluator (EXPLAIN throws) — the filtered descending order is still correct.
+        AssertExplainUsesEvaluator(connection, "SELECT v FROM t WHERE v > 'a' ORDER BY rowid DESC;");
+
+        ReadRows(connection, "SELECT v FROM t WHERE v > 'a' ORDER BY rowid DESC;")
+            .Select(row => row[0])
+            .Should()
+            .Equal(SqlValue.Text("c"), SqlValue.Text("b"));
+    }
+
+    // Asserts the statement is NOT lowered to bytecode (EXPLAIN throws), which proves the
+    // reverse-scan route did not claim it. Used for shapes the reverse gate declines that
+    // also fail the sorter route's bare-rowid-key check, so they land on the evaluator.
+    private static void AssertExplainUsesEvaluator(EmbeddedConnection connection, string sql)
+        => Assert.Throws<EmbeddedSqlException>(
+            () => ReadRows(connection, "EXPLAIN " + sql.TrimEnd(';') + ";"),
+            "an evaluator-routed statement cannot be EXPLAIN'd");
 
     // Returns true when EXPLAIN of the query lowers to a sorter-backed program, i.e. the
     // compiled ORDER BY route (not the evaluator) owns execution.

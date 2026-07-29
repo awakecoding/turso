@@ -144,6 +144,70 @@ public sealed class ManagedDocumentedBoundaryTests
         Assert.Throws<NotSupportedException>(() => adapter.UpdateBatchSize = 10);
     }
 
+    // Readme.md:695 documents that file-backed trigger definitions containing function
+    // calls are rejected because connection-local implementations cannot be reconstructed
+    // on reopen. A builtin scalar function (UPPER) is the first shape a caller reaches for,
+    // so it must fail loudly at CREATE TRIGGER time rather than silently persisting a body
+    // that would misbehave (or throw) after reopen.
+    [Test]
+    public void FileBackedTriggerWithBuiltinFunctionIsRejected()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using var connection = OpenFile(path);
+            ExecuteNonQuery(connection, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+            ExecuteNonQuery(connection, "CREATE TABLE audit (id INTEGER PRIMARY KEY, upper_name TEXT)");
+
+            var error = Assert.Throws<SqliteException>(() =>
+                ExecuteNonQuery(connection, "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit (upper_name) VALUES (UPPER(NEW.name)); END"));
+
+            error!.Message.Should().Contain("cannot persist trigger");
+            error.Message.Should().Contain("File-backed schema definitions cannot retain");
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    // Readme.md "Known divergences from SQLite" documents that a double-quoted token in a
+    // value context is resolved strictly as a column identifier: an unresolved name throws
+    // `no such column` rather than falling back to a string literal the way stock SQLite
+    // (SQLITE_DQS, the default, including e_sqlite3) does. Single-quoted literals are the
+    // portable form. This pins the strict behavior so a future DQS-style fallback cannot
+    // silently slip in without updating the documentation.
+    [Test]
+    public void DoubleQuotedTokenInValueContextIsResolvedAsColumnNotStringLiteral()
+    {
+        using var connection = Open();
+        Execute(connection, "INSERT INTO t VALUES (1, 'characters')");
+
+        // (1) A double-quoted real column name resolves to the column value (strict
+        //     identifier), not to the literal token. A DQS string-literal fallback would
+        //     return the text "a" here instead of the stored integer 1.
+        ReadOne(connection, "SELECT \"a\" FROM t").Should().Be("1");
+
+        // (2) A double-quoted token that is NOT a column throws `no such column`, matching
+        //     strict identifier resolution. Stock SQLite with SQLITE_DQS (the default,
+        //     including e_sqlite3) would fall back to the string literal 'characters' and
+        //     return a row. This pins the documented divergence.
+        var error = Assert.Throws<SqliteException>(() =>
+            ReadOne(connection, "SELECT \"characters\" FROM t"));
+
+        error!.Message.Should().Contain("no such column: characters");
+    }
+
+    private static string? ReadOne(SqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+            return "<NO ROWS>";
+        return reader.IsDBNull(0) ? "<NULL>" : reader.GetValue(0)?.ToString();
+    }
+
     private static SqliteConnection Open()
     {
         var connection = new SqliteConnection("Data Source=:memory:");
@@ -151,6 +215,40 @@ public sealed class ManagedDocumentedBoundaryTests
         Execute(connection, "CREATE TABLE t(a INTEGER, b TEXT)");
         Execute(connection, "CREATE TABLE s(a INTEGER, b TEXT)");
         return connection;
+    }
+
+    private static SqliteConnection OpenFile(string path)
+    {
+        // Pooling=False hands the file lock back on dispose so the test can delete it; the
+        // explicit Local Provider=Managed pins the managed file store whose reopen
+        // constraint is the boundary under test.
+        var connection = new SqliteConnection($"Data Source={path};Pooling=False;Local Provider=Managed");
+        connection.Open();
+        return connection;
+    }
+
+    private static void ExecuteNonQuery(SqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private static string CreateDatabasePath()
+    {
+        var directory = Path.Combine(TestContext.CurrentContext.WorkDirectory, "managed-boundary");
+        Directory.CreateDirectory(directory);
+        return Path.Combine(directory, $"file-trigger-{Guid.NewGuid():N}.db");
+    }
+
+    private static void DeleteDatabase(string path)
+    {
+        foreach (var suffix in new[] { string.Empty, "-wal", "-shm", "-journal" })
+        {
+            var candidate = path + suffix;
+            if (File.Exists(candidate))
+                File.Delete(candidate);
+        }
     }
 
     private static void Execute(SqliteConnection connection, string sql)
