@@ -123,6 +123,17 @@ public interface IManagedConnectionAdapter : IDisposable
 
     bool HasAttachedDatabases => true;
 
+    /// <summary>
+    /// How long contended transaction-lock acquisitions wait before reporting busy,
+    /// mirroring <c>sqlite3_busy_timeout</c>. Adapters without a managed transaction
+    /// lock ignore the value.
+    /// </summary>
+    TimeSpan BusyTimeout
+    {
+        get => TimeSpan.Zero;
+        set { }
+    }
+
     void ResetForPooling()
         => throw new NotSupportedException("This managed connection adapter does not support pooling.");
 
@@ -356,6 +367,12 @@ public sealed class ManagedConnectionAdapter : IManagedConnectionAdapter
     public bool HasAttachedDatabases => GetConnection().HasAttachedDatabases;
 
     public ManagedConnectionHooks Hooks => GetConnection().Hooks;
+
+    public TimeSpan BusyTimeout
+    {
+        get => GetConnection().BusyTimeout;
+        set => GetConnection().BusyTimeout = value;
+    }
 
     public IManagedStatementAdapter Prepare(string sql)
     {

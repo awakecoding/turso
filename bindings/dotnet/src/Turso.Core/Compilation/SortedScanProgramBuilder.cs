@@ -104,11 +104,11 @@ public static class SortedScanProgramBuilder
         var filterCount = predicate is null ? 0 : 1;
 
         // When carryRowId is set, an extra trailing register holds the scanned row's rowid
-        // (populated by a RowId opcode) so the caller's comparer can break ORDER BY ties by
-        // rowid ascending — matching SQLite/Microsoft.Data.Sqlite, which scans rows in rowid
-        // order and sorts stably. The staging block grows from W to W+1 columns and the output
-        // block shifts past it. WITHOUT-ROWID tables pass carryRowId=false and keep their
-        // existing relative tie order.
+        // (populated by a RowId opcode); the sorter record keeps it for output/shape
+        // compatibility while equal keys preserve sorter-insertion order (the stable
+        // sorter breaks ties by insertion index = scan order). The staging block grows
+        // from W to W+1 columns and the output block shifts past it. WITHOUT-ROWID
+        // tables pass carryRowId=false and keep their existing relative tie order.
         var recordWidth = width + (carryRowId ? 1 : 0);
 
         // Fixed layout so jump targets can be computed up front. The staging block

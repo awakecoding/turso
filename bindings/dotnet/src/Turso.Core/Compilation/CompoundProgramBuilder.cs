@@ -437,7 +437,8 @@ public static class CompoundProgramBuilder
                 x.Projector,
                 x.Equality,
                 x.GroupSetIndex + distinctBase,
-                x.Hasher),
+                x.Hasher,
+                x.KeyOutput is { } keyOutput ? Range(keyOutput) : null),
             DistinctGateInstruction x => new DistinctGateInstruction(
                 Range(x.Values),
                 x.Equality,
@@ -531,7 +532,8 @@ public static class CompoundProgramBuilder
                 x.Projector,
                 x.Equality,
                 x.GroupSetIndex + distinctBase,
-                x.Hasher),
+                x.Hasher,
+                x.KeyOutput is { } keyOutput ? Range(keyOutput) : null),
             DistinctGateInstruction x => new DistinctGateInstruction(
                 Range(x.Values),
                 x.Equality,

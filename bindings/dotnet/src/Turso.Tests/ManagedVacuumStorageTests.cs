@@ -318,7 +318,7 @@ public sealed class ManagedVacuumStorageTests
     }
 
     [Test]
-    public void VacuumPublishesSiblingPagerGenerationAndStalesSiblingCatalogWrites()
+    public void VacuumPublishesSiblingPagerGenerationAndRefreshesSiblingAutocommitWrites()
     {
         var fileSystem = new InMemoryFileSystem();
         const string path = "vacuum-sibling-generation.db";
@@ -338,14 +338,17 @@ public sealed class ManagedVacuumStorageTests
 
         SqliteDatabaseHeader.Parse(siblingPager.ReadCommittedPage(1)).SchemaCookie
             .Should().Be(unchecked(schemaCookieBefore + 1));
-        Assert.Throws<EmbeddedSqlException>(() =>
-            Execute(sibling, "INSERT INTO data VALUES (4, 'stale');"))!
-            .Message.Should().Contain("managed file catalog changed");
-
-        sibling.ResetForPooling();
-        Execute(sibling, "INSERT INTO data VALUES (4, 'refreshed');");
+        // Native parity: the sibling's fresh autocommit write refreshes the catalog at
+        // statement start, so it observes the post-VACUUM committed view and succeeds
+        // without a manual reset. (Verified against Microsoft.Data.Sqlite/e_sqlite3.)
+        Execute(sibling, "INSERT INTO data VALUES (4, 'stale');");
         ReadValue(sibling, "SELECT value FROM data WHERE id=4;")
-            .Should().Be(SqlValue.Text("refreshed"));
+            .Should().Be(SqlValue.Text("stale"));
+
+        // An explicit pool reset still leaves the connection fully usable.
+        sibling.ResetForPooling();
+        ReadValue(sibling, "SELECT value FROM data WHERE id=4;")
+            .Should().Be(SqlValue.Text("stale"));
     }
 
     [Test]

@@ -529,6 +529,45 @@ public class ManagedFileStorageTests
             .Should().Equal("c", "b", "a");
     }
 
+    [Test]
+    public void ReopenAfterMainFileDeletionDiscardsOrphanedWalAndCreatesFresh()
+    {
+        var path = CreatePhysicalDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);");
+                Execute(connection, "INSERT INTO t VALUES (1, 'ada');");
+
+                // Detach without disposing the pager so the -wal is not checkpointed
+                // away, then delete only the main database file — exactly what EFCore's
+                // EnsureDeleted does (File.Delete on the DataSource path).
+                ((IDisposable)database).Dispose();
+            }
+
+            File.Delete(path);
+            File.Exists(path).Should().BeFalse();
+            File.Exists(path + "-wal").Should().BeTrue("the orphaned WAL outlives the main file");
+
+            // Native SQLite creates a fresh database when the main file is missing;
+            // the managed engine must not fault with "missing its main database file".
+            using var reopened = EmbeddedDatabase.OpenFile(path);
+            using var reopenedConnection = reopened.Connect();
+            Query(reopenedConnection, "SELECT name FROM sqlite_schema WHERE type = 'table';")
+                .Select(row => row[0].AsText())
+                .Should().NotContain("t", "the orphaned WAL frames are discarded with the deleted database");
+            Execute(reopenedConnection, "CREATE TABLE fresh(id INTEGER PRIMARY KEY);");
+            Execute(reopenedConnection, "INSERT INTO fresh VALUES (1);");
+            Query(reopenedConnection, "SELECT id FROM fresh;")[0][0].AsInteger().Should().Be(1);
+        }
+        finally
+        {
+            DeletePhysicalDatabase(path);
+        }
+    }
+
     private static void Execute(EmbeddedConnection connection, string sql)
     {
         using var statement = connection.Prepare(sql);

@@ -108,13 +108,13 @@ public sealed class AggregateStorageIntegrationTests
             var rows = ReadRows(connection, grouped);
             rows.Should().HaveCount(2);
             rows[0].Should().Equal(
-                SqlValue.Text("C"),
-                SqlValue.Integer(2),
-                SqlValue.Integer(5));
-            rows[1].Should().Equal(
                 SqlValue.Text("B"),
                 SqlValue.Integer(1),
                 SqlValue.Integer(7));
+            rows[1].Should().Equal(
+                SqlValue.Text("C"),
+                SqlValue.Integer(2),
+                SqlValue.Integer(5));
             AssertCompiled(connection, grouped);
         }
 
@@ -122,9 +122,9 @@ public sealed class AggregateStorageIntegrationTests
         using var verifiedConnection = verified.Connect();
         ReadRows(verifiedConnection, grouped)[0]
             .Should().Equal(
-                SqlValue.Text("C"),
-                SqlValue.Integer(2),
-                SqlValue.Integer(5));
+                SqlValue.Text("B"),
+                SqlValue.Integer(1),
+                SqlValue.Integer(7));
     }
 
     [Test]
@@ -188,19 +188,23 @@ public sealed class AggregateStorageIntegrationTests
         AssertCompiled(connection, grouped);
     }
 
+    // Group rows are emitted in ascending key order (the managed engine always aggregates
+    // through its sorter; unlike SQLite it does not skip the sorter when a DESC clustering
+    // index already provides group order). The bare-column representatives stay driven by
+    // cluster scan order within each group, which is what this helper pins.
     private static void AssertGroupedRows(IReadOnlyList<SqlValue[]> rows)
     {
         rows.Should().HaveCount(2);
         rows[0].Should().Equal(
-            SqlValue.Text("B"),
-            SqlValue.Text("b-one"),
-            SqlValue.Integer(1),
-            SqlValue.Integer(10));
-        rows[1].Should().Equal(
             SqlValue.Text("A"),
             SqlValue.Text("a-one"),
             SqlValue.Integer(2),
             SqlValue.Integer(50));
+        rows[1].Should().Equal(
+            SqlValue.Text("B"),
+            SqlValue.Text("b-one"),
+            SqlValue.Integer(1),
+            SqlValue.Integer(10));
     }
 
     private static void AssertCompiled(EmbeddedConnection connection, string sql)

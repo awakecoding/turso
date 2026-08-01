@@ -53,7 +53,7 @@ public sealed class ManagedConnectionPoolingTests
             connection.ManagedConnection.Should().BeSameAs(physicalConnection);
             prepared.ExecuteScalar().Should().Be(1L);
             connection.ExecuteScalar<long>("SELECT COUNT(*) FROM data;").Should().Be(0);
-            connection.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(0);
+            connection.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(1);
             connection.ExecuteScalar<long>("PRAGMA recursive_triggers;").Should().Be(0);
             connection.ExecuteScalar<long>("PRAGMA query_only;").Should().Be(0);
             connection.ExecuteScalar<long>("SELECT last_insert_rowid();").Should().Be(0);
@@ -86,6 +86,34 @@ public sealed class ManagedConnectionPoolingTests
             stale.ExecuteScalar<long>("SELECT value FROM data;").Should().Be(1);
             stale.ExecuteNonQuery("INSERT INTO data VALUES (2);");
             stale.ExecuteScalar<long>("SELECT COUNT(*) FROM data;").Should().Be(2);
+        }
+        finally
+        {
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void PooledReopenSurvivesSharedMemoryCarrierRemovedByNativeClose()
+    {
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var seeder = Open(path))
+            {
+                seeder.ExecuteNonQuery("CREATE TABLE data(value INTEGER); INSERT INTO data VALUES (1);");
+            }
+
+            // Stock SQLite removes the -shm lock carrier on the last clean close, and
+            // a foreign reader never recreates it. The managed read-only probe refuses
+            // to create it by contract, so the pooling catalog refresh must tolerate
+            // its absence instead of faulting the reopened pooled connection.
+            File.Delete(path + "-shm");
+
+            using var connection = Open(path);
+            connection.ExecuteScalar<long>("SELECT value FROM data;").Should().Be(1);
+            connection.ExecuteNonQuery("INSERT INTO data VALUES (2);");
+            connection.ExecuteScalar<long>("SELECT COUNT(*) FROM data;").Should().Be(2);
         }
         finally
         {

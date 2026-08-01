@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Text;
 using Turso.Core;
 
 namespace Turso.Data.Sqlite;
@@ -85,8 +87,82 @@ public partial class SqliteConnection
             double doubleValue => SqlValue.Real(doubleValue),
             decimal decimalValue => SqlValue.Text(decimalValue.ToString(CultureInfo.InvariantCulture)),
             byte[] bytes => SqlValue.Blob(bytes),
+            ITuple tuple => SqlValue.Text(EncodeTuple(tuple)),
             _ => SqlValue.Text(Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty),
         };
+    }
+
+    // Aggregate accumulators round-trip through SqlValue in the managed engine, unlike the
+    // native provider which keeps callback state in memory. Tuples are encoded as tagged text
+    // so seeded aggregates such as EF Core's ef_avg ((decimal sum, ulong count)) survive.
+    private const string TupleEncodingPrefix = "\u001FT";
+    private const char TupleFieldSeparator = '\u001F';
+
+    private static string EncodeTuple(ITuple tuple)
+    {
+        var builder = new StringBuilder(TupleEncodingPrefix);
+        builder.Append(tuple.Length.ToString(CultureInfo.InvariantCulture));
+        for (var index = 0; index < tuple.Length; index++)
+        {
+            builder.Append(TupleFieldSeparator);
+            builder.Append(tuple[index] switch
+            {
+                null => string.Empty,
+                double doubleValue => doubleValue.ToString("R", CultureInfo.InvariantCulture),
+                float floatValue => floatValue.ToString("R", CultureInfo.InvariantCulture),
+                IConvertible convertible => convertible.ToString(CultureInfo.InvariantCulture),
+                var other => other.ToString() ?? string.Empty,
+            });
+        }
+
+        return builder.ToString();
+    }
+
+    private static T CoerceAccumulator<T>(object? value)
+    {
+        if (value is T typed)
+            return typed;
+        if (value is string text)
+        {
+            if (typeof(ITuple).IsAssignableFrom(typeof(T)) && text.StartsWith(TupleEncodingPrefix, StringComparison.Ordinal))
+                return (T)DecodeTuple(text, typeof(T));
+            // Non-tuple accumulators (EF Core's ef_sum/ef_min/ef_max use decimal?) also
+            // round-trip through SqlValue.Text, so coerce the text back to the accumulator
+            // type instead of letting the blind cast below fail.
+            var targetType = Nullable.GetUnderlyingType(typeof(T)) ?? typeof(T);
+            if (targetType != typeof(string) && typeof(IConvertible).IsAssignableFrom(targetType))
+                return (T)Convert.ChangeType(text, targetType, CultureInfo.InvariantCulture);
+        }
+
+        return (T)value!;
+    }
+
+    private static object DecodeTuple(string text, Type tupleType)
+    {
+        var fields = text.Split(TupleFieldSeparator);
+        var elementTypes = tupleType.IsGenericType ? tupleType.GetGenericArguments() : Type.EmptyTypes;
+        // Layout after splitting "\u001FT{arity}\u001Ff0\u001Ff1...": "", "T{arity}", f0, f1, ...
+        if (fields.Length != elementTypes.Length + 2
+            || fields[0].Length != 0
+            || fields[1].Length < 2
+            || fields[1][0] != 'T'
+            || !int.TryParse(fields[1].AsSpan(1), NumberStyles.Integer, CultureInfo.InvariantCulture, out var arity)
+            || arity != elementTypes.Length)
+        {
+            throw new InvalidCastException($"Cannot decode aggregate accumulator '{text}' as {tupleType}.");
+        }
+
+        var elements = new object?[elementTypes.Length];
+        for (var index = 0; index < elementTypes.Length; index++)
+        {
+            var field = fields[index + 2];
+            var elementType = Nullable.GetUnderlyingType(elementTypes[index]) ?? elementTypes[index];
+            elements[index] = field.Length == 0
+                ? elementType == typeof(string) ? string.Empty : Nullable.GetUnderlyingType(elementTypes[index]) is not null ? null : Convert.ChangeType(field, elementType, CultureInfo.InvariantCulture)
+                : Convert.ChangeType(field, elementType, CultureInfo.InvariantCulture);
+        }
+
+        return Activator.CreateInstance(tupleType, elements)!;
     }
 
     private static object?[] ToManagedObjects(IReadOnlyList<SqlValue> values)
@@ -145,6 +221,10 @@ public partial class SqliteConnection
             return (T)(object)Convert.ToString(value, CultureInfo.InvariantCulture)!;
         if (targetType == typeof(bool))
             return (T)(object)Convert.ToBoolean(value, CultureInfo.InvariantCulture);
+        // REAL->decimal must go through %.15g text like native SQLite (sqlite3_value_text),
+        // not Convert.ChangeType, which on .NET 11+ expands the double's exact binary value.
+        if (targetType == typeof(decimal) && value is double realValue)
+            return (T)(object)decimal.Parse(realValue.ToString("G15", CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
 
         return (T)Convert.ChangeType(value, targetType, CultureInfo.InvariantCulture);
     }

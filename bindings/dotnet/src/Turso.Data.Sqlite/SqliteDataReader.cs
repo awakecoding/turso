@@ -224,7 +224,73 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         if (value.Kind == ReaderValueKind.Text && value.Text.Length == 1)
             return value.Text[0];
 
-        return (char)value.Integer;
+        // Microsoft.Data.Sqlite parity: anything else coerces through the INTEGER column
+        // path — TEXT parses a CAST-style digit prefix ('' or 'abc' -> 0), REAL truncates —
+        // and the checked cast surfaces out-of-range values like MDS does.
+        var coerced = value.Kind switch
+        {
+            ReaderValueKind.Integer => value.Integer,
+            ReaderValueKind.Real => (long)value.Real,
+            ReaderValueKind.Text => ParseTextAsIntegerPrefix(value.Text),
+            ReaderValueKind.Null => throw new InvalidOperationException(
+                Properties.Resources.CalledOnNullValue(ordinal)),
+            _ => GetInt64(ordinal),
+        };
+
+        return checked((char)coerced);
+    }
+
+    // CAST-style text-to-integer conversion matching the native column-int64 API:
+    // skips leading ASCII whitespace, accepts an optional sign, consumes a digit
+    // prefix, yields 0 when no digits are present, and clamps on overflow.
+    private static long ParseTextAsIntegerPrefix(string text)
+    {
+        var index = 0;
+        while (index < text.Length && text[index] is ' ' or '\t' or '\n' or '\v' or '\f' or '\r')
+        {
+            index++;
+        }
+
+        var negative = false;
+        if (index < text.Length && (text[index] == '+' || text[index] == '-'))
+        {
+            negative = text[index] == '-';
+            index++;
+        }
+
+        ulong magnitude = 0;
+        var sawDigit = false;
+        var overflow = false;
+        while (index < text.Length && text[index] >= '0' && text[index] <= '9')
+        {
+            sawDigit = true;
+            if (!overflow)
+            {
+                var digit = (ulong)(text[index] - '0');
+                if (magnitude > (ulong.MaxValue - digit) / 10)
+                {
+                    overflow = true;
+                }
+                else
+                {
+                    magnitude = magnitude * 10 + digit;
+                }
+            }
+
+            index++;
+        }
+
+        if (!sawDigit)
+        {
+            return 0;
+        }
+
+        if (negative)
+        {
+            return overflow || magnitude > (ulong)long.MaxValue + 1 ? long.MinValue : -(long)magnitude;
+        }
+
+        return overflow || magnitude > (ulong)long.MaxValue ? long.MaxValue : (long)magnitude;
     }
 
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
@@ -286,7 +352,11 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         return value.Kind switch
         {
             ReaderValueKind.Text => decimal.Parse(value.Text, NumberStyles.Float, CultureInfo.InvariantCulture),
-            ReaderValueKind.Real => Convert.ToDecimal(value.Real, CultureInfo.InvariantCulture),
+            // Format through "G15" instead of Convert.ToDecimal(double): .NET 11 changed
+            // double-to-decimal conversion to keep the exact binary expansion, but SQLite's
+            // own REAL-to-decimal path (and Microsoft.Data.Sqlite, which parses the 15-digit
+            // text form) rounds to 15 significant digits.
+            ReaderValueKind.Real => decimal.Parse(value.Real.ToString("G15", CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture),
             ReaderValueKind.Integer => value.Integer,
             _ => Convert.ToDecimal(GetValue(ordinal), CultureInfo.InvariantCulture)
         };
@@ -325,7 +395,9 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
         var value = GetValue(ordinal);
         if (value == DBNull.Value)
         {
-            if (typeof(T) == typeof(DBNull))
+            // Microsoft.Data.Sqlite surfaces DBNull.Value for object/DBNull reads so callers
+            // (e.g. EF Core's detailed read-error path) can distinguish NULL from cast errors.
+            if (typeof(T) == typeof(DBNull) || typeof(T) == typeof(object))
                 return (T)value;
 
             throw new InvalidOperationException(Properties.Resources.CalledOnNullValue(ordinal));
@@ -368,6 +440,28 @@ public class SqliteDataReader : DbDataReader, IConnectionOwnedReader
 
         if (targetType != typeof(T) && value.GetType() == targetType)
             return (T)value;
+
+        // Microsoft.Data.Sqlite reads unsigned types with unchecked casts so two's-complement
+        // values written through the matching unchecked parameter binds round-trip.
+        if (targetType == typeof(ulong))
+            return (T)(object)unchecked((ulong)GetInt64(ordinal));
+
+        if (targetType == typeof(uint))
+            return (T)(object)unchecked((uint)GetInt64(ordinal));
+
+        if (targetType == typeof(ushort))
+            return (T)(object)unchecked((ushort)GetInt64(ordinal));
+
+        if (targetType == typeof(byte))
+            return (T)(object)unchecked((byte)GetInt64(ordinal));
+
+        if (targetType == typeof(sbyte))
+            return (T)(object)unchecked((sbyte)GetInt64(ordinal));
+
+        // Microsoft.Data.Sqlite routes char reads (including char?) through GetChar,
+        // whose TEXT coercion Convert.ChangeType cannot reproduce (e.g. '' -> '\0').
+        if (targetType == typeof(char))
+            return (T)(object)GetChar(ordinal);
 
         return (T)Convert.ChangeType(value, targetType, CultureInfo.InvariantCulture);
     }

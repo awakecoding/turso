@@ -60,7 +60,13 @@ public sealed class ManagedDocumentedBoundaryTests
         using var connection = Open();
         object? handle = connection.Handle;
         handle.Should().BeNull();
-        connection.ServerVersion.Should().Be("3.0.0");
+    }
+
+    [Test]
+    public void ServerVersionMirrorsSqliteVersion()
+    {
+        using var connection = Open();
+        connection.ServerVersion.Should().Be("3.50.4");
     }
 
     [Test]
@@ -144,26 +150,35 @@ public sealed class ManagedDocumentedBoundaryTests
         Assert.Throws<NotSupportedException>(() => adapter.UpdateBatchSize = 10);
     }
 
-    // Readme.md:695 documents that file-backed trigger definitions containing function
-    // calls are rejected because connection-local implementations cannot be reconstructed
-    // on reopen. A builtin scalar function (UPPER) is the first shape a caller reaches for,
-    // so it must fail loudly at CREATE TRIGGER time rather than silently persisting a body
-    // that would misbehave (or throw) after reopen.
+    // File-backed trigger definitions may reference the engine's built-in functions: the
+    // stored CREATE SQL re-resolves to the same implementations after reopen, so the body
+    // keeps working. (Application-registered callbacks remain rejected; see
+    // ManagedSchemaDefinitionRecoverySafetyTests.)
     [Test]
-    public void FileBackedTriggerWithBuiltinFunctionIsRejected()
+    public void FileBackedTriggerWithBuiltinFunctionPersistsAcrossReopen()
     {
         var path = CreateDatabasePath();
         try
         {
-            using var connection = OpenFile(path);
-            ExecuteNonQuery(connection, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
-            ExecuteNonQuery(connection, "CREATE TABLE audit (id INTEGER PRIMARY KEY, upper_name TEXT)");
+            using (var connection = OpenFile(path))
+            {
+                ExecuteNonQuery(connection, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+                ExecuteNonQuery(connection, "CREATE TABLE audit (id INTEGER PRIMARY KEY, upper_name TEXT)");
+                ExecuteNonQuery(connection, "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit (upper_name) VALUES (UPPER(NEW.name)); END");
+                ExecuteNonQuery(connection, "INSERT INTO t (name) VALUES ('before')");
+            }
 
-            var error = Assert.Throws<SqliteException>(() =>
-                ExecuteNonQuery(connection, "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit (upper_name) VALUES (UPPER(NEW.name)); END"));
-
-            error!.Message.Should().Contain("cannot persist trigger");
-            error.Message.Should().Contain("File-backed schema definitions cannot retain");
+            using (var reopened = OpenFile(path))
+            {
+                ExecuteNonQuery(reopened, "INSERT INTO t (name) VALUES ('after')");
+                using var command = reopened.CreateCommand();
+                command.CommandText = "SELECT upper_name FROM audit ORDER BY id";
+                using var reader = command.ExecuteReader();
+                var values = new List<string>();
+                while (reader.Read())
+                    values.Add(reader.GetString(0));
+                values.Should().Equal("BEFORE", "AFTER");
+            }
         }
         finally
         {

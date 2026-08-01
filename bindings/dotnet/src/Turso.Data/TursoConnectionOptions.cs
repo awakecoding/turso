@@ -75,7 +75,11 @@ public class TursoConnectionOptions
                 }
                 else if (!dataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
                 {
-                    throw new NotSupportedException(ManagedSharedCacheContract.UnsupportedConfigurationMessage);
+                    // File-backed Cache=Shared opens as an ordinary private file
+                    // connection. The managed engine cannot emulate SQLite shared-cache
+                    // semantics (cross-connection dirty reads, table locks) for file
+                    // databases, so it deliberately provides stronger (private)
+                    // isolation instead of rejecting the keyword outright.
                 }
 
                 // Every remaining shape resolves to an anonymous :memory: database, which
@@ -306,9 +310,6 @@ internal readonly record struct ManagedLocalOpenOptions(
 
 internal static class ManagedSharedCacheContract
 {
-    public const string UnsupportedConfigurationMessage =
-        "Cache=Shared with Local Provider=Managed is supported only for in-memory databases: use Mode=Memory with a non-empty Data Source for a named shared cache, or an anonymous :memory: Data Source for a connection-private cache; file-backed shared caches are not supported.";
-
     public const string ReadUncommittedNotSupportedMessage =
         "PRAGMA read_uncommitted and IsolationLevel.ReadUncommitted are not supported for managed shared-memory databases because the managed engine preserves transaction isolation and does not expose dirty reads.";
 }

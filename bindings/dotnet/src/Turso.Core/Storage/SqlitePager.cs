@@ -301,7 +301,8 @@ public sealed class SqlitePager : IDisposable
                 effectiveLockManager,
                 SqlitePagerLockOperation.Checkpoint,
                 configuredBusyTimeout,
-                lockStopwatch);
+                lockStopwatch,
+                pagerReadOnly: false);
             pageStore = SqlitePageStore.Create(
                 storageFileSystem,
                 databasePath,
@@ -423,7 +424,8 @@ public sealed class SqlitePager : IDisposable
                 effectiveLockManager,
                 openOperation,
                 configuredBusyTimeout,
-                lockStopwatch);
+                lockStopwatch,
+                pagerReadOnly: readOnly);
             using var recoveryLock = readOnly
                 ? null
                 : effectiveLockManager.EnterRecoveryLock(
@@ -551,7 +553,8 @@ public sealed class SqlitePager : IDisposable
         SqlitePagerLockManager lockManager,
         SqlitePagerLockOperation operation,
         TimeSpan configuredTimeout,
-        Stopwatch? stopwatch)
+        Stopwatch? stopwatch,
+        bool pagerReadOnly)
     {
         var remaining = SqlitePagerLockManager.RemainingFileLockTimeout(configuredTimeout, stopwatch);
         if (remaining == TimeSpan.Zero && configuredTimeout != TimeSpan.Zero)
@@ -561,7 +564,7 @@ public sealed class SqlitePager : IDisposable
         {
             return operation switch
             {
-                SqlitePagerLockOperation.Reader => lockManager.EnterReader(remaining),
+                SqlitePagerLockOperation.Reader => lockManager.EnterReader(remaining, pagerReadOnly),
                 SqlitePagerLockOperation.Writer => lockManager.EnterWriter(remaining),
                 SqlitePagerLockOperation.Checkpoint => lockManager.EnterCheckpoint(remaining),
                 _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown SQLite lock operation."),
@@ -576,7 +579,7 @@ public sealed class SqlitePager : IDisposable
     /// <summary>Reads a copy of one page from the committed WAL-overlay view.</summary>
     public byte[] ReadCommittedPage(uint pageNumber)
     {
-        using var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(null));
+        using var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(null), IsReadOnly);
         lock (_gate)
         {
             ThrowIfNotReadable();
@@ -593,7 +596,7 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     public void ReadCommittedPage(uint pageNumber, Span<byte> destination)
     {
-        using var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(null));
+        using var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(null), IsReadOnly);
         lock (_gate)
         {
             ThrowIfNotReadable();
@@ -608,7 +611,7 @@ public sealed class SqlitePager : IDisposable
     /// </summary>
     public SqlitePagerReadTransaction BeginReadTransaction(TimeSpan? busyTimeout = null)
     {
-        var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(busyTimeout));
+        var readerLock = _lockManager.EnterReader(ResolveBusyTimeout(busyTimeout), IsReadOnly);
         try
         {
             lock (_gate)
@@ -1410,6 +1413,14 @@ public sealed class SqlitePager : IDisposable
     /// </remarks>
     private bool RequiresSharedStorageRescan
         => _foreignReadOnly || (_lockManager.UsesFileBackedWalLocks && _clientOwnership is null);
+
+    /// <summary>
+    /// The shared per-file storage generation, published after any WAL commit or
+    /// checkpoint by any connection on the file. A cheap race-free signal that the
+    /// committed view may have changed: reading it takes the lock-manager gate
+    /// briefly and never rescans the WAL. See <see cref="SqlitePagerLockManager.Generation"/>.
+    /// </summary>
+    internal long CommittedViewGeneration => _lockManager.Generation;
 
     /// <summary>
     /// Captures a token identifying the pager's current committed view after a

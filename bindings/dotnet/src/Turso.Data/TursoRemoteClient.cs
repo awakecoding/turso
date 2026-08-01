@@ -666,7 +666,10 @@ internal sealed class RemoteResponseValue
     {
         return Type switch
         {
-            "float" => Convert.ToDecimal(ParseFloat(), CultureInfo.InvariantCulture),
+            // Format through "G15" instead of Convert.ToDecimal(double): .NET 11 changed
+            // double-to-decimal conversion to keep the exact binary expansion, while SQLite
+            // REAL-to-decimal semantics round to 15 significant digits.
+            "float" => decimal.Parse(ParseFloat().ToString("G15", CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture),
             "integer" => ParseInteger(),
             "text" => decimal.Parse(Value.GetString() ?? "", CultureInfo.InvariantCulture),
             _ => throw new InvalidCastException($"Cannot convert remote {Type} value to Decimal."),

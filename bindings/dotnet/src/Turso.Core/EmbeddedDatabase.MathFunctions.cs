@@ -6,8 +6,8 @@ public sealed partial class EmbeddedDatabase
 {
     // Reported by sqlite_version()/sqlite_source_id() for applications that gate on
     // a SQLite version. Kept in sync with the Rust core (core/vdbe/execute.rs).
-    private const string SqliteCompatibilityVersion = "3.50.4";
-    private const string SqliteCompatibilitySourceId =
+    public const string SqliteCompatibilityVersion = "3.50.4";
+    internal const string SqliteCompatibilitySourceId =
         "0000-00-00 00:00:00 0000000000000000000000000000000000000000000000000000000000000000";
 
     // Backing state for changes()/total_changes(). Updated only by INSERT, UPDATE,

@@ -305,11 +305,15 @@ public sealed class ManagedMaintenanceStatementTests
 
         Execute(primary, "PRAGMA user_version=88;");
         Execute(primary, "REINDEX data_value;");
-        Assert.Throws<EmbeddedSqlException>(() => Execute(stale, "INSERT INTO data VALUES (1, 'stale');"))!
-            .Message.Should().Contain("managed file catalog changed");
-        stale.ResetForPooling();
+        // Native parity: the sibling's fresh autocommit statements refresh the catalog
+        // at statement start, so it observes primary's committed pragma without a manual
+        // reset and the write succeeds against the latest committed view.
         ReadInteger(stale, "PRAGMA user_version;").Should().Be(88);
         Execute(stale, "INSERT INTO data VALUES (1, 'refreshed');");
+        // An explicit pool reset still leaves the connection fully usable.
+        stale.ResetForPooling();
+        ReadInteger(stale, "PRAGMA user_version;").Should().Be(88);
+        ReadText(stale, "SELECT value FROM data WHERE id = 1;").Should().Be("refreshed");
     }
 
     [TestCase(false)]

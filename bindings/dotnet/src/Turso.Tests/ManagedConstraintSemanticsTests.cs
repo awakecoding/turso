@@ -145,6 +145,128 @@ public sealed class ManagedConstraintSemanticsTests
     }
 
     [Test]
+    public void UnknownFunctionsInDefaultsAndChecksDeferErrorsToEvaluation()
+    {
+        // SQLite resolves functions in CHECK constraints at CREATE time but defers DEFAULT
+        // expressions to insert time, where unknown names surface as evaluation errors.
+        using (var sqlite = new MsData.SqliteConnection("Data Source=:memory:"))
+        {
+            sqlite.Open();
+            Execute(sqlite, "CREATE TABLE deferred_default(id INTEGER, stamp TEXT DEFAULT (nosuchfunc(1)));");
+            Action sqliteDefault = () => Execute(sqlite, "INSERT INTO deferred_default DEFAULT VALUES;");
+            sqliteDefault.Should().Throw<MsData.SqliteException>().WithMessage("*unknown function*");
+
+            Action sqliteCheck = () => Execute(sqlite, "CREATE TABLE rejected_check(id INTEGER CHECK (nosuchcheck(id) > 0));");
+            sqliteCheck.Should().Throw<MsData.SqliteException>().WithMessage("*no such function*");
+        }
+
+        var path = CreateDatabasePath();
+        try
+        {
+            using (var database = EmbeddedDatabase.OpenFile(path))
+            using (var connection = database.Connect())
+            {
+                Execute(connection, "CREATE TABLE deferred_default(id INTEGER, stamp TEXT DEFAULT (nosuchfunc(1)));");
+                Action managedDefault = () => Execute(connection, "INSERT INTO deferred_default DEFAULT VALUES;");
+                managedDefault.Should().Throw<EmbeddedSqlException>().WithMessage("*no such function*");
+
+                Action managedCheck = () => Execute(connection, "CREATE TABLE rejected_check(id INTEGER CHECK (nosuchcheck(id) > 0));");
+                managedCheck.Should().Throw<EmbeddedSqlException>().WithMessage("*no such function*");
+
+                // Non-deterministic built-ins are valid in CHECK constraints.
+                Execute(connection, "CREATE TABLE nondet_check(id INTEGER CHECK (random() IS NOT NULL));");
+                Execute(connection, "INSERT INTO nondet_check VALUES (1);");
+                ScalarInteger(connection, "SELECT count(*) FROM nondet_check;").Should().Be(1);
+            }
+
+            using (var reopened = EmbeddedDatabase.OpenFile(path))
+            using (var connection = reopened.Connect())
+            {
+                ReadRows(connection, "PRAGMA table_info(deferred_default);").Should().HaveCount(2);
+                ReadRows(connection, "PRAGMA table_info(nondet_check);").Should().HaveCount(1);
+            }
+
+            using var sqlite = new MsData.SqliteConnection($"Data Source={path};Pooling=False");
+            sqlite.Open();
+            ScalarText(sqlite, "PRAGMA integrity_check;").Should().Be("ok");
+            ScalarText(sqlite, "SELECT sql FROM sqlite_schema WHERE name = 'deferred_default';")
+                .Should().Contain("DEFAULT (nosuchfunc(1))");
+        }
+        finally
+        {
+            MsData.SqliteConnection.ClearAllPools();
+            DeleteDatabase(path);
+        }
+    }
+
+    [Test]
+    public void DefaultExpressionsAreNotEvaluatedForColumnsTheInsertProvides()
+    {
+        // SQLite evaluates a DEFAULT expression only when the column is omitted, so an
+        // unknown function in one must not fail inserts that supply the value explicitly.
+        using (var sqlite = new MsData.SqliteConnection("Data Source=:memory:"))
+        {
+            sqlite.Open();
+            Execute(sqlite, "CREATE TABLE t(id INTEGER, stamp TEXT DEFAULT (nosuchfunc(1)));");
+            Execute(sqlite, "INSERT INTO t(id, stamp) VALUES (1, 'explicit');");
+            ScalarText(sqlite, "SELECT stamp FROM t;").Should().Be("explicit");
+
+            Action omitted = () => Execute(sqlite, "INSERT INTO t(id) VALUES (2);");
+            omitted.Should().Throw<MsData.SqliteException>().WithMessage("*unknown function*");
+        }
+
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, stamp TEXT DEFAULT (nosuchfunc(1)));");
+        Execute(connection, "INSERT INTO t(id, stamp) VALUES (1, 'explicit');");
+        ScalarText(connection, "SELECT stamp FROM t;").Should().Be("explicit");
+
+        Action managedOmitted = () => Execute(connection, "INSERT INTO t(id) VALUES (2);");
+        managedOmitted.Should().Throw<EmbeddedSqlException>().WithMessage("*no such function*");
+    }
+
+    [Test]
+    public void NonDeterministicBuiltInDefaultsEvaluatePerRow()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(
+            connection,
+            "CREATE TABLE values_table(id INTEGER, stamp TEXT DEFAULT (strftime('%Y', 'now')), payload BLOB DEFAULT (randomblob(4)));");
+        Execute(connection, "INSERT INTO values_table(id) VALUES (1);");
+
+        var row = ReadRows(connection, "SELECT length(stamp), typeof(payload), length(payload) FROM values_table;").Single();
+        row.Should().Equal(SqlValue.Integer(4), SqlValue.Text("blob"), SqlValue.Integer(4));
+    }
+
+    [Test]
+    public void AggregateFunctionsAreRejectedInChecksButDeferredInDefaults()
+    {
+        // SQLite rejects aggregates in CHECK constraints at CREATE ("misuse of aggregate
+        // function") but accepts them in DEFAULT expressions, failing only at insert time.
+        using (var sqlite = new MsData.SqliteConnection("Data Source=:memory:"))
+        {
+            sqlite.Open();
+            Action sqliteCheck = () => Execute(sqlite, "CREATE TABLE t(x INTEGER CHECK (sum(x) > 0));");
+            sqliteCheck.Should().Throw<MsData.SqliteException>().WithMessage("*aggregate*");
+
+            Execute(sqlite, "CREATE TABLE d(x INTEGER DEFAULT (count(*)));");
+            Action sqliteDefault = () => Execute(sqlite, "INSERT INTO d DEFAULT VALUES;");
+            sqliteDefault.Should().Throw<MsData.SqliteException>();
+        }
+
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Action managedCheck = () => Execute(connection, "CREATE TABLE t(x INTEGER CHECK (sum(x) > 0));");
+        managedCheck.Should().Throw<EmbeddedSqlException>()
+            .WithMessage("aggregate and window functions are prohibited in CHECK constraints");
+
+        Execute(connection, "CREATE TABLE d(x INTEGER DEFAULT (count(*)));");
+        Action managedDefault = () => Execute(connection, "INSERT INTO d DEFAULT VALUES;");
+        managedDefault.Should().Throw<EmbeddedSqlException>();
+    }
+
+    [Test]
     public void AlterAddColumnValidatesChecksAndAcceptsSignedLiteralDefaults()
     {
         using var database = new EmbeddedDatabase();
@@ -1071,6 +1193,9 @@ public sealed class ManagedConstraintSemanticsTests
 
     private static long ScalarInteger(MsData.SqliteConnection connection, string sql)
         => Convert.ToInt64(Scalar(connection, sql));
+
+    private static string ScalarText(EmbeddedConnection connection, string sql)
+        => ReadRows(connection, sql).Single().Single().AsText();
 
     private static string ScalarText(MsData.SqliteConnection connection, string sql)
         => (string)Scalar(connection, sql)!;

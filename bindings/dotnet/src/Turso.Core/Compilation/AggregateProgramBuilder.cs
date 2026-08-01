@@ -549,9 +549,13 @@ public static class AggregateProgramBuilder
     /// <summary>
     /// Builds a row-aware GROUP BY program. Computed keys are projected once in
     /// filtered source order and assigned a stable first-seen group id. The first
-    /// sorter makes each group's rows contiguous; the second buffers finalized
-    /// result records so HAVING, ORDER BY, and result DISTINCT occur after every
-    /// group has been aggregated.
+    /// sorter orders staged rows by <paramref name="groupKeyOrder"/> (ascending key
+    /// order, matching SQLite's aggregation sorter, so groups drain in key order);
+    /// the second buffers finalized result records so HAVING, ORDER BY, and result
+    /// DISTINCT occur after every group has been aggregated. Each output record
+    /// carries the group's key between the ORDER BY keys and the HAVING flag, and
+    /// <paramref name="outputOrderComparer"/> is expected to break ORDER BY ties on
+    /// those key columns so a statement without ORDER BY emits groups in key order.
     /// </summary>
     public static VdbeProgram BuildRowGrouped(
         string tableName,
@@ -559,6 +563,7 @@ public static class AggregateProgramBuilder
         int groupKeyCount,
         VdbeGroupKeyProjector groupKeyProjector,
         VdbeGroupComparer groupEquality,
+        VdbeRowComparer groupKeyOrder,
         VdbeAggregate collector,
         IReadOnlyList<VdbeAggregate> outputs,
         IReadOnlyList<VdbeAggregate> orderKeys,
@@ -571,6 +576,7 @@ public static class AggregateProgramBuilder
         ValidateRowPlan(tableName, tableColumnCount, collector, outputs, having);
         ArgumentNullException.ThrowIfNull(groupKeyProjector);
         ArgumentNullException.ThrowIfNull(groupEquality);
+        ArgumentNullException.ThrowIfNull(groupKeyOrder);
         ArgumentNullException.ThrowIfNull(orderKeys);
         ArgumentNullException.ThrowIfNull(outputOrderComparer);
         if (groupKeyCount <= 0)
@@ -578,24 +584,30 @@ public static class AggregateProgramBuilder
         foreach (var orderKey in orderKeys)
             ValidateAggregate(orderKey, nameof(orderKeys));
 
-        var sourceRecordBase = 0;
-        var groupIdRegister = tableColumnCount;
-        var sourceRecordCount = tableColumnCount + 1;
+        // Source sorter record: [group key | row columns | group id]. Staging the key
+        // lets the source sorter order by key without re-projecting per comparison.
+        var keyBase = 0;
+        var rowBase = keyBase + groupKeyCount;
+        var groupIdRegister = rowBase + tableColumnCount;
+        var sourceRecordCount = groupKeyCount + tableColumnCount + 1;
         var savedGroupIdRegister = sourceRecordCount;
-        var outputRecordBase = savedGroupIdRegister + 1;
+        var savedKeyBase = savedGroupIdRegister + 1;
+        var outputRecordBase = savedKeyBase + groupKeyCount;
         var orderBase = outputRecordBase;
-        var firstSeenBase = orderBase + orderKeys.Count;
-        var havingBase = firstSeenBase + 1;
+        var outputKeyBase = orderBase + orderKeys.Count;
+        var havingBase = outputKeyBase + groupKeyCount;
         var outputBase = havingBase + 1;
-        var outputRecordCount = orderKeys.Count + 2 + outputs.Count;
+        var outputRecordCount = orderKeys.Count + groupKeyCount + 1 + outputs.Count;
         var registerCount = outputRecordBase + outputRecordCount;
 
         var cursor = new Cursor(0);
         var sourceSorter = new Sorter(0);
         var outputSorter = new Sorter(1);
         var accumulator = new Accumulator(0);
-        var row = new RegisterRange(new Register(sourceRecordBase), tableColumnCount);
-        var sourceRecord = new RegisterRange(new Register(sourceRecordBase), sourceRecordCount);
+        var row = new RegisterRange(new Register(rowBase), tableColumnCount);
+        var groupKey = new RegisterRange(new Register(keyBase), groupKeyCount);
+        var savedKey = new RegisterRange(new Register(savedKeyBase), groupKeyCount);
+        var sourceRecord = new RegisterRange(new Register(keyBase), sourceRecordCount);
         var savedGroup = new RegisterRange(new Register(savedGroupIdRegister), 1);
         var currentGroup = new RegisterRange(new Register(groupIdRegister), 1);
         var outputRecord = new RegisterRange(new Register(outputRecordBase), outputRecordCount);
@@ -604,8 +616,9 @@ public static class AggregateProgramBuilder
             ?? (static values => values[0].AsInteger() != 0);
         var emitDescription = having?.Description ?? "emit finalized group";
 
-        VdbeRowComparer sourceOrder = (left, right) =>
-            left[tableColumnCount].AsInteger().CompareTo(right[tableColumnCount].AsInteger());
+        // Equal keys are one group, so a 0 from the key comparer needs no tie-break:
+        // the stable sorter keeps scan order inside each group.
+        VdbeRowComparer sourceOrder = groupKeyOrder;
 
         var ins = new List<VdbeInstruction>
         {
@@ -626,7 +639,7 @@ public static class AggregateProgramBuilder
         }
 
         for (var column = 0; column < tableColumnCount; column++)
-            ins.Add(new ColumnInstruction(cursor, column, new Register(sourceRecordBase + column)));
+            ins.Add(new ColumnInstruction(cursor, column, new Register(rowBase + column)));
         ins.Add(new GroupKeyInstruction(
             row,
             new Register(groupIdRegister),
@@ -634,7 +647,8 @@ public static class AggregateProgramBuilder
             groupKeyProjector,
             groupEquality,
             GroupSetIndex: 0,
-            Hasher: groupHasher));
+            Hasher: groupHasher,
+            KeyOutput: groupKey));
         ins.Add(new SorterInsertInstruction(sourceSorter, sourceRecord));
 
         var nextIngestAddress = ins.Count;
@@ -646,6 +660,13 @@ public static class AggregateProgramBuilder
         ins.Add(new SorterSortInstruction(sourceSorter, new ProgramCounter(0)));
         ins.Add(new SorterDataInstruction(sourceSorter, sourceRecord));
         ins.Add(new CopyInstruction(new Register(groupIdRegister), new Register(savedGroupIdRegister)));
+        for (var index = 0; index < groupKeyCount; index++)
+        {
+            ins.Add(new CopyInstruction(
+                new Register(keyBase + index),
+                new Register(savedKeyBase + index)));
+        }
+
         ins.Add(new AggResetInstruction(accumulator));
         ins.Add(new AggStepInstruction(accumulator, collector, row));
 
@@ -673,14 +694,23 @@ public static class AggregateProgramBuilder
             outputBase,
             orderBase,
             havingBase,
-            firstSeenBase,
-            savedGroupIdRegister,
+            outputKeyBase,
+            savedKey,
             having);
         ins.Add(new AggResetInstruction(accumulator));
         ins.Add(new CopyInstruction(new Register(groupIdRegister), new Register(savedGroupIdRegister)));
 
         var sameGroupStep = ins.Count;
         ins.Add(new AggStepInstruction(accumulator, collector, row));
+        // Track the key of the row just folded into the group so the finalization at
+        // the next group boundary can stamp the finished group's key onto its record.
+        for (var index = 0; index < groupKeyCount; index++)
+        {
+            ins.Add(new CopyInstruction(
+                new Register(keyBase + index),
+                new Register(savedKeyBase + index)));
+        }
+
         ins.Add(new SorterNextInstruction(sourceSorter, new ProgramCounter(drainLoop)));
 
         var finalizeLast = ins.Count;
@@ -694,8 +724,8 @@ public static class AggregateProgramBuilder
             outputBase,
             orderBase,
             havingBase,
-            firstSeenBase,
-            savedGroupIdRegister,
+            outputKeyBase,
+            savedKey,
             having);
 
         var closeSourceAddress = ins.Count;
@@ -782,8 +812,8 @@ public static class AggregateProgramBuilder
         int outputBase,
         int orderBase,
         int havingBase,
-        int firstSeenBase,
-        int savedGroupIdRegister,
+        int outputKeyBase,
+        RegisterRange savedKey,
         AggregateFinalizerFilter? having)
     {
         for (var index = 0; index < outputs.Count; index++)
@@ -807,9 +837,13 @@ public static class AggregateProgramBuilder
                 new Register(orderBase + index)));
         }
 
-        ins.Add(new CopyInstruction(
-            new Register(savedGroupIdRegister),
-            new Register(firstSeenBase)));
+        for (var index = 0; index < savedKey.Count; index++)
+        {
+            ins.Add(new CopyInstruction(
+                new Register(savedKey.Start.Index + index),
+                new Register(outputKeyBase + index)));
+        }
+
         ins.Add(new SorterInsertInstruction(outputSorter, outputRecord));
     }
 

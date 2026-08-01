@@ -47,9 +47,18 @@ internal sealed class SqliteWalSharedMemoryLocks : ISqlitePagerLockCoordinator
     }
 
     public IDisposable Acquire(SqlitePagerLockOperation operation, TimeSpan timeout)
+        => Acquire(operation, timeout, pagerReadOnly: true);
+
+    /// <summary>
+    /// Acquires a range on behalf of one pager. A read-write pager may create the
+    /// missing lock carrier on demand exactly like a native read-write connection
+    /// does; a read-only pager must never create it (see the interoperability
+    /// contract), so its reader locks fail while the carrier is absent.
+    /// </summary>
+    internal IDisposable Acquire(SqlitePagerLockOperation operation, TimeSpan timeout, bool pagerReadOnly)
         => operation switch
         {
-            SqlitePagerLockOperation.Reader => AcquireReader(timeout),
+            SqlitePagerLockOperation.Reader => AcquireReader(timeout, pagerReadOnly),
             SqlitePagerLockOperation.Writer => AcquireRange(
                 operation,
                 WriteLockOffset,
@@ -66,7 +75,7 @@ internal sealed class SqliteWalSharedMemoryLocks : ISqlitePagerLockCoordinator
     public IDisposable AcquireRecovery(TimeSpan timeout)
         => AcquireRange(SqlitePagerLockOperation.Writer, RecoveryLockOffset, length: 1, timeout);
 
-    private IDisposable AcquireReader(TimeSpan timeout)
+    private IDisposable AcquireReader(TimeSpan timeout, bool pagerReadOnly)
     {
         var stopwatch = StartTimeout(timeout);
         while (true)
@@ -86,7 +95,7 @@ internal sealed class SqliteWalSharedMemoryLocks : ISqlitePagerLockCoordinator
                     if (TryLockRange(
                             FirstReaderLockOffset + slot,
                             length: 1,
-                            readOnly: true,
+                            readOnly: pagerReadOnly,
                             out var lockStream,
                             out lastContention))
                     {

@@ -1726,6 +1726,14 @@ internal sealed class SqlParser
         return new OrderByTerm(expression, descending, nullPlacement, ordinal);
     }
 
+    private OrderByTerm ParseAggregateOrderByTerm()
+    {
+        // ORDER BY terms inside an aggregate are plain expressions evaluated per grouped row:
+        // an integer literal is a constant there, never a projection ordinal like in a
+        // select-level ORDER BY.
+        return ParseOrderByTerm() with { Ordinal = null };
+    }
+
     private static long? TryParseOrderByOrdinal(ReadOnlySpan<char> expression)
     {
         var collation = expression.IndexOf("COLLATE", StringComparison.OrdinalIgnoreCase);
@@ -2068,12 +2076,17 @@ internal sealed class SqlParser
     {
         if (Consume(TokenKind.LeftParen))
         {
-            if (!IsQueryStart())
-                throw Error("Derived tables must contain a SELECT query.");
+            if (IsQueryStart())
+            {
+                var query = ParseQuery();
+                Expect(TokenKind.RightParen);
+                return new DerivedTableSource(query, ParseTableAlias());
+            }
 
-            var query = ParseQuery();
+            // Parenthesized join clause, e.g. a JOIN (b JOIN c ON ...) ON ...
+            var inner = ParseTableSource();
             Expect(TokenKind.RightParen);
-            return new DerivedTableSource(query, ParseTableAlias());
+            return inner;
         }
 
         var name = ParseSchemaQualifiedName();
@@ -2567,17 +2580,22 @@ internal sealed class SqlParser
                     var arguments = new List<Expression> { ParseExpression() };
                     while (Consume(TokenKind.Comma))
                         arguments.Add(ParseExpression());
-                    if (CurrentIsKeyword("ORDER"))
+                    IReadOnlyList<OrderByTerm>? aggregateOrderBy = null;
+                    if (ConsumeKeyword("ORDER"))
                     {
-                        throw Error(
-                            "ORDER BY within aggregate functions is not supported by the managed engine.");
+                        ExpectKeyword("BY");
+                        var orderByTerms = new List<OrderByTerm> { ParseAggregateOrderByTerm() };
+                        while (Consume(TokenKind.Comma))
+                            orderByTerms.Add(ParseAggregateOrderByTerm());
+
+                        aggregateOrderBy = orderByTerms;
                     }
                     Expect(TokenKind.RightParen);
                     if (string.Equals(token.Text, "COUNT", StringComparison.OrdinalIgnoreCase) && arguments.Count != 1)
                         throw Error("wrong number of arguments to function COUNT()");
 
                     var (filter, window) = ParseFunctionSuffix();
-                    return new FunctionExpression(functionName, arguments, false, distinct, filter, window);
+                    return new FunctionExpression(functionName, arguments, false, distinct, filter, window, aggregateOrderBy);
                 }
 
                 var bareColumn = new ColumnExpression(token.Text, BooleanKeyword: GetBooleanKeyword(token));

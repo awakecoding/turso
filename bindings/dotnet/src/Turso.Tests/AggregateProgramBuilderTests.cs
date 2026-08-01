@@ -542,6 +542,7 @@ public class AggregateProgramBuilderTests
             groupKeyCount: 1,
             groupKeyProjector: row => [row[0]],
             groupEquality: (left, right) => left[0].Equals(right[0]),
+            groupKeyOrder: (left, right) => left[0].AsInteger().CompareTo(right[0].AsInteger()),
             collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
             outputs:
             [
@@ -562,9 +563,9 @@ public class AggregateProgramBuilderTests
         using var statement = new ResumableStatement(program, [new VdbeCursorSource(rows)]);
 
         statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
-        statement.CurrentRow.Should().Equal(SqlValue.Integer(2), SqlValue.Integer(25));
-        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
         statement.CurrentRow.Should().Equal(SqlValue.Integer(1), SqlValue.Integer(17));
+        statement.StepResumable().Should().Be(ResumableStatementStepResult.Row);
+        statement.CurrentRow.Should().Equal(SqlValue.Integer(2), SqlValue.Integer(25));
         statement.StepResumable().Should().Be(ResumableStatementStepResult.Done);
 
         statement.Reset();
@@ -573,8 +574,8 @@ public class AggregateProgramBuilderTests
 
         var replay = Drain(statement);
         replay.Should().HaveCount(3);
-        replay[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(26));
-        replay[1].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(17));
+        replay[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(17));
+        replay[1].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(26));
         replay[2].Should().Equal(SqlValue.Integer(3), SqlValue.Integer(4));
     }
 
@@ -588,6 +589,7 @@ public class AggregateProgramBuilderTests
             groupKeyCount: 1,
             groupKeyProjector: row => [row[0]],
             groupEquality: (left, right) => left[0].Equals(right[0]),
+            groupKeyOrder: (left, right) => left[0].AsInteger().CompareTo(right[0].AsInteger()),
             collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
             outputs: [CollectedRowsAggregate("group-key", rows => rows[0][0])],
             orderKeys: [],
@@ -619,6 +621,7 @@ public class AggregateProgramBuilderTests
                 equalityCalls++;
                 return left[0].Equals(right[0]);
             },
+            groupKeyOrder: (left, right) => left[0].AsInteger().CompareTo(right[0].AsInteger()),
             collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
             outputs: [CollectedRowsAggregate("group-key", rows => rows[0][0])],
             orderKeys: [],
@@ -673,6 +676,7 @@ public class AggregateProgramBuilderTests
             groupKeyCount: 1,
             groupKeyProjector: row => [row[0]],
             groupEquality: (left, right) => left[0].Equals(right[0]),
+            groupKeyOrder: (left, right) => left[0].AsInteger().CompareTo(right[0].AsInteger()),
             collector: CollectedRowsAggregate("rows", _ => SqlValue.Null),
             outputs:
             [

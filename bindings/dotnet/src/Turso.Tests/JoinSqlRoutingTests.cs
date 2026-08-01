@@ -845,6 +845,60 @@ public class JoinSqlRoutingTests
             () => ReadRows(connection, "EXPLAIN SELECT z.* FROM users u JOIN orders o ON u.id = o.user_id;"));
     }
 
+    [Test]
+    public void ParenthesizedJoinClauseParsesAndExecutes()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        SeedOrders(connection);
+
+        var rows = ReadRows(
+            connection,
+            "SELECT u.name, o.id, o.amount FROM users u INNER JOIN (orders o INNER JOIN users u2 ON o.user_id = u2.id) ON u.id = o.user_id ORDER BY o.id;");
+
+        rows.Should().HaveCount(3);
+        rows[0].Should().Equal(SqlValue.Text("ada"), SqlValue.Integer(100), SqlValue.Integer(10));
+        rows[1].Should().Equal(SqlValue.Text("ada"), SqlValue.Integer(101), SqlValue.Integer(20));
+        rows[2].Should().Equal(SqlValue.Text("bo"), SqlValue.Integer(102), SqlValue.Integer(30));
+    }
+
+    [Test]
+    public void ParenthesizedJoinClausePreservesLeftJoinGrouping()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        SeedOrders(connection);
+        Execute(connection, "INSERT INTO users VALUES (3, 'cy');");
+
+        // The parenthesized group only contains order 102 (joined to u2 'bo'), so the LEFT JOIN
+        // must NULL-extend ada and cy rather than filtering them like a flattened inner join would.
+        var rows = ReadRows(
+            connection,
+            "SELECT u.name, o.id FROM users u LEFT JOIN (orders o INNER JOIN users u2 ON o.user_id = u2.id AND u2.name = 'bo') ON u.id = o.user_id ORDER BY u.name;");
+
+        rows.Should().HaveCount(3);
+        rows[0].Should().Equal(SqlValue.Text("ada"), SqlValue.Null);
+        rows[1].Should().Equal(SqlValue.Text("bo"), SqlValue.Integer(102));
+        rows[2].Should().Equal(SqlValue.Text("cy"), SqlValue.Null);
+    }
+
+    [Test]
+    public void NestedParenthesizedJoinChainMatchesNorthwindInvoicesShape()
+    {
+        using var connection = new EmbeddedDatabase().Connect();
+        SeedOrders(connection);
+        Execute(connection, "CREATE TABLE items(id INTEGER, order_id INTEGER, sku TEXT);");
+        Execute(connection, "INSERT INTO items VALUES (1, 100, 'x'), (2, 100, 'y'), (3, 102, 'z');");
+
+        // Mirrors the classic Northwind "Invoices" view: a JOIN (b JOIN (c JOIN d ON ...) ON ...) ON ...
+        var rows = ReadRows(
+            connection,
+            "SELECT o.id, u.name, i.sku FROM orders o INNER JOIN (users u INNER JOIN (items i INNER JOIN orders o2 ON i.order_id = o2.id) ON u.id = o2.user_id) ON o.id = i.order_id ORDER BY i.sku;");
+
+        rows.Should().HaveCount(3);
+        rows[0].Should().Equal(SqlValue.Integer(100), SqlValue.Text("ada"), SqlValue.Text("x"));
+        rows[1].Should().Equal(SqlValue.Integer(100), SqlValue.Text("ada"), SqlValue.Text("y"));
+        rows[2].Should().Equal(SqlValue.Integer(102), SqlValue.Text("bo"), SqlValue.Text("z"));
+    }
+
     private static void SeedOrders(EmbeddedConnection connection)
     {
         Execute(connection, "CREATE TABLE users(id INTEGER, name TEXT);");

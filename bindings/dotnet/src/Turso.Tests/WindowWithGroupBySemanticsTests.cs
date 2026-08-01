@@ -152,9 +152,9 @@ public sealed class WindowWithGroupBySemanticsTests
     }
 
     // The window pass observes exactly the group order the engine's plain GROUP BY produces:
-    // first-encounter order. That order is a pre-existing managed-engine difference from SQLite,
-    // which emits groups sorted by key; this pins the two managed paths together so an unordered
-    // window over groups can never disagree with the unordered grouped projection beside it.
+    // ascending key order, matching the order SQLite's aggregation sorter emits groups in.
+    // This pins the two managed paths together so an unordered window over groups can never
+    // disagree with the unordered grouped projection beside it.
     [Test]
     public void GroupedWindowObservesTheSameGroupOrderAsThePlainGroupedPath()
     {
@@ -164,7 +164,7 @@ public sealed class WindowWithGroupBySemanticsTests
             .ToList();
         var windowed = ReadRows(connection, "SELECT grp, row_number() OVER () FROM t GROUP BY grp;");
 
-        plain.Should().Equal("c", "a", "b", "d");
+        plain.Should().Equal("a", "b", "c", "d");
         windowed.Select(row => row[0].AsText()).Should().Equal(plain);
         windowed.Select(row => row[1].AsInteger()).Should().Equal(1L, 2L, 3L, 4L);
     }

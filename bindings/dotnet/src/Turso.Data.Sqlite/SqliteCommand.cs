@@ -202,7 +202,13 @@ public class SqliteCommand : DbCommand
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         => _cancellation.Run<DbDataReader>(token => Execute("ExecuteReader", behavior, token));
 
-    public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+    public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+        => cancellationToken.IsCancellationRequested
+            // Base DbCommand parity: the non-reader paths surface exact TaskCanceledException.
+            ? Task.FromCanceled<int>(cancellationToken)
+            : ExecuteNonQueryAsyncCore(cancellationToken);
+
+    private async Task<int> ExecuteNonQueryAsyncCore(CancellationToken cancellationToken)
     {
         await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken)
             .ConfigureAwait(false);
@@ -218,7 +224,13 @@ public class SqliteCommand : DbCommand
         return reader.RecordsAffected;
     }
 
-    public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
+    public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
+        => cancellationToken.IsCancellationRequested
+            // Base DbCommand parity: the non-reader paths surface exact TaskCanceledException.
+            ? Task.FromCanceled<object?>(cancellationToken)
+            : ExecuteScalarAsyncCore(cancellationToken);
+
+    private async Task<object?> ExecuteScalarAsyncCore(CancellationToken cancellationToken)
     {
         await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken)
             .ConfigureAwait(false);
@@ -238,9 +250,15 @@ public class SqliteCommand : DbCommand
     }
 
     protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
-        => _cancellation.RunAsync<DbDataReader>(
+    {
+        // Microsoft.Data.Sqlite parity: a pre-canceled token throws exact
+        // OperationCanceledException from the reader-execution path (EF Core's
+        // async query contract), not derived TaskCanceledException.
+        cancellationToken.ThrowIfCancellationRequested();
+        return _cancellation.RunAsync<DbDataReader>(
             token => Execute("ExecuteReader", behavior, token),
             cancellationToken);
+    }
 
     protected override void Dispose(bool disposing)
     {
@@ -393,9 +411,41 @@ public class SqliteCommand : DbCommand
         sql = RewriteFacadeStatement(sql, connection);
         if (connection.IsManagedConnection)
         {
+            // Mirror the native path below: Microsoft.Data.Sqlite maps CommandTimeout onto
+            // sqlite3_busy_timeout per command, so managed lock contention waits the same way.
+            connection.ManagedConnection.BusyTimeout =
+                CommandTimeout == 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(CommandTimeout);
             IManagedStatementAdapter? managedStatement = null;
             try
             {
+                if (Environment.GetEnvironmentVariable("TURSO_TRACE_SQL") is not null)
+                {
+                    // A spinning statement is diagnosed from a hard-killed test host, so the
+                    // trace must be durable per statement. Console.Error alone is unreliable
+                    // here: vstest captures the testhost's stderr instead of streaming it to
+                    // the redirecting console, and an unflushed buffer loses the guilty SQL.
+                    // Append to a file (TURSO_TRACE_SQL_FILE, or a temp default) so the last
+                    // prepared statement before a freeze is always recoverable.
+                    var traced = $"[TURSO-SQL] {sql.ReplaceLineEndings(" ")}";
+                    Console.Error.WriteLine(traced);
+                    Console.Error.Flush();
+                    var traceFile = Environment.GetEnvironmentVariable("TURSO_TRACE_SQL_FILE");
+                    if (string.IsNullOrEmpty(traceFile))
+                    {
+                        traceFile = Path.Combine(Path.GetTempPath(), "turso-trace-sql.log");
+                    }
+
+                    try
+                    {
+                        using var stream = new FileStream(traceFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                        using var writer = new StreamWriter(stream);
+                        writer.WriteLine(traced);
+                    }
+                    catch
+                    {
+                        // Tracing is diagnostic-only and must never break execution.
+                    }
+                }
                 managedStatement = connection.ManagedConnection.Prepare(sql);
                 BindManagedParameters(managedStatement);
 

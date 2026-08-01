@@ -45,15 +45,16 @@ public sealed class ManagedSchemaDefinitionRecoverySafetyTests
             Execute(connection, "CREATE TABLE entries(value INTEGER);");
             Execute(connection, "CREATE TABLE audit(value INTEGER);");
             Execute(connection, "INSERT INTO entries VALUES (7);");
+            connection.RegisterScalarFunction("CUSTOM_ABS", 1, arguments => arguments[0]);
 
             Assert.Throws<EmbeddedSqlException>(() => Execute(
                 connection,
-                "CREATE VIEW function_entries AS SELECT abs(value) AS value FROM entries;"))!
-                .Message.Should().Contain("function");
+                "CREATE VIEW function_entries AS SELECT CUSTOM_ABS(value) AS value FROM entries;"))!
+                .Message.Should().Contain("function CUSTOM_ABS()");
             Assert.Throws<EmbeddedSqlException>(() => Execute(
                 connection,
-                "CREATE TRIGGER function_trigger AFTER INSERT ON entries BEGIN INSERT INTO audit VALUES (abs(1)); END;"))!
-                .Message.Should().Contain("function");
+                "CREATE TRIGGER function_trigger AFTER INSERT ON entries BEGIN INSERT INTO audit VALUES (CUSTOM_ABS(1)); END"))!
+                .Message.Should().Contain("function CUSTOM_ABS()");
 
             ScalarInteger(connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'view';").Should().Be(0);
             ScalarInteger(connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger';").Should().Be(0);
@@ -64,6 +65,101 @@ public sealed class ManagedSchemaDefinitionRecoverySafetyTests
         ScalarInteger(reopenedConnection, "SELECT value FROM entries;").Should().Be(7);
         ScalarInteger(reopenedConnection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'view';").Should().Be(0);
         ScalarInteger(reopenedConnection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger';").Should().Be(0);
+    }
+
+    [Test]
+    public void BuiltinFunctionViewAndTriggerPersistAcrossReopen()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "builtin-function-schema.db";
+
+        using (var database = EmbeddedDatabase.OpenFile(path, fileSystem))
+        using (var connection = database.Connect())
+        {
+            Execute(connection, "CREATE TABLE products(name TEXT, price REAL);");
+            Execute(connection, "CREATE TABLE audit(note TEXT);");
+            Execute(connection, "INSERT INTO products VALUES ('widget', 10.0), ('gadget', 20.0), ('sprocket', 30.0);");
+            // Mirrors the classic Northwind view 'Products Above Average Price'.
+            Execute(
+                connection,
+                """
+                CREATE VIEW above_average AS
+                SELECT upper(name) AS name, price FROM products
+                WHERE price > (SELECT avg(price) FROM products);
+                """);
+            Execute(
+                connection,
+                "CREATE TRIGGER products_audit AFTER INSERT ON products BEGIN INSERT INTO audit VALUES (trim(NEW.name)); END");
+            Execute(
+                connection,
+                """
+                CREATE VIEW running_total AS
+                SELECT name, sum(price) OVER (ORDER BY price) AS running FROM products;
+                """);
+        }
+
+        using var reopened = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var reopenedConnection = reopened.Connect();
+        Scalar(reopenedConnection, "SELECT name FROM above_average;").Should().Be("SPROCKET");
+        Execute(reopenedConnection, "INSERT INTO products VALUES ('  cog  ', 5.0);");
+        Scalar(reopenedConnection, "SELECT note FROM audit;").Should().Be("cog");
+        // Includes the post-reopen 'cog' row (5.0): 5 + 10 + 20.
+        ScalarInteger(reopenedConnection, "SELECT CAST(running AS INTEGER) FROM running_total WHERE name = 'gadget';").Should().Be(35);
+    }
+
+    [Test]
+    public void BuiltinFunctionViewStillRejectsOtherRuntimeDependencies()
+    {
+        var fileSystem = new InMemoryFileSystem();
+        const string path = "builtin-view-remaining-dependencies.db";
+
+        using var database = EmbeddedDatabase.OpenFile(path, fileSystem);
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE entries(value INTEGER);");
+
+        using (var statement = connection.Prepare("CREATE VIEW bound AS SELECT abs(?1) AS value FROM entries;"))
+        {
+            statement.Bind(1, SqlValue.Integer(1));
+            var create = () => statement.Step();
+            create.Should().Throw<EmbeddedSqlException>()
+                .WithMessage("*cannot persist view 'bound' because it uses a bind parameter*");
+        }
+
+        Assert.Throws<EmbeddedSqlException>(() => Execute(
+            connection,
+            "CREATE VIEW unknown_fn AS SELECT no_such_fn(value) AS value FROM entries;"))!
+            .Message.Should().Contain("function NO_SUCH_FN()");
+
+        ScalarInteger(connection, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'view';").Should().Be(0);
+    }
+
+    [Test]
+    public void BuiltinFunctionNameSetMatchesEvaluatorDispatch()
+    {
+        using var database = EmbeddedDatabase.OpenFile("parity.db", new InMemoryFileSystem());
+        using var connection = database.Connect();
+
+        foreach (var name in SqliteBuiltinFunctions.All)
+        {
+            if (SqliteBuiltinFunctions.IsWindowOnly(name))
+                continue;
+
+            try
+            {
+                using var statement = connection.Prepare($"SELECT {name}(1);");
+                while (statement.Step() == StatementStepResult.Row)
+                {
+                }
+            }
+            catch (EmbeddedSqlException exception)
+            {
+                // Arity and context errors are fine: they prove the engine dispatched the
+                // name. Only "no such function" means the persistence allow-list drifted.
+                exception.Message.Should().NotContain(
+                    $"no such function: {name}",
+                    because: $"{name} is allow-listed for persisted schema but the engine does not implement it");
+            }
+        }
     }
 
     [Test]

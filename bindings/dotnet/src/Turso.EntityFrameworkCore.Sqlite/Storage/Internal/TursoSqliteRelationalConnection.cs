@@ -124,6 +124,10 @@ public class TursoSqliteRelationalConnection : SqliteRelationalConnection
             null => null,
             decimal decimalValue => decimalValue,
             string text => decimal.Parse(text, NumberStyles.Number, CultureInfo.InvariantCulture),
+            // Format doubles through "G15": .NET 11 changed Convert.ToDecimal(double) to keep
+            // the exact binary expansion, while SQLite REAL-to-decimal semantics round to 15
+            // significant digits.
+            double doubleValue => decimal.Parse(doubleValue.ToString("G15", CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture),
             _ => Convert.ToDecimal(value, CultureInfo.InvariantCulture)
         };
 

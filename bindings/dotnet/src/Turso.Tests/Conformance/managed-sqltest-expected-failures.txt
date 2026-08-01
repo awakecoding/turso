@@ -42,7 +42,6 @@ alter_rename_column_partial_idx.sqltest::rename-column-updates-expression-index-
 alter_rename_column_partial_idx.sqltest::rename-column-expression-index-other-col-unchanged | output does not match pattern 'CREATE INDEX idx ON t\s*\(b\s*\+\s*1\)'
 alter_rename_column_partial_idx.sqltest::rename-column-expression-index-then-rename-again | output does not match pattern 'CREATE INDEX idx ON t\s*\(a3\s*\+\s*1\)'
 alter_table.sqltest::alter-table-rename-column | expected 2 row(s), got 2 row(s); row 0 expected 'CREATE TABLE t (b INTEGER)' but was 'CREATE TABLE "t" ("b" INTEGER)'
-alter_table.sqltest::alter-table-rename-column-view-star | expected 2 row(s), got 0 row(s)
 alter_table.sqltest::alter-table-rename-column-view-on-view | expected success but got error: error in view v2 after rename: no such column: b
 alter_table.sqltest::alter-table-rename-column-view-tablecall-branch | expected success but got error: no such column: t.b
 alter_table.sqltest::alter-table-rename-column-view-attached-db-qualified | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'cannot reference'
@@ -105,12 +104,6 @@ before-update-trigger-correlated-subquery.sqltest::before-update-trigger-uncorre
 bracket-quoting.sqltest::bracket-default-identifier | expected success but got error: default value of column is not constant: hello
 bracket-quoting.sqltest::bracket-transaction-name | expected success but got error: Expected End. At SQL offset 18.
 bracket-quoting.sqltest::bracket-analyze-table-name | expected success but got error: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were changed.
-changes.sqltest::changes-insert-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '0'
-changes.sqltest::changes-insert-in-transaction-after-commit | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '0'
-changes.sqltest::changes-delete-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '2' but was '3'
-changes.sqltest::changes-insert-in-transaction-with-prior-data | expected 1 row(s), got 1 row(s); row 0 expected '2' but was '3'
-changes.sqltest::changes-update-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '2' but was '3'
-changes.sqltest::changes-multiple-stmts-in-transaction | expected 2 row(s), got 2 row(s); row 0 expected '2' but was '0'
 changes.sqltest::changes-with-trigger-body-statements | expected 3 row(s), got 3 row(s); row 1 expected '1' but was '0'
 changes.sqltest::changes-restores-previous-value-between-trigger-invocations | expected 6 row(s), got 6 row(s); row 5 expected '8' but was '4'
 changes.sqltest::changes-sub-trigger-isolation | expected 5 row(s), got 5 row(s); row 1 expected 'sub:1' but was 'sub:0'
@@ -130,7 +123,6 @@ collate.sqltest::collate_subquery_preserves_column_collation | expected 2 row(s)
 collate.sqltest::collate_subquery_preserves_explicit_collation | expected 2 row(s), got 2 row(s); row 0 expected '2' but was '1'
 collate.sqltest::collate_groupby_ordinal_with_explicit_collate | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '1'
 collate.sqltest::collate_orderby_ordinal_with_collate_inside_parens | expected 1 row(s), got 1 row(s); row 0 expected 'a/b/c/Z' but was 'b/Z/c/a'
-composite-index-sort-elim.sqltest::group-by-eq-prefix | expected 3 row(s), got 3 row(s); row 0 expected 'art/3/2024-06-15' but was 'tech/3/2024-06-10'
 compound-select-orderby.sqltest::three-way-union-order-by | expected 11 row(s), got 11 row(s); row 0 expected '1/alpha' but was '1/apple'
 compound-select-orderby.sqltest::union-order-by-expr-no-match | error 'ORDER BY term does not match any column in the result set' does not match pattern '1st ORDER BY term does not match any column in the result set'
 create_index.sqltest::create-index-string-literal-no-such-column | expected an error but the statement succeeded
@@ -395,7 +387,6 @@ pragma/require_where.sqltest::pragma-require-where-delete-with-where-ok | expect
 pragma/require_where.sqltest::pragma-require-where-update-with-where-ok | expected success but got error: Unsupported PRAGMA i_am_a_dummy. At SQL offset 20.
 pragma/require_where.sqltest::pragma-require-where-delete-without-where | error 'Unsupported PRAGMA i_am_a_dummy. At SQL offset 20.' does not match pattern 'DELETE without a WHERE clause is not allowed when require_where \(or i_am_a_dummy\) is enabled'
 pragma/require_where.sqltest::pragma-require-where-update-without-where | error 'Unsupported PRAGMA i_am_a_dummy. At SQL offset 20.' does not match pattern 'UPDATE without a WHERE clause is not allowed when require_where \(or i_am_a_dummy\) is enabled'
-pragma/table_info_composite_pk.sqltest::table-info-view | expected 2 row(s), got 0 row(s)
 pragma/table_list.sqltest::pragma-table-list-single-table | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
 pragma/table_list.sqltest::pragma-table-list-equals-syntax | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
 pragma/table_list.sqltest::pragma-table-list-view | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
@@ -450,7 +441,6 @@ select/memory.sqltest::collate-compound-14 | expected 2 row(s), got 2 row(s); ro
 select/memory.sqltest::where-variable-predicate | expected success but got error: Missing value for parameter ?1.
 simple-count-optimization.sqltest::simple-count-index-correctness | expected success but got error: no query solution
 snapshot_tests/analyze/stat1_rows.sqltest::analyze-indexed-table-does-not-insert-null-stat1-row | expected success but got error: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were changed.
-snapshot_tests/subqueries/subquery-sort-elision.sqltest::cte-group-feeds-window | expected 3 row(s), got 3 row(s); row 1 expected '20/4' but was '30/7'
 snapshot_tests/subqueries/subquery-sort-elision.sqltest::partial-partition-match | expected 7 row(s), got 7 row(s); row 0 expected '1/20/20' but was '1/30/50'
 snapshot_tests/subqueries/subquery-sort-elision.sqltest::window-partial-not-elided | expected 7 row(s), got 7 row(s); row 0 expected '1/20/20' but was '1/30/50'
 snapshot_tests/subqueries/subquery-sort-elision.sqltest::window-no-cte-order-not-elided | expected 7 row(s), got 7 row(s); row 0 expected '1/50' but was '3/100'
@@ -486,9 +476,6 @@ temp_tables.sqltest::temp-store-change-survives-rollback-before-temp-db-exists |
 temp_tables_mvcc.sqltest::pragma-temp-journal-mode-mvcc-is-ignored | expected 2 row(s), got 2 row(s); row 0 expected 'wal' but was 'memory'
 temp_tables_mvcc.sqltest::begin-concurrent-still-fails-after-temp-journal-mode-mvcc | error 'Expected End. At SQL offset 6.' does not match pattern 'Concurrent transaction mode is only supported when MVCC is enabled'
 temp_tables_mvcc.sqltest::temp-autoincrement-is-allowed-when-main-db-is-mvcc | expected 3 row(s), got 3 row(s); row 0 expected 'mvcc' but was 'wal'
-total-changes.sqltest::total-changes-insert-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '0'
-total-changes.sqltest::total-changes-insert-in-transaction-after-commit | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '0'
-total-changes.sqltest::total-changes-multiple-stmts-in-transaction | expected 1 row(s), got 1 row(s); row 0 expected '4' but was '2'
 total-changes.sqltest::total-changes-includes-trigger-body-rows | expected 1 row(s), got 1 row(s); row 0 expected '2' but was '1'
 total-changes.sqltest::total-changes-includes-fk-cascade-rows | expected 2 row(s), got 2 row(s); row 1 expected '4' but was '3'
 transactions.sqltest::temp-and-main-table-in-immediate-tx | expected success but got error: Cross-database statements are not supported by managed ATTACH; every persistent table reference must resolve to one database.

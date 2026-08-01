@@ -242,7 +242,7 @@ public class ManagedTransactionModeLockingTests
         var rollbacks = 0;
         raw.sqlite3_rollback_hook(b.Handle!, _ => rollbacks++, null);
 
-        NativeError(() => NativeExec(b, "INSERT INTO t VALUES (1);"))!
+        NativeError(() => NativeExecFast(b, "INSERT INTO t VALUES (1);"))!
             .SqliteErrorCode.Should().Be(SqliteBusy);
 
         rollbacks.Should().Be(0);
@@ -287,7 +287,7 @@ public class ManagedTransactionModeLockingTests
         NativeExec(a, "PRAGMA journal_mode=wal;");
         NativeExec(a, "BEGIN IMMEDIATE;");
 
-        var writeError = NativeError(() => NativeExec(b, "INSERT INTO t VALUES (2);"));
+        var writeError = NativeError(() => NativeExecFast(b, "INSERT INTO t VALUES (2);"));
         writeError.Should().NotBeNull();
         writeError!.SqliteErrorCode.Should().Be(SqliteBusy);
 
@@ -448,7 +448,7 @@ public class ManagedTransactionModeLockingTests
 
         NativeError(() => NativeExec(b, "BEGIN DEFERRED;")).Should().BeNull();
 
-        var writeError = NativeError(() => NativeExec(b, "INSERT INTO t VALUES (2);"));
+        var writeError = NativeError(() => NativeExecFast(b, "INSERT INTO t VALUES (2);"));
         writeError.Should().NotBeNull();
         writeError!.SqliteErrorCode.Should().Be(SqliteBusy);
     }
@@ -463,7 +463,7 @@ public class ManagedTransactionModeLockingTests
         NativeExec(a, "PRAGMA journal_mode=wal;");
         NativeExec(a, "BEGIN IMMEDIATE;");
 
-        var beginError = NativeError(() => NativeExec(b, "BEGIN IMMEDIATE;"));
+        var beginError = NativeError(() => NativeExecFast(b, "BEGIN IMMEDIATE;"));
         beginError.Should().NotBeNull();
         beginError!.SqliteErrorCode.Should().Be(SqliteBusy);
     }
@@ -479,7 +479,7 @@ public class ManagedTransactionModeLockingTests
         NativeExec(a, "BEGIN EXCLUSIVE;");
 
         NativeError(() => NativeExec(b, "SELECT COUNT(*) FROM t;")).Should().BeNull();
-        NativeError(() => NativeExec(b, "BEGIN IMMEDIATE;"))!.SqliteErrorCode.Should().Be(SqliteBusy);
+        NativeError(() => NativeExecFast(b, "BEGIN IMMEDIATE;"))!.SqliteErrorCode.Should().Be(SqliteBusy);
     }
 
     [Test]
@@ -492,21 +492,22 @@ public class ManagedTransactionModeLockingTests
         NativeExec(a, "PRAGMA journal_mode=delete;");
         NativeExec(a, "BEGIN EXCLUSIVE;");
 
-        var readError = NativeError(() => NativeExec(b, "SELECT COUNT(*) FROM t;"));
+        var readError = NativeError(() => NativeExecFast(b, "SELECT COUNT(*) FROM t;"));
         readError.Should().NotBeNull();
         readError!.SqliteErrorCode.Should().Be(SqliteBusy);
     }
 
     /// <summary>
-    /// <c>CommandTimeout</c> is not a busy timeout for the managed engine. Native
-    /// SQLite maps it onto <c>sqlite3_busy_timeout</c> and retries for that long,
-    /// but the managed engine documents <c>PRAGMA busy_timeout</c> as unsupported
-    /// (see <see cref="ManagedDocumentedBoundaryTests"/>) and the write
-    /// reservation is fail-fast, so a lost race is reported immediately. This
-    /// pins that divergence so it cannot change silently.
+    /// <c>CommandTimeout</c> is a busy timeout for the managed engine, exactly as
+    /// <see cref="NativeSqliteTreatsCommandTimeoutAsABusyWait"/> measures for
+    /// native SQLite: Microsoft.Data.Sqlite maps it onto
+    /// <c>sqlite3_busy_timeout</c>, and the managed transaction lock now waits
+    /// out the same timeout instead of failing fast. <c>PRAGMA busy_timeout</c>
+    /// stays unsupported (see <see cref="ManagedDocumentedBoundaryTests"/>); the
+    /// command-timeout mapping is the only way in.
     /// </summary>
     [Test]
-    public void CommandTimeoutDoesNotTurnABusyBeginIntoABusyWait()
+    public void CommandTimeoutTurnsABusyBeginIntoABusyWait()
     {
         using var db = new ManagedFileDatabase();
         using var a = db.Connect();
@@ -515,15 +516,48 @@ public class ManagedTransactionModeLockingTests
         a.ExecuteNonQuery("BEGIN IMMEDIATE;");
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var error = Capture(() => ExecuteWithTimeout(b, "BEGIN EXCLUSIVE;", timeoutSeconds: 5));
+        var error = Capture(() => ExecuteWithTimeout(b, "BEGIN EXCLUSIVE;", timeoutSeconds: 2));
         stopwatch.Stop();
 
         error.Should().NotBeNull();
         error!.SqliteErrorCode.Should().Be(SqliteBusy);
 
-        // The load-bearing assertion: it failed fast rather than burning the
-        // five second CommandTimeout waiting for a lock it will never poll for.
-        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(2));
+        // The load-bearing assertion: it burned the CommandTimeout waiting for the
+        // lock before reporting busy, rather than failing fast.
+        stopwatch.Elapsed.Should().BeGreaterThan(TimeSpan.FromSeconds(1));
+    }
+
+    /// <summary>
+    /// The other half of the busy-wait contract: a contender that waits out the
+    /// holder's commit acquires the lock and proceeds, which is what makes
+    /// parallel test suites sharing one database file (EFCore's Inheritance
+    /// fixtures) survive on the managed engine.
+    /// </summary>
+    [Test]
+    public void BusyWaitAcquiresTheLockWhenTheHolderReleasesInTime()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        a.ExecuteNonQuery("BEGIN IMMEDIATE;");
+
+        var releaser = Task.Run(() =>
+        {
+            Thread.Sleep(400);
+            a.ExecuteNonQuery("COMMIT;");
+        });
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var error = Capture(() => ExecuteWithTimeout(b, "BEGIN IMMEDIATE;", timeoutSeconds: 5));
+        stopwatch.Stop();
+
+        error.Should().BeNull();
+        stopwatch.Elapsed.Should().BeGreaterThan(TimeSpan.FromMilliseconds(300));
+
+        b.ExecuteNonQuery("INSERT INTO t VALUES (1);");
+        b.ExecuteNonQuery("COMMIT;");
+        releaser.GetAwaiter().GetResult();
     }
 
     /// <summary>
@@ -563,10 +597,138 @@ public class ManagedTransactionModeLockingTests
     }
 
     /// <summary>
-    /// The other half of <see cref="CommandTimeoutDoesNotTurnABusyBeginIntoABusyWait"/>:
-    /// native SQLite really does retry for the CommandTimeout before reporting
-    /// busy, so the managed fail-fast behaviour is a measured divergence rather
-    /// than an assumed one.
+    /// A connection that opened the file before a sibling committed no longer
+    /// has its snapshot invalidated at BEGIN: the stale catalog is re-read and
+    /// the transaction proceeds on the latest committed state.
+    /// </summary>
+    [Test]
+    public void BeginReloadsTheCatalogSnapshotWhenASiblingCommittedFirst()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        // B's in-memory snapshot now predates A's commit.
+        a.ExecuteNonQuery("INSERT INTO t VALUES (1);");
+
+        b.ExecuteNonQuery("BEGIN IMMEDIATE;");
+        b.ExecuteNonQuery("INSERT INTO t VALUES (2);");
+        b.ExecuteNonQuery("COMMIT;");
+
+        using var reader = db.Connect();
+        using var command = reader.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM t;";
+        command.ExecuteScalar().Should().Be(2L);
+    }
+
+    /// <summary>
+    /// The autocommit half of the stale-snapshot contract: the statement is
+    /// re-executed against the reloaded catalog instead of persisting on the old
+    /// version and silently losing the sibling's committed row.
+    /// </summary>
+    [Test]
+    public void AutocommitWriteRetriesOnAReloadedSnapshotInsteadOfLosingTheSiblingCommit()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        a.ExecuteNonQuery("INSERT INTO t VALUES (1);");
+        b.ExecuteNonQuery("INSERT INTO t VALUES (2);");
+
+        using var reader = db.Connect();
+        using var command = reader.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM t;";
+        command.ExecuteScalar().Should().Be(2L);
+    }
+
+    /// <summary>
+    /// A zero busy timeout governs lock-waiting only, not snapshot visibility. Once the
+    /// sibling has committed (releasing the write lock), a fresh autocommit statement
+    /// reads the latest committed view and succeeds - native SQLite behaves the same.
+    /// Genuine lock contention without a budget still fails fast (the BEGIN IMMEDIATE
+    /// cases above).
+    /// </summary>
+    [Test]
+    public void AutocommitWriteAfterSiblingCommitSucceedsWithoutABusyTimeout()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect(defaultTimeoutSeconds: 0);
+
+        a.ExecuteNonQuery("INSERT INTO t VALUES (1);");
+        b.ExecuteNonQuery("INSERT INTO t VALUES (2);");
+
+        using var reader = db.Connect();
+        using var command = reader.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM t;";
+        command.ExecuteScalar().Should().Be(2L);
+    }
+
+    /// <summary>
+    /// A DEFERRED transaction that went stale before its first write cannot
+    /// commit: like SQLite's <c>SQLITE_BUSY_SNAPSHOT</c> it must roll back. The
+    /// error surfaces with the public busy message, not the internal catalog
+    /// wording.
+    /// </summary>
+    [Test]
+    public void DeferredTransactionOnAStaleSnapshotReportsBusyAtCommit()
+    {
+        using var db = new ManagedFileDatabase();
+        using var a = db.Connect();
+        using var b = db.Connect();
+
+        // B's snapshot is taken at BEGIN; A then commits past it.
+        b.ExecuteNonQuery("BEGIN DEFERRED;");
+        a.ExecuteNonQuery("INSERT INTO t VALUES (1);");
+
+        b.ExecuteNonQuery("INSERT INTO t VALUES (2);");
+        var error = Capture(() => b.ExecuteNonQuery("COMMIT;"));
+        error.Should().NotBeNull();
+        error!.SqliteErrorCode.Should().Be(SqliteBusy);
+        error.Message.Should().Contain("database is locked");
+
+        // The must-rollback contract: the transaction is still open until an
+        // explicit ROLLBACK, after which the connection is usable again.
+        b.ExecuteNonQuery("ROLLBACK;");
+        Capture(() => b.ExecuteNonQuery("INSERT INTO t VALUES (3);")).Should().BeNull();
+    }
+
+    /// <summary>
+    /// Regression for the convoy starvation the stale-retry once caused: every
+    /// contender burned its whole busy budget waiting for a completely free
+    /// instant on the write lock, which never comes when the lock passes
+    /// holder-to-holder. With wait-out-the-persist plus reload-at-BEGIN, each
+    /// worker waits only for its own turn.
+    /// </summary>
+    [Test]
+    public void ParallelImmediateWritersAllCommitAcrossStaleSnapshotReloads()
+    {
+        using var db = new ManagedFileDatabase();
+        const int workers = 8;
+        var connections = Enumerable.Range(0, workers).Select(_ => db.Connect()).ToArray();
+
+        var tasks = connections.Select(connection => Task.Run(() =>
+        {
+            ExecuteWithTimeout(connection, "BEGIN IMMEDIATE;", timeoutSeconds: 10);
+            // Hold the reservation briefly so the workers actually convoy.
+            Thread.Sleep(150);
+            ExecuteWithTimeout(connection, "INSERT INTO t VALUES (1);", timeoutSeconds: 10);
+            ExecuteWithTimeout(connection, "COMMIT;", timeoutSeconds: 10);
+        })).ToArray();
+
+        Task.WaitAll(tasks);
+
+        using var reader = db.Connect();
+        using var command = reader.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM t;";
+        command.ExecuteScalar().Should().Be((long)workers);
+    }
+
+    /// <summary>
+    /// The native half of <see cref="CommandTimeoutTurnsABusyBeginIntoABusyWait"/>:
+    /// native SQLite retries for the CommandTimeout before reporting busy, and
+    /// the managed engine now matches it.
     /// </summary>
     [Test]
     public void NativeSqliteTreatsCommandTimeoutAsABusyWait()
@@ -636,8 +798,25 @@ public class ManagedTransactionModeLockingTests
     }
 
     /// <summary>
+    /// Native assertions about busy errors would otherwise wait out the 30
+    /// second default: Microsoft.Data.Sqlite maps CommandTimeout onto
+    /// sqlite3_busy_timeout per command, which overrides the fixture's
+    /// <c>PRAGMA busy_timeout=0</c>. One second is enough to prove the error.
+    /// </summary>
+    private static void NativeExecFast(MsData.SqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.CommandTimeout = 1;
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>
     /// A throwaway managed file database seeded with a single table, shared by
-    /// the two connections each test opens against it.
+    /// the two connections each test opens against it. The 1 second default
+    /// timeout keeps busy assertions quick: <c>CommandTimeout</c> is the managed
+    /// busy timeout, so a contended statement would otherwise wait out the 30
+    /// second default before failing.
     /// </summary>
     private sealed class ManagedFileDatabase : IDisposable
     {
@@ -654,9 +833,9 @@ public class ManagedTransactionModeLockingTests
 
         public string Path { get; }
 
-        public SqliteConnection Connect()
+        public SqliteConnection Connect(int defaultTimeoutSeconds = 1)
         {
-            var connection = new SqliteConnection($"Data Source={Path};Local Provider=Managed");
+            var connection = new SqliteConnection($"Data Source={Path};Local Provider=Managed;Default Timeout={defaultTimeoutSeconds}");
             connection.Open();
             _connections.Add(connection);
             return connection;

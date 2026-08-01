@@ -8,9 +8,6 @@ namespace Turso.Tests;
 [NonParallelizable]
 public sealed class ManagedSharedCacheContractTests
 {
-    private const string UnsupportedConfigurationMessage =
-        "Cache=Shared with Local Provider=Managed is supported only for in-memory databases: use Mode=Memory with a non-empty Data Source for a named shared cache, or an anonymous :memory: Data Source for a connection-private cache; file-backed shared caches are not supported.";
-
     private const string ReadUncommittedNotSupportedMessage =
         "PRAGMA read_uncommitted and IsolationLevel.ReadUncommitted are not supported for managed shared-memory databases because the managed engine preserves transaction isolation and does not expose dirty reads.";
 
@@ -273,24 +270,42 @@ public sealed class ManagedSharedCacheContractTests
             .WithMessage("Encryption is supported only for file-backed databases when Local Provider=Managed.");
     }
 
-    [TestCase("Data Source=managed-file-shared;Cache=Shared")]
-    [TestCase("Data Source=managed-file-shared;Mode=ReadWriteCreate;Cache=Shared")]
-    public void ManagedProviderRejectsSharedCacheOutsideNamedMemoryMode(string options)
+    // File-backed Cache=Shared is accepted: the managed engine cannot emulate SQLite
+    // shared-cache semantics (cross-connection dirty reads, table locks) for file
+    // databases, so it opens each connection as an ordinary private file connection
+    // with strictly stronger isolation instead of rejecting the keyword outright.
+    [TestCase("Data Source={0};Cache=Shared")]
+    [TestCase("Data Source={0};Mode=ReadWriteCreate;Cache=Shared")]
+    public void ManagedProviderOpensFileBackedSharedCacheAsPrivateFileConnection(string options)
     {
-        var connectionString = options + ";Local Provider=Managed";
-        using var sqlite = new SqliteConnection(connectionString);
-        using var turso = new TursoConnection(connectionString);
+        var path = Path.Combine(Path.GetTempPath(), "turso-shared-cache-" + Guid.NewGuid().ToString("N") + ".db")
+            .Replace('\\', '/');
+        try
+        {
+            var connectionString = string.Format(options + ";Local Provider=Managed", path);
+            using var sqlite = new SqliteConnection(connectionString);
+            using var turso = new TursoConnection(connectionString);
+            using var second = new SqliteConnection(connectionString);
 
-        sqlite.Invoking(static connection => connection.Open())
-            .Should()
-            .Throw<NotSupportedException>()
-            .WithMessage(UnsupportedConfigurationMessage);
-        turso.Invoking(static connection => connection.Open())
-            .Should()
-            .Throw<NotSupportedException>()
-            .WithMessage(UnsupportedConfigurationMessage);
-        sqlite.State.Should().Be(ConnectionState.Closed);
-        turso.State.Should().Be(ConnectionState.Closed);
+            sqlite.Open();
+            sqlite.ExecuteNonQuery("CREATE TABLE data(value INTEGER); INSERT INTO data VALUES (42);");
+
+            // Both facades and every parallel open see one durable file, each through
+            // its own private connection.
+            turso.Open();
+            ReadTursoInt64(turso, "SELECT value FROM data;").Should().Be(42);
+            second.Open();
+            second.ExecuteScalar<long>("SELECT value FROM data;").Should().Be(42);
+
+            // Private connections keep connection-local callbacks available.
+            second.CreateFunction("local_answer", static () => 42L);
+            second.ExecuteScalar<long>("SELECT local_answer();").Should().Be(42);
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            DeleteDatabaseFiles(path);
+        }
     }
 
     // PSSqlite's default connection string is 'Data Source=:memory:;Cache=Shared'. Real
@@ -444,6 +459,24 @@ public sealed class ManagedSharedCacheContractTests
         using var command = connection.CreateCommand();
         command.CommandText = sql;
         return Convert.ToInt64(command.ExecuteScalar());
+    }
+
+    private static void DeleteDatabaseFiles(string path)
+    {
+        foreach (var file in new[] { path, path + "-wal", path + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(file))
+                    File.Delete(file);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
     }
 
     private static async Task<int> ExecuteNonQueryAsync(SqliteConnection connection, string sql)

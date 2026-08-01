@@ -119,7 +119,7 @@ public class TursoParameter : DbParameter
         return parameterValueKind switch
         {
             ParameterValueKind.Null => SqlValue.Null,
-            ParameterValueKind.Integer => SqlValue.Integer(Convert.ToInt64(Value, CultureInfo.InvariantCulture)),
+            ParameterValueKind.Integer => SqlValue.Integer(ToInt64Unchecked(Value)),
             ParameterValueKind.Real => SqlValue.Real(Convert.ToDouble(Value, CultureInfo.InvariantCulture)),
             ParameterValueKind.Text => SqlValue.Text(ToInvariantString(Value)),
             ParameterValueKind.Blob => SqlValue.Blob((byte[])Value),
@@ -137,12 +137,15 @@ public class TursoParameter : DbParameter
         }
     }
 
+    private static long ToInt64Unchecked(object value)
+        => value is ulong u64 ? unchecked((long)u64) : Convert.ToInt64(value, CultureInfo.InvariantCulture);
+
     private static TursoValue GetTursoValue(object value, ParameterValueKind parameterValueKind)
     {
         return parameterValueKind switch
         {
             ParameterValueKind.Null => new TursoValue { ValueType = TursoValueType.Null },
-            ParameterValueKind.Integer => new TursoValue { ValueType = TursoValueType.Integer, IntValue = Convert.ToInt64(value) },
+            ParameterValueKind.Integer => new TursoValue { ValueType = TursoValueType.Integer, IntValue = ToInt64Unchecked(value) },
             ParameterValueKind.Real => new TursoValue { ValueType = TursoValueType.Real, RealValue = Convert.ToDouble(value, CultureInfo.InvariantCulture) },
             ParameterValueKind.Text => new TursoValue { ValueType = TursoValueType.Text, StringValue = ToInvariantString(value) },
             ParameterValueKind.Blob => new TursoValue { ValueType = TursoValueType.Blob, BlobValue = (byte[])value },

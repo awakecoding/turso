@@ -105,14 +105,126 @@ public class EmbeddedEngineTests
     }
 
     [Test]
-    public void OrderedAggregateArgumentsAreExplicitlyRejected()
+    public void GroupConcatOrdersRowsByAggregateOrderByTerms()
+    {
+        using var connection = CreateOrderedAggregateTable();
+
+        ReadSingle(connection, "SELECT group_concat(s ORDER BY id) FROM t;")
+            .Should().Be(SqlValue.Text("b,a,c"));
+        ReadSingle(connection, "SELECT group_concat(s ORDER BY id DESC) FROM t;")
+            .Should().Be(SqlValue.Text("c,a,b"));
+        ReadSingle(connection, "SELECT group_concat(s, '|' ORDER BY s DESC) FROM t;")
+            .Should().Be(SqlValue.Text("c|b|a"));
+        ReadSingle(connection, "SELECT group_concat(s ORDER BY g DESC, id ASC) FROM t;")
+            .Should().Be(SqlValue.Text("c,b,a"));
+    }
+
+    [Test]
+    public void AggregateOrderByHonorsNullPlacement()
+    {
+        using var connection = CreateOrderedAggregateTable();
+
+        // ASC defaults to NULLS FIRST: row 2 (n NULL) leads.
+        ReadSingle(connection, "SELECT group_concat(s ORDER BY n) FROM t;")
+            .Should().Be(SqlValue.Text("a,b,c"));
+        ReadSingle(connection, "SELECT group_concat(s ORDER BY n NULLS LAST) FROM t;")
+            .Should().Be(SqlValue.Text("b,c,a"));
+        ReadSingle(connection, "SELECT group_concat(s ORDER BY n DESC NULLS FIRST) FROM t;")
+            .Should().Be(SqlValue.Text("a,c,b"));
+    }
+
+    [Test]
+    public void AggregateOrderByAppliesPerGroup()
+    {
+        using var connection = CreateOrderedAggregateTable();
+        using var statement = connection.Prepare(
+            "SELECT g, group_concat(s ORDER BY id DESC) FROM t GROUP BY g ORDER BY g;");
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(1));
+        statement.GetValue(1).Should().Be(SqlValue.Text("a,b"));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(2));
+        statement.GetValue(1).Should().Be(SqlValue.Text("c"));
+        statement.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    [Test]
+    public void AggregateOrderByOrdinalLiteralIsAConstantNotAProjectionReference()
+    {
+        using var connection = CreateOrderedAggregateTable();
+
+        // Inside an aggregate an integer term is a constant (stable input order), never
+        // the projection-ordinal rewrite a select-level ORDER BY 1 would get.
+        ReadSingle(connection, "SELECT group_concat(s ORDER BY 1) FROM t;")
+            .Should().Be(SqlValue.Text("b,a,c"));
+    }
+
+    [Test]
+    public void AggregateOrderByAppliesToEveryAggregateKind()
+    {
+        using var connection = CreateOrderedAggregateTable();
+
+        ReadSingle(connection, "SELECT string_agg(s, ';' ORDER BY id DESC) FROM t;")
+            .Should().Be(SqlValue.Text("c;a;b"));
+        ReadSingle(connection, "SELECT json_group_array(s ORDER BY id DESC) FROM t WHERE s IS NOT NULL;")
+            .Should().Be(SqlValue.Text("[\"c\",\"a\",\"b\"]"));
+        ReadSingle(connection, "SELECT sum(id ORDER BY id DESC) FROM t;")
+            .Should().Be(SqlValue.Integer(10));
+        ReadSingle(connection, "SELECT count(s ORDER BY s) FROM t;")
+            .Should().Be(SqlValue.Integer(3));
+    }
+
+    [Test]
+    public void AggregateOrderByMatchesTheEfStringTranslationsShape()
     {
         var database = new EmbeddedDatabase();
         using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE \"BasicTypesEntities\" (\"Id\" INTEGER, \"Int\" INTEGER, \"String\" TEXT);");
+        Execute(connection, "INSERT INTO \"BasicTypesEntities\" VALUES (1, 1, 'foo'), (2, 1, 'bar'), (3, 1, 'baz');");
+
+        ReadSingle(
+                connection,
+                "SELECT COALESCE(group_concat(\"String\", '|' ORDER BY \"Id\" DESC), '') FROM \"BasicTypesEntities\" GROUP BY \"Int\";")
+            .Should().Be(SqlValue.Text("baz|bar|foo"));
+    }
+
+    [Test]
+    public void DistinctAggregateWithOrderByIsExplicitlyRejected()
+    {
+        using var connection = CreateOrderedAggregateTable();
 
         Assert.Throws<EmbeddedSqlException>(
-                () => connection.Prepare("SELECT group_concat(value ORDER BY value);"))!
-            .Message.Should().Contain("ORDER BY within aggregate functions is not supported");
+                () => connection.Prepare("SELECT group_concat(DISTINCT s ORDER BY s) FROM t;").Step())!
+            .Message.Should().Contain("DISTINCT aggregates with ORDER BY");
+    }
+
+    [Test]
+    public void WindowFunctionWithAggregateOrderByIsExplicitlyRejected()
+    {
+        using var connection = CreateOrderedAggregateTable();
+
+        Assert.Throws<EmbeddedSqlException>(
+                () => connection.Prepare("SELECT group_concat(s ORDER BY id) OVER () FROM t;").Step())!
+            .Message.Should().Contain("ORDER BY within window functions");
+    }
+
+    private static EmbeddedConnection CreateOrderedAggregateTable()
+    {
+        var database = new EmbeddedDatabase();
+        var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER, s TEXT, g INTEGER, n INTEGER);");
+        Execute(connection, "INSERT INTO t VALUES (1, 'b', 1, 10), (2, 'a', 1, NULL), (3, 'c', 2, 30), (4, NULL, 2, 20);");
+        return connection;
+    }
+
+    private static SqlValue ReadSingle(EmbeddedConnection connection, string sql)
+    {
+        using var statement = connection.Prepare(sql);
+        statement.Step().Should().Be(StatementStepResult.Row);
+        var value = statement.GetValue(0);
+        statement.Step().Should().Be(StatementStepResult.Done);
+        return value;
     }
 
     [Test]
@@ -227,7 +339,7 @@ public class EmbeddedEngineTests
     }
 
     [Test]
-    public void GroupedOrderByEvaluatesCallbackKeysOnceInGroupSourceOrder()
+    public void GroupedOrderByEvaluatesCallbackKeysOnceInSortedGroupKeyOrder()
     {
         var observed = new List<long>();
         var database = new EmbeddedDatabase();
@@ -251,7 +363,7 @@ public class EmbeddedEngineTests
         statement.Step().Should().Be(StatementStepResult.Row);
         statement.GetValue(0).Should().Be(SqlValue.Text("later"));
         statement.Step().Should().Be(StatementStepResult.Done);
-        observed.Should().Equal(30, 3);
+        observed.Should().Equal(3, 30);
     }
 
     [Test]
@@ -887,6 +999,135 @@ public class EmbeddedEngineTests
     }
 
     [Test]
+    public void LikeMatchesWildcardsAppearingInTheSubject()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        using var statement = connection.Prepare(
+            "SELECT " +
+            "'%Bar' LIKE '%', " +
+            "'%Bar%' LIKE '%\\%' ESCAPE '\\', " +
+            "'B%a%%r%' LIKE '%\\%%' ESCAPE '\\', " +
+            "'a%bc' LIKE 'a\\%%c' ESCAPE '\\', " +
+            "'_Bar' LIKE '\\_B%' ESCAPE '\\', " +
+            "'_B_a_r' LIKE '\\_B%' ESCAPE '\\', " +
+            "'%B%a%r' LIKE '\\%B%' ESCAPE '\\', " +
+            "'x%' LIKE '\\%' ESCAPE '\\', " +
+            "'%x' LIKE '\\%' ESCAPE '\\';");
+
+        statement.Step().Should().Be(StatementStepResult.Row);
+        for (var i = 0; i < 7; i++)
+        {
+            statement.GetValue(i).Should().Be(SqlValue.Integer(1), $"case {i} should match (native sqlite3 verified)");
+        }
+
+        statement.GetValue(7).Should().Be(SqlValue.Integer(0));
+        statement.GetValue(8).Should().Be(SqlValue.Integer(0));
+    }
+
+    [Test]
+    public void LimitAndOffsetRejectColumnReferencesLikeNativeSqlite()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(x);");
+        Execute(connection, "INSERT INTO t VALUES (1), (2), (3);");
+        Execute(connection, "CREATE TABLE a(id);");
+        Execute(connection, "INSERT INTO a VALUES (1), (2);");
+        Execute(connection, "CREATE TABLE b(nick, sid);");
+        Execute(connection, "INSERT INTO b VALUES ('x', 1), ('y', 2);");
+
+        // Native sqlite3 3.53.3 rejects every direct column reference in LIMIT/OFFSET
+        // with "no such column: X" - even a correlated outer reference, a reference
+        // inside a larger expression, or one on a compound SELECT's LIMIT.
+        AssertLimitRejected(connection, "SELECT x FROM t LIMIT t.x;", "no such column: t.x");
+        AssertLimitRejected(connection, "SELECT x FROM t LIMIT 1 + t.x;", "no such column: t.x");
+        AssertLimitRejected(connection, "SELECT x FROM t LIMIT abs(t.x);", "no such column: t.x");
+        AssertLimitRejected(connection, "SELECT x FROM t LIMIT 1 OFFSET t.x;", "no such column: t.x");
+        AssertLimitRejected(
+            connection,
+            "SELECT id FROM a WHERE (SELECT nick FROM b WHERE b.sid = a.id ORDER BY nick LIMIT 1 OFFSET a.id) = 'x';",
+            "no such column: a.id");
+        AssertLimitRejected(
+            connection,
+            "SELECT x FROM t UNION ALL SELECT x FROM t LIMIT t.x;",
+            "no such column: t.x");
+
+        // Scalar subqueries inside LIMIT stay legal (their columns are scoped by the
+        // nested query), as do plain constant expressions.
+        using (var statement = connection.Prepare("SELECT x FROM t LIMIT (SELECT 2);"))
+        {
+            var rows = 0;
+            while (statement.Step() == StatementStepResult.Row)
+                rows++;
+            rows.Should().Be(2);
+        }
+
+        using (var statement = connection.Prepare("SELECT x FROM t LIMIT 1 + 1 OFFSET 1;"))
+        {
+            var rows = 0;
+            while (statement.Step() == StatementStepResult.Row)
+                rows++;
+            rows.Should().Be(2);
+        }
+
+        static void AssertLimitRejected(EmbeddedConnection connection, string sql, string message)
+        {
+            var exception = Assert.Throws<EmbeddedSqlException>(() =>
+            {
+                using var statement = connection.Prepare(sql);
+                while (statement.Step() == StatementStepResult.Row)
+                {
+                }
+            });
+            exception!.Message.Should().Be(message);
+        }
+    }
+
+    [Test]
+    public void OrderByTiesFollowScanOrderLikeNativeStableSorter()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT COLLATE NOCASE);");
+        // Out-of-rowid-order insertion: the managed row store scans in insertion order
+        // (native's b-tree would scan in rowid order, so absolute tie order can differ
+        // from native here). The invariant both engines share is self-consistency:
+        // ORDER BY ties follow whatever the bare scan enumerates, because the sorter is
+        // stable. EF Core's Northwind assertions check exactly this consistency.
+        Execute(connection, "INSERT INTO t VALUES (221, 'a'), (203, 'A'), (250, 'b'), (210, 'B');");
+
+        CollectIds(connection, "SELECT id FROM t;").Should().Equal(221, 203, 250, 210);
+
+        // NOCASE ties ('a'='A', 'b'='B') keep scan order instead of breaking by rowid.
+        CollectIds(connection, "SELECT id FROM t ORDER BY v;").Should().Equal(221, 203, 250, 210);
+        CollectIds(connection, "SELECT id FROM t ORDER BY v DESC;").Should().Equal(250, 210, 221, 203);
+
+        // In-order insertion (scan order == rowid order) keeps the native-visible tie order.
+        Execute(connection, "CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT COLLATE NOCASE);");
+        Execute(connection, "INSERT INTO u VALUES (1, 'a'), (2, 'A'), (3, 'b');");
+        CollectIds(connection, "SELECT id FROM u ORDER BY v;").Should().Equal(1, 2, 3);
+
+        // Compound ORDER BY ties follow compound materialization order (arm order, then
+        // within-arm scan order) instead of an unstable raw List.Sort.
+        Execute(connection, "CREATE TABLE c1(id INTEGER PRIMARY KEY, v TEXT COLLATE NOCASE);");
+        Execute(connection, "CREATE TABLE c2(id INTEGER PRIMARY KEY, v TEXT COLLATE NOCASE);");
+        Execute(connection, "INSERT INTO c1 VALUES (5, 'x'), (2, 'y');");
+        Execute(connection, "INSERT INTO c2 VALUES (9, 'X'), (4, 'w');");
+        CollectIds(connection, "SELECT id, v FROM c1 UNION ALL SELECT id, v FROM c2 ORDER BY v;")
+            .Should().Equal(4, 5, 9, 2);
+
+        static List<long> CollectIds(EmbeddedConnection connection, string sql)
+        {
+            using var statement = connection.Prepare(sql);
+            var ids = new List<long>();
+            while (statement.Step() == StatementStepResult.Row)
+                ids.Add(statement.GetValue(0).AsInteger());
+            return ids;
+        }
+    }
+
+    [Test]
     public void CaseExpressionsSelectTheFirstMatchingBranch()
     {
         var database = new EmbeddedDatabase();
@@ -1044,6 +1285,184 @@ public class EmbeddedEngineTests
         inSubquery.Step().Should().Be(StatementStepResult.Row);
         inSubquery.GetValue(0).Should().Be(SqlValue.Integer(3));
         inSubquery.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    // Regression for the EF Northwind shape: correlated EXISTS plus a correlated
+    // COUNT over a grouped join, with no usable persisted index. Without the
+    // statement-scoped transient equality lookup this re-scanned the details table
+    // for every outer row (quadratic; ~85s at this scale, well under 1s with it).
+    [Test]
+    public void CorrelatedJoinSubqueriesReuseTransientLookups()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE orders(id INTEGER PRIMARY KEY, placed TEXT);");
+        Execute(connection, "CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT);");
+        Execute(connection, "CREATE TABLE details(order_id INTEGER, product_id INTEGER);");
+        for (var i = 1; i <= 800; i++)
+        {
+            Execute(connection, $"INSERT INTO orders VALUES ({i}, '2024-01-01');");
+            Execute(connection, $"INSERT INTO details VALUES ({i}, {i % 40 + 1}), ({i}, {i % 40 + 2}), ({i}, {i % 40 + 3});");
+        }
+
+        for (var p = 1; p <= 43; p++)
+        {
+            Execute(connection, $"INSERT INTO products VALUES ({p}, 'p{p}');");
+        }
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        using var statement = connection.Prepare(
+            "SELECT o.id, " +
+            "CASE WHEN EXISTS (SELECT 1 FROM details AS d WHERE d.order_id = o.id AND d.product_id < 25) " +
+            "THEN 1 ELSE 0 END, " +
+            "CASE WHEN (SELECT COUNT(*) FROM (" +
+            "SELECT 1 AS marker FROM details AS d2 " +
+            "INNER JOIN products AS p ON d2.product_id = p.id " +
+            "WHERE d2.order_id = o.id AND d2.product_id < 25 " +
+            "GROUP BY p.name) AS grouped) > 1 THEN 1 ELSE 0 END " +
+            "FROM orders AS o WHERE o.placed IS NOT NULL;");
+        var rows = 0;
+        var existsSum = 0;
+        var multiGroupSum = 0;
+        while (statement.Step() == StatementStepResult.Row)
+        {
+            rows++;
+            existsSum += (int)statement.GetValue(1).AsInteger();
+            multiGroupSum += (int)statement.GetValue(2).AsInteger();
+        }
+
+        stopwatch.Stop();
+        rows.Should().Be(800);
+        // Order i has details for products i%40+1..+3: a product < 25 exists for i%40 in 0..23,
+        // and more than one such product for i%40 in 0..22.
+        existsSum.Should().Be(480);
+        multiGroupSum.Should().Be(460);
+        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(15));
+    }
+
+    // The transient lookup must not serve stale rows: an UPDATE mutating the probed
+    // table mid-statement bumps the row-store revision, and the next correlated
+    // evaluation rebuilds its buckets instead of reusing the pre-mutation map.
+    [Test]
+    public void CorrelatedSubqueryLookupRebuildsAfterSameStatementMutation()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE counters(id INTEGER PRIMARY KEY, qty INTEGER);");
+        Execute(connection, "INSERT INTO counters VALUES (1, 10), (2, 20), (3, 30);");
+
+        Execute(connection,
+            "UPDATE counters SET qty = qty + (SELECT COUNT(*) FROM counters AS c2 WHERE c2.id = counters.id);");
+
+        using var statement = connection.Prepare("SELECT qty FROM counters ORDER BY id;");
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(11));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(21));
+        statement.Step().Should().Be(StatementStepResult.Row);
+        statement.GetValue(0).Should().Be(SqlValue.Integer(31));
+        statement.Step().Should().Be(StatementStepResult.Done);
+    }
+
+    // Regression for the EF Northwind Navigations/SplitInclude solo stall (#8c): a single-table
+    // WHERE conjunct on the preserved side of a LEFT join over a CROSS join must be pushed into
+    // the base scan, not materialized as the full LxR cartesian first (native SQLite pushes the
+    // constant filter down). The ROW_NUMBER window keeps the query on the interpreted GetJoinRows
+    // path (the compiled join route declines window functions) where GetJoinRowsWithPredicatePushdown
+    // /GetSideSourceRows apply. Without the pushdown the 2490x830 pair materialization blows the
+    // time bound; with it the details scan probes only the ~3 rows matching order_id = 1.
+    [Test]
+    public void LeftJoinOverCrossJoinPushesSingleTablePredicateIntoBaseScan()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER);");
+        Execute(connection, "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);");
+        Execute(connection, "CREATE TABLE details(order_id INTEGER, product_id INTEGER);");
+        Execute(connection, "INSERT INTO orders SELECT value, (value % 91) + 1 FROM generate_series(1, 830, 1);");
+        Execute(connection, "INSERT INTO customers SELECT value, 'c' FROM generate_series(1, 91, 1);");
+        Execute(connection, "INSERT INTO details SELECT (value % 830) + 1, value FROM generate_series(1, 2490, 1);");
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        using var statement = connection.Prepare(
+            "SELECT COUNT(*) FROM (" +
+            "SELECT o2.id, ROW_NUMBER() OVER (PARTITION BY o2.id ORDER BY o2.id) AS rn " +
+            "FROM details AS o1 CROSS JOIN orders AS o2 " +
+            "LEFT JOIN customers AS c ON o2.customer_id = c.id " +
+            "WHERE o1.order_id = 1) AS t;");
+        statement.Step().Should().Be(StatementStepResult.Row);
+        var count = statement.GetValue(0).AsInteger();
+        stopwatch.Stop();
+
+        // order_id = 1 matches details rows 830/1660/2490 -> 3 rows x 830 orders.
+        count.Should().Be(2490);
+        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(15));
+    }
+
+    // Correctness guard for the LEFT-join pushdown: a conjunct pushed into the preserved (left)
+    // side must not convert the outer join to an inner one - the null-supplying (right) side
+    // still pads NULLs for preserved rows with no match. The window function forces the
+    // interpreted path where the pushdown lives.
+    [Test]
+    public void LeftJoinPushdownPreservesNullPadding()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        Execute(connection, "CREATE TABLE a(id INTEGER PRIMARY KEY, x INTEGER);");
+        Execute(connection, "CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER, y TEXT);");
+        Execute(connection, "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30);");
+        Execute(connection, "INSERT INTO b VALUES (1, 1, 'one'), (2, 3, 'three');");
+
+        var rows = ReadRows(connection,
+            "SELECT a.id, b.y, ROW_NUMBER() OVER (ORDER BY a.id) AS rn " +
+            "FROM a LEFT JOIN b ON b.aid = a.id WHERE a.x >= 20 ORDER BY a.id;");
+
+        rows.Should().HaveCount(2);
+        rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Null, SqlValue.Integer(1));
+        rows[1].Should().Equal(SqlValue.Integer(3), SqlValue.Text("three"), SqlValue.Integer(2));
+    }
+
+    // Regression for the EF ComplexTypeQuery hang: DISTINCT over a derived table over
+    // a UNION with wide projections. Collation resolution re-derived each source's full
+    // collation scope once per output column at every nesting level, multiplying cost
+    // by the column count each level - 18 output columns already exceeded 60s before
+    // the statement-scoped memoization; EF's 42-column query never finished.
+    [Test]
+    public void DistinctOverUnionDerivedTablesResolveCollisionsOncePerSource()
+    {
+        var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+        const int textColumns = 8;
+        var rawNames = Enumerable.Range(1, textColumns).Select(i => $"T{i}").ToArray();
+        Execute(connection,
+            $"CREATE TABLE u(id INTEGER PRIMARY KEY, {string.Join(", ", rawNames.Select(n => $"{n} TEXT"))});");
+        Execute(connection, "INSERT INTO u(id) VALUES (1), (2);");
+
+        string Side(string a, string b) =>
+            $"SELECT {a}.id, {string.Join(", ", rawNames.Select(n => $"{a}.{n}"))}, {b}.id AS id0, " +
+            $"{string.Join(", ", rawNames.Select(n => $"{b}.{n} AS {n}0"))} FROM u AS {a} CROSS JOIN u AS {b}";
+        string Mid(string a) =>
+            string.Join(", ", new[] { $"{a}.id" }
+                .Concat(rawNames.Select(n => $"{a}.{n}"))
+                .Concat(new[] { $"{a}.id0" })
+                .Concat(rawNames.Select(n => $"{a}.{n}0")));
+        var query =
+            $"SELECT {Mid("o1")} FROM (" +
+            $"SELECT DISTINCT {Mid("o0")} FROM (" +
+            $"SELECT {Mid("o")} FROM ({Side("c", "c0")} UNION {Side("c1", "c2")}) AS o " +
+            $"ORDER BY o.id, o.id0 LIMIT 3) AS o0) AS o1 ORDER BY o1.id, o1.id0 LIMIT 3;";
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        using var statement = connection.Prepare(query);
+        var rows = 0;
+        while (statement.Step() == StatementStepResult.Row)
+        {
+            rows++;
+        }
+
+        stopwatch.Stop();
+        rows.Should().Be(3);
+        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(15));
     }
 
     [Test]

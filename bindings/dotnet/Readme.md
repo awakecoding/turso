@@ -87,17 +87,24 @@ change managed locking behavior, matching SQLite's timing:
   the managed default for file databases, SQLite's EXCLUSIVE does not block
   readers and neither does this.
 
-There is no busy timeout, matching SQLite's default `busy_timeout=0`. Note that
-this diverges from `Microsoft.Data.Sqlite`, which maps `CommandTimeout` onto
-`sqlite3_busy_timeout` and therefore retries a contended `BEGIN IMMEDIATE` for up
-to `CommandTimeout` before reporting busy. The managed write reservation is
-fail-fast, so `CommandTimeout` does not delay a busy `BEGIN` — consistent with
-`PRAGMA busy_timeout` being unsupported here. Locking is
+The default busy timeout is zero, matching SQLite's default `busy_timeout=0`.
+Like `Microsoft.Data.Sqlite`, `CommandTimeout` maps onto the equivalent of
+`sqlite3_busy_timeout`, so a contended `BEGIN IMMEDIATE` waits up to
+`CommandTimeout` for the holder to release before reporting busy (and
+`CommandTimeout=0` waits indefinitely). `PRAGMA busy_timeout` itself stays
+unsupported. Locking is
 process-local, which is sufficient because a managed physical database is already
-owned exclusively by one process. Two connections that both hold live snapshots
-still reject the loser's commit with a catalog-version conflict rather than a
-lock error, because a managed connection's catalog snapshot is fixed for its
-lifetime.
+owned exclusively by one process.
+
+The same busy timeout also governs the snapshot-stale contract, the managed
+equivalent of SQLite's `SQLITE_BUSY_SNAPSHOT`. When a sibling connection's
+commit moved the durable catalog past a connection's snapshot, `BEGIN` waits
+out any in-flight commit, re-reads the catalog, and proceeds; an autocommit
+statement is re-executed against the reloaded catalog so the sibling's rows
+survive. A transaction that already went stale before committing still fails
+with `SQLITE_BUSY` ("database is locked") and must roll back — SQLite's
+must-rollback semantics — and a zero busy timeout keeps every one of these
+paths fail-fast instead of retrying.
 
 ### Hooks, authorizer, tracing, and the progress handler
 
@@ -588,7 +595,7 @@ mode. Supported common connection string keywords include:
 | `Data Source` | Local database path or `:memory:`; remote URL for `TursoConnection`. Aliases include `DataSource` and `Filename`. |
 | `Mode` | Local only. Managed local honors `Memory`, `ReadOnly`, `ReadWrite`, and `ReadWriteCreate` with explicit file-existence checks. |
 | `Foreign Read Only` | Local managed only. Opens a database owned by another engine (for example `winget`'s `index.db`) without claiming ownership or requiring `-shm`; see [Managed foreign read-only opens](#managed-foreign-read-only-opens). |
-| `Cache` | Local only. Managed `Cache=Shared` is supported only with a named `Data Source` and `Mode=Memory`; see below. |
+| `Cache` | Local only. Managed `Cache=Shared` is supported with a named `Data Source` and `Mode=Memory`; file databases accept it as an ordinary private file connection (SQLite shared-cache semantics are not emulated); see below. |
 | `Foreign Keys` | Applied by local `SqliteConnection` through `PRAGMA foreign_keys`; the managed engine supports composite keys, referential actions, and deferred constraints. Direct managed `TursoConnection` rejects the keyword. |
 | `Local Provider` | `Managed` is the default for local databases. Set `Native` when `Turso.Data.Sqlite.Native` or a RID-specific `Turso.Data.Sqlite.NativeAot.*` companion is referenced. |
 | `Recursive Triggers` | Tracked by local `SqliteConnection`; direct managed `TursoConnection` rejects the keyword. |
@@ -648,7 +655,10 @@ ABORT-class failures.
 `DEFERRABLE INITIALLY DEFERRED` and `PRAGMA defer_foreign_keys` participate in managed
 transactions and savepoints. A failed deferred `COMMIT` or outermost `RELEASE` leaves the
 transaction open so the violation can be repaired. `PRAGMA foreign_keys` remains
-connection-local and cannot change while a transaction is active.
+connection-local and cannot change while a transaction is active. The managed engine
+keeps the SQLite CLI default (OFF); managed `SqliteConnection` instances default it to
+ON at open, matching the e_sqlite3 build Microsoft.Data.Sqlite ships
+(SQLITE_DEFAULT_FOREIGN_KEYS=1). `Foreign Keys=False` in the connection string opts out.
 `PRAGMA foreign_key_list` and `PRAGMA foreign_key_check` expose the retained schema and
 violations. As in SQLite, named `MATCH` clauses are accepted and use MATCH SIMPLE
 behavior.
@@ -696,7 +706,9 @@ The managed engine rejects these shapes before target-row mutation:
   DML combined with conflict clauses, UPSERT, limited DML, or RETURNING.
 - Table/column renames with structural trigger dependencies; independent column renames
   remain supported.
-- File-backed trigger definitions that contain function calls, explicit custom
+- File-backed view and trigger definitions may use the engine's built-in functions, which
+  resolve identically on every connection. They remain rejected when they contain bind
+  parameters, connection-registered (application-defined) functions, explicit custom
   collations, or target/reference tables declaring custom collations, because
   connection-local implementations cannot be reconstructed on reopen.
 
@@ -738,7 +750,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 - `REINDEX` atomically rebuilds the selected managed table/index (including rich, partial, expression, constraint, and `WITHOUT ROWID` forms) through a forced full-catalog pager rewrite without changing the schema cookie. Unqualified all-index and collation forms are supported when no database is attached; with attachments, callers must qualify one table or index so independent files are never presented as one atomic mutation. `ANALYZE` is an explicit pre-mutation error because managed `sqlite_stat*` persistence and planner consumption are not implemented.
 - `PRAGMA page_size` accepts SQLite page sizes from 512 through 65536 as a pending value per selected database. `PRAGMA [schema.]journal_mode`, `VACUUM`, `VACUUM main`, and attached-schema `VACUUM` target that database independently; in-place page-size changes apply only in `DELETE` mode, while `VACUUM ... INTO <expression>` may apply the pending size in either journal mode without changing the source. `INTO` publishes a compact `DELETE`-mode snapshot through an atomic file-system replacement, retains encryption, AUTOINCREMENT sequence state, and supported catalog/header semantics, and accepts only ordinary file paths on file systems that provide that guarantee. VACUUM rejects active transactions, result readers, blob handles, read-only/query-only connections, unsafe output aliases, and non-empty destinations before mutating authoritative storage.
 - Managed named shared-memory databases use `Data Source=NAME;Mode=Memory;Cache=Shared`. Connections with the same case-sensitive name share one managed catalog and page/cache owner until the last logical connection closes. Reopening while another connection remains open preserves the database; reopening after the last close creates an empty database. The SQLite facade accepts `Pooling=True` for connection-string compatibility but never pools shared memory; `TursoConnection` requires `Pooling=False` and rejects `Pooling=True` before opening. `ClearPool` and `ClearAllPools` affect file pools only.
-- Managed `Cache=Shared` is rejected for file databases because that configuration cannot provide a true shared managed page/cache owner. Anonymous in-memory databases follow SQLite semantics: an empty Data Source or a `:memory:` Data Source without `Mode=Memory` stays connection-private even with `Cache=Shared`, while `Data Source=:memory:;Mode=Memory;Cache=Shared` routes through the shared-cache URI form and becomes a named shared-memory database named `:memory:`, matching Microsoft.Data.Sqlite. `Cache=Private` and the default cache remain connection-private for memory databases. Managed named shared-memory connections also reject connection-local functions, aggregates, and collations because the current managed function registry belongs to the shared database rather than an individual connection; private anonymous in-memory connections keep their own catalog and therefore allow them.
+- Managed `Cache=Shared` is accepted for file databases but treated as an ordinary private file connection per open: the managed engine cannot emulate SQLite's shared-cache semantics (cross-connection uncommitted visibility and table locks) for files, so it deliberately provides the stronger private isolation instead of rejecting the keyword. Anonymous in-memory databases follow SQLite semantics: an empty Data Source or a `:memory:` Data Source without `Mode=Memory` stays connection-private even with `Cache=Shared`, while `Data Source=:memory:;Mode=Memory;Cache=Shared` routes through the shared-cache URI form and becomes a named shared-memory database named `:memory:`, matching Microsoft.Data.Sqlite. `Cache=Private` and the default cache remain connection-private for memory databases. Managed named shared-memory connections also reject connection-local functions, aggregates, and collations because the current managed function registry belongs to the shared database rather than an individual connection; private anonymous in-memory connections keep their own catalog and therefore allow them.
 - `PRAGMA read_uncommitted` remains connection-local compatibility state for native and managed private-cache connections. Managed shared-memory databases preserve transaction isolation and reject enabling `PRAGMA read_uncommitted` or beginning an `IsolationLevel.ReadUncommitted` transaction rather than claiming unsupported dirty-read behavior.
 - Managed `BackupDatabase` atomically replaces existing managed destinations, including schema, rows, `schema_version`, `user_version`, and `application_id`, and accepts `main` or attached database names. The connection-private TEMP database is excluded, and selecting `temp` as a named source or destination is rejected before destination mutation. Active `main` source transactions are copied from their current snapshot without being completed, and active source readers remain usable. Selecting an attached source while its owning connection has an active transaction fails busy before destination mutation because that attachment's transaction clone cannot yet be exposed as an independent backup source. Non-transactional file sources are reopened before snapshot acquisition so commits from other connections are included. Memory and physical-file endpoints are supported, including encrypted file-to-file re-encryption; failures before publication leave the destination unchanged.
 - Managed backup rejects an active destination transaction or reader, copying a recognized database identity onto itself, file-to-file copies through custom file systems with unknown identity semantics, and managed/native provider mixing before changing the destination. Physical files acquire exclusive SQLite lock-byte ownership when opened, so hard-link, junction, symbolic-link, short-path, and case aliases cannot be opened as a second managed database and therefore cannot reach destination mutation.

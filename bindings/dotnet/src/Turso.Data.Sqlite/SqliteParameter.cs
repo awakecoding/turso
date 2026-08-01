@@ -246,9 +246,14 @@ public class SqliteParameter : DbParameter
 
     private static long ToInt64(object value)
     {
-        return value is Enum enumValue
-            ? Convert.ToInt64(enumValue, CultureInfo.InvariantCulture)
-            : Convert.ToInt64(value, CultureInfo.InvariantCulture);
+        // Microsoft.Data.Sqlite binds ulong with an unchecked (long) cast, so values above
+        // long.MaxValue round-trip through SQLite INTEGER as two's complement.
+        return value switch
+        {
+            ulong u64 => unchecked((long)u64),
+            Enum enumValue => Convert.ToInt64(enumValue, CultureInfo.InvariantCulture),
+            _ => Convert.ToInt64(value, CultureInfo.InvariantCulture),
+        };
     }
 
     private static double ToDouble(object value)

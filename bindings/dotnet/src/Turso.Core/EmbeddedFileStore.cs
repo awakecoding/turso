@@ -97,13 +97,22 @@ internal sealed class EmbeddedFileStore : IDisposable
             _ = SqlitePageSize.Encode(requestedPageSize);
 
         SqlitePager pager;
-        if (!databaseExists && !walExists)
+        if (!databaseExists)
         {
             if (readOnly)
             {
                 throw new EmbeddedSqlException(
-                    $"Cannot open managed database '{path}' read-only because neither its database file nor write-ahead log exists.");
+                    $"Cannot open managed database '{path}' read-only because its database file does not exist.");
             }
+
+            // The main database file is absent. A lingering write-ahead log is
+            // orphaned — its frames reference a database that was deleted (for
+            // example by EFCore's EnsureDeleted, which removes only the main
+            // file). Native SQLite discards the orphaned WAL and creates a
+            // fresh database; match that so delete/reopen cycles do not fault
+            // with "missing its main database file".
+            if (walExists)
+                fileSystem.DeleteFile(walPath);
 
             var header = SqliteDatabaseHeader.CreateDefault() with
             {
@@ -116,7 +125,7 @@ internal sealed class EmbeddedFileStore : IDisposable
                 unchecked((uint)Random.Shared.Next()));
             pager = SqlitePager.Create(fileSystem, path, walPath, walHeader, header, encryption: encryption);
         }
-        else if (databaseExists)
+        else
         {
             if (initialPageSize is not null || initialTextEncoding is not null)
             {
@@ -130,11 +139,6 @@ internal sealed class EmbeddedFileStore : IDisposable
                 readOnly,
                 encryption: encryption,
                 foreignReadOnly: foreignReadOnly);
-        }
-        else
-        {
-            throw new EmbeddedSqlException(
-                $"The managed file database '{path}' is missing its main database file.");
         }
 
         try
@@ -157,6 +161,12 @@ internal sealed class EmbeddedFileStore : IDisposable
     /// connections to detect owner commits between statements.
     /// </summary>
     internal SqlitePagerViewToken CaptureCommittedViewToken() => _pager.CaptureCommittedViewToken();
+
+    /// <summary>
+    /// The shared per-file storage generation (see <see cref="SqlitePager.CommittedViewGeneration"/>).
+    /// A cheap race-free signal that the committed view may have changed; never rescans the WAL.
+    /// </summary>
+    internal long CommittedViewGeneration => _pager.CommittedViewGeneration;
 
     private EmbeddedFileCatalog Load()
     {
@@ -8354,7 +8364,15 @@ internal sealed class EmbeddedFileStore : IDisposable
                 or StarExpression or QualifiedStarExpression => null,
             ParameterExpression => "a bind parameter",
             RowValueExpression rowValue => FindRuntimeDependency(rowValue.Values),
-            FunctionExpression function => $"function {function.Name}()",
+            // Only engine built-ins may appear in persisted schema: their implementations exist on
+            // every connection, so the stored SQL re-resolves identically after reopen. Unknown
+            // names may be connection-registered managed callbacks, which cannot survive reopen.
+            // Arguments, FILTER, and window parts are still walked for runtime dependencies.
+            FunctionExpression function => FirstRuntimeDependency(
+                SqliteBuiltinFunctions.Contains(function.Name) ? null : $"function {function.Name}()",
+                FindRuntimeDependency(function.Arguments),
+                FindRuntimeDependency(function.Filter),
+                function.Window is null ? null : FindRuntimeDependency(function.Window)),
             ScalarSubqueryExpression subquery => FindRuntimeDependency(subquery.Query),
             ExistsExpression exists => FindRuntimeDependency(exists.Query),
             CollationExpression collation => IsBuiltInCollation(collation.Name)

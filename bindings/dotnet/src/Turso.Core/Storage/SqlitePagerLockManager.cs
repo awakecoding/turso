@@ -160,7 +160,15 @@ public sealed class SqlitePagerLockManager
 
     /// <summary>Acquires a read-snapshot lock.</summary>
     public SqlitePagerLockLease EnterReader(TimeSpan? busyTimeout = null)
-        => Enter(SqlitePagerLockOperation.Reader, NormalizeTimeout(busyTimeout));
+        => Enter(SqlitePagerLockOperation.Reader, NormalizeTimeout(busyTimeout), pagerReadOnly: true);
+
+    /// <summary>
+    /// Acquires a read-snapshot lock for a pager whose read-only state is known.
+    /// A read-write pager may recreate a missing shared-memory lock carrier on
+    /// demand like a native read-write connection; a read-only pager must not.
+    /// </summary>
+    internal SqlitePagerLockLease EnterReader(TimeSpan? busyTimeout, bool pagerReadOnly)
+        => Enter(SqlitePagerLockOperation.Reader, NormalizeTimeout(busyTimeout), pagerReadOnly);
 
     /// <summary>Acquires the single WAL writer lock.</summary>
     public SqlitePagerLockLease EnterWriter(TimeSpan? busyTimeout = null)
@@ -195,7 +203,10 @@ public sealed class SqlitePagerLockManager
         }
     }
 
-    private SqlitePagerLockLease Enter(SqlitePagerLockOperation operation, TimeSpan timeout)
+    private SqlitePagerLockLease Enter(
+        SqlitePagerLockOperation operation,
+        TimeSpan timeout,
+        bool pagerReadOnly = true)
     {
         var stopwatch = timeout == Timeout.InfiniteTimeSpan ? null : Stopwatch.StartNew();
         lock (_gate)
@@ -242,7 +253,7 @@ public sealed class SqlitePagerLockManager
 
                 if (operation == SqlitePagerLockOperation.Reader)
                 {
-                    AcquireSharedReaderLock(coordinatorTimeout);
+                    AcquireSharedReaderLock(coordinatorTimeout, pagerReadOnly);
                 }
                 else
                 {
@@ -336,7 +347,7 @@ public sealed class SqlitePagerLockManager
     /// local reader is active. A per-page acquisition would otherwise cost an
     /// operating-system lock round trip for every committed page read.
     /// </summary>
-    private void AcquireSharedReaderLock(TimeSpan timeout)
+    private void AcquireSharedReaderLock(TimeSpan timeout, bool pagerReadOnly)
     {
         lock (_gate)
         {
@@ -344,7 +355,9 @@ public sealed class SqlitePagerLockManager
                 return;
         }
 
-        var acquired = _coordinator!.Acquire(SqlitePagerLockOperation.Reader, timeout)
+        var acquired = (_coordinator is SqliteWalSharedMemoryLocks sharedMemoryLocks
+                ? sharedMemoryLocks.Acquire(SqlitePagerLockOperation.Reader, timeout, pagerReadOnly)
+                : _coordinator!.Acquire(SqlitePagerLockOperation.Reader, timeout))
             ?? throw new InvalidOperationException("SQLite pager lock coordinator returned no lease.");
 
         var redundant = false;

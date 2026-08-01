@@ -17,8 +17,8 @@ public sealed partial class EmbeddedDatabase
         var tables = context.Tables;
         return statement switch
         {
-            PragmaTableInfoStatement tableInfo => ExecutePragmaTableInfo(tableInfo, tables),
-            PragmaTableXInfoStatement tableXInfo => ExecutePragmaTableXInfo(tableXInfo, tables),
+            PragmaTableInfoStatement tableInfo => ExecutePragmaTableInfo(tableInfo, context),
+            PragmaTableXInfoStatement tableXInfo => ExecutePragmaTableXInfo(tableXInfo, context),
             PragmaIndexListStatement indexList => ExecutePragmaIndexList(indexList, tables),
             PragmaIndexInfoStatement indexInfo => ExecutePragmaIndexInfo(indexInfo, tables),
             PragmaIndexXInfoStatement indexXInfo => ExecutePragmaIndexXInfo(indexXInfo, tables),

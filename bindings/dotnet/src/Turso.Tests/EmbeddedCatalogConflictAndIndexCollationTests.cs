@@ -8,7 +8,7 @@ namespace Turso.Tests;
 public sealed class EmbeddedCatalogConflictAndIndexCollationTests
 {
     [Test]
-    public void StaleFileCatalogAutocommitIsRejectedWithoutLosingTheCommittedRowAfterReopen()
+    public void StaleFileCatalogAutocommitRefreshesAndPreservesTheCommittedRowAfterReopen()
     {
         var path = CreateDatabasePath();
         try
@@ -22,16 +22,21 @@ public sealed class EmbeddedCatalogConflictAndIndexCollationTests
             {
                 Execute(first, "INSERT INTO entries VALUES ('first');");
 
-                Action staleWrite = () => Execute(stale, "INSERT INTO entries VALUES ('stale');");
-                staleWrite.Should().Throw<EmbeddedSqlException>()
-                    .WithMessage("*managed file catalog changed*");
+                // Native SQLite keeps no persistent autocommit snapshot: once the peer
+                // has committed (releasing the write lock), a fresh autocommit write
+                // reads the latest committed view and succeeds. The managed engine
+                // refreshes the stale catalog at statement start to match. (Verified
+                // against Microsoft.Data.Sqlite/e_sqlite3: the write succeeds and both
+                // rows persist.) Contrast with the explicit-transaction case below,
+                // which keeps its open snapshot and is rejected at commit.
+                Execute(stale, "INSERT INTO entries VALUES ('stale');");
             }
 
             using var reopenedDatabase = EmbeddedDatabase.OpenFile(path);
             using var reopened = reopenedDatabase.Connect();
             QueryText(reopened, "SELECT value FROM entries ORDER BY value;")
                 .Should()
-                .Equal("first");
+                .Equal("first", "stale");
         }
         finally
         {
@@ -61,8 +66,8 @@ public sealed class EmbeddedCatalogConflictAndIndexCollationTests
                 Execute(stale, "INSERT INTO entries VALUES ('stale');");
 
                 Action staleCommit = () => Execute(stale, "COMMIT;");
-                staleCommit.Should().Throw<EmbeddedSqlException>()
-                    .WithMessage("*managed file catalog changed*");
+                staleCommit.Should().Throw<EmbeddedBusyException>()
+                    .WithMessage("database is locked");
                 Execute(stale, "ROLLBACK;");
             }
 

@@ -76,9 +76,12 @@ Additional current behavior:
 - The carrier handle is retained while any range is held and closed once the last
   range is released, because closing a descriptor would drop process-owned POSIX
   record locks.
-- Reader carriers open with `FileMode.Open`. A missing `-shm` therefore fails with
-  `InvalidOperationException` instead of being created, so a read-only open never
-  mutates storage. Writer and checkpoint carriers use `FileMode.OpenOrCreate`.
+- Reader carriers requested by a read-only pager open with `FileMode.Open`. A
+  missing `-shm` therefore fails with `InvalidOperationException` instead of being
+  created, so a read-only open never mutates storage. Writer and checkpoint
+  carriers use `FileMode.OpenOrCreate`, and so does a reader lock taken by a
+  read-write pager: like a native read-write connection, such a pager recreates
+  the carrier on demand after a stock SQLite client removed it on clean close.
 - Byte-range locking is enabled on Windows and Linux only; anything else throws
   `PlatformNotSupportedException` rather than falling back to process-local locks.
 - Contention is polled every 10 ms until the pager busy timeout expires and is
@@ -511,6 +514,7 @@ the Stage 0 boundary:
 | `ManagedRolesNeverClaimSqliteCheckpointLockByteAlone` | §1.3 — byte 121 is unused by managed roles |
 | `ManagedRolesStayInsideSqliteReservedSharedMemoryLockArea` | §1.2 — no locks outside bytes 120–127 |
 | `ManagedReadOnlyOpenRefusesToCreateAMissingSharedMemoryLockCarrier` | §1.2, §3 — read-only opens never create `-shm` |
+| `PooledReopenSurvivesSharedMemoryCarrierRemovedByNativeClose` (`ManagedConnectionPoolingTests.cs`) | §1.2 — a read-write pager recreates a missing carrier on demand like a native read-write connection, and the pooling catalog refresh tolerates its absence |
 
 `bindings/dotnet/src/Turso.Tests/ForeignReadOnlyOpenTests.cs` pins the §1.9
 foreign read-only boundary against `Microsoft.Data.Sqlite` as the owner:

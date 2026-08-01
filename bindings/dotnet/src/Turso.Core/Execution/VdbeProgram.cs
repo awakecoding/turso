@@ -1422,7 +1422,9 @@ public sealed record FilterRegistersInstruction(
 /// <summary>
 /// Projects a GROUP BY key from <paramref name="Row"/>, finds or creates its
 /// first-seen group in <paramref name="GroupSetIndex"/>, and writes that stable
-/// zero-based group id to <paramref name="Destination"/>.
+/// zero-based group id to <paramref name="Destination"/>. When
+/// <paramref name="KeyOutput"/> is set, the projected key itself is also written
+/// to that register range (whose width must equal <paramref name="KeyCount"/>).
 /// </summary>
 public sealed record GroupKeyInstruction(
     RegisterRange Row,
@@ -1431,7 +1433,8 @@ public sealed record GroupKeyInstruction(
     VdbeGroupKeyProjector Projector,
     VdbeGroupComparer Equality,
     int GroupSetIndex,
-    VdbeGroupHasher? Hasher = null) : VdbeInstruction
+    VdbeGroupHasher? Hasher = null,
+    RegisterRange? KeyOutput = null) : VdbeInstruction
 {
     public override VdbeOpcode Opcode => VdbeOpcode.GroupKey;
 }
@@ -2306,6 +2309,16 @@ public sealed class VdbeProgram
                     {
                         throw new VdbeProgramValidationException(
                             $"VDBE instruction {instructionIndex} projects a GROUP BY key with a null equality.");
+                    }
+
+                    if (groupKey.KeyOutput is { } keyOutput)
+                    {
+                        ValidateRegisterRange(keyOutput, instructionIndex);
+                        if (keyOutput.Count != groupKey.KeyCount)
+                        {
+                            throw new VdbeProgramValidationException(
+                                $"VDBE instruction {instructionIndex} writes a GROUP BY key of width {groupKey.KeyCount} to a register range of width {keyOutput.Count}.");
+                        }
                     }
 
                     ValidateDistinctSet(groupKey.GroupSetIndex, instructionIndex);

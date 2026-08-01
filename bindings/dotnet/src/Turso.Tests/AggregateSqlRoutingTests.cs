@@ -78,7 +78,7 @@ public class AggregateSqlRoutingTests
     }
 
     [Test]
-    public void GroupByProducesFirstSeenGroupsWithMultipleAggregates()
+    public void GroupByEmitsGroupsInAscendingKeyOrderWithMultipleAggregates()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
@@ -87,8 +87,36 @@ public class AggregateSqlRoutingTests
         var rows = ReadRows(connection, "SELECT k, count(*), sum(v) FROM t GROUP BY k;");
 
         rows.Should().HaveCount(2);
-        rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2), SqlValue.Integer(25));
-        rows[1].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2), SqlValue.Integer(17));
+        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2), SqlValue.Integer(17));
+        rows[1].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2), SqlValue.Integer(25));
+    }
+
+    [Test]
+    public void GroupByWithoutOrderByEmitsGroupsInSortedKeyOrder()
+    {
+        // SQLite aggregates through a sorter, so grouped queries without ORDER BY observe
+        // groups in ascending key order (NULLs first, per-key collation). Queries relying on
+        // this de-facto order (e.g. LIMIT over a grouped subquery) must match natively.
+        string[] setup =
+        [
+            "CREATE TABLE t(k TEXT COLLATE NOCASE, v INTEGER);",
+            "INSERT INTO t VALUES ('banana', 1), ('Apple', 2), (NULL, 3), ('cherry', 4), ('apple', 5), ('banana', 6);",
+        ];
+
+        AssertMatchesSqlite(setup, "SELECT k, count(*), sum(v) FROM t GROUP BY k;");
+        AssertMatchesSqlite(setup, "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 1;");
+        AssertMatchesSqlite(setup, "SELECT k FROM t GROUP BY k LIMIT 2;");
+        AssertMatchesSqlite(
+            setup,
+            "SELECT (SELECT max(v) FROM t i WHERE i.k IS o.k) FROM t o GROUP BY o.k LIMIT 1;");
+
+        string[] multiKeySetup =
+        [
+            "CREATE TABLE m(a INTEGER, b TEXT, v REAL);",
+            "INSERT INTO m VALUES (2, 'x', 1.5), (1, 'y', 2.5), (2, 'w', 3.5), (1, 'x', 4.5), (2, 'x', 5.5);",
+        ];
+        AssertMatchesSqlite(multiKeySetup, "SELECT a, b, count(*), sum(v) FROM m GROUP BY a, b;");
+        AssertMatchesSqlite(multiKeySetup, "SELECT a, b FROM m GROUP BY a, b LIMIT 3;");
     }
 
     [Test]
@@ -115,8 +143,8 @@ public class AggregateSqlRoutingTests
         var rows = ReadRows(connection, "SELECT k, count(*) FROM t GROUP BY k;");
 
         rows.Should().HaveCount(3);
-        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
-        rows[1].Should().Equal(SqlValue.Null, SqlValue.Integer(2));
+        rows[0].Should().Equal(SqlValue.Null, SqlValue.Integer(2));
+        rows[1].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
         rows[2].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(1));
     }
 
@@ -320,7 +348,7 @@ public class AggregateSqlRoutingTests
         statement.GetColumnName(2).Should().Be("total");
         var initialRows = DrainRows(statement);
         initialRows.Should().ContainSingle();
-        initialRows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2), SqlValue.Integer(17));
+        initialRows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2), SqlValue.Integer(25));
 
         statement.Reset();
         statement.Bind(1, SqlValue.Integer(1));
@@ -328,8 +356,8 @@ public class AggregateSqlRoutingTests
         statement.Bind(3, SqlValue.Integer(0));
         var reboundRows = DrainRows(statement);
         reboundRows.Should().HaveCount(3);
-        reboundRows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2), SqlValue.Integer(25));
-        reboundRows[1].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2), SqlValue.Integer(17));
+        reboundRows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2), SqlValue.Integer(17));
+        reboundRows[1].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2), SqlValue.Integer(25));
         reboundRows[2].Should().Equal(SqlValue.Integer(3), SqlValue.Integer(1), SqlValue.Integer(9));
 
         using var initialExplain = connection.Prepare("EXPLAIN " + sql);
@@ -450,7 +478,7 @@ public class AggregateSqlRoutingTests
         Execute(connection, "INSERT INTO t VALUES (2), (1), (2), (1);");
 
         ReadRows(connection, "SELECT k FROM t GROUP BY k;")
-            .Select(row => row[0]).Should().Equal(SqlValue.Integer(2), SqlValue.Integer(1));
+            .Select(row => row[0]).Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
 
         Opcodes(ReadRows(connection, "EXPLAIN SELECT k FROM t GROUP BY k;"))
             .Should().Contain("GroupKey").And.Contain("AggStep").And.Contain("AggFinalize");
@@ -623,7 +651,7 @@ public class AggregateSqlRoutingTests
     }
 
     [Test]
-    public void TiedGroupedOrderingMatchesEvaluatorFirstSeenOrder()
+    public void TiedGroupedOrderingMatchesEvaluatorSortedKeyOrder()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(k INTEGER);");
@@ -644,7 +672,7 @@ public class AggregateSqlRoutingTests
         for (var index = 0; index < compiledRows.Count; index++)
             compiledRows[index].Should().Equal(fallbackRows[index]);
         compiledRows.Select(row => row[0].AsInteger())
-            .Should().Equal(Enumerable.Range(1, 20).Reverse().Select(value => (long)value));
+            .Should().Equal(Enumerable.Range(1, 20).Select(value => (long)value));
     }
 
     [Test]
@@ -662,8 +690,8 @@ public class AggregateSqlRoutingTests
         var rows = ReadRows(connection, query);
 
         rows.Should().HaveCount(4);
-        rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2));
-        rows[1].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
+        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(1));
+        rows[1].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2));
         rows[2].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
         rows[3].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2));
         Opcodes(ReadRows(connection, "EXPLAIN " + query))

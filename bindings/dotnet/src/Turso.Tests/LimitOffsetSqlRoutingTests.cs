@@ -271,7 +271,7 @@ public class LimitOffsetSqlRoutingTests
     }
 
     [Test]
-    public void GroupedAggregateLimitRoutesAndKeepsFirstSeenGroups()
+    public void GroupedAggregateLimitRoutesAndKeepsSortedKeyGroups()
     {
         using var connection = new EmbeddedDatabase().Connect();
         Execute(connection, "CREATE TABLE t(k INTEGER, v INTEGER);");
@@ -279,7 +279,7 @@ public class LimitOffsetSqlRoutingTests
 
         var rows = ReadRows(connection, "SELECT k, count(*) FROM t GROUP BY k LIMIT 1;");
         rows.Should().ContainSingle();
-        rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2));
+        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
 
         Opcodes(ReadRows(connection, "EXPLAIN SELECT k, count(*) FROM t GROUP BY k LIMIT 1;"))
             .Should().Contain("SameGroup").And.Contain("AggStep").And.Contain("LimitGate");
@@ -294,7 +294,7 @@ public class LimitOffsetSqlRoutingTests
 
         var rows = ReadRows(connection, "SELECT k, count(*) FROM t GROUP BY k LIMIT 1 OFFSET 1;");
         rows.Should().ContainSingle();
-        rows[0].Should().Equal(SqlValue.Integer(1), SqlValue.Integer(2));
+        rows[0].Should().Equal(SqlValue.Integer(2), SqlValue.Integer(2));
 
         Opcodes(ReadRows(connection, "EXPLAIN SELECT k, count(*) FROM t GROUP BY k LIMIT 1 OFFSET 1;"))
             .Should().Contain("OffsetGate").And.Contain("LimitGate");

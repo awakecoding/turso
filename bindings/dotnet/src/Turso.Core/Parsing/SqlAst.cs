@@ -732,7 +732,8 @@ internal sealed record FunctionExpression(
     bool CountStar,
     bool Distinct = false,
     Expression? Filter = null,
-    WindowSpecification? Window = null) : Expression;
+    WindowSpecification? Window = null,
+    IReadOnlyList<OrderByTerm>? AggregateOrderBy = null) : Expression;
 
 internal sealed record ScalarSubqueryExpression(QueryStatement Query) : Expression;
 

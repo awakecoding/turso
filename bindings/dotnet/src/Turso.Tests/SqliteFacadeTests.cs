@@ -91,6 +91,29 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void PreCanceledTokenThrowsExactOperationCanceledExceptionOnReaderPathLikeMicrosoftDataSqlite()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1;";
+        var canceled = new CancellationToken(canceled: true);
+
+        // Microsoft.Data.Sqlite parity (EF Core's async query contract): the reader-execution
+        // path throws EXACT OperationCanceledException for a pre-canceled token, not the
+        // derived TaskCanceledException. Assert.ThrowsAsync is exact-type, so a
+        // TaskCanceledException here would fail.
+        Assert.ThrowsAsync<OperationCanceledException>(() => command.ExecuteReaderAsync(canceled));
+
+        // The non-reader paths keep base DbCommand parity: exact TaskCanceledException.
+        Assert.ThrowsAsync<TaskCanceledException>(async () => await command.ExecuteNonQueryAsync(canceled));
+        Assert.ThrowsAsync<TaskCanceledException>(async () => await command.ExecuteScalarAsync(canceled));
+
+        // The command remains usable after the canceled call.
+        command.ExecuteScalar().Should().Be(1L);
+    }
+
+    [Test]
     public void SchemaCollectionsReportTablesAndColumns()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -213,6 +236,30 @@ public class SqliteFacadeTests
         connection.Open();
 
         connection.DataSource.Should().Be(path);
+    }
+
+    [Test]
+    public void InMemoryConnectionReportsEmptyDataSourceWhenOpen()
+    {
+        // Native SQLite's sqlite3_db_filename returns "" for in-memory databases, and
+        // Microsoft.Data.Sqlite exposes that empty string via DataSource. EFCore's
+        // SqliteDatabaseCreator.Delete uses !string.IsNullOrEmpty(path) to decide whether
+        // to File.Delete, so an in-memory connection must report "" (not ":memory:")
+        // once open to avoid an IOException on File.Delete(":memory:").
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.DataSource.Should().Be(":memory:", "before open the raw option is returned");
+
+        connection.Open();
+        connection.DataSource.Should().BeEmpty("after open native parity returns empty for in-memory");
+    }
+
+    [Test]
+    public void InMemoryConnectionReportsEmptyDataSourceWhenOpenWithEmptyDataSource()
+    {
+        using var connection = new SqliteConnection();
+        connection.Open();
+
+        connection.DataSource.Should().BeEmpty("after open native parity returns empty for in-memory");
     }
 
     [Test]
@@ -599,6 +646,129 @@ public class SqliteFacadeTests
         using var reader = connection.ExecuteReader("SELECT test();");
         reader.Read().Should().BeTrue();
         reader.GetDecimal(0).Should().Be(expected);
+    }
+
+    [Test]
+    public void GetDecimalOnRealRoundsToSqliteTextPrecision()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value REAL);");
+        connection.ExecuteNonQuery("INSERT INTO Data VALUES (9.8), (34.8), (11.2);");
+
+        using var reader = connection.ExecuteReader("SELECT Value FROM Data ORDER BY rowid;");
+        var values = new List<decimal>();
+        while (reader.Read())
+        {
+            values.Add(reader.GetDecimal(0));
+        }
+
+        // GetDecimal must match SQLite's own REAL-to-decimal text conversion (15 significant
+        // digits) rather than the exact binary expansion produced by Convert.ToDecimal on
+        // .NET 11+, which changed double-to-decimal conversion semantics.
+        values.Should().Equal(9.8m, 34.8m, 11.2m);
+    }
+
+    [Test]
+    public void GetCharCoercesTextLikeMicrosoftDataSqlite()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        using var reader = connection.ExecuteReader(
+            "SELECT substr('', 1, 1), substr('Bar', 3, 1), 67, 68.9, '65', 'ab', '  66x';");
+        reader.Read().Should().BeTrue();
+
+        // MDS parity: length-1 TEXT returns the character; anything else coerces through
+        // sqlite3_column_int64's CAST-style prefix parse ('' or 'ab' -> 0, '65' -> 'A'),
+        // and REAL truncates. EF's char materializer (substr of FirstOrDefault) hits this
+        // path whenever a TEXT value is not exactly one character long.
+        reader.GetChar(0).Should().Be('\0');
+        reader.GetChar(1).Should().Be('r');
+        reader.GetChar(2).Should().Be('C');
+        reader.GetChar(3).Should().Be('D');
+        reader.GetChar(4).Should().Be('A');
+        reader.GetChar(5).Should().Be('\0');
+        reader.GetChar(6).Should().Be('B');
+
+        reader.GetFieldValue<char>(0).Should().Be('\0');
+        reader.GetFieldValue<char>(1).Should().Be('r');
+        reader.GetFieldValue<char?>(0).Should().Be('\0');
+    }
+
+    [Test]
+    public void GetCharOutOfRangeThrowsLikeMicrosoftDataSqlite()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        using var reader = connection.ExecuteReader("SELECT '70000', '-1';");
+        reader.Read().Should().BeTrue();
+
+        // MDS uses checked((char)GetInt64), so values outside [0, 65535] overflow.
+        reader.Invoking(r => r.GetChar(0)).Should().Throw<OverflowException>();
+        reader.Invoking(r => r.GetChar(1)).Should().Throw<OverflowException>();
+    }
+
+    [Test]
+    public void ManagedConnectionDefaultsForeignKeysOnLikeESqlite3()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
+        connection.Open();
+        connection.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(1);
+
+        connection.ExecuteNonQuery("CREATE TABLE Parent(Id INTEGER PRIMARY KEY);");
+        connection.ExecuteNonQuery("CREATE TABLE Child(ParentId INTEGER REFERENCES Parent(Id) ON DELETE CASCADE);");
+        connection.ExecuteNonQuery("INSERT INTO Parent VALUES (1); INSERT INTO Child VALUES (1);");
+        connection.ExecuteNonQuery("DELETE FROM Parent WHERE Id = 1;");
+
+        connection.ExecuteScalar<long>("SELECT COUNT(*) FROM Child;").Should().Be(0);
+    }
+
+    [Test]
+    public void ManagedConnectionHonorsForeignKeysFalseOptOut()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:;Local Provider=Managed;Foreign Keys=False");
+        connection.Open();
+        connection.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(0);
+    }
+
+    [Test]
+    public void GetFieldValueOfObjectOnNullReturnsDBNullValue()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER);");
+        connection.ExecuteNonQuery("INSERT INTO Data VALUES (NULL);");
+
+        using var reader = connection.ExecuteReader("SELECT Value FROM Data;");
+        reader.Read().Should().BeTrue();
+        reader.GetFieldValue<object>(0).Should().Be(DBNull.Value);
+        reader.Invoking(r => r.GetFieldValue<long>(0))
+            .Should().Throw<InvalidOperationException>();
+    }
+
+    [Test]
+    public void UlongParameterAboveInt64MaxBindsUncheckedLikeMicrosoftDataSqlite()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER);");
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "INSERT INTO Data VALUES ($value);";
+            var parameter = command.CreateParameter();
+            parameter.ParameterName = "$value";
+            parameter.Value = 10000000000000000001UL;
+            command.Parameters.Add(parameter);
+            command.ExecuteNonQuery();
+        }
+
+        using var reader = connection.ExecuteReader("SELECT Value FROM Data;");
+        reader.Read().Should().BeTrue();
+        var stored = reader.GetInt64(0);
+        unchecked((ulong)stored).Should().Be(10000000000000000001UL);
+        reader.GetFieldValue<ulong>(0).Should().Be(10000000000000000001UL);
     }
 
     [Test]

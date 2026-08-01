@@ -130,6 +130,28 @@ public sealed class ManagedScalarFunctionParityTests
         ReadValue(connection, "SELECT total_changes();").Should().Be(SqlValue.Integer(6));
     }
 
+    // Explicit-transaction statements run against a working catalog clone through a
+    // separate Execute overload; the counters must still track those in-transaction
+    // writes (EF Core's no-RETURNING backfill relies on changes() inside its implicit
+    // transaction).
+    [Test]
+    public void ManagedEngineTracksChangesInsideExplicitTransactions()
+    {
+        using var database = new EmbeddedDatabase();
+        using var connection = database.Connect();
+
+        Execute(connection, "CREATE TABLE t(a);");
+        Execute(connection, "BEGIN;");
+        Execute(connection, "INSERT INTO t VALUES (1), (2);");
+        ReadValue(connection, "SELECT changes();").Should().Be(SqlValue.Integer(2));
+        ReadValue(connection, "SELECT total_changes();").Should().Be(SqlValue.Integer(2));
+        Execute(connection, "UPDATE t SET a = a + 10 WHERE a = 1;");
+        ReadValue(connection, "SELECT changes();").Should().Be(SqlValue.Integer(1));
+        ReadValue(connection, "SELECT total_changes();").Should().Be(SqlValue.Integer(3));
+        Execute(connection, "COMMIT;");
+        ReadValue(connection, "SELECT changes();").Should().Be(SqlValue.Integer(1));
+    }
+
     // A SELECT must not clear the counters that a preceding DML statement set.
     [Test]
     public void ManagedEngineLeavesChangeCountersUntouchedByNonMutatingStatements()

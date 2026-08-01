@@ -24,7 +24,6 @@ public static class Resources
 
     public static string ManagedExtensionsNotSupported => "SQLite extension loading is not supported when Local Provider=Managed because extensions require the native SQLite loader.";
 
-    public static string ManagedSharedCacheNotSupported => ManagedSharedCacheContract.UnsupportedConfigurationMessage;
 
     public static string ManagedSharedCacheReadUncommittedNotSupported => ManagedSharedCacheContract.ReadUncommittedNotSupportedMessage;
 

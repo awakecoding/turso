@@ -61,7 +61,16 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     public override string Database => "main";
 
-    public override string DataSource => _dataSource ?? _connectionOptions.DataSource;
+    public override string DataSource => _dataSource switch
+    {
+        // Native SQLite's sqlite3_db_filename returns "" for in-memory databases;
+        // Microsoft.Data.Sqlite exposes that empty string via DataSource. EFCore's
+        // SqliteDatabaseCreator.Delete branches on !string.IsNullOrEmpty(path) and
+        // would otherwise try File.Delete(":memory:"), so match the contract.
+        ":memory:" => string.Empty,
+        null => _connectionOptions.DataSource,
+        var path => path,
+    };
 
     public int DefaultTimeout
     {
@@ -94,7 +103,12 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
         }
     }
 
-    public override string ServerVersion => "3.0.0";
+    /// <summary>
+    /// The SQLite version this engine is wire- and SQL-compatible with. Mirrors what
+    /// <c>sqlite_version()</c> returns, so callers that feature-gate on the server
+    /// version (e.g. EFCore) see the real compatibility level rather than a stub.
+    /// </summary>
+    public override string ServerVersion => Turso.Core.EmbeddedDatabase.SqliteCompatibilityVersion;
 
     public override ConnectionState State => _database is null && _managedDatabase is null
         ? ConnectionState.Closed
@@ -636,8 +650,14 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
     private void ApplyConnectionOptions()
     {
+        // The e_sqlite3 build Microsoft.Data.Sqlite ships is compiled with
+        // SQLITE_DEFAULT_FOREIGN_KEYS=1, so managed connections default to enforcing
+        // foreign keys unless the connection string says otherwise. The managed engine
+        // itself keeps the SQLite CLI default (OFF).
         if (_connectionOptions.ForeignKeys.HasValue)
             ExecuteNonQuery("PRAGMA foreign_keys = " + (_connectionOptions.ForeignKeys.Value ? "1" : "0") + ";");
+        else if (IsManagedConnection)
+            ExecuteNonQuery("PRAGMA foreign_keys = 1;");
         if (_connectionOptions.RecursiveTriggers)
             _recursiveTriggers = true;
     }
@@ -884,14 +904,6 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
            && options.Cache == SqliteCacheMode.Shared
            && !string.IsNullOrWhiteSpace(options.DataSource);
 
-    // Anonymous in-memory databases stay connection-private under shared-cache mode:
-    // Microsoft.Data.Sqlite only promotes them to a named shared cache when Mode=Memory
-    // routes the open through the shared-cache URI form.
-    private static bool IsAnonymousMemorySharedCacheConfiguration(SqliteConnectionStringBuilder options)
-        => options.DataSource.Length == 0
-           || (options.Mode != SqliteOpenMode.Memory
-               && options.DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase));
-
     private static bool IsNativeSharedMemory(SqliteConnectionStringBuilder options)
         => options.EffectiveLocalProvider != TursoLocalProvider.Managed
            && options.Mode == SqliteOpenMode.Memory
@@ -908,8 +920,11 @@ public partial class SqliteConnection : DbConnection, ILocalReaderConnection
 
         if (!IsManagedSharedMemoryConfiguration(_connectionOptions))
         {
-            if (!IsAnonymousMemorySharedCacheConfiguration(_connectionOptions))
-                throw new NotSupportedException(Properties.Resources.ManagedSharedCacheNotSupported);
+            // Anonymous in-memory databases stay connection-private, and file-backed
+            // Cache=Shared opens as an ordinary private file connection: the managed
+            // engine cannot emulate SQLite shared-cache semantics for file databases,
+            // so it deliberately provides stronger isolation instead of rejecting the
+            // keyword outright (matches TursoConnectionOptions.GetManagedLocalOpenOptions).
             return;
         }
 

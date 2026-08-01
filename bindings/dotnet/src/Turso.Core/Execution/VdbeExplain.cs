@@ -188,7 +188,8 @@ public static class VdbeExplain
                 groupKey.Destination.Index,
                 groupKey.KeyCount,
                 $"group-set[{groupKey.GroupSetIndex}]",
-                $"r[{groupKey.Destination.Index}]=group key {FormatRange(groupKey.Row)} in set {groupKey.GroupSetIndex}"),
+                $"r[{groupKey.Destination.Index}]=group key {FormatRange(groupKey.Row)} in set {groupKey.GroupSetIndex}"
+                    + (groupKey.KeyOutput is { } keyOutput ? $", key to {FormatRange(keyOutput)}" : string.Empty)),
             ProjectRegistersInstruction project => (
                 project.Input.Start.Index,
                 project.Output.Start.Index,

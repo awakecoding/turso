@@ -522,6 +522,11 @@ public sealed class ResumableStatement : IDisposable
                         }
 
                         _registers[groupKey.Destination.Index] = SqlValue.Integer(groupIndex);
+                        if (groupKey.KeyOutput is { } keyOutput)
+                        {
+                            Array.Copy(key, 0, _registers, keyOutput.Start.Index, key.Length);
+                        }
+
                         AdvanceInstructionPointer();
                         break;
                     }

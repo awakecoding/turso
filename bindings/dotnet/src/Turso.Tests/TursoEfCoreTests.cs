@@ -276,6 +276,12 @@ public class TursoEfCoreTests
 
         (await context.Customers.CountAsync(customer => customer.Name == "Helen")).Should().Be(0);
 
+        // Managed connections enforce foreign keys (e_sqlite3 parity), so dependent orders
+        // must be deleted before their customers.
+        await context.Orders
+            .Where(order => !order.Customer.IsActive)
+            .ExecuteDeleteAsync();
+
         var deleted = await context.Customers
             .Where(customer => !customer.IsActive)
             .ExecuteDeleteAsync();
