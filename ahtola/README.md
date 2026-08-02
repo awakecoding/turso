@@ -155,6 +155,8 @@ ahtola/
 ├── docs/                                 # WAL interop contract (Turso target)
 ├── scripts/                              # test + package closure validators
 ├── build.ps1                             # restore / build / test / pack
+├── NuGet.config
+├── LICENSE
 └── Ahtola.slnx
 ```
 
