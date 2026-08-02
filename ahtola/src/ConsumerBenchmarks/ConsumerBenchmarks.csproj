@@ -12,7 +12,11 @@
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" Version="0.15.4" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.9" />
-    <PackageReference Include="Turso.Data.Sqlite" Version="0.8.0-pre.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" />
+    <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
   </ItemGroup>
 
 </Project>

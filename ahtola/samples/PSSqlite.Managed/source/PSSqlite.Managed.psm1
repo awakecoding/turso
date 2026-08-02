@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-    Demo functions wiring PowerShell to the fully managed Turso.Data.Sqlite provider.
+    Demo functions wiring PowerShell to the fully managed Devolutions.Ahtola.Data.Sqlite provider (Turso.Data.Sqlite types).
 
 .DESCRIPTION
     This module never touches the native e_sqlite3/SQLitePCLRaw binaries. Every
@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS sample_metadata (
         try {
             $insertCommand.CommandText = 'INSERT INTO sample_metadata (key, value) VALUES (@key, @value);'
             [void]$insertCommand.Parameters.AddWithValue('@key', 'provider')
-            [void]$insertCommand.Parameters.AddWithValue('@value', 'Turso.Data.Sqlite (Managed)')
+            [void]$insertCommand.Parameters.AddWithValue('@value', 'Ahtola.Data.Sqlite (Managed)')
             [void]$insertCommand.ExecuteNonQuery()
         }
         finally {

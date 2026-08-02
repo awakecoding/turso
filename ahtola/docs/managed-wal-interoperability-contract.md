@@ -14,10 +14,10 @@ relaxing a guard ahead of the stage that replaces it.
 
 Source of truth:
 
-- `bindings/dotnet/src/Turso.Core/Storage/SqliteManagedFileOwnership.cs`
-- `bindings/dotnet/src/Turso.Core/Storage/SqliteWalSharedMemoryLocks.cs`
-- `bindings/dotnet/src/Turso.Core/Storage/SqlitePagerLockManager.cs`
-- `bindings/dotnet/src/Turso.Core/Storage/SqlitePager.cs`
+- `src/Turso.Core/Storage/SqliteManagedFileOwnership.cs`
+- `src/Turso.Core/Storage/SqliteWalSharedMemoryLocks.cs`
+- `src/Turso.Core/Storage/SqlitePagerLockManager.cs`
+- `src/Turso.Core/Storage/SqlitePager.cs`
 
 ## 1. The current contract
 
@@ -500,7 +500,7 @@ lock must remain and must keep failing closed.
 
 ## 4. Characterization coverage
 
-`bindings/dotnet/src/Turso.Tests/SqliteWalInteroperabilityContractTests.cs` pins
+`src/Turso.Tests/SqliteWalInteroperabilityContractTests.cs` pins
 the Stage 0 boundary:
 
 | Test | Contract clause |
@@ -516,7 +516,7 @@ the Stage 0 boundary:
 | `ManagedReadOnlyOpenRefusesToCreateAMissingSharedMemoryLockCarrier` | §1.2, §3 — read-only opens never create `-shm` |
 | `PooledReopenSurvivesSharedMemoryCarrierRemovedByNativeClose` (`ManagedConnectionPoolingTests.cs`) | §1.2 — a read-write pager recreates a missing carrier on demand like a native read-write connection, and the pooling catalog refresh tolerates its absence |
 
-`bindings/dotnet/src/Turso.Tests/ForeignReadOnlyOpenTests.cs` pins the §1.9
+`src/Turso.Tests/ForeignReadOnlyOpenTests.cs` pins the §1.9
 foreign read-only boundary against `Microsoft.Data.Sqlite` as the owner:
 
 | Test | Contract clause |

@@ -1,5 +1,5 @@
 <Project>
-  <Target Name="SetTursoAssemblyTitle" BeforeTargets="GetAssemblyAttributes">
+  <Target Name="SetAhtolaAssemblyTitle" BeforeTargets="GetAssemblyAttributes">
     <PropertyGroup>
       <AssemblyTitle Condition="'$(Title)' != ''">$(Title)</AssemblyTitle>
     </PropertyGroup>

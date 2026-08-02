@@ -34,7 +34,7 @@ already-known-and-accepted write-path gap.
 
 Each shape runs against both:
 
-- **Turso managed** — `Turso.Data.Sqlite` with `Local Provider=Managed`
+- **Ahtola managed** — `Devolutions.Ahtola.Data.Sqlite` with `Local Provider=Managed`
   (the pure C# engine).
 - **Microsoft.Data.Sqlite** — the baseline oracle, using the native
   `Microsoft.Data.Sqlite` package.
@@ -105,17 +105,17 @@ Environment used for baseline (fill in):
 - Machine: _TBD_
 - OS: _TBD_
 - .NET SDK: _TBD_
-- `Turso.Data.Sqlite` version: `0.8.0-pre.2`
+- `Devolutions.Ahtola.Data.Sqlite` version: `0.8.0-pre.2`
 - Date: _TBD_
 
 ## Notes on project setup
 
 - Targets `net8.0` with `BenchmarkDotNet` (matching the existing
   `Benchmarks` project's BenchmarkDotNet version).
-- `Turso.Data.Sqlite` is restored from the local feed configured in this
+- `Devolutions.Ahtola.Data.Sqlite` is restored from the local feed configured in this
   folder's `nuget.config` (`../../artifacts/nupkg`), pinned to
   `0.8.0-pre.2`. Rebuild the package (`dotnet pack` for
-  `Turso.Data.Sqlite`) before bumping this version.
+  `Devolutions.Ahtola.Data.Sqlite`) before bumping this version.
 - `Microsoft.Data.Sqlite` is restored from nuget.org as the baseline oracle.
 - This project is intentionally separate from the existing `Benchmarks`
   project (which benchmarks the native engine via a `ProjectReference` and

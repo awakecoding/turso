@@ -66,10 +66,10 @@ validate-managed-package: validate-managed-project-closure
 		rm -rf ./samples/ManagedPackageConsumer/bin ./samples/ManagedPackageConsumer/obj "$$consumer_output"; \
 		mkdir -p ./samples/ManagedPackageConsumer/obj; \
 		printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<configuration>' '  <packageSources>' '    <clear />' '    <add key="managed-package" value="$(MANAGED_PACKAGE_OUTPUT_ABSOLUTE)" />' '    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />' '  </packageSources>' '</configuration>' > "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)"; \
-		dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --configfile "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=$$target_framework; \
-		dotnet build --no-restore --framework $$target_framework ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=$$target_framework; \
-		dotnet run --no-build --no-restore --framework $$target_framework --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=$$target_framework; \
-		dotnet publish --configuration Debug --no-build --no-restore --framework $$target_framework --output "$$consumer_output" ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:TursoPackageVersion=0.0.0-managed-local -p:TursoConsumerTargetFramework=$$target_framework; \
+		dotnet restore ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj --configfile "$(MANAGED_PACKAGE_CONSUMER_NUGET_CONFIG)" --packages "$(MANAGED_PACKAGE_OUTPUT)/.nuget-packages" -p:AhtolaPackageVersion=0.0.0-managed-local -p:AhtolaConsumerTargetFramework=$$target_framework; \
+		dotnet build --no-restore --framework $$target_framework ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:AhtolaPackageVersion=0.0.0-managed-local -p:AhtolaConsumerTargetFramework=$$target_framework; \
+		dotnet run --no-build --no-restore --framework $$target_framework --project ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:AhtolaPackageVersion=0.0.0-managed-local -p:AhtolaConsumerTargetFramework=$$target_framework; \
+		dotnet publish --configuration Debug --no-build --no-restore --framework $$target_framework --output "$$consumer_output" ./samples/ManagedPackageConsumer/ManagedPackageConsumer.csproj -p:AhtolaPackageVersion=0.0.0-managed-local -p:AhtolaConsumerTargetFramework=$$target_framework; \
 		$(MANAGED_CLOSURE_VALIDATOR) -ProjectAssetsFile ./samples/ManagedPackageConsumer/obj/project.assets.json -PublishOutput "$$consumer_output"; \
 	done
 

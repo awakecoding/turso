@@ -2,14 +2,15 @@
 
 <#
 .SYNOPSIS
-    Builds PSSqlite.Managed and vendors the managed Turso assemblies used by the module.
+    Builds PSSqlite.Managed and vendors the managed Ahtola assemblies used by the module.
 
 .DESCRIPTION
     Runs `dotnet build` against PSSqlite.Managed.csproj. The csproj restores
-    Turso.Data.Sqlite from the local NuGet feed configured in nuget.config
-    (bindings/dotnet/artifacts/nupkg) and copies the three managed assemblies
-    (Turso.Core.dll, Turso.Data.dll, Turso.Data.Sqlite.dll) into
-    source/lib/net8.0 via an MSBuild target that runs after Build.
+    Devolutions.Ahtola.Data.Sqlite from the local NuGet feed configured in nuget.config
+    (ahtola/artifacts/nupkg) and copies the three managed assemblies
+    (Turso.Core.dll, Turso.Data.dll, Turso.Data.Sqlite.dll — assembly names remain
+    Turso.* until the rename phase) into source/lib/net8.0 via an MSBuild target
+    that runs after Build.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -26,7 +27,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ''
 if (Test-Path -LiteralPath $vendorDir) {
-    Write-Host "Vendored managed Turso assemblies at: $vendorDir"
+    Write-Host "Vendored managed Ahtola assemblies at: $vendorDir"
     Get-ChildItem -LiteralPath $vendorDir -Filter '*.dll' | ForEach-Object {
         Write-Host "  $($_.Name)"
     }

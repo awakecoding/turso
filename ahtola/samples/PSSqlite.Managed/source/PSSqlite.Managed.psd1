@@ -2,10 +2,10 @@
     RootModule        = 'PSSqlite.Managed.psm1'
     ModuleVersion     = '0.1.0'
     GUID              = 'b3d2f8e0-6a4a-4f7c-9a3b-2a7e6a1d9c10'
-    Author            = 'Turso'
-    CompanyName       = 'Turso'
-    Copyright         = '(c) Turso. All rights reserved.'
-    Description       = 'Minimal PowerShell 7 module sample wiring PowerShell to the fully managed Turso.Data.Sqlite provider (no native e_sqlite3/SQLitePCLRaw binaries).'
+    Author            = 'Devolutions'
+    CompanyName       = 'Devolutions'
+    Copyright         = '(c) Devolutions. All rights reserved.'
+    Description       = 'Minimal PowerShell 7 module sample wiring PowerShell to the fully managed Devolutions.Ahtola.Data.Sqlite provider (namespaces still Turso.*; no native e_sqlite3/SQLitePCLRaw binaries).'
     PowerShellVersion = '7.0'
     CompatiblePSEditions = @('Core')
 
@@ -20,8 +20,8 @@
 
     PrivateData = @{
         PSData = @{
-            Tags       = @('Turso', 'Sqlite', 'Managed')
-            ProjectUri = 'https://github.com/tursodatabase/turso'
+            Tags       = @('Ahtola', 'Sqlite', 'Managed', 'Devolutions')
+            ProjectUri = 'https://github.com/Devolutions/ahtola'
         }
     }
 }

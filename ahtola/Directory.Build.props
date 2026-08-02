@@ -1,9 +1,9 @@
 <Project>
   <PropertyGroup>
     <Version>0.8.0-pre.22</Version>
-    <TursoTargetFrameworks>net8.0;net9.0;net10.0</TursoTargetFrameworks>
-    <TursoEntityFrameworkCoreVersion>9.0.9</TursoEntityFrameworkCoreVersion>
-    <TursoEntityFrameworkCoreVersionRange>[9.0.9,10.0.0)</TursoEntityFrameworkCoreVersionRange>
+    <AhtolaTargetFrameworks>net8.0;net9.0;net10.0</AhtolaTargetFrameworks>
+    <AhtolaEntityFrameworkCoreVersion>9.0.9</AhtolaEntityFrameworkCoreVersion>
+    <AhtolaEntityFrameworkCoreVersionRange>[9.0.9,10.0.0)</AhtolaEntityFrameworkCoreVersionRange>
     <Company>Devolutions</Company>
     <Product>Ahtola</Product>
     <Copyright>Copyright (c) 2026 Devolutions</Copyright>

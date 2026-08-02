@@ -23,6 +23,28 @@ All managed assemblies target `net8.0`, `net9.0`, and `net10.0`. .NET Framework 
 No Rust toolchain or native runtime asset is needed to restore, build, pack, or
 run any Ahtola package.
 
+## Naming (Phase 1)
+
+| Layer | Name |
+| --- | --- |
+| NuGet PackageId | `Devolutions.Ahtola.*` |
+| C# namespaces / assembly names / public types | still `Turso.*` (`TursoConnection`, `UseTurso`, …) |
+| Project folders under `src/` | still `Turso.*` |
+
+A later phase will rename namespaces, assemblies, and types to `Ahtola.*`. Until
+then, package IDs are Ahtola and source/API identifiers remain Turso-compatible.
+
+### What ships vs what remains in source
+
+- **Shipped packages** are pure managed only: Core, Data.Sqlite, EF Core Sqlite.
+- **Pure-managed remote Hrana** on `TursoConnection` (HTTP `/v2/pipeline`) remains
+  in source and is covered by tests against a canned server. No native dependency.
+- **Abstract native / replica / sync provider hooks** may still compile as extension
+  points, but **no native or Sync companion packages** are built or published from
+  this tree. Connection-string paths that require those companions fail closed.
+- OS-level P/Invoke used by the managed pager for file locks/WAL is intentional
+  engine code, not a Rust SDK binding.
+
 ## Managed engine scope
 
 The managed local engine is an independent C# SQL engine that reads and writes
@@ -128,8 +150,7 @@ wall-clock accounting that would make the reported numbers mean anything.
 `TursoDataAdapter` and `TursoCommandBuilder` support the classic `DataSet` model.
 `Fill`, `FillSchema` and `Update` round trips persist inserts, updates and deletes,
 and both `TursoConnection` and the `SqliteConnection` facade use the same adapter.
-Round trips are covered by tests on managed local connections, and on native local
-connections when the native companion is present.
+Round trips are covered by tests on managed local connections.
 
 `GetSchema` is also shared: both connection types answer from one implementation that
 reads the catalog with ordinary SQL on the owning connection. A remote or replica
@@ -362,8 +383,9 @@ that contract, so generic ADO.NET callers and the provider cannot drift.
 | Explicit `Sync` | No | No | No | Yes, with Sync companion | No | No |
 | Encryption | AES-128/256-GCM managed format | Native SDK cipher set | Local encryption options rejected | Remote encryption options; local at-rest options rejected | AES-128/256-GCM managed format | `Encryption Cipher`/`Encryption Key` rejected |
 
-`Turso.Data.Sqlite` is a local-only migration facade; remote URLs fail before they
-can be interpreted as file paths. Use `TursoConnection` for Hrana and embedded
+The `Turso.Data.Sqlite` facade (package `Devolutions.Ahtola.Data.Sqlite`) is a
+local-only migration surface; remote URLs fail before they can be interpreted as
+file paths. Use `TursoConnection` for Hrana and embedded
 replicas. `TursoConnection` rejects `Pooling=True` before provider or network
 access unless the target is an eligible unencrypted managed file; named shared
 memory requires `Pooling=False`. The SQLite facade accepts its default
@@ -388,7 +410,8 @@ connection.Open();
 
 ## Migrating from Microsoft.Data.Sqlite
 
-For common embedded SQLite usage, `Turso.Data.Sqlite` exposes a SQLite-compatible facade over the Turso engine:
+For common embedded SQLite usage, `Devolutions.Ahtola.Data.Sqlite` exposes a
+SQLite-compatible facade (namespace `Turso.Data.Sqlite`) over the managed engine:
 
 ```diff
 - using Microsoft.Data.Sqlite;
@@ -546,7 +569,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 
 ## SQLite-compatible facade coverage
 
-- `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, managed fixed-length blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
+- `Devolutions.Ahtola.Data.Sqlite` (`Turso.Data.Sqlite` namespace) is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, managed fixed-length blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
 - Managed `ATTACH` supports file-backed aliases, filename expressions and parameters, `file:` URIs with `mode=ro|rw|rwc`, inherited page encryption, same-cipher hexadecimal `KEY` overrides, same-database SELECT/DML/CTE/subquery routing, and transactions/savepoints that modify at most one persistent database. A transaction may also modify its connection-private TEMP catalog. Statements whose reads span multiple database schemas and transactions that attempt to write a second persistent database are rejected before the unsafe operation because independent WAL files cannot be committed atomically. Attached in-memory databases, URI options other than `mode`, cross-database views/triggers, and plaintext-to-encrypted `KEY` attachment without a primary cipher remain unsupported.
 - Managed pooling retains at most 32 idle physical connections per canonical file/read-only key and at most 64 keys. `:memory:`, `Mode=Memory`, shared-memory, encrypted, native, remote/replica, and connections with custom functions, aggregates, or collations are not pooled. Returning a pooled connection closes readers and blobs, rolls back transactions, invalidates prepared commands, detaches databases, destroys the TEMP catalog, and resets connection-local pragmas and row-id state. Renting it refreshes the managed catalog from durable storage before reuse.
 - File-backed managed indexes preserve explicit, `UNIQUE`, and `PRIMARY KEY` origin and term metadata, including mixed `ASC`/`DESC` order and SQLite's built-in `BINARY`, `NOCASE`, and `RTRIM` collations. Implicit constraint indexes cover table-level and column-level forms, including non-rowid-alias `TEXT` or composite `PRIMARY KEY` declarations and `INTEGER PRIMARY KEY DESC`, which SQLite backs with a separate `sqlite_autoindex` unique index. Rich index mutations use an atomic full-tree rewrite; the bounded in-place path remains limited to ascending `BINARY` terms. Application-defined index collations remain rejected before publication because their ordering cannot be reconstructed safely on reopen.
@@ -619,11 +642,11 @@ actually use.
 
 ## Entity Framework Core
 
-`Turso.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook for local
-managed or native Turso databases. It reuses EF Core SQLite's LINQ translation
+`Devolutions.Ahtola.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook
+for local managed databases. It reuses EF Core SQLite's LINQ translation
 pipeline and executes generated SQL through the local-only `Turso.Data.Sqlite`
-facade. Embedded replicas and remote Hrana URLs are not part of this provider
-line.
+facade (package `Devolutions.Ahtola.Data.Sqlite`). Embedded replicas and remote
+Hrana URLs are not part of this provider line.
 
 The current provider line supports EF Core 9.x on `net8.0`, `net9.0`, and `net10.0`. Its package dependency is constrained to `Microsoft.EntityFrameworkCore.Sqlite.Core` versions `[9.0.9, 10.0.0)` because the provider integrates with EF Core's internal SQLite services, and `UseTurso` rejects any other loaded EF Core major during options configuration. Do not override that dependency with EF Core 8.x or 10.x; those majors require separately compiled and tested provider lines.
 
