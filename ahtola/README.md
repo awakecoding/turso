@@ -2,9 +2,9 @@
 
 A pure managed (C#) SQLite-compatible database engine and ADO.NET / EF Core provider, by Devolutions.
 
-Ahtola is a from-scratch C# reimplementation of a SQLite-compatible database engine. It is **not** a binding over native SQLite, and **not** a binding over Turso's Rust core. There is no native companion, no P/Invoke, and no Rust toolchain required to restore, build, pack, or run.
+Ahtola is a from-scratch C# reimplementation of a SQLite-compatible database engine. It is **not** a binding over native SQLite, and **not** a binding over Ahtola's Rust core. There is no native companion, no P/Invoke, and no Rust toolchain required to restore, build, pack, or run.
 
-The `Devolutions.Ahtola.Data.Sqlite` package includes a SQLite-compatible `Microsoft.Data.Sqlite` facade (`SqliteConnection`, `SqliteCommand`, `SqliteDataReader`, etc.) plus Ahtola's own `System.Data.Common` types (`TursoConnection`, `TursoCommand`, `TursoDataReader`, `TursoParameter`, `TursoTransaction`, `TursoFactory`). The namespaces retain the `Turso.*` prefix for source compatibility with existing providers.
+The `Devolutions.Ahtola.Data.Sqlite` package includes a SQLite-compatible `Microsoft.Data.Sqlite` facade (`SqliteConnection`, `SqliteCommand`, `SqliteDataReader`, etc.) plus Ahtola's own `System.Data.Common` types (`AhtolaConnection`, `AhtolaCommand`, `AhtolaDataReader`, `AhtolaParameter`, `AhtolaTransaction`, `AhtolaFactory`) under the `Ahtola` / `Ahtola.Data.Sqlite` namespaces.
 
 ## Install
 
@@ -17,27 +17,24 @@ All managed assemblies target `net8.0`, `net9.0`, and `net10.0`. .NET Framework 
 | Package | Contract |
 | --- | --- |
 | `Devolutions.Ahtola.Core` | The pure managed engine. Standalone library; no native assets. |
-| `Devolutions.Ahtola.Data.Sqlite` | Managed ADO.NET provider. Includes the `Microsoft.Data.Sqlite`-compatible facade and Ahtola's `TursoConnection` family. Embeds `Turso.Data`; depends on `Devolutions.Ahtola.Core`. |
+| `Devolutions.Ahtola.Data.Sqlite` | Managed ADO.NET provider. Includes the `Microsoft.Data.Sqlite`-compatible facade and Ahtola's `AhtolaConnection` family. Embeds `Ahtola.Data`; depends on `Devolutions.Ahtola.Core`. |
 | `Devolutions.Ahtola.EntityFrameworkCore.Sqlite` | EF Core 9.x provider for Ahtola.Data.Sqlite. |
 
 No Rust toolchain or native runtime asset is needed to restore, build, pack, or
 run any Ahtola package.
 
-## Naming (Phase 1)
+## Naming
 
 | Layer | Name |
 | --- | --- |
 | NuGet PackageId | `Devolutions.Ahtola.*` |
-| C# namespaces / assembly names / public types | still `Turso.*` (`TursoConnection`, `UseTurso`, …) |
-| Project folders under `src/` | still `Turso.*` |
-
-A later phase will rename namespaces, assemblies, and types to `Ahtola.*`. Until
-then, package IDs are Ahtola and source/API identifiers remain Turso-compatible.
+| C# namespaces / assembly names / public types | `Ahtola.*` (`AhtolaConnection`, `UseAhtola`, …) |
+| Project folders under `src/` | `Ahtola.*` |
 
 ### What ships vs what remains in source
 
 - **Shipped packages** are pure managed only: Core, Data.Sqlite, EF Core Sqlite.
-- **Pure-managed remote Hrana** on `TursoConnection` (HTTP `/v2/pipeline`) remains
+- **Pure-managed remote Hrana** on `AhtolaConnection` (HTTP `/v2/pipeline`) remains
   in source and is covered by tests against a canned server. No native dependency.
 - **Abstract native / replica / sync provider hooks** may still compile as extension
   points, but **no native or Sync companion packages** are built or published from
@@ -48,7 +45,7 @@ then, package IDs are Ahtola and source/API identifiers remain Turso-compatible.
 ## Managed engine scope
 
 The managed local engine is an independent C# SQL engine that reads and writes
-SQLite's on-disk format. It is not a port of Turso's Rust core, and it is not a
+SQLite's on-disk format. It is not a port of Ahtola's Rust core, and it is not a
 drop-in replacement for `Microsoft.Data.Sqlite` or for SQLite itself. Choose it
 when you need a fully managed, native-asset-free local database for small to
 moderate workloads.
@@ -58,7 +55,7 @@ it implements. What it does not share is the engine architecture:
 
 | Area | Managed engine reality |
 | --- | --- |
-| Execution | A tree-walking evaluator with a partial bytecode compiler layered on top. The managed VDBE defines its own instruction set rather than SQLite's or Turso's; compiled predicates re-enter the evaluator for row-local expressions. Any statement stepped with a cancellation token, and many statement shapes listed below, run entirely in the evaluator. |
+| Execution | A tree-walking evaluator with a partial bytecode compiler layered on top. The managed VDBE defines its own instruction set rather than SQLite's or Ahtola's; compiled predicates re-enter the evaluator for row-local expressions. Any statement stepped with a cancellation token, and many statement shapes listed below, run entirely in the evaluator. |
 | Query planning | No cost model, join reordering, predicate pushdown, subquery flattening, covering-index detection, or `sqlite_stat*` statistics. Index selection scans the table's indexes in name order and takes the first usable match. `ANALYZE` is an explicit error rather than a no-op. |
 | `EXPLAIN` | Emits managed instruction names, not SQLite opcodes, and errors for evaluator-owned statements instead of fabricating a program. `EXPLAIN QUERY PLAN` reports the managed execution boundary (`MANAGED COMPILED VDBE`, `MANAGED EVALUATOR FALLBACK`, or a real `SCAN`/`SEARCH ... USING INDEX` row) rather than SQLite optimizer internals. |
 | Storage | Table rows are materialized in managed memory rather than paged incrementally from a B-tree, so a database must fit in the process heap. There is no page defragmentation, freelist reclamation on the bounded write path, interior-page split/merge balancing, `auto_vacuum`, or pointer-map support. Use `VACUUM` to compact. |
@@ -147,9 +144,9 @@ wall-clock accounting that would make the reported numbers mean anything.
 
 ### Disconnected ADO.NET
 
-`TursoDataAdapter` and `TursoCommandBuilder` support the classic `DataSet` model.
+`AhtolaDataAdapter` and `AhtolaCommandBuilder` support the classic `DataSet` model.
 `Fill`, `FillSchema` and `Update` round trips persist inserts, updates and deletes,
-and both `TursoConnection` and the `SqliteConnection` facade use the same adapter.
+and both `AhtolaConnection` and the `SqliteConnection` facade use the same adapter.
 Round trips are covered by tests on managed local connections.
 
 `GetSchema` is also shared: both connection types answer from one implementation that
@@ -157,7 +154,7 @@ reads the catalog with ordinary SQL on the owning connection. A remote or replic
 connection therefore describes the database it is attached to, and a statement the
 target rejects surfaces that engine's own error instead of an empty table that would
 read as "no objects exist". Remote behaviour is covered against a canned Hrana server;
-it has not been validated against a live Turso Cloud instance.
+it has not been validated against a live Ahtola Cloud instance.
 
 `GetSchema` runs those catalog statements on the caller's behalf, so an installed
 authorizer sees them and a trace handler reports them. That is deliberate: the
@@ -177,14 +174,14 @@ constant collections and leaves the four catalog collections undefined.
 
 Deliberate limits:
 
-- `TursoCommandBuilder` generates statements for a single-table `SELECT` only, and the
+- `AhtolaCommandBuilder` generates statements for a single-table `SELECT` only, and the
   select list must expose a key column. Joins, expressions, and multi-table selects
   need hand-written `InsertCommand`/`UpdateCommand`/`DeleteCommand`.
 - `UpdateBatchSize` stays at 1; each changed row is a separate round trip.
 - `MissingSchemaAction.AddWithKey` does not promote a rowid-alias `INTEGER PRIMARY KEY`
   to a `DataTable` primary key. This matches `Microsoft.Data.Sqlite`: SQLite publishes
   no uniqueness metadata for a rowid alias, so `System.Data` declines to infer the key.
-  `TursoCommandBuilder` is unaffected because it reads `IsKey` from the schema table.
+  `AhtolaCommandBuilder` is unaffected because it reads `IsKey` from the schema table.
 - `GetSchema` defines `MetaDataCollections`, `ReservedWords`, `Tables`, `Columns`,
   `Indexes` and `IndexColumns`. Any other collection name is an `ArgumentException`.
 - An authorizer that returns `SqliteAuthorizerResult.Ignore` for an `UPDATE` makes
@@ -205,7 +202,7 @@ Deliberate limits:
 - Experimental MVCC and vector search.
 - `BEGIN CONCURRENT` and `ANALYZE`. Each is rejected during parsing.
 - Chained `ON CONFLICT` clauses on a single `INSERT`.
-- Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Turso's
+- Encryption beyond AES-128-GCM and AES-256-GCM. Databases written with Ahtola's
   AEGIS ciphers fail closed rather than being partially read.
 - File-backed databases on macOS and on 32-bit Linux. Managed lock leases require
   Linux OFD locks (`F_OFD_SETLK`) or Windows `LockFileEx`, so opening any
@@ -217,7 +214,7 @@ Deliberate limits:
 
 The managed engine has its own regression suite and runs the repository's
 `sqlite-sqltests` conformance corpus in full. Cases it does not yet satisfy are
-listed in `src/Turso.Tests/Conformance/managed-sqltest-expected-failures.txt`,
+listed in `src/Ahtola.Tests/Conformance/managed-sqltest-expected-failures.txt`,
 so both coverage and known gaps are visible; it does not run the upstream SQLite
 TCL suites. Fault injection is limited to the detached WAL coordinator
 primitives, where process-isolated workers cover writer and checkpoint
@@ -283,9 +280,9 @@ The managed SQL contract enables SQLite's optional single-table `UPDATE`/`DELETE
 ## Getting started
 
 ```C#
-using Turso;
+using Ahtola;
 
-using var connection = new TursoConnection("Data Source=:memory:");
+using var connection = new AhtolaConnection("Data Source=:memory:");
 connection.Open();
 
 connection.ExecuteNonQuery("CREATE TABLE t(a, b)");
@@ -305,13 +302,13 @@ while (reader.Read())
 
 ## ADO.NET usage
 
-Code written against `DbConnection` can use `TursoConnection` directly:
+Code written against `DbConnection` can use `AhtolaConnection` directly:
 
 ```C#
 using System.Data.Common;
-using Turso;
+using Ahtola;
 
-await using DbConnection connection = new TursoConnection("Data Source=app.db");
+await using DbConnection connection = new AhtolaConnection("Data Source=app.db");
 connection.Open();
 
 await using var command = connection.CreateCommand();
@@ -324,16 +321,16 @@ command.Parameters.Add(parameter);
 var value = command.ExecuteScalar();
 ```
 
-Remote Turso/libSQL databases can use the same `TursoConnection` surface with a remote URL and auth token:
+Remote Ahtola/libSQL databases can use the same `AhtolaConnection` surface with a remote URL and auth token:
 
 ```C#
-await using var connection = new TursoConnection(
-    "Data Source=libsql://example-org.turso.io;Auth Token=eyJ...");
+await using var connection = new AhtolaConnection(
+    "Data Source=libsql://example-org.Ahtola.io;Auth Token=eyJ...");
 await connection.OpenAsync();
 
 await using var command = connection.CreateCommand();
 command.CommandText = "SELECT name FROM customers WHERE id = $id";
-command.Parameters.Add(new TursoParameter("$id", 42));
+command.Parameters.Add(new AhtolaParameter("$id", 42));
 
 var name = await command.ExecuteScalarAsync();
 ```
@@ -364,11 +361,11 @@ Local batches execute each batch command in order on one connection and expose c
 
 ## Facade capability matrix
 
-`TursoConnection.Capabilities` and `SqliteConnection.Capabilities` expose the same
+`AhtolaConnection.Capabilities` and `SqliteConnection.Capabilities` expose the same
 executable contract used by provider feature gates. `CanCreateBatch` is sourced from
 that contract, so generic ADO.NET callers and the provider cannot drift.
 
-| Capability | `TursoConnection` managed local | `TursoConnection` native local | `TursoConnection` remote Hrana | `TursoConnection` embedded replica | `SqliteConnection` managed local | `SqliteConnection` native local |
+| Capability | `AhtolaConnection` managed local | `AhtolaConnection` native local | `AhtolaConnection` remote Hrana | `AhtolaConnection` embedded replica | `SqliteConnection` managed local | `SqliteConnection` native local |
 | --- | --- | --- | --- | --- | --- | --- |
 | `DbBatch` / `CanCreateBatch` | Yes, sequential | Yes, sequential | Yes, one Hrana batch | No | Yes, sequential | Yes, sequential |
 | Async open, command, reader, transaction | Yes, worker-backed local I/O | Yes, worker-backed local I/O | Yes, HTTP I/O | Yes, replica/native I/O | Yes, worker-backed local I/O | Yes, worker-backed local I/O |
@@ -383,10 +380,10 @@ that contract, so generic ADO.NET callers and the provider cannot drift.
 | Explicit `Sync` | No | No | No | Yes, with Sync companion | No | No |
 | Encryption | AES-128/256-GCM managed format | Native SDK cipher set | Local encryption options rejected | Remote encryption options; local at-rest options rejected | AES-128/256-GCM managed format | `Encryption Cipher`/`Encryption Key` rejected |
 
-The `Turso.Data.Sqlite` facade (package `Devolutions.Ahtola.Data.Sqlite`) is a
+The `Ahtola.Data.Sqlite` facade (package `Devolutions.Ahtola.Data.Sqlite`) is a
 local-only migration surface; remote URLs fail before they can be interpreted as
-file paths. Use `TursoConnection` for Hrana and embedded
-replicas. `TursoConnection` rejects `Pooling=True` before provider or network
+file paths. Use `AhtolaConnection` for Hrana and embedded
+replicas. `AhtolaConnection` rejects `Pooling=True` before provider or network
 access unless the target is an eligible unencrypted managed file; named shared
 memory requires `Pooling=False`. The SQLite facade accepts its default
 `Pooling=True` keyword for named shared-memory and native compatibility without
@@ -399,10 +396,10 @@ execution; syncing or routing an attached database is not implied. The SQLite
 facade keeps its UDF, aggregate, collation, extension, backup, blob, and
 attachment behavior over the managed engine.
 
-Provider factories are available through `TursoFactory.Instance`:
+Provider factories are available through `AhtolaFactory.Instance`:
 
 ```C#
-DbProviderFactory factory = TursoFactory.Instance;
+DbProviderFactory factory = AhtolaFactory.Instance;
 using var connection = factory.CreateConnection();
 connection!.ConnectionString = "Data Source=:memory:";
 connection.Open();
@@ -411,11 +408,11 @@ connection.Open();
 ## Migrating from Microsoft.Data.Sqlite
 
 For common embedded SQLite usage, `Devolutions.Ahtola.Data.Sqlite` exposes a
-SQLite-compatible facade (namespace `Turso.Data.Sqlite`) over the managed engine:
+SQLite-compatible facade (namespace `Ahtola.Data.Sqlite`) over the managed engine:
 
 ```diff
 - using Microsoft.Data.Sqlite;
-+ using Turso.Data.Sqlite;
++ using Ahtola.Data.Sqlite;
 
 - using var connection = new SqliteConnection("Data Source=app.db");
 + using var connection = new SqliteConnection("Data Source=app.db");
@@ -426,23 +423,23 @@ mode. Supported common connection string keywords include:
 
 | Keyword | Notes |
 | --- | --- |
-| `Data Source` | Local database path or `:memory:`; remote URL for `TursoConnection`. Aliases include `DataSource` and `Filename`. |
+| `Data Source` | Local database path or `:memory:`; remote URL for `AhtolaConnection`. Aliases include `DataSource` and `Filename`. |
 | `Mode` | Local only. Managed local honors `Memory`, `ReadOnly`, `ReadWrite`, and `ReadWriteCreate` with explicit file-existence checks. |
 | `Foreign Read Only` | Local managed only. Opens a database owned by another engine (for example `winget`'s `index.db`) without claiming ownership or requiring `-shm`; see [Managed foreign read-only opens](#managed-foreign-read-only-opens). |
 | `Cache` | Local only. Managed `Cache=Shared` is supported with a named `Data Source` and `Mode=Memory`; file databases accept it as an ordinary private file connection (SQLite shared-cache semantics are not emulated); see below. |
-| `Foreign Keys` | Applied by local `SqliteConnection` through `PRAGMA foreign_keys`; the managed engine supports composite keys, referential actions, and deferred constraints. Direct managed `TursoConnection` rejects the keyword. |
+| `Foreign Keys` | Applied by local `SqliteConnection` through `PRAGMA foreign_keys`; the managed engine supports composite keys, referential actions, and deferred constraints. Direct managed `AhtolaConnection` rejects the keyword. |
 | `Local Provider` | `Managed` is the default and only local provider in Ahtola (no native companion is shipped). |
-| `Recursive Triggers` | Tracked by local `SqliteConnection`; direct managed `TursoConnection` rejects the keyword. |
+| `Recursive Triggers` | Tracked by local `SqliteConnection`; direct managed `AhtolaConnection` rejects the keyword. |
 | `Default Timeout` | Default command timeout. Aliases include `Command Timeout`; for managed local databases it controls busy waits, not total query duration. |
-| `Pooling` | Defaults to `True` on the SQLite-compatible facade. Managed physical pooling applies only to ordinary unencrypted file-backed databases. Named shared memory accepts the default keyword only through `SqliteConnection` and is not pooled; `TursoConnection` requires `Pooling=False`. |
+| `Pooling` | Defaults to `True` on the SQLite-compatible facade. Managed physical pooling applies only to ordinary unencrypted file-backed databases. Named shared memory accepts the default keyword only through `SqliteConnection` and is not pooled; `AhtolaConnection` requires `Pooling=False`. |
 | `Vfs` | Native `SqliteConnection` only. Managed local rejects native SQLite VFS names. |
-| `Encryption Cipher` | Local only. Managed local supports AES-128-GCM and AES-256-GCM; native `TursoConnection` uses the SDK cipher set; native `SqliteConnection` rejects it. |
+| `Encryption Cipher` | Local only. Managed local supports AES-128-GCM and AES-256-GCM; native `AhtolaConnection` uses the SDK cipher set; native `SqliteConnection` rejects it. |
 | `Encryption Key` | Hex-encoded local key used with `Encryption Cipher`; follows the same facade/provider boundaries. |
-| `Auth Token` | Bearer token for remote Turso/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
-| `Replica Path` | Embedded replica `TursoConnection` only. Requires a remote Turso URL and the embedded-replica companion (not shipped with Ahtola's pure-managed line). |
-| `Read Your Writes` | Remote `TursoConnection` only. Keeps the Hrana session baton across commands; `False` uses stateless requests. |
-| `Sync Interval` | Retained for connection-string compatibility. Only `0` is accepted; call `TursoConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly and await every operation. |
-| `Tls` | Remote `TursoConnection` only. Optional `libsql://` development override; conflicts with explicit HTTP(S) schemes fail early. |
+| `Auth Token` | Bearer token for remote Ahtola/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
+| `Replica Path` | Embedded replica `AhtolaConnection` only. Requires a remote Ahtola URL and the embedded-replica companion (not shipped with Ahtola's pure-managed line). |
+| `Read Your Writes` | Remote `AhtolaConnection` only. Keeps the Hrana session baton across commands; `False` uses stateless requests. |
+| `Sync Interval` | Retained for connection-string compatibility. Only `0` is accepted; call `AhtolaConnection.Sync()` or `SyncAsync(CancellationToken)` explicitly and await every operation. |
+| `Tls` | Remote `AhtolaConnection` only. Optional `libsql://` development override; conflicts with explicit HTTP(S) schemes fail early. |
 
 ### Managed foreign read-only opens
 
@@ -548,7 +545,7 @@ The managed engine rejects these shapes before target-row mutation:
 
 ### Managed local encryption format
 
-Managed local encryption implements Turso encrypted database format version `0` only. Page 1 starts with the 16-byte header `"Turso"`, version byte `0`, a cipher ID, and nine zero reserved bytes. The remaining SQLite header bytes stay readable and are authenticated as associated data. AES-GCM pages reserve 28 bytes for a 16-byte authentication tag and 12-byte nonce.
+Managed local encryption implements Ahtola encrypted database format version `0` only. Page 1 starts with the 16-byte header `"Ahtola"`, version byte `0`, a cipher ID, and nine zero reserved bytes. The remaining SQLite header bytes stay readable and are authenticated as associated data. AES-GCM pages reserve 28 bytes for a 16-byte authentication tag and 12-byte nonce.
 
 | Cipher ID | Rust format cipher | Key bytes | Page metadata bytes | Managed provider |
 | ---: | --- | ---: | ---: | --- |
@@ -569,13 +566,13 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 
 ## SQLite-compatible facade coverage
 
-- `Devolutions.Ahtola.Data.Sqlite` (`Turso.Data.Sqlite` namespace) is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, managed fixed-length blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
+- `Devolutions.Ahtola.Data.Sqlite` (`Ahtola.Data.Sqlite` namespace) is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, managed fixed-length blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
 - Managed `ATTACH` supports file-backed aliases, filename expressions and parameters, `file:` URIs with `mode=ro|rw|rwc`, inherited page encryption, same-cipher hexadecimal `KEY` overrides, same-database SELECT/DML/CTE/subquery routing, and transactions/savepoints that modify at most one persistent database. A transaction may also modify its connection-private TEMP catalog. Statements whose reads span multiple database schemas and transactions that attempt to write a second persistent database are rejected before the unsafe operation because independent WAL files cannot be committed atomically. Attached in-memory databases, URI options other than `mode`, cross-database views/triggers, and plaintext-to-encrypted `KEY` attachment without a primary cipher remain unsupported.
 - Managed pooling retains at most 32 idle physical connections per canonical file/read-only key and at most 64 keys. `:memory:`, `Mode=Memory`, shared-memory, encrypted, native, remote/replica, and connections with custom functions, aggregates, or collations are not pooled. Returning a pooled connection closes readers and blobs, rolls back transactions, invalidates prepared commands, detaches databases, destroys the TEMP catalog, and resets connection-local pragmas and row-id state. Renting it refreshes the managed catalog from durable storage before reuse.
 - File-backed managed indexes preserve explicit, `UNIQUE`, and `PRIMARY KEY` origin and term metadata, including mixed `ASC`/`DESC` order and SQLite's built-in `BINARY`, `NOCASE`, and `RTRIM` collations. Implicit constraint indexes cover table-level and column-level forms, including non-rowid-alias `TEXT` or composite `PRIMARY KEY` declarations and `INTEGER PRIMARY KEY DESC`, which SQLite backs with a separate `sqlite_autoindex` unique index. Rich index mutations use an atomic full-tree rewrite; the bounded in-place path remains limited to ascending `BINARY` terms. Application-defined index collations remain rejected before publication because their ordering cannot be reconstructed safely on reopen.
 - Managed SELECT sources accept SQLite's `INDEXED BY index-name` and `NOT INDEXED` clauses after an optional alias. `INDEXED BY` forces the named index, including constraint-owned, expression, collated, descending, partial, and `WITHOUT ROWID` secondary indexes; a missing or wrong-table index fails instead of silently choosing another route, and a partial index fails with `no query solution` unless the query predicates safely imply its `WHERE` clause for that join side. `NOT INDEXED` suppresses managed secondary-index selection while retaining SQLite's rowid/primary-key table semantics.
 - `SqliteConnection.ClearPool(connection)` retires the file/read-only pool selected by that connection string, and `SqliteConnection.ClearAllPools()` retires every managed pool. Idle handles are disposed immediately; rented handles are disposed instead of being reused when returned, so clearing is safe while connections are open.
-- `TursoConnection` uses the same contract when `Pooling=True` is explicitly selected and exposes corresponding `TursoConnection.ClearPool(connection)` and `TursoConnection.ClearAllPools()` methods.
+- `AhtolaConnection` uses the same contract when `Pooling=True` is explicitly selected and exposes corresponding `AhtolaConnection.ClearPool(connection)` and `AhtolaConnection.ClearAllPools()` methods.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
 - Managed physical databases are not concurrently interoperable with ordinary SQLite clients. All managed connections in one process share exclusive ownership of SQLite's main-file lock-byte range until the last connection is disposed; other managed processes and SQLite clients receive a busy/ownership failure. Windows uses its native byte-range locks and 64-bit Linux uses open-file-description locks so closing a secondary database descriptor cannot silently release ownership. Do not mix a native SQLite client into the owning process. A handoff to SQLite is one-way: dispose every managed connection after a successful commit and, in WAL mode, checkpoint, then let SQLite own the database and companion-file lifecycle. Disposing the logical connections is not sufficient on its own when pooling is active: the SQLite facade defaults to `Pooling=True`, and a returned handle stays in the managed physical pool holding ownership, so a subsequent SQLite client still fails with `database is locked`. Open the database with `Pooling=False`, or call `SqliteConnection.ClearAllPools()` after disposing, before handing off. This applies to read-only usage too, because every physical pager takes the same ownership lock. SQLite may delete or replace managed WAL sidecars, so the managed provider deliberately refuses to reopen an altered WAL pair. After an interrupted managed writer, reopen it with the managed provider first so managed WAL or rollback-journal recovery completes. Windows can retain the ownership lock through a read-only database handle; platforms whose lock primitive requires writable access still reject read-only ownership when the file cannot be opened accordingly. The managed `-shm` file is a byte-lock carrier only and never contains a SQLite WAL-index. The one read-only exception is `Foreign Read Only=True`, which explicitly opts out of ownership to read a database owned by another engine; see [Managed foreign read-only opens](#managed-foreign-read-only-opens). [Managed WAL interoperability contract](docs/managed-wal-interoperability-contract.md) documents the exact lock-byte map, busy/recovery/cache-invalidation rules, the foreign read-only contract, and the staged work required before multi-process WAL access could be supported.
 - Managed file databases implement durable `WAL` and `DELETE` journal modes. `DELETE` writes use SQLite-compatible rollback journals containing exact on-disk page images, so encrypted pages remain encrypted; writable reopen recovers a valid hot journal, while read-only reopen fails without modifying it. `PERSIST`, `TRUNCATE`, `MEMORY`, and `OFF` are not implemented for files and leave the current mode unchanged.
@@ -583,7 +580,7 @@ Managed backup is a logical snapshot copy. The source key decrypts the source co
 - `PRAGMA integrity_check` and `PRAGMA quick_check` report the declared NOT NULL and CHECK constraints that stored rows violate, honor SQLite's default 100-problem budget and its optional integer limit, accept a bare table-name restriction, and return a single `ok` row for a healthy database. Both return the same problems and differ only in their result column name: the managed file store validates stored index records and page structure while loading, so a database SQLite would describe as `non-unique entry in index` or `wrong # of entries in index` fails to open instead of being reported. There is no managed auto-checkpoint policy, so a WAL grows until one of the engine's own checkpoint points is reached.
 - `REINDEX` atomically rebuilds the selected managed table/index (including rich, partial, expression, constraint, and `WITHOUT ROWID` forms) through a forced full-catalog pager rewrite without changing the schema cookie. Unqualified all-index and collation forms are supported when no database is attached; with attachments, callers must qualify one table or index so independent files are never presented as one atomic mutation. `ANALYZE` is an explicit pre-mutation error because managed `sqlite_stat*` persistence and planner consumption are not implemented.
 - `PRAGMA page_size` accepts SQLite page sizes from 512 through 65536 as a pending value per selected database. `PRAGMA [schema.]journal_mode`, `VACUUM`, `VACUUM main`, and attached-schema `VACUUM` target that database independently; in-place page-size changes apply only in `DELETE` mode, while `VACUUM ... INTO <expression>` may apply the pending size in either journal mode without changing the source. `INTO` publishes a compact `DELETE`-mode snapshot through an atomic file-system replacement, retains encryption, AUTOINCREMENT sequence state, and supported catalog/header semantics, and accepts only ordinary file paths on file systems that provide that guarantee. VACUUM rejects active transactions, result readers, blob handles, read-only/query-only connections, unsafe output aliases, and non-empty destinations before mutating authoritative storage.
-- Managed named shared-memory databases use `Data Source=NAME;Mode=Memory;Cache=Shared`. Connections with the same case-sensitive name share one managed catalog and page/cache owner until the last logical connection closes. Reopening while another connection remains open preserves the database; reopening after the last close creates an empty database. The SQLite facade accepts `Pooling=True` for connection-string compatibility but never pools shared memory; `TursoConnection` requires `Pooling=False` and rejects `Pooling=True` before opening. `ClearPool` and `ClearAllPools` affect file pools only.
+- Managed named shared-memory databases use `Data Source=NAME;Mode=Memory;Cache=Shared`. Connections with the same case-sensitive name share one managed catalog and page/cache owner until the last logical connection closes. Reopening while another connection remains open preserves the database; reopening after the last close creates an empty database. The SQLite facade accepts `Pooling=True` for connection-string compatibility but never pools shared memory; `AhtolaConnection` requires `Pooling=False` and rejects `Pooling=True` before opening. `ClearPool` and `ClearAllPools` affect file pools only.
 - Managed `Cache=Shared` is accepted for file databases but treated as an ordinary private file connection per open: the managed engine cannot emulate SQLite's shared-cache semantics (cross-connection uncommitted visibility and table locks) for files, so it deliberately provides the stronger private isolation instead of rejecting the keyword. Anonymous in-memory databases follow SQLite semantics: an empty Data Source or a `:memory:` Data Source without `Mode=Memory` stays connection-private even with `Cache=Shared`, while `Data Source=:memory:;Mode=Memory;Cache=Shared` routes through the shared-cache URI form and becomes a named shared-memory database named `:memory:`, matching Microsoft.Data.Sqlite. `Cache=Private` and the default cache remain connection-private for memory databases. Managed named shared-memory connections also reject connection-local functions, aggregates, and collations because the current managed function registry belongs to the shared database rather than an individual connection; private anonymous in-memory connections keep their own catalog and therefore allow them.
 - `PRAGMA read_uncommitted` remains connection-local compatibility state for native and managed private-cache connections. Managed shared-memory databases preserve transaction isolation and reject enabling `PRAGMA read_uncommitted` or beginning an `IsolationLevel.ReadUncommitted` transaction rather than claiming unsupported dirty-read behavior.
 - Managed `BackupDatabase` atomically replaces existing managed destinations, including schema, rows, `schema_version`, `user_version`, and `application_id`, and accepts `main` or attached database names. The connection-private TEMP database is excluded, and selecting `temp` as a named source or destination is rejected before destination mutation. Active `main` source transactions are copied from their current snapshot without being completed, and active source readers remain usable. Selecting an attached source while its owning connection has an active transaction fails busy before destination mutation because that attachment's transaction clone cannot yet be exposed as an independent backup source. Non-transactional file sources are reopened before snapshot acquisition so commits from other connections are included. Memory and physical-file endpoints are supported, including encrypted file-to-file re-encryption; failures before publication leave the destination unchanged.
@@ -642,13 +639,13 @@ actually use.
 
 ## Entity Framework Core
 
-`Devolutions.Ahtola.EntityFrameworkCore.Sqlite` adds a `UseTurso` provider hook
+`Devolutions.Ahtola.EntityFrameworkCore.Sqlite` adds a `UseAhtola` provider hook
 for local managed databases. It reuses EF Core SQLite's LINQ translation
-pipeline and executes generated SQL through the local-only `Turso.Data.Sqlite`
+pipeline and executes generated SQL through the local-only `Ahtola.Data.Sqlite`
 facade (package `Devolutions.Ahtola.Data.Sqlite`). Embedded replicas and remote
 Hrana URLs are not part of this provider line.
 
-The current provider line supports EF Core 9.x on `net8.0`, `net9.0`, and `net10.0`. Its package dependency is constrained to `Microsoft.EntityFrameworkCore.Sqlite.Core` versions `[9.0.9, 10.0.0)` because the provider integrates with EF Core's internal SQLite services, and `UseTurso` rejects any other loaded EF Core major during options configuration. Do not override that dependency with EF Core 8.x or 10.x; those majors require separately compiled and tested provider lines.
+The current provider line supports EF Core 9.x on `net8.0`, `net9.0`, and `net10.0`. Its package dependency is constrained to `Microsoft.EntityFrameworkCore.Sqlite.Core` versions `[9.0.9, 10.0.0)` because the provider integrates with EF Core's internal SQLite services, and `UseAhtola` rejects any other loaded EF Core major during options configuration. Do not override that dependency with EF Core 8.x or 10.x; those majors require separately compiled and tested provider lines.
 
 ```bash
 dotnet add package Devolutions.Ahtola.EntityFrameworkCore.Sqlite
@@ -662,27 +659,27 @@ public sealed class AppDbContext : DbContext
     public DbSet<Customer> Customers => Set<Customer>();
 
     protected override void OnConfiguring(DbContextOptionsBuilder options)
-        => options.UseTurso("Data Source=app.db");
+        => options.UseAhtola("Data Source=app.db");
 }
 ```
 
-You can also pass an existing Turso SQLite-compatible connection:
+You can also pass an existing Ahtola SQLite-compatible connection:
 
 ```C#
 using Microsoft.EntityFrameworkCore;
-using Turso.Data.Sqlite;
+using Ahtola.Data.Sqlite;
 
 await using var connection = new SqliteConnection("Data Source=app.db");
 var options = new DbContextOptionsBuilder<AppDbContext>()
-    .UseTurso(connection)
+    .UseAhtola(connection)
     .Options;
 ```
 
 The local provider supports the normal EF Core SQLite query pipeline, including composed `IQueryable<T>` filters, navigation-property joins, ordering, paging, grouping, aggregates, async materialization, and `SaveChangesAsync`. Schema creation can use `EnsureCreated`, `EnsureCreatedAsync`, and EF migrations against local database files. Managed migrations support history tracking, literal defaults, descending indexes, and model-backed table, column, and index renames when the renamed table or column has no foreign-key, table-constraint, trigger, or computed-column dependencies. Filtered indexes, SQL-expression defaults, raw SQL operations, idempotent migration scripts, and dependent renames fail before application schema mutation because the managed engine cannot execute those forms safely.
 
 Remote `libsql://`, `http://`, `https://`, `ws://`, and `wss://` EF Core support
-is not part of the local provider. `UseTurso` rejects those data sources during
+is not part of the local provider. `UseAhtola` rejects those data sources during
 options configuration, before a context or connection is used. Embedded replicas
-are also excluded because `UseTurso` executes through `SqliteConnection`. Use
-`TursoConnection` directly for remote or replica ADO.NET access; remote/serverless
+are also excluded because `UseAhtola` executes through `SqliteConnection`. Use
+`AhtolaConnection` directly for remote or replica ADO.NET access; remote/serverless
 EF support needs a separate retry and transaction design.

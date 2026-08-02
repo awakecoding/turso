@@ -8,9 +8,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$nativePackagePattern = '(?i)Turso\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))'
+$nativePackagePattern = '(?i)Ahtola\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))'
 $nativeConfigurationPattern = "(?i)$nativePackagePattern|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary"
-$nativeArchiveEntryPattern = '(?i)(^|[\\/])(runtimes|native)[\\/]|(^|[\\/])(Turso\.Raw|Turso\.Data\.Native|Turso\.Data\.Sync)\.dll$|(^|[\\/])(lib)?turso(_sync)?_sdk_kit(\.dll|\.so|\.dylib|\.a|\.lib)?$'
+$nativeArchiveEntryPattern = '(?i)(^|[\\/])(runtimes|native)[\\/]|(^|[\\/])(Ahtola\.Raw|Ahtola\.Data\.Native|Ahtola\.Data\.Sync)\.dll$|(^|[\\/])(lib)?Ahtola(_sync)?_sdk_kit(\.dll|\.so|\.dylib|\.a|\.lib)?$'
 
 function Fail([string]$Message) {
     throw "Managed release closure validation failed: $Message"
@@ -106,7 +106,7 @@ function Test-ProjectAssets([string]$Path) {
     }
 
     if ($assets -match "(?i)`"$nativePackagePattern/") {
-        Fail "assets file '$Path' restores a native Turso companion package."
+        Fail "assets file '$Path' restores a native Ahtola companion package."
     }
 }
 
@@ -121,7 +121,7 @@ function Test-PublishOutput([string]$Path, [bool]$IsNativeAot) {
     }
 
     foreach ($file in $files) {
-        if ($file.Name -match '(?i)^(Turso\.Raw|Turso\.Data\.Native|Turso\.Data\.Sync)\.dll$|^(lib)?turso(_sync)?_sdk_kit(\.dll|\.so|\.dylib|\.a|\.lib)?$') {
+        if ($file.Name -match '(?i)^(Ahtola\.Raw|Ahtola\.Data\.Native|Ahtola\.Data\.Sync)\.dll$|^(lib)?Ahtola(_sync)?_sdk_kit(\.dll|\.so|\.dylib|\.a|\.lib)?$') {
             Fail "publish output '$Path' contains native companion asset '$($file.Name)'."
         }
     }

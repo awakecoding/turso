@@ -6,7 +6,7 @@ fully **managed** `Devolutions.Ahtola.Data.Sqlite` provider — there are **no n
 connection opts into `Local Provider=Managed`, so all reads/writes go through
 Ahtola's managed storage engine.
 
-Assembly file names and C# namespaces still use the `Turso.*` prefix (Phase 1
+Assembly file names and C# namespaces still use the `Ahtola.*` prefix (Phase 1
 compatibility). Package IDs are `Devolutions.Ahtola.*`.
 
 This is a self-contained sibling to [`ManagedPackageConsumer`](../ManagedPackageConsumer),
@@ -22,8 +22,8 @@ without needing the .NET SDK or any native SQLite binary at import time.
   `Devolutions.Ahtola.Data.Sqlite` packages live), alongside nuget.org.
 - `PSSqlite.Managed.csproj` — a `net8.0` helper project (the lowest TFM the
   package ships) that references `Devolutions.Ahtola.Data.Sqlite` and, after
-  building, copies `Turso.Core.dll`, `Turso.Data.dll`, and
-  `Turso.Data.Sqlite.dll` into `source/lib/net8.0/`.
+  building, copies `Ahtola.Core.dll`, `Ahtola.Data.dll`, and
+  `Ahtola.Data.Sqlite.dll` into `source/lib/net8.0/`.
 - `source/PSSqlite.Managed.psd1` — the module manifest (PowerShell 7+,
   `RootModule = 'PSSqlite.Managed.psm1'`,
   `ScriptsToProcess = 'ScriptsToProcess\PreLoadTypes.ps1'`).
@@ -34,11 +34,11 @@ without needing the .NET SDK or any native SQLite binary at import time.
     returns rows as `PSCustomObject`s.
   - `Start-ManagedSample` — end-to-end demo: creates a metadata table,
     inserts a row, reads it back, prints it, then calls
-    `[Turso.Data.Sqlite.SqliteConnection]::ClearAllPools()` on close.
+    `[Ahtola.Data.Sqlite.SqliteConnection]::ClearAllPools()` on close.
 - `source/ScriptsToProcess/PreLoadTypes.ps1` — loads the three vendored
   assemblies via `[System.Reflection.Assembly]::LoadFrom()` from
-  `source/lib/net8.0`, in dependency order: `Turso.Core` → `Turso.Data` →
-  `Turso.Data.Sqlite`. No native library, no PATH/RID resolution, no net48
+  `source/lib/net8.0`, in dependency order: `Ahtola.Core` → `Ahtola.Data` →
+  `Ahtola.Data.Sqlite`. No native library, no PATH/RID resolution, no net48
   branch. Throws a clear error if any DLL is missing (run `build.ps1` first).
 - `build.ps1` — runs `dotnet build`, which triggers the restore + vendor
   copy, and prints where the DLLs landed.
@@ -52,7 +52,7 @@ without needing the .NET SDK or any native SQLite binary at import time.
 ```
 
 This restores `Devolutions.Ahtola.Data.Sqlite` from the local feed and vendors
-`Turso.Core.dll`, `Turso.Data.dll`, and `Turso.Data.Sqlite.dll` into
+`Ahtola.Core.dll`, `Ahtola.Data.dll`, and `Ahtola.Data.Sqlite.dll` into
 `source/lib/net8.0/`.
 
 ## Import and run the demo

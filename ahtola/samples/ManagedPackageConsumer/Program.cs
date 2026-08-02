@@ -1,7 +1,7 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
-using Turso;
-using Turso.Data.Sqlite;
+using Ahtola;
+using Ahtola.Data.Sqlite;
 
 var databasePath = Path.Combine(AppContext.BaseDirectory, $"managed-package-{Guid.NewGuid():N}.db");
 using var connection = new SqliteConnection(
@@ -15,19 +15,19 @@ try
     command.CommandText = "SELECT 1";
 
     if (command.ExecuteScalar() is not 1L)
-        throw new InvalidOperationException("The managed Turso package consumer returned an unexpected result.");
+        throw new InvalidOperationException("The managed Ahtola package consumer returned an unexpected result.");
 
     connection.Close();
     connection.Open();
     if (command.ExecuteScalar() is not 1L)
-        throw new InvalidOperationException("The managed Turso package pool returned an unexpected result.");
+        throw new InvalidOperationException("The managed Ahtola package pool returned an unexpected result.");
 
     SqliteConnection.ClearPool(connection);
     connection.Close();
     SqliteConnection.ClearAllPools();
 
     var options = new DbContextOptionsBuilder<ConsumerContext>()
-        .UseTurso(connection)
+        .UseAhtola(connection)
         .Options;
     using (var context = new ConsumerContext(options))
     {
@@ -36,17 +36,17 @@ try
         context.SaveChanges();
 
         if (context.Records.Single().Value != "packaged")
-            throw new InvalidOperationException("The packaged Turso EF Core provider returned an unexpected result.");
+            throw new InvalidOperationException("The packaged Ahtola EF Core provider returned an unexpected result.");
     }
 
     if (typeof(DbContext).Assembly.GetName().Version?.Major != 9)
-        throw new InvalidOperationException("The managed Turso package consumer must run against EF Core 9.x.");
+        throw new InvalidOperationException("The managed Ahtola package consumer must run against EF Core 9.x.");
 
     try
     {
         _ = new DbContextOptionsBuilder<ConsumerContext>()
-            .UseTurso("Data Source=libsql://example-org.turso.io");
-        throw new InvalidOperationException("UseTurso must reject remote URLs during configuration.");
+            .UseAhtola("Data Source=libsql://example-org.Ahtola.io");
+        throw new InvalidOperationException("UseAhtola must reject remote URLs during configuration.");
     }
     catch (NotSupportedException exception) when (
         exception.Message.Contains("retry and transaction semantics", StringComparison.Ordinal))
@@ -54,7 +54,7 @@ try
     }
 
     const string encryptionKey = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
-    var encryptedPath = Path.Combine(Path.GetTempPath(), $"turso-managed-package-{Guid.NewGuid():N}.db");
+    var encryptedPath = Path.Combine(Path.GetTempPath(), $"Ahtola-managed-package-{Guid.NewGuid():N}.db");
     try
     {
         var encryptedConnectionString =
@@ -94,7 +94,7 @@ try
     if (AppDomain.CurrentDomain.GetAssemblies().Any(assembly =>
             string.Equals(assembly.GetName().Name, "Turso.Raw", StringComparison.Ordinal)))
     {
-        throw new InvalidOperationException("The managed Turso package consumer must not load Turso.Raw.");
+        throw new InvalidOperationException("The managed Ahtola package consumer must not load Turso.Raw.");
     }
 
     EnsureNoNativeCompanionWasRestored();
@@ -113,7 +113,7 @@ finally
 static async Task VerifyEntityFrameworkIntegrationAsync(SqliteConnection connection)
 {
     var options = new DbContextOptionsBuilder<ManagedPackageContext>()
-        .UseTurso(connection)
+        .UseAhtola(connection)
         .Options;
 
     await using var context = new ManagedPackageContext(options);
@@ -144,7 +144,7 @@ static void EnsureNoNativeCompanionWasRestored()
         if (nativePackage is not null)
         {
             throw new InvalidOperationException(
-                $"The managed Turso package consumer must not restore native companion package {nativePackage}.");
+                $"The managed Ahtola package consumer must not restore native companion package {nativePackage}.");
         }
 
         return;
@@ -155,17 +155,17 @@ static void EnsureNoNativeCompanionWasRestored()
 
 static void VerifySourceFreeReplicaOptions()
 {
-    var options = new TursoReplicaOptions(
+    var options = new AhtolaReplicaOptions(
         "replica.db",
-        new Uri("https://example.turso.io"),
+        new Uri("https://example.Ahtola.io"),
         authToken: null)
     {
         LongPollTimeout = TimeSpan.FromSeconds(15),
-        PartialBootstrap = TursoPartialBootstrapOptions.Prefix(64 * 1024),
+        PartialBootstrap = AhtolaPartialBootstrapOptions.Prefix(64 * 1024),
         PushOperationsThreshold = 1000,
         PullBytesThreshold = 1024 * 1024,
     };
-    using var replica = TursoConnection.CreateReplica(options);
+    using var replica = AhtolaConnection.CreateReplica(options);
     try
     {
         replica.Open();
@@ -181,61 +181,61 @@ static void VerifySourceFreeReplicaOptions()
 
 static void VerifyPublicCapabilityContract()
 {
-    using var tursoManaged = new TursoConnection("Data Source=:memory:;Local Provider=Managed");
+    using var ahtolaManaged = new AhtolaConnection("Data Source=:memory:;Local Provider=Managed");
     AssertCapabilities(
-        tursoManaged.Capabilities,
-        tursoManaged.CanCreateBatch,
-        TursoConnectionFacade.TursoData,
-        TursoConnectionMode.ManagedLocal,
+        ahtolaManaged.Capabilities,
+        ahtolaManaged.CanCreateBatch,
+        AhtolaConnectionFacade.AhtolaData,
+        AhtolaConnectionMode.ManagedLocal,
         [true, true, true, true, false, false, false, false, false, false, true, true, false]);
 
-    using var tursoNative = new TursoConnection("Data Source=:memory:;Local Provider=Native");
+    using var ahtolaNative = new AhtolaConnection("Data Source=:memory:;Local Provider=Native");
     AssertCapabilities(
-        tursoNative.Capabilities,
-        tursoNative.CanCreateBatch,
-        TursoConnectionFacade.TursoData,
-        TursoConnectionMode.NativeLocal,
+        ahtolaNative.Capabilities,
+        ahtolaNative.CanCreateBatch,
+        AhtolaConnectionFacade.AhtolaData,
+        AhtolaConnectionMode.NativeLocal,
         [true, true, true, true, false, false, false, false, false, false, true, false, false]);
 
-    using var tursoRemote = new TursoConnection("Data Source=https://example.turso.io");
+    using var ahtolaRemote = new AhtolaConnection("Data Source=https://example.Ahtola.io");
     AssertCapabilities(
-        tursoRemote.Capabilities,
-        tursoRemote.CanCreateBatch,
-        TursoConnectionFacade.TursoData,
-        TursoConnectionMode.RemoteHrana,
+        ahtolaRemote.Capabilities,
+        ahtolaRemote.CanCreateBatch,
+        AhtolaConnectionFacade.AhtolaData,
+        AhtolaConnectionMode.RemoteHrana,
         [true, true, true, true, false, false, false, false, false, false, false, false, false]);
 
-    using var tursoReplica = new TursoConnection(
-        "Data Source=https://example.turso.io;Replica Path=replica.db");
+    using var ahtolaReplica = new AhtolaConnection(
+        "Data Source=https://example.Ahtola.io;Replica Path=replica.db");
     AssertCapabilities(
-        tursoReplica.Capabilities,
-        tursoReplica.CanCreateBatch,
-        TursoConnectionFacade.TursoData,
-        TursoConnectionMode.EmbeddedReplica,
+        ahtolaReplica.Capabilities,
+        ahtolaReplica.CanCreateBatch,
+        AhtolaConnectionFacade.AhtolaData,
+        AhtolaConnectionMode.EmbeddedReplica,
         [false, true, true, true, false, false, false, false, false, false, false, false, true]);
 
     using var sqliteManaged = new SqliteConnection("Data Source=:memory:;Local Provider=Managed");
     AssertCapabilities(
         sqliteManaged.Capabilities,
         sqliteManaged.CanCreateBatch,
-        TursoConnectionFacade.Sqlite,
-        TursoConnectionMode.ManagedLocal,
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.ManagedLocal,
         [true, true, true, true, true, true, true, true, true, false, true, true, false]);
 
     using var sqliteNative = new SqliteConnection("Data Source=:memory:;Local Provider=Native");
     AssertCapabilities(
         sqliteNative.Capabilities,
         sqliteNative.CanCreateBatch,
-        TursoConnectionFacade.Sqlite,
-        TursoConnectionMode.NativeLocal,
+        AhtolaConnectionFacade.Sqlite,
+        AhtolaConnectionMode.NativeLocal,
         [true, true, true, true, true, true, true, true, true, true, true, false, false]);
 }
 
 static void AssertCapabilities(
-    TursoConnectionCapabilities capabilities,
+    AhtolaConnectionCapabilities capabilities,
     bool canCreateBatch,
-    TursoConnectionFacade facade,
-    TursoConnectionMode mode,
+    AhtolaConnectionFacade facade,
+    AhtolaConnectionMode mode,
     bool[] expected)
 {
     var actual = new[]

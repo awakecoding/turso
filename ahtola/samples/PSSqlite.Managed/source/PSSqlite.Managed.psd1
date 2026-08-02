@@ -5,11 +5,11 @@
     Author            = 'Devolutions'
     CompanyName       = 'Devolutions'
     Copyright         = '(c) Devolutions. All rights reserved.'
-    Description       = 'Minimal PowerShell 7 module sample wiring PowerShell to the fully managed Devolutions.Ahtola.Data.Sqlite provider (namespaces still Turso.*; no native e_sqlite3/SQLitePCLRaw binaries).'
+    Description       = 'Minimal PowerShell 7 module sample wiring PowerShell to the fully managed Devolutions.Ahtola.Data.Sqlite provider (namespaces still Ahtola.*; no native e_sqlite3/SQLitePCLRaw binaries).'
     PowerShellVersion = '7.0'
     CompatiblePSEditions = @('Core')
 
-    # Loads the vendored Turso.Core / Turso.Data / Turso.Data.Sqlite assemblies
+    # Loads the vendored Ahtola.Core / Ahtola.Data / Ahtola.Data.Sqlite assemblies
     # (in that order) via Assembly.LoadFrom before the root module is imported.
     ScriptsToProcess  = @('ScriptsToProcess\PreLoadTypes.ps1')
 

@@ -1,8 +1,8 @@
 # Consumer Read Benchmarks
 
 BenchmarkDotNet microbenchmarks for read-heavy query shapes taken from real
-Turso consumer projects. These exist to **guard against regressions** in the
-managed (pure C#) Turso engine's read path over time — **not** to claim
+Ahtola consumer projects. These exist to **guard against regressions** in the
+managed (pure C#) Ahtola engine's read path over time — **not** to claim
 performance parity with the native engine or with `Microsoft.Data.Sqlite`.
 
 Per the top-level Readme, the managed engine is currently **10–56× slower
@@ -48,7 +48,7 @@ against it directly.
 From the repository root (or this folder):
 
 ```powershell
-dotnet run -c Release --project D:\dev\turso-dotnet\bindings\dotnet\src\ConsumerBenchmarks\ConsumerBenchmarks.csproj --filter '*'
+dotnet run -c Release --project D:\dev\Ahtola-dotnet\bindings\dotnet\src\ConsumerBenchmarks\ConsumerBenchmarks.csproj --filter '*'
 ```
 
 Useful variants:
@@ -71,11 +71,11 @@ suite in a shared/CI-critical-path context without accounting for that.
 ## What the numbers mean
 
 - **`Mean` / `Error` / `StdDev`** — wall-clock time per operation. Compare a
-  given Turso-managed benchmark's `Mean` release-over-release; a large
+  given Ahtola-managed benchmark's `Mean` release-over-release; a large
   regression (e.g. >20-30%) on a read-heavy shape is a signal worth
   investigating, since these shapes should be relatively cheap for the
   managed engine even though writes are not.
-- **`Ratio`** — Turso-managed time ÷ Microsoft.Data.Sqlite baseline time for
+- **`Ratio`** — Ahtola-managed time ÷ Microsoft.Data.Sqlite baseline time for
   the same shape. This number is expected to be **> 1** (managed is slower)
   and is provided for context, not as a pass/fail gate. Do **not** treat
   `Ratio` improvements/regressions alone as a correctness signal — track the
@@ -88,16 +88,16 @@ suite in a shared/CI-critical-path context without accounting for that.
 ## Baseline numbers (fill in after each benchmark run)
 
 Replace this table with the output of a full `dotnet run -c Release --filter '*'`
-run. Record the machine, .NET SDK version, and Turso package version alongside
+run. Record the machine, .NET SDK version, and Ahtola package version alongside
 the numbers so future comparisons are meaningful.
 
 | Benchmark | Mean | Error | StdDev | Ratio | Allocated |
 |---|---|---|---|---|---|
-| `CatalogSearch_TursoManaged` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| `CatalogSearch_AhtolaManaged` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | `CatalogSearch_MicrosoftDataSqlite` | _TBD_ | _TBD_ | _TBD_ | 1.00 | _TBD_ |
-| `MetadataSelect_TursoManaged` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| `MetadataSelect_AhtolaManaged` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | `MetadataSelect_MicrosoftDataSqlite` | _TBD_ | _TBD_ | _TBD_ | 1.00 | _TBD_ |
-| `PinsReadOnlyOpenAndList_TursoManaged` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| `PinsReadOnlyOpenAndList_AhtolaManaged` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 | `PinsReadOnlyOpenAndList_MicrosoftDataSqlite` | _TBD_ | _TBD_ | _TBD_ | 1.00 | _TBD_ |
 
 Environment used for baseline (fill in):
@@ -120,5 +120,5 @@ Environment used for baseline (fill in):
 - This project is intentionally separate from the existing `Benchmarks`
   project (which benchmarks the native engine via a `ProjectReference` and
   does not exercise the managed-provider connection-string contract). It is
-  not wired into `Turso.slnx`; add a project reference there if you want it
+  not wired into `Ahtola.slnx`; add a project reference there if you want it
   to build as part of the full solution.

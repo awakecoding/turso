@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Runs the managed Turso test suite and proves that it actually executed tests.
+    Runs the managed Ahtola test suite and proves that it actually executed tests.
 
 .DESCRIPTION
     `dotnet test` exits 0 both when a suite passes and when a suite silently
@@ -18,7 +18,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Project = './src/Turso.Tests/Turso.Tests.csproj',
+    [string]$Project = './src/Ahtola.Tests/Ahtola.Tests.csproj',
     [string]$Framework,
     [string]$Filter,
     [string]$Configuration = 'Debug',
@@ -56,7 +56,7 @@ function Fail([string]$Message) {
 }
 
 function New-ToolchainDenyDirectory {
-    $directory = Join-Path ([System.IO.Path]::GetTempPath()) "turso-managed-deny-$([System.Guid]::NewGuid().ToString('N'))"
+    $directory = Join-Path ([System.IO.Path]::GetTempPath()) "Ahtola-managed-deny-$([System.Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
     foreach ($tool in @('cargo', 'rustc')) {
         $message = "managed .NET validation must not invoke $tool"

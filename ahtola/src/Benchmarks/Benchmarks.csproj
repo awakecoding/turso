@@ -16,7 +16,7 @@
     </ItemGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" />
+      <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" />
     </ItemGroup>
 
 </Project>

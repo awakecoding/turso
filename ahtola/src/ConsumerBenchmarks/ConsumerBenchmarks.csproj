@@ -15,8 +15,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Turso.Data\Turso.Data.csproj" />
-    <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
+    <ProjectReference Include="..\Ahtola.Data\Ahtola.Data.csproj" />
+    <ProjectReference Include="..\Ahtola.Data.Sqlite\Ahtola.Data.Sqlite.csproj" />
   </ItemGroup>
 
 </Project>

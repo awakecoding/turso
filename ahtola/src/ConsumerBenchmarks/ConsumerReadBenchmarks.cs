@@ -1,7 +1,7 @@
 using System.Globalization;
 using BenchmarkDotNet.Attributes;
 using MdsConnection = Microsoft.Data.Sqlite.SqliteConnection;
-using TursoManagedConnection = Turso.Data.Sqlite.SqliteConnection;
+using AhtolaManagedConnection = Ahtola.Data.Sqlite.SqliteConnection;
 
 namespace ConsumerBenchmarks;
 
@@ -9,7 +9,7 @@ namespace ConsumerBenchmarks;
 /// Read-heavy consumer benchmarks modeled on real-world consumer query shapes
 /// (a winget-style package search tool ("pinget") and a metadata/schema
 /// inspection tool ("synedgy")). These benchmarks exist to guard against
-/// *regressions* in the managed Turso engine's read path, not to claim
+/// *regressions* in the managed Ahtola engine's read path, not to claim
 /// parity with the native engine or with Microsoft.Data.Sqlite. See the
 /// README in this folder for interpretation guidance.
 /// </summary>
@@ -29,34 +29,34 @@ public class ConsumerReadBenchmarks
     private string _pinsDbPath = null!;
 
     // Winget catalog search (in-memory, shared connections reused across invocations).
-    private TursoManagedConnection _tursoCatalogConnection = null!;
+    private AhtolaManagedConnection _ahtolaCatalogConnection = null!;
     private MdsConnection _mdsCatalogConnection = null!;
 
     // Metadata SELECT (in-memory, small schema).
-    private TursoManagedConnection _tursoMetadataConnection = null!;
+    private AhtolaManagedConnection _ahtolaMetadataConnection = null!;
     private MdsConnection _mdsMetadataConnection = null!;
 
     [GlobalSetup]
     public void GlobalSetup()
     {
-        _tempDirectory = Path.Combine(Path.GetTempPath(), $"turso-consumer-bench-{Guid.NewGuid():N}");
+        _tempDirectory = Path.Combine(Path.GetTempPath(), $"Ahtola-consumer-bench-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDirectory);
         _catalogDbPath = Path.Combine(_tempDirectory, "catalog.db");
         _pinsDbPath = Path.Combine(_tempDirectory, "pins.db");
 
         // Winget catalog search setup (in-memory).
-        _tursoCatalogConnection = new TursoManagedConnection("Data Source=:memory:;Local Provider=Managed");
-        _tursoCatalogConnection.Open();
-        SeedCatalog(_tursoCatalogConnection);
+        _ahtolaCatalogConnection = new AhtolaManagedConnection("Data Source=:memory:;Local Provider=Managed");
+        _ahtolaCatalogConnection.Open();
+        SeedCatalog(_ahtolaCatalogConnection);
 
         _mdsCatalogConnection = new MdsConnection("Data Source=:memory:");
         _mdsCatalogConnection.Open();
         SeedCatalog(_mdsCatalogConnection);
 
         // Metadata SELECT setup (in-memory, small schema).
-        _tursoMetadataConnection = new TursoManagedConnection("Data Source=:memory:;Local Provider=Managed");
-        _tursoMetadataConnection.Open();
-        SeedMetadataSchema(_tursoMetadataConnection);
+        _ahtolaMetadataConnection = new AhtolaManagedConnection("Data Source=:memory:;Local Provider=Managed");
+        _ahtolaMetadataConnection.Open();
+        SeedMetadataSchema(_ahtolaMetadataConnection);
 
         _mdsMetadataConnection = new MdsConnection("Data Source=:memory:");
         _mdsMetadataConnection.Open();
@@ -69,12 +69,12 @@ public class ConsumerReadBenchmarks
     [GlobalCleanup]
     public void GlobalCleanup()
     {
-        _tursoCatalogConnection?.Dispose();
+        _ahtolaCatalogConnection?.Dispose();
         _mdsCatalogConnection?.Dispose();
-        _tursoMetadataConnection?.Dispose();
+        _ahtolaMetadataConnection?.Dispose();
         _mdsMetadataConnection?.Dispose();
 
-        TursoManagedConnection.ClearAllPools();
+        AhtolaManagedConnection.ClearAllPools();
         MdsConnection.ClearAllPools();
 
         if (Directory.Exists(_tempDirectory))
@@ -95,8 +95,8 @@ public class ConsumerReadBenchmarks
     // ---------------------------------------------------------------
 
     [BenchmarkCategory(CatalogSearchCategory)]
-    [Benchmark(Description = "CatalogSearch: Turso Managed")]
-    public int CatalogSearch_TursoManaged() => RunCatalogSearch(_tursoCatalogConnection);
+    [Benchmark(Description = "CatalogSearch: Ahtola Managed")]
+    public int CatalogSearch_AhtolaManaged() => RunCatalogSearch(_ahtolaCatalogConnection);
 
     [BenchmarkCategory(CatalogSearchCategory)]
     [Benchmark(Baseline = true, Description = "CatalogSearch: Microsoft.Data.Sqlite")]
@@ -107,8 +107,8 @@ public class ConsumerReadBenchmarks
     // ---------------------------------------------------------------
 
     [BenchmarkCategory(MetadataSelectCategory)]
-    [Benchmark(Description = "MetadataSelect: Turso Managed")]
-    public int MetadataSelect_TursoManaged() => RunMetadataSelect(_tursoMetadataConnection);
+    [Benchmark(Description = "MetadataSelect: Ahtola Managed")]
+    public int MetadataSelect_AhtolaManaged() => RunMetadataSelect(_ahtolaMetadataConnection);
 
     [BenchmarkCategory(MetadataSelectCategory)]
     [Benchmark(Baseline = true, Description = "MetadataSelect: Microsoft.Data.Sqlite")]
@@ -119,10 +119,10 @@ public class ConsumerReadBenchmarks
     // ---------------------------------------------------------------
 
     [BenchmarkCategory(PinsReadOnlyOpenAndListCategory)]
-    [Benchmark(Description = "PinsReadOnlyOpenAndList: Turso Managed")]
-    public int PinsReadOnlyOpenAndList_TursoManaged()
+    [Benchmark(Description = "PinsReadOnlyOpenAndList: Ahtola Managed")]
+    public int PinsReadOnlyOpenAndList_AhtolaManaged()
     {
-        using var connection = new TursoManagedConnection(
+        using var connection = new AhtolaManagedConnection(
             $"Data Source={_pinsDbPath};Mode=ReadOnly;Pooling=False;Local Provider=Managed");
         connection.Open();
         return RunPinsList(connection);
@@ -290,7 +290,7 @@ public class ConsumerReadBenchmarks
     private void BuildPinsDatabase()
     {
         var connectionString = $"Data Source={_pinsDbPath};Pooling=False;Local Provider=Managed";
-        using var connection = new TursoManagedConnection(connectionString);
+        using var connection = new AhtolaManagedConnection(connectionString);
         connection.Open();
 
         using (var create = connection.CreateCommand())

@@ -14,10 +14,10 @@ relaxing a guard ahead of the stage that replaces it.
 
 Source of truth:
 
-- `src/Turso.Core/Storage/SqliteManagedFileOwnership.cs`
-- `src/Turso.Core/Storage/SqliteWalSharedMemoryLocks.cs`
-- `src/Turso.Core/Storage/SqlitePagerLockManager.cs`
-- `src/Turso.Core/Storage/SqlitePager.cs`
+- `src/Ahtola.Core/Storage/SqliteManagedFileOwnership.cs`
+- `src/Ahtola.Core/Storage/SqliteWalSharedMemoryLocks.cs`
+- `src/Ahtola.Core/Storage/SqlitePagerLockManager.cs`
+- `src/Ahtola.Core/Storage/SqlitePager.cs`
 
 ## 1. The current contract
 
@@ -31,7 +31,7 @@ Source of truth:
 | Locked range | `[0x4000_0000, 0x4000_0200)` — 512 bytes covering SQLite's `PENDING_BYTE`, `RESERVED_BYTE`, and the full 510-byte `SHARED` range |
 | Lock kind | Exclusive/write. Windows `FileStream.Lock` (`LockFile`); Linux `fcntl(F_OFD_SETLK, F_WRLCK)` through `LinuxOpenFileDescriptionLocks` |
 | Platform gate | Windows, or 64-bit Linux with a 32-byte `struct flock`. Every other platform throws `PlatformNotSupportedException` at open |
-| Applies to | `PhysicalFileSystem` only, after unwrapping `TursoEncryptionFileSystem`. In-memory and custom file systems receive no cross-process boundary at all |
+| Applies to | `PhysicalFileSystem` only, after unwrapping `AhtolaEncryptionFileSystem`. In-memory and custom file systems receive no cross-process boundary at all |
 | Lifetime | Acquired by the first `SqlitePager.Create`/`Open` for a path, reference-counted across every managed pager in the process, released only when the last one is disposed |
 | Registry key | `Path.GetFullPath(...)`, upper-invariant on Windows |
 | Contention | Retried every 10 ms until the configured busy timeout, then `SqlitePagerClientOwnershipException` (an `InvalidOperationException` exposing `DatabasePath` and `Timeout`) |
@@ -500,7 +500,7 @@ lock must remain and must keep failing closed.
 
 ## 4. Characterization coverage
 
-`src/Turso.Tests/SqliteWalInteroperabilityContractTests.cs` pins
+`src/Ahtola.Tests/SqliteWalInteroperabilityContractTests.cs` pins
 the Stage 0 boundary:
 
 | Test | Contract clause |
@@ -516,7 +516,7 @@ the Stage 0 boundary:
 | `ManagedReadOnlyOpenRefusesToCreateAMissingSharedMemoryLockCarrier` | §1.2, §3 — read-only opens never create `-shm` |
 | `PooledReopenSurvivesSharedMemoryCarrierRemovedByNativeClose` (`ManagedConnectionPoolingTests.cs`) | §1.2 — a read-write pager recreates a missing carrier on demand like a native read-write connection, and the pooling catalog refresh tolerates its absence |
 
-`src/Turso.Tests/ForeignReadOnlyOpenTests.cs` pins the §1.9
+`src/Ahtola.Tests/ForeignReadOnlyOpenTests.cs` pins the §1.9
 foreign read-only boundary against `Microsoft.Data.Sqlite` as the owner:
 
 | Test | Contract clause |
@@ -527,8 +527,8 @@ foreign read-only boundary against `Microsoft.Data.Sqlite` as the owner:
 | `HotRollbackJournalFailsClosed` | §1.9, §3 — an unreadable hot journal faults instead of guessing |
 | `ExplicitReadTransactionPinsSnapshotWhileOwnerCommits` | §1.9 — explicit transactions pin their snapshot |
 | `ForeignReadOnlyRejectsWrites` | §1.9 — writes are rejected |
-| `ForeignReadOnlyWorksThroughTursoConnection` | §1.9 — both ADO surfaces expose the mode |
-| `FacadeRejectsInvalidForeignReadOnlyCombinations` / `TursoConnectionRejectsInvalidForeignReadOnlyCombinations` | §1.9 — pooling, shared cache, encryption, and remote/native providers are refused |
+| `ForeignReadOnlyWorksThroughAhtolaConnection` | §1.9 — both ADO surfaces expose the mode |
+| `FacadeRejectsInvalidForeignReadOnlyCombinations` / `AhtolaConnectionRejectsInvalidForeignReadOnlyCombinations` | §1.9 — pooling, shared cache, encryption, and remote/native providers are refused |
 
 Related existing coverage:
 

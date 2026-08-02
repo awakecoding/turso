@@ -28,30 +28,30 @@ all: build-managed
 restore: restore-managed
 
 restore-managed:
-	dotnet restore ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
-	dotnet restore ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	dotnet restore ./src/Ahtola.Data.Sqlite/Ahtola.Data.Sqlite.csproj
+	dotnet restore ./src/Ahtola.EntityFrameworkCore.Sqlite/Ahtola.EntityFrameworkCore.Sqlite.csproj
 
 build-managed: restore-managed
-	dotnet build --no-restore -c Debug ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
-	dotnet build --no-restore -c Debug ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	dotnet build --no-restore -c Debug ./src/Ahtola.Data.Sqlite/Ahtola.Data.Sqlite.csproj
+	dotnet build --no-restore -c Debug ./src/Ahtola.EntityFrameworkCore.Sqlite/Ahtola.EntityFrameworkCore.Sqlite.csproj
 
 test-managed: validate-managed-package
 	$(MANAGED_TEST_RUNNER) -Framework $(MANAGED_TEST_FRAMEWORK) -MinimumExecutedTests $(MANAGED_TEST_MINIMUM_EXECUTED)
 
 format-check:
 	dotnet format ./Ahtola.slnx --verify-no-changes
-	dotnet format ./src/Turso.Tests/Turso.Tests.csproj --verify-no-changes
+	dotnet format ./src/Ahtola.Tests/Ahtola.Tests.csproj --verify-no-changes
 
 pack-managed: restore-managed validate-managed-project-closure
 	rm -rf "$(MANAGED_PACKAGE_OUTPUT)"
-	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Core/Turso.Core.csproj
-	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj
-	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj
+	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Ahtola.Core/Ahtola.Core.csproj
+	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Ahtola.Data.Sqlite/Ahtola.Data.Sqlite.csproj
+	dotnet pack --no-restore -c Release $(MANAGED_PACKAGE_OUTPUT_ARG) $(MANAGED_PACKAGE_VERSION_ARG) ./src/Ahtola.EntityFrameworkCore.Sqlite/Ahtola.EntityFrameworkCore.Sqlite.csproj
 	$(MAKE) validate-managed-packed-closure
 
 validate-managed-project-closure:
-	@if grep -E -i '(Turso\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./Directory.Build.props ./Directory.Build.targets ./Ahtola.slnx || grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(Turso\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./src/Turso.Core ./src/Turso.Data ./src/Turso.Data.Sqlite ./src/Turso.EntityFrameworkCore.Sqlite ./samples/ManagedPackageConsumer; then \
-		echo "Managed package, solution, and build configurations must not reference native Turso packages, P/Invoke assets, or Rust tooling"; \
+	@if grep -E -i '(Ahtola\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./Directory.Build.props ./Directory.Build.targets ./Ahtola.slnx || grep -R -E -i --include='*.csproj' --include='*.props' --include='*.targets' '(Ahtola\.(Raw|Data\.(Native|Sync)|Data\.Sqlite\.(Native[^"]*|Sync))|cargo|rustc|cargo-ndk|turso_sdk_kit|DirectPInvoke|NativeLibrary|DllImport|LibraryImport|TursoUseStaticNativeLibrary)' ./src/Ahtola.Core ./src/Ahtola.Data ./src/Ahtola.Data.Sqlite ./src/Ahtola.EntityFrameworkCore.Sqlite ./samples/ManagedPackageConsumer; then \
+		echo "Managed package, solution, and build configurations must not reference native Ahtola packages, P/Invoke assets, or Rust tooling"; \
 		exit 1; \
 	fi
 

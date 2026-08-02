@@ -2,12 +2,12 @@
 
 <#
 .SYNOPSIS
-    Demo functions wiring PowerShell to the fully managed Devolutions.Ahtola.Data.Sqlite provider (Turso.Data.Sqlite types).
+    Demo functions wiring PowerShell to the fully managed Devolutions.Ahtola.Data.Sqlite provider (Ahtola.Data.Sqlite types).
 
 .DESCRIPTION
     This module never touches the native e_sqlite3/SQLitePCLRaw binaries. Every
     connection string opts into "Local Provider=Managed", which routes all
-    reads/writes through Turso's managed storage engine.
+    reads/writes through Ahtola's managed storage engine.
 #>
 
 $script:ManagedConnectionString = 'Data Source=:memory:;Cache=Shared;Local Provider=Managed'
@@ -15,7 +15,7 @@ $script:ManagedConnectionString = 'Data Source=:memory:;Cache=Shared;Local Provi
 function New-ManagedConnection {
     <#
     .SYNOPSIS
-        Creates and opens a Turso.Data.Sqlite.SqliteConnection backed entirely
+        Creates and opens a Ahtola.Data.Sqlite.SqliteConnection backed entirely
         by the managed provider.
 
     .PARAMETER ConnectionString
@@ -23,16 +23,16 @@ function New-ManagedConnection {
         connection string.
 
     .OUTPUTS
-        Turso.Data.Sqlite.SqliteConnection
+        Ahtola.Data.Sqlite.SqliteConnection
     #>
     [CmdletBinding()]
-    [OutputType([Turso.Data.Sqlite.SqliteConnection])]
+    [OutputType([Ahtola.Data.Sqlite.SqliteConnection])]
     param(
         [Parameter()]
         [string]$ConnectionString = $script:ManagedConnectionString
     )
 
-    $connection = [Turso.Data.Sqlite.SqliteConnection]::new($ConnectionString)
+    $connection = [Ahtola.Data.Sqlite.SqliteConnection]::new($ConnectionString)
     $connection.Open()
     return $connection
 }
@@ -43,7 +43,7 @@ function Invoke-ManagedQuery {
         Runs a SQL command against an open managed connection and returns rows.
 
     .PARAMETER Connection
-        An open Turso.Data.Sqlite.SqliteConnection.
+        An open Ahtola.Data.Sqlite.SqliteConnection.
 
     .PARAMETER CommandText
         The SQL text to execute.
@@ -58,7 +58,7 @@ function Invoke-ManagedQuery {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [Turso.Data.Sqlite.SqliteConnection]$Connection,
+        [Ahtola.Data.Sqlite.SqliteConnection]$Connection,
 
         [Parameter(Mandatory)]
         [string]$CommandText,
@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS sample_metadata (
 
         # Managed pooling still applies to :memory:;Cache=Shared connections;
         # clear pools so no pooled state lingers after the demo runs.
-        [Turso.Data.Sqlite.SqliteConnection]::ClearAllPools()
+        [Ahtola.Data.Sqlite.SqliteConnection]::ClearAllPools()
     }
 }
 

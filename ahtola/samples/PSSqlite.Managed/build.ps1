@@ -8,8 +8,8 @@
     Runs `dotnet build` against PSSqlite.Managed.csproj. The csproj restores
     Devolutions.Ahtola.Data.Sqlite from the local NuGet feed configured in nuget.config
     (ahtola/artifacts/nupkg) and copies the three managed assemblies
-    (Turso.Core.dll, Turso.Data.dll, Turso.Data.Sqlite.dll — assembly names remain
-    Turso.* until the rename phase) into source/lib/net8.0 via an MSBuild target
+    (Ahtola.Core.dll, Ahtola.Data.dll, Ahtola.Data.Sqlite.dll — assembly names remain
+    Ahtola.* until the rename phase) into source/lib/net8.0 via an MSBuild target
     that runs after Build.
 #>
 

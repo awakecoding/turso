@@ -4,7 +4,7 @@ using System.Runtime.CompilerServices;
 using BenchmarkDotNet.Attributes;
 using Microsoft.Data.Sqlite;
 using SQLitePCL;
-using Turso;
+using Ahtola;
 
 namespace Benchmarks;
 
@@ -13,7 +13,7 @@ public class Benchmarks
 {
     private SQLiteConnection _systemDataSqliteConnection;
     private SqliteConnection _microsoftDataSqliteConnection;
-    private TursoConnection _tursoConnection;
+    private AhtolaConnection _ahtolaConnection;
 
     [GlobalSetup]
     public void Setup()
@@ -24,15 +24,15 @@ public class Benchmarks
         _microsoftDataSqliteConnection = new SqliteConnection("Data Source=:memory:");
         _microsoftDataSqliteConnection.Open();
 
-        _tursoConnection = new TursoConnection("Data Source=:memory:");
-        _tursoConnection.Open();
+        _ahtolaConnection = new AhtolaConnection("Data Source=:memory:");
+        _ahtolaConnection.Open();
         CreateTable(_systemDataSqliteConnection);
         CreateTable(_microsoftDataSqliteConnection);
-        CreateTable(_tursoConnection);
+        CreateTable(_ahtolaConnection);
     }
 
     [Benchmark]
-    public void TursoSelect() => Select(_tursoConnection);
+    public void AhtolaSelect() => Select(_ahtolaConnection);
 
     [Benchmark]
     public void SystemSqliteSelect() => Select(_systemDataSqliteConnection);
