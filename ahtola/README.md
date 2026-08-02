@@ -114,13 +114,20 @@ id (AES-GCM page AEAD).
 
 ## Build and test
 
-```bash
-make restore
-make build
-make test          # managed suite + packaged consumer validation
-make pack
-make validate-managed-package
+PowerShell entrypoint (preferred):
+
+```powershell
+./build.ps1 restore
+./build.ps1 build
+./build.ps1 test              # packaged consumer gate + managed suite
+./build.ps1 pack
+./build.ps1 validate-package
+./build.ps1 format-check
 ```
+
+Optional parameters: `-Configuration Debug|Release`, `-Framework net10.0`,
+`-PackageVersion …`, `-PackageOutput ./artifacts/managed-packages`,
+`-MinimumExecutedTests 2500`.
 
 Or with the .NET SDK only:
 
@@ -147,6 +154,7 @@ ahtola/
 ├── samples/                              # ManagedPackageConsumer, PSSqlite.Managed
 ├── docs/                                 # WAL interop contract (Turso target)
 ├── scripts/                              # test + package closure validators
+├── build.ps1                             # restore / build / test / pack
 └── Ahtola.slnx
 ```
 

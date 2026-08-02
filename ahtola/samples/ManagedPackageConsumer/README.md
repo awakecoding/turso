@@ -8,6 +8,6 @@ and the absence of native companion packages.
 
 Run it through the package gate:
 
-```bash
-make validate-managed-package
+```powershell
+./build.ps1 validate-package
 ```
