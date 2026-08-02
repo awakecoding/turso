@@ -91,13 +91,14 @@ Treat Ahtola as SQLite-*compatible*, not a full SQLite replacement:
 - **File-backed platforms** — Windows and 64-bit Linux only today. In-memory
   works everywhere; macOS / 32-bit Linux physical opens throw
   `PlatformNotSupportedException`.
-- **Process-exclusive files** — one managed process owns a physical DB; ordinary
-  SQLite clients and other processes get busy/ownership failures. Handoff to
-  SQLite requires disposing connections and clearing pools
+- **Process-exclusive files (Stage 0)** — one managed process owns a physical DB;
+  Turso, ordinary SQLite, and other processes get busy/ownership failures.
+  Concurrent multi-process WAL with the Turso Rust engine is the contract goal,
+  not current behavior. Handoff requires disposing connections and clearing pools
   (`Pooling=False` or `SqliteConnection.ClearAllPools()`). See
-  [docs/managed-wal-interoperability-contract.md](docs/managed-wal-interoperability-contract.md).
+  [docs/wal-interoperability-contract.md](docs/wal-interoperability-contract.md).
 - **Foreign read-only** — `Mode=ReadOnly;Foreign Read Only=True;Pooling=False`
-  can read a DB still owned by native SQLite (e.g. winget `index.db`) without
+  can read a DB still owned by native SQLite/Turso (e.g. winget `index.db`) without
   taking ownership.
 - **Not implemented** — virtual tables / FTS / R-Tree, loadable extensions, raw
   `sqlite3*` handles (`Handle` is null), MVCC, `BEGIN CONCURRENT`, `ANALYZE`,
@@ -144,7 +145,7 @@ ahtola/
 ├── src/Ahtola.EntityFrameworkCore.Sqlite/
 ├── src/Ahtola.Tests/
 ├── samples/                              # ManagedPackageConsumer, PSSqlite.Managed
-├── docs/                                 # WAL / ownership contract
+├── docs/                                 # WAL interop contract (Turso target)
 ├── scripts/                              # test + package closure validators
 └── Ahtola.slnx
 ```

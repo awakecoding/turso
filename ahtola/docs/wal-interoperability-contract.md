@@ -1,23 +1,32 @@
-# Managed WAL interoperability contract
+# WAL interoperability contract
 
-Status: **Stage 0 — process-exclusive ownership.** Managed physical databases are
-*not* concurrently interoperable with ordinary SQLite clients or with other
-managed processes, with one read-only exception: an explicit `Foreign Read
-Only=True` connection may read a database owned by an ordinary SQLite client
-without claiming ownership (§1.9). This document is the normative description of
-what the managed pager does today, why each guard exists, and the staged work
-required before any form of SQLite-compatible multi-process WAL access can be
-claimed.
+**Goal:** multi-process WAL interoperability with the original **Turso Rust
+engine** (and, by the same on-disk protocol, stock SQLite). Ahtola should be able
+to share a physical database with `tursodb` / the Turso core under the same WAL,
+`-shm`, lock, and handoff rules those engines already use — not invent a
+managed-only WAL dialect.
+
+**Status today: Stage 0 — process-exclusive ownership.** Managed physical
+databases are *not* yet concurrently interoperable with Turso, ordinary SQLite
+clients, or other managed processes. One read-only exception: an explicit
+`Foreign Read Only=True` connection may read a database owned by an ordinary
+SQLite (or Turso) client without claiming ownership (§1.9). This document is the
+normative description of what the managed pager does today, why each guard
+exists, and the staged work required before Turso-compatible multi-process WAL
+access can be claimed.
 
 Nothing here describes behavior that is unimplemented, and nothing here authorizes
 relaxing a guard ahead of the stage that replaces it.
 
-Source of truth:
+Source of truth (Ahtola):
 
 - `src/Ahtola.Core/Storage/SqliteManagedFileOwnership.cs`
 - `src/Ahtola.Core/Storage/SqliteWalSharedMemoryLocks.cs`
 - `src/Ahtola.Core/Storage/SqlitePagerLockManager.cs`
 - `src/Ahtola.Core/Storage/SqlitePager.cs`
+
+External reference (interop target): Turso’s Rust pager/WAL implementation in the
+upstream Turso / `tursodb` tree (SQLite-compatible WAL-index and lock bytes).
 
 ## 1. The current contract
 
@@ -254,10 +263,11 @@ mutation may observe the new incarnation rather than failing. That tradeoff is
 acceptable for a read-only guest, and it is strictly safer than claiming shared
 state that does not exist.
 
-## 2. Required staged transition to SQLite-compatible multi-process WAL
+## 2. Required staged transition to Turso / SQLite multi-process WAL
 
-Each stage is a prerequisite for the next. No stage may ship with the ownership
-lock relaxed until Stage 6.
+Each stage is a prerequisite for the next. Stages target the same WAL-index
+layout, lock bytes, and handoff rules Turso’s Rust engine and stock SQLite
+already share. No stage may ship with the ownership lock relaxed until Stage 6.
 
 ### Stage 1 — WAL-index format and shared mapping
 

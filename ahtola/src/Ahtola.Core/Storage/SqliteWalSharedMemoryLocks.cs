@@ -18,7 +18,7 @@ namespace Ahtola.Core.Storage;
 /// process-owned POSIX record lock for that file. Windows and Linux
 /// <see cref="FileStream.Lock"/> report contention immediately, and this
 /// component retries with a bounded delay until the pager busy timeout expires.
-/// See <c>docs/managed-wal-interoperability-contract.md</c> for
+/// See <c>docs/wal-interoperability-contract.md</c> for
 /// the normative lock-byte map and the staged transition to a real WAL-index.
 /// </remarks>
 internal sealed class SqliteWalSharedMemoryLocks : ISqlitePagerLockCoordinator

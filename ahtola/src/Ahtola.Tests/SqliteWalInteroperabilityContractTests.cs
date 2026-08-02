@@ -6,12 +6,13 @@ using Ahtola.Core.Storage;
 namespace Ahtola.Tests;
 
 /// <summary>
-/// Characterizes the managed WAL interoperability contract documented in
-/// <c>docs/managed-wal-interoperability-contract.md</c>. These
-/// tests pin the observable Stage 0 boundary between the managed pager and
-/// ordinary SQLite clients: the <c>-shm</c> file is a byte-lock carrier only,
-/// managed roles occupy exactly SQLite's reserved lock-byte range, and managed
-/// lock demands are deliberately stricter than SQLite's WAL protocol.
+/// Characterizes the WAL interoperability contract documented in
+/// <c>docs/wal-interoperability-contract.md</c>. These tests pin the observable
+/// Stage 0 boundary between the managed pager and ordinary SQLite / Turso
+/// clients: the <c>-shm</c> file is a byte-lock carrier only, managed roles
+/// occupy exactly SQLite's reserved lock-byte range, and managed lock demands
+/// are deliberately stricter than the shared Turso/SQLite WAL protocol until
+/// later stages land.
 /// </summary>
 /// <remarks>
 /// External contention is produced from a worker process because POSIX record

@@ -29,7 +29,7 @@ public class EmbeddedBusyException : EmbeddedSqlException
 /// <remarks>
 /// This lock is process-local by design. A managed physical database is owned
 /// exclusively by one process for its whole lifetime (see
-/// <c>docs/managed-wal-interoperability-contract.md</c>), so every connection
+/// <c>docs/wal-interoperability-contract.md</c>), so every connection
 /// that can contend for a write is in this process. The lock is layered above
 /// the pager and adds no cross-process boundary of its own, so it neither
 /// relaxes nor duplicates that ownership guard.
