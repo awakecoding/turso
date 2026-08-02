@@ -106,7 +106,7 @@ public sealed class ManagedSchemaAndAdapterAuthorizerTests
     /// <summary>
     /// Documents the one case where a round trip reports success without persisting the row, so
     /// that it is an asserted limit rather than a lurking surprise. See the "Disconnected ADO.NET"
-    /// section of <c>bindings/dotnet/Readme.md</c>.
+    /// section of <c>README.md</c>.
     /// </summary>
     [Test]
     public void AnIgnoredUpdateIsAcceptedByTheDataSetWithoutReachingTheDatabase()

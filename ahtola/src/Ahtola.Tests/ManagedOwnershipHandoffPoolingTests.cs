@@ -7,7 +7,7 @@ namespace Ahtola.Tests;
 /// Pins the interaction between managed connection pooling and the exclusive
 /// main-file ownership lock described in the "Managed physical databases are not
 /// concurrently interoperable with ordinary SQLite clients" section of
-/// <c>bindings/dotnet/Readme.md</c>.
+/// <c>README.md</c>.
 ///
 /// Disposing the logical connections is not sufficient to hand a database back to
 /// an ordinary SQLite client: the SQLite facade defaults to <c>Pooling=True</c>, so

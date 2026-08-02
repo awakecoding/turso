@@ -7,7 +7,7 @@ namespace Ahtola.Tests;
 
 /// <summary>
 /// Guards the "Managed engine scope" boundaries published in
-/// <c>bindings/dotnet/Readme.md</c>. If one of these surfaces becomes supported,
+/// <c>README.md</c>. If one of these surfaces becomes supported,
 /// this suite fails so the documentation is corrected in the same change rather
 /// than drifting into an overstated compatibility claim.
 /// </summary>
@@ -82,7 +82,7 @@ public sealed class ManagedDocumentedBoundaryTests
 
     /// <summary>
     /// Update, commit and rollback hooks, the authorizer, tracing and the progress handler moved
-    /// out of the "Not implemented" list in <c>bindings/dotnet/Readme.md</c>, so this asserts the
+    /// out of the "Not implemented" list in <c>README.md</c>, so this asserts the
     /// documented direction of that scope change: the surface must stay published. Behavior lives
     /// in <c>ManagedHookAndAuthorizerTests</c> and <c>ManagedHookSqliteDifferentialTests</c>.
     /// </summary>
