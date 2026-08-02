@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TursoConsumerTargetFramework Condition="'$(TursoConsumerTargetFramework)' == ''">net9.0</TursoConsumerTargetFramework>
+    <TargetFramework>$(TursoConsumerTargetFramework)</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <WarningsAsErrors>$(WarningsAsErrors);NU1608</WarningsAsErrors>
+    <TursoPackageVersion Condition="'$(TursoPackageVersion)' == ''">0.0.0-managed-local</TursoPackageVersion>
+    <TursoConsumerEntityFrameworkCoreVersion Condition="'$(TursoConsumerEntityFrameworkCoreVersion)' == ''">9.0.9</TursoConsumerEntityFrameworkCoreVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Devolutions.Ahtola.Data.Sqlite" Version="$(TursoPackageVersion)" />
+    <PackageReference Include="Devolutions.Ahtola.EntityFrameworkCore.Sqlite" Version="$(TursoPackageVersion)" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite.Core" Version="$(TursoConsumerEntityFrameworkCoreVersion)" />
+  </ItemGroup>
+</Project>

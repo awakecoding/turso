@@ -1,0 +1,612 @@
+# Cases in sqlite/conformance/sqlite-sqltests that the managed engine does not yet satisfy.
+# Format: <relative path>::<test name> | <summary of the observed difference>
+# Regenerate with:
+#   dotnet test src/Turso.Tests/Turso.Tests.csproj \
+#     --filter FullyQualifiedName~RegenerateExpectedFailures -- NUnit.Explicit=true
+
+affinity.sqltest::affinity-rowid | expected 2 row(s), got 1 row(s)
+affinity.sqltest::affinity-in-subquery-text-lhs-integer-rhs | expected 3 row(s), got 1 row(s); row 0 expected '01' but was '1'
+affinity.sqltest::affinity-scalar-subquery-text-comparison | expected 1 row(s), got 1 row(s); row 0 expected '0' but was '1'
+affinity.sqltest::affinity-scalar-subquery-text-delete-predicate | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
+affinity.sqltest::affinity-ascii-whitespace-1_1 | expected 1 row(s), got 1 row(s); row 0 expected 'text/3' but was 'integer/2'
+affinity.sqltest::affinity-compound-subquery-all-text | expected 2 row(s), got 2 row(s); row 0 expected 'text/1' but was 'text/0'
+affinity.sqltest::affinity-compound-subquery-numeric-col-plus-numeric-literal | expected 2 row(s), got 2 row(s); row 0 expected 'integer/1' but was 'integer/0'
+affinity.sqltest::affinity-compound-subquery-numeric-literal-first-then-col | expected 2 row(s), got 2 row(s); row 0 expected 'real/1' but was 'real/0'
+after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-with-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-with-index-small | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+after-insert-trigger-cache-spill.sqltest::before-insert-trigger-cache-spill-with-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-no-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+after-insert-trigger-cache-spill.sqltest::after-insert-trigger-cache-spill-multi-index | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_integer_label | expected success but got error: no such function: JSONB_GROUP_OBJECT
+agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_real_label | expected success but got error: no such function: JSONB_GROUP_OBJECT
+agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_text_numeric_label_unchanged | expected success but got error: no such function: JSONB_GROUP_OBJECT
+agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_numeric_column_labels | expected success but got error: no such function: JSONB_GROUP_OBJECT
+agg-functions/jsonb-group-object-numeric-labels.sqltest::jsonb_group_object_does_not_stringify_value | expected success but got error: no such function: JSONB_ARRAY
+agg-functions/memory.sqltest::filter-with-having | expected success but got error: no such column: cnt
+agg-functions/order-by-aggregate-misuse.sqltest::order-by-min-misuse | expected an error but the statement succeeded
+agg-functions/order-by-aggregate-misuse.sqltest::order-by-max-misuse | expected an error but the statement succeeded
+agg-functions/order-by-aggregate-misuse.sqltest::order-by-sum-misuse | expected an error but the statement succeeded
+agg-functions/order-by-aggregate-misuse.sqltest::order-by-count-misuse | expected an error but the statement succeeded
+agg-functions/sum-large-float.sqltest::sum-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 33.
+agg-functions/sum-large-float.sqltest::total-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 35.
+agg-functions/sum-large-float.sqltest::avg-large-float-infinity | expected success but got error: Expected RightParen. At SQL offset 33.
+alter-rename-column-qualified-trigger-error.sqltest::rename-column-trigger-when-doubly-qualified-ref-error-message | error 'Expected keyword BEGIN. At SQL offset 48.' does not match pattern 'no such column: main\.t\.b'
+alter-table-quoted-trigger-target.sqltest::drop-column-with-unrelated-quoted-trigger-target | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t2 (id INTEGER PRIMARY KEY, keep_col TEXT)' but was 'CREATE TABLE "t2" ("id" INTEGER PRIMARY KEY, "keep_col" TEXT)'
+alter-table-quoted-trigger-target.sqltest::rename-column-with-unrelated-quoted-trigger-target | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t2 (id INTEGER PRIMARY KEY, d TEXT)' but was 'CREATE TABLE "t2" ("id" INTEGER PRIMARY KEY, "d" TEXT)'
+alter_rename_column_partial_idx.sqltest::rename-column-updates-partial-index-where-clause-sql | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE INDEX idx ON t (b) WHERE a2 = 1' but was 'CREATE INDEX "idx" ON "t" ("b") WHERE a2 = 1'
+alter_rename_column_partial_idx.sqltest::rename-column-partial-index-complex-where | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE INDEX idx ON t (b) WHERE a2 > 0 AND c < 10' but was 'CREATE INDEX "idx" ON "t" ("b") WHERE a2 > 0 AND c < 10'
+alter_rename_column_partial_idx.sqltest::rename-column-partial-index-rename-where-col-only | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE INDEX idx ON t (b) WHERE c = 1' but was 'CREATE INDEX "idx" ON "t" ("b") WHERE c = 1'
+alter_rename_column_partial_idx.sqltest::rename-column-updates-expression-index-key | output does not match pattern 'CREATE INDEX idx ON t\s*\(a2\s*\+\s*1\)'
+alter_rename_column_partial_idx.sqltest::rename-column-updates-expression-index-multi-column | output does not match pattern 'CREATE INDEX idx ON t\s*\(a2\s*\+\s*b\s*\*\s*2\)'
+alter_rename_column_partial_idx.sqltest::rename-column-expression-index-other-col-unchanged | output does not match pattern 'CREATE INDEX idx ON t\s*\(b\s*\+\s*1\)'
+alter_rename_column_partial_idx.sqltest::rename-column-expression-index-then-rename-again | output does not match pattern 'CREATE INDEX idx ON t\s*\(a3\s*\+\s*1\)'
+alter_table.sqltest::alter-table-rename-column | expected 2 row(s), got 2 row(s); row 0 expected 'CREATE TABLE t (b INTEGER)' but was 'CREATE TABLE "t" ("b" INTEGER)'
+alter_table.sqltest::alter-table-rename-column-view-on-view | expected success but got error: error in view v2 after rename: no such column: b
+alter_table.sqltest::alter-table-rename-column-view-tablecall-branch | expected success but got error: no such column: t.b
+alter_table.sqltest::alter-table-rename-column-view-attached-db-qualified | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'cannot reference'
+alter_table.sqltest::alter-table-rename-column-trigger-attached-db-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+alter_table.sqltest::alter-table-rename-column-view-attached-db-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+alter_table.sqltest::alter-table-rename-column-case-insensitive | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (b INT)' but was 'CREATE TABLE "t" ("b" INT)'
+alter_table.sqltest::alter-table-rename-quoted-column | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t ("ab cd" INTEGER)' but was 'CREATE TABLE "t" ("ab cd" INTEGER)'
+alter_table.sqltest::alter-table-add-column | expected 3 row(s), got 3 row(s); row 1 expected 'CREATE TABLE t (a, b)' but was 'CREATE TABLE "t" ("a", "b")'
+alter_table.sqltest::alter-table-add-column-typed | expected 2 row(s), got 2 row(s); row 0 expected 'CREATE TABLE t (a, b DEFAULT 0)' but was 'CREATE TABLE "t" ("a", "b" DEFAULT 0)'
+alter_table.sqltest::alter-table-add-quoted-column | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE test (a, "b c")' but was 'CREATE TABLE "test" ("a", "b c")'
+alter_table.sqltest::alter-table-add-column-hyphen-digit-schema-sql | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (id INTEGER PRIMARY KEY, "c-39uSrAeJEV" TEXT)' but was 'CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "c-39uSrAeJEV" TEXT)'
+alter_table.sqltest::alter-table-add-column-keyword-schema-sql | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (id INTEGER PRIMARY KEY, "select" TEXT)' but was 'CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "select" TEXT)'
+alter_table.sqltest::alter-table-add-column-trailing-named-constraint | expected success but got error: Expected a constraint after CONSTRAINT c. At SQL offset 39.
+alter_table.sqltest::alter-table-drop-column | expected 7 row(s), got 7 row(s); row 3 expected 'CREATE TABLE t (a)' but was 'CREATE TABLE "t" ("a")'
+alter_table.sqltest::alter-table-drop-column-special-name | expected 2 row(s), got 2 row(s); row 1 expected 'CREATE TABLE t (a, "c c")' but was 'CREATE TABLE "t" ("a", "c c")'
+alter_table.sqltest::alter-table-drop-column-unique-special-name-schema-sql | output does not match pattern 'CREATE TABLE t \(a, "c c", UNIQUE\s?\(a, "c c"\)\)'
+alter_table.sqltest::alter-table-rename-to-quoted-identifier | expected 11 row(s), got 11 row(s); row 0 expected 'CREATE TABLE "t t" (a)' but was 'CREATE TABLE "t t" ("a")'
+alter_table.sqltest::alter-table-add-notnull-col | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (a, b NOT NULL)' but was 'CREATE TABLE "t" ("a", "b" NOT NULL)'
+alter_table.sqltest::alter-tbl-regression | expected success but got error: no such table: main.p_ren1
+alter_table.sqltest::strict-alter-add-column-default-type-mismatch | error 'cannot store TEXT value in INTEGER column t1.id' does not match pattern 'type mismatch on DEFAULT'
+alter_table.sqltest::strict-alter-add-column-default-integer-fractional | error 'cannot store REAL value in INTEGER column t.b' does not match pattern 'type mismatch on DEFAULT'
+alter_table.sqltest::strict-alter-add-column-default-real-nonnumeric | error 'cannot store TEXT value in REAL column t.b' does not match pattern 'type mismatch on DEFAULT'
+alter_table.sqltest::strict-alter-add-column-default-text-blob | error 'cannot store BLOB value in TEXT column t.b' does not match pattern 'type mismatch on DEFAULT'
+alter_table.sqltest::strict-alter-add-column-default-blob-text | error 'cannot store TEXT value in BLOB column t.b' does not match pattern 'type mismatch on DEFAULT'
+alter_table.sqltest::alter-add-column-invalid-collation | expected an error but the statement succeeded
+alter_table.sqltest::alter-table-drop-column-expr-index-unreferenced | expected success but got error: non-deterministic functions are prohibited in index expressions
+alter_table.sqltest::alter-table-drop-column-preserves-expression-index-sentinel | expected success but got error: non-deterministic functions are prohibited in index expressions
+alter_table.sqltest::alter-table-rename-column-updates-unique-sets | output does not match pattern 'CREATE TABLE t\s*\(a INTEGER, c TEXT, d INTEGER, UNIQUE\s*\(c\)\)'
+alter_table.sqltest::alter-table-rename-trigger-fires-after-rename | expected success but got error: error in trigger trig1 after rename table: no such table: t1
+alter_table.sqltest::alter-table-rename-trigger-body-update | expected success but got error: error in trigger trig1 after rename table: no such table: t1
+alter_table.sqltest::alter-table-rename-trigger-body-delete | expected success but got error: error in trigger trig1 after rename table: no such table: t2
+alter_table.sqltest::alter-table-rename-trigger-body-insert-other-table | expected success but got error: error in trigger trig1 after rename table: no such table: log
+alter_table.sqltest::alter-table-rename-trigger-schema-tbl-name | expected success but got error: error in trigger trig1 after rename table: no such table: t1
+alter_table.sqltest::alter-table-rename-trigger-self-insert-sql-rewritten | expected success but got error: error in trigger tr after rename table: no such table: t1
+alter_table.sqltest::alter-table-rename-trigger-self-insert-blob-text-binding | expected success but got error: error in trigger tr after rename table: no such table: t1
+alter_table.sqltest::alter-table-rename-trigger-self-insert-wide-row | expected success but got error: error in trigger tr after rename table: no such table: wide
+alter_table.sqltest::alter-table-rename-column-temp-trigger-main-cross-table | expected success but got error: no such column: b
+alter_table.sqltest::alter-table-rename-column-temp-trigger-main-alias-cross-table | expected success but got error: no such column: u.b
+alter_table.sqltest::alter-table-rename-temp-table-invalid-temp-trigger-missing-main-table | expected an error but the statement succeeded
+alter_table.sqltest::alter-table-rename-table-rewrites-temp-trigger-on-temp-table | expected success but got error: no such table: rename_src_main
+alter_table.sqltest::alter-table-rename-column-temp-trigger-exists-result-expr-error | expected an error but the statement succeeded
+alter_table.sqltest::alter-table-rename-column-temp-trigger-result-scalar-subquery | expected success but got error: no such column: b
+alter_table.sqltest::alter-table-rename-column-temp-table-rejects-invalid-trigger-rewrite | expected an error but the statement succeeded
+alter_table.sqltest::alter-table-rename-column-temp-trigger-attached-cross-table | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+alter_table.sqltest::temp-trigger-attached-read-cross-table | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+alter_table.sqltest::alter-table-drop-column-temp-trigger-invalid | expected an error but the statement succeeded
+alter_table.sqltest::alter-table-drop-column-invalid-temp-trigger-missing-main-table | expected an error but the statement succeeded
+alter_table.sqltest::alter-rename-col-schema-update-cmd-from | expected success but got error: no such column: src.b
+alter_table.sqltest::fail-drop-column-cross-table-trigger-update-where-expr | error 'error in trigger trg after drop column: table has no column named m' does not match pattern 'error in trigger trg after drop column: no such column: m'
+alter_table.sqltest::drop-column-cross-table-trigger-insert-col-list-deferred | expected success but got error: error in trigger trg after drop column: table has no column named m
+alter_table.sqltest::drop-column-cross-table-trigger-set-target-deferred | expected success but got error: error in trigger trg after drop column: table has no column named m
+alter_table.sqltest::drop-column-cross-table-trigger-unreferenced | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t1 (m TEXT, d REAL)' but was 'CREATE TABLE "t1" ("m" TEXT, "d" REAL)'
+alter_table.sqltest::drop-column-other-table-trigger-insert-col-deferred | expected success but got error: error in trigger tu after drop column: table has no column named zer
+alter_table.sqltest::drop-column-owning-table-trigger-insert-col-deferred | expected success but got error: error in trigger tu after drop column: table has no column named x
+alter_table.sqltest::drop-column-owning-table-trigger-update-set-deferred | expected success but got error: error in trigger tu after drop column: table has no column named x
+alter_table.sqltest::alter-table-rename-then-rename-column-with-trigger | expected success but got error: error in trigger tr after rename table: no such table: orders
+autoincr.sqltest::autoinc-create-sequence-table | expected 3 row(s), got 2 row(s); row 0 expected '__turso_internal_seq___turso_internal_autoincrement_t1' but was 'sqlite_sequence'
+autoincr.sqltest::autoinc-alter-column-clears-sequence-row | expected success but got error: Expected ADD, DROP, or RENAME after ALTER TABLE. At SQL offset 14.
+before-update-trigger-correlated-subquery.sqltest::before-update-trigger-uncorrelated-subquery | expected 3 row(s), got 3 row(s); row 1 expected '2/600' but was '2/1100'
+bracket-quoting.sqltest::bracket-default-identifier | expected success but got error: default value of column is not constant: hello
+bracket-quoting.sqltest::bracket-transaction-name | expected success but got error: Expected End. At SQL offset 18.
+bracket-quoting.sqltest::bracket-analyze-table-name | expected success but got error: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were changed.
+changes.sqltest::changes-with-trigger-body-statements | expected 3 row(s), got 3 row(s); row 1 expected '1' but was '0'
+changes.sqltest::changes-restores-previous-value-between-trigger-invocations | expected 6 row(s), got 6 row(s); row 5 expected '8' but was '4'
+changes.sqltest::changes-sub-trigger-isolation | expected 5 row(s), got 5 row(s); row 1 expected 'sub:1' but was 'sub:0'
+changes.sqltest::changes-update-trigger-body-reset-count | expected 8 row(s), got 8 row(s); row 7 expected '12' but was '6'
+changes.sqltest::changes-delete-trigger-body-reset-count | expected 8 row(s), got 8 row(s); row 7 expected '12' but was '6'
+char.sqltest::char-non-integer | expected 1 row(s), got 1 row(s); row 0 expected '' but was ' '
+check_constraint.sqltest::check_constraint_pragma_ignore | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
+check_constraint.sqltest::check_constraint_rename_table_qualified_ref | expected success but got error: ALTER TABLE RENAME cannot rewrite table-qualified CHECK expressions until managed schema token rewriting is implemented.
+check_constraint.sqltest::check_constraint_ddl_column_level_preserved | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
+check_constraint.sqltest::check_constraint_inline_rename_then_drop_keeps_renamed_ref | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
+check_constraint.sqltest::check_constraint_update_only_checks_changed_columns | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
+check_constraint.sqltest::check_constraint_update_table_level_multi_column | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
+check_constraint.sqltest::check_constraint_integrity_check_detects_real_violation | expected success but got error: Unsupported PRAGMA ignore_check_constraints. At SQL offset 32.
+collate.sqltest::collate_subquery_from_nocase_outer_comparison | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
+collate.sqltest::collate_union_all_nocase_branch | expected 2 row(s), got 2 row(s); row 0 expected '1' but was '0'
+collate.sqltest::collate_subquery_preserves_column_collation | expected 2 row(s), got 2 row(s); row 0 expected '2' but was '1'
+collate.sqltest::collate_subquery_preserves_explicit_collation | expected 2 row(s), got 2 row(s); row 0 expected '2' but was '1'
+collate.sqltest::collate_groupby_ordinal_with_explicit_collate | expected 1 row(s), got 1 row(s); row 0 expected '3' but was '1'
+collate.sqltest::collate_orderby_ordinal_with_collate_inside_parens | expected 1 row(s), got 1 row(s); row 0 expected 'a/b/c/Z' but was 'b/Z/c/a'
+compound-select-orderby.sqltest::three-way-union-order-by | expected 11 row(s), got 11 row(s); row 0 expected '1/alpha' but was '1/apple'
+compound-select-orderby.sqltest::union-order-by-expr-no-match | error 'ORDER BY term does not match any column in the result set' does not match pattern '1st ORDER BY term does not match any column in the result set'
+create_index.sqltest::create-index-string-literal-no-such-column | expected an error but the statement succeeded
+create_index.sqltest::create-index-strftime-with-column | expected success but got error: non-deterministic functions are prohibited in index expressions
+create_index.sqltest::create-index-date-literal | expected success but got error: non-deterministic functions are prohibited in index expressions
+create_index.sqltest::create-index-mixed-string-literal-column | expected an error but the statement succeeded
+create_index.sqltest::create-index-parenthesized-string-no-such-column | expected an error but the statement succeeded
+create_index.sqltest::create-index-nulls-first-rejected | error 'Unexpected token in index expression. At SQL offset 26.' does not match pattern 'NULLS'
+create_index.sqltest::create-index-nulls-last-rejected | error 'Unexpected token in index expression. At SQL offset 26.' does not match pattern 'NULLS'
+create_index.sqltest::create-index-nulls-first-with-desc-rejected | error 'Unexpected token in index expression. At SQL offset 31.' does not match pattern 'NULLS'
+create_table.sqltest::create_table_multiple_column_primary_keys | expected an error but the statement succeeded
+create_table.sqltest::create_table_duplicate_primary_key_clause | expected an error but the statement succeeded
+create_table.sqltest::create_table_trailing_named_column_constraint | expected success but got error: Expected a constraint after CONSTRAINT e. At SQL offset 99.
+create_table.sqltest::create_table_trailing_named_column_constraint_primary_key_enforced | expected success but got error: Expected a constraint after CONSTRAINT d. At SQL offset 87.
+create_table.sqltest::create_table_primary_key_nulls_last_rejected | error 'Expected RightParen. At SQL offset 40.' does not match pattern 'NULLS'
+create_table.sqltest::create_table_unique_nulls_first_rejected | error 'Expected RightParen. At SQL offset 35.' does not match pattern 'NULLS'
+create_table.sqltest::create_table_unique_desc_nulls_first_rejected | error 'Expected RightParen. At SQL offset 41.' does not match pattern 'NULLS'
+create_table_as_select.sqltest::ctas_group_by_having | expected success but got error: no such column: total
+create_table_as_select.sqltest::ctas_schema_sql | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst(id INT,name TEXT)' but was 'CREATE TABLE "dst" ("id" INT, "name" TEXT)'
+create_table_as_select.sqltest::ctas_schema_sql_expression_columns | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst("a + 1","count(*)")' but was 'CREATE TABLE "dst" ("BinaryExpression { Left = ColumnExpression { Name = a, Qualifier = , UnqualifiedNam
+create_table_as_select.sqltest::ctas_schema_sql_mixed_alias_expr | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst(id INT,"b // c","length(b)")' but was 'CREATE TABLE "dst" ("id" INT, "BinaryExpression { Left = ColumnExpression { Name = b, Qualifier
+create_table_as_select.sqltest::ctas_schema_sql_literals | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst("1","'text'","3.14","NULL")' but was 'CREATE TABLE "dst" ("LiteralExpression { Value = Turso.Core.SqlValue }", "LiteralExpression { Va
+create_table_as_select.sqltest::ctas_schema_sql_quoted_source_col | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst("weird col" TEXT)' but was 'CREATE TABLE "dst" ("weird col" TEXT)'
+create_table_as_select.sqltest::ctas_schema_expr_reparseable | expected success but got error: no such column: a + 1
+create_table_as_select.sqltest::ctas_duplicate_column_names | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst(id INT,"id:1" INT,name TEXT,value TEXT)' but was 'CREATE TABLE "dst" ("id" INT, "id:1" INT, "name" TEXT, "value" TEXT)'
+create_table_as_select.sqltest::ctas_triple_duplicate_columns | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst(x INT,"x:1" INT,"x:2" INT)' but was 'CREATE TABLE "dst" ("x" INT, "x:1" INT, "x:2" INT)'
+create_table_as_select.sqltest::ctas_compound_select_column_names | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE dst(a INT,b TEXT)' but was 'CREATE TABLE "dst" ("a" INT, "b" TEXT)'
+cte.sqltest::cte-update-direct-ref-keyed | error 'Managed CTE DML requires every CTE to contribute to the DML statement; c is unused.' does not match pattern 'no such'
+cte.sqltest::cte-update-direct-ref-nonkeyed | error 'Managed CTE DML requires every CTE to contribute to the DML statement; c is unused.' does not match pattern 'no such'
+cte.sqltest::cte-unreferenced-column-mismatch-delete | expected success but got error: Managed CTE DML requires every CTE to contribute to the DML statement; cte is unused.
+cte.sqltest::cte-unreferenced-column-mismatch-update | expected success but got error: Managed CTE DML requires every CTE to contribute to the DML statement; cte is unused.
+cte.sqltest::cte-unreferenced-column-mismatch-select | expected success but got error: table cte has 3 values for 1 columns
+cte.sqltest::cte-unreferenced-column-mismatch-multi-cte | expected success but got error: table cte_bad has 3 values for 1 columns
+cte.sqltest::cte-dual-ref-indexed-subquery-empty | expected success but got error: Expected RightParen. At SQL offset 20.
+cte.sqltest::cte-dual-ref-indexed-subquery | expected success but got error: Expected RightParen. At SQL offset 20.
+cte.sqltest::cte-unreferenced-qualified-column-orderby-exists | error 'Expected RightParen. At SQL offset 22.' does not match pattern 'no such column: cte\.y'
+cte.sqltest::cte-alias-scalar-subquery-alias-name | expected success but got error: Expected RightParen. At SQL offset 20.
+cte.sqltest::cte-no-alias-scalar-subquery | expected success but got error: Expected RightParen. At SQL offset 20.
+cte.sqltest::cte-alias-scalar-subquery-multiple-columns | expected success but got error: Expected RightParen. At SQL offset 20.
+cte.sqltest::cte-alias-scalar-subquery-multiple-ctes | expected success but got error: Expected RightParen. At SQL offset 20.
+cte_expressions.sqltest::cte-limit-inside | expected success but got error: Expected RightParen. At SQL offset 20.
+cte_expressions.sqltest::cte-offset-inside | expected success but got error: Expected RightParen. At SQL offset 20.
+cte_expressions.sqltest::cte-limit-zero-inside | expected success but got error: Expected RightParen. At SQL offset 20.
+cte_expressions.sqltest::cte-multi-union | expected success but got error: Expected RightParen. At SQL offset 29.
+cte_expressions.sqltest::cte-union-all-with-duplicates | expected success but got error: Expected RightParen. At SQL offset 20.
+cte_expressions.sqltest::cte-empty-result | expected success but got error: Expected RightParen. At SQL offset 20.
+cte_expressions.sqltest::cte-empty-with-aggregate | expected success but got error: Expected RightParen. At SQL offset 20.
+cte_expressions.sqltest::cte-schema-qualified-table-reference | expected success but got error: circular reference: t
+default_value.sqltest::default-value-identifier | expected success but got error: default value of column is not constant: asdf
+default_value.sqltest::default-value-ident-to-str | expected success but got error: default value of column is not constant: x
+default_value.sqltest::default-value-column-name | error 'default value of column is not constant: x' does not match pattern 'default value of column \[y\] is not constant'
+delete.sqltest::doubly-qualified-delete | expected success but got error: Expected End. At SQL offset 32.
+delete.sqltest::mvcc-delete-via-index-removes-checkpointed-rows | expected success but got error: Unsupported PRAGMA wal_checkpoint. At SQL offset 21.
+detach/transaction.sqltest::detach-fails-with-active-read-transaction | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern '.*database aux is locked.*'
+detach/transaction.sqltest::detach-fails-with-active-write-transaction | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern '.*database aux is locked.*'
+detach/transaction.sqltest::detach-succeeds-after-commit | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+foreign_keys.sqltest::fk-column-constraint-multi-parent | expected an error but the statement succeeded
+foreign_keys.sqltest::fk-self-ipk-text-child-coerces-rowid-ok | expected success but got error: FOREIGN KEY constraint failed
+foreign_keys.sqltest::fk-deferred-update-self-ref-rowid-affinity-one-stmt | expected success but got error: FOREIGN KEY constraint failed
+foreign_keys.sqltest::fk-cascade-delete-self-referential-explain-terminates | expected success but got error: EXPLAIN is only supported for statements lowered to the bytecode compiler.
+foreign_keys.sqltest::fk-alter-table-add-column-enforced | expected success but got error: ALTER TABLE ADD COLUMN with REFERENCES is not supported.
+gencol.sqltest::gencol_self_table_affinity_indexed_update_returning | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 9.
+gencol.sqltest::gencol_self_table_affinity_indexed_delete_returning | expected success but got error: Managed DELETE does not support INDEXED BY or NOT INDEXED. At SQL offset 14.
+gencol.sqltest::gencol_validate_isnull | expected success but got error: Expected RightParen. At SQL offset 35.
+gencol.sqltest::gencol_validate_notnull | expected success but got error: Expected RightParen. At SQL offset 35.
+gencol.sqltest::gencol_func_substr | expected success but got error: function substr() is not allowed in a generated column
+gencol.sqltest::gencol_func_nested_upper_substr | expected success but got error: function substr() is not allowed in a generated column
+gencol.sqltest::gencol_alter_add_virtual | expected 2 row(s), got 2 row(s); row 0 expected '5/10' but was '5/'
+gencol.sqltest::gencol_alter_add_virtual_explicit | expected 1 row(s), got 1 row(s); row 0 expected '3/103' but was '3/'
+gencol.sqltest::gencol_alter_add_multiple_virtual | expected 1 row(s), got 1 row(s); row 0 expected '5/10/15' but was '5//'
+gencol.sqltest::gencol_alter_add_virtual_function | expected 1 row(s), got 1 row(s); row 0 expected 'hello/HELLO' but was 'hello/'
+gencol.sqltest::gencol_alter_add_virtual_complex_expr | expected 1 row(s), got 1 row(s); row 0 expected '3/7/10' but was '3/7/'
+gencol.sqltest::gencol_alter_add_virtual_random_error | error 'function random() is not allowed in a generated column' does not match pattern 'non-deterministic functions prohibited in generated columns'
+gencol.sqltest::gencol_create_current_timestamp_rejected | error 'expression is not allowed in a generated column' does not match pattern 'non-deterministic functions prohibited in generated columns'
+gencol.sqltest::gencol_create_current_date_rejected | error 'expression is not allowed in a generated column' does not match pattern 'non-deterministic functions prohibited in generated columns'
+gencol.sqltest::gencol_create_current_time_rejected | error 'expression is not allowed in a generated column' does not match pattern 'non-deterministic functions prohibited in generated columns'
+gencol.sqltest::gencol_create_current_timestamp_nested_rejected | error 'expression is not allowed in a generated column' does not match pattern 'non-deterministic functions prohibited in generated columns'
+gencol.sqltest::gencol_alter_add_current_timestamp_rejected | error 'expression is not allowed in a generated column' does not match pattern 'non-deterministic functions prohibited in generated columns'
+gencol.sqltest::gencol_alter_add_column_generated_pk_rejected | error 'Cannot add a PRIMARY KEY or UNIQUE column.' does not match pattern '(Cannot add a PRIMARY KEY column/generated columns cannot be part of the PRIMARY KEY)'
+gencol.sqltest::gencol_alter_add_virtual_not_null_violation | error 'Cannot add a NOT NULL column without a default value.' does not match pattern 'NOT NULL constraint failed'
+gencol.sqltest::gencol_alter_add_virtual_not_null_ok | expected success but got error: Cannot add a NOT NULL column without a default value.
+gencol.sqltest::gencol_alter_add_virtual_check_with_existing_virtual_middle | expected 2 row(s), got 2 row(s); row 0 expected '1/2/10/11' but was '1/2/10/'
+gencol.sqltest::gencol_alter_add_virtual_check_with_existing_virtual_middle_violation | expected an error but the statement succeeded
+gencol.sqltest::gencol_alter_add_virtual_insert_after | expected 2 row(s), got 2 row(s); row 0 expected '1/10' but was '1/'
+gencol.sqltest::gencol_alter_add_virtual_after_add_default_notnull | expected success but got error: Cannot add a NOT NULL column without a default value.
+gencol.sqltest::gencol_alter_add_stored_rejected | expected an error but the statement succeeded
+gencol.sqltest::gencol_rename_column_updates_expression | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t1 (c TEXT, b TEXT AS (c))' but was 'CREATE TABLE "t1" ("c" TEXT, "b" TEXT AS (c) VIRTUAL)'
+gencol.sqltest::gencol_rename_column_other_table_unaffected | output does not match pattern '^CREATE TABLE t2 ?\(c, othername, extra AS \(c \+ 1\)\)$'
+gencol.sqltest::gencol_rename_column_other_table_matching_name_unaffected | output does not match pattern '^CREATE TABLE t2 ?\(a, z AS \(a \+ 1\)\)$'
+gencol.sqltest::rename_then_drop_keeps_renamed_column | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (a REAL AS (ee), c INTEGER, f INTEGER AS (c * ee), ee REAL)' but was 'CREATE TABLE "t" ("a" REAL AS (ee) VIRTUAL, "c" INTEGER, "f" INTEG
+gencol.sqltest::gencol_error_subquery | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
+gencol.sqltest::gencol_error_in_select | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
+gencol.sqltest::gencol_error_exists | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
+gencol.sqltest::gencol_error_aggregate | error 'function sum() is not allowed in a generated column' does not match pattern '(aggregate functions prohibited/misuse of aggregate function)'
+gencol.sqltest::gencol_error_aggregate_star | error 'aggregate and window functions are not allowed in a generated column' does not match pattern '(aggregate functions prohibited/misuse of aggregate function)'
+gencol.sqltest::gencol_error_nondeterministic_virtual | error 'function random() is not allowed in a generated column' does not match pattern 'non-deterministic functions prohibited in generated columns'
+gencol.sqltest::gencol_deterministic_date_function | expected success but got error: function date() is not allowed in a generated column
+gencol.sqltest::gencol_error_nondeterministic_datetime | error 'function datetime() is not allowed in a generated column' does not match pattern 'non-deterministic'
+gencol.sqltest::gencol_error_nondeterministic_strftime | error 'function strftime() is not allowed in a generated column' does not match pattern 'non-deterministic'
+gencol.sqltest::gencol_error_nondeterministic_unixepoch | error 'function unixepoch() is not allowed in a generated column' does not match pattern 'non-deterministic'
+gencol.sqltest::gencol_error_dot_operator | error 'no such column: t1.b' does not match pattern 'the "." operator prohibited in generated columns'
+gencol.sqltest::gencol_error_doubly_qualified | error 'Expected RightParen. At SQL offset 40.' does not match pattern 'the "." operator prohibited in generated columns'
+gencol.sqltest::gencol_error_window_function | error 'aggregate and window functions are not allowed in a generated column' does not match pattern '(window functions prohibited/misuse of window function)'
+gencol.sqltest::gencol_error_nested_window_function | error 'aggregate and window functions are not allowed in a generated column' does not match pattern '(window functions prohibited/misuse of window function)'
+gencol.sqltest::gencol_error_bind_parameter | error 'Missing value for parameter ?1.' does not match pattern '(bind parameters prohibited/parameters prohibited in generated columns)'
+gencol.sqltest::gencol_error_bind_parameter_unnamed | error 'Missing value for parameter at position 1.' does not match pattern '(bind parameters prohibited/parameters prohibited in generated columns)'
+gencol.sqltest::gencol_stored_rejected | expected an error but the statement succeeded
+gencol.sqltest::gencol_stored_generated_always_rejected | expected an error but the statement succeeded
+gencol.sqltest::gencol_error_nested_subquery_in_func | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
+gencol.sqltest::gencol_error_nested_aggregate | error 'function sum() is not allowed in a generated column' does not match pattern '(aggregate functions prohibited/misuse of aggregate function)'
+gencol.sqltest::gencol_error_nested_nondeterministic | error 'function random() is not allowed in a generated column' does not match pattern 'non-deterministic functions prohibited in generated columns'
+gencol.sqltest::gencol_error_nested_dot_in_case | error 'no such column: t1.a' does not match pattern 'the "." operator prohibited in generated columns'
+gencol.sqltest::gencol_error_nested_subquery_in_case | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
+gencol.sqltest::gencol_error_nested_in_select | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
+gencol.sqltest::gencol_error_nested_exists_in_arith | error 'subqueries are not allowed in a generated column' does not match pattern 'subqueries prohibited in generated columns'
+gencol.sqltest::gencol_error_nested_aggregate_star | error 'aggregate and window functions are not allowed in a generated column' does not match pattern '(aggregate functions prohibited/misuse of aggregate function)'
+gencol.sqltest::gencol_error_nested_doubly_qualified | error 'Expected RightParen. At SQL offset 44.' does not match pattern 'the "." operator prohibited in generated columns'
+gencol.sqltest::gencol_validate_nested_isnull_arith | expected success but got error: Expected RightParen. At SQL offset 51.
+gencol.sqltest::gencol_validate_nested_notnull_arith | expected success but got error: Expected RightParen. At SQL offset 51.
+gencol.sqltest::fk-gencol-unique-idx-update-cascade | expected success but got error: FOREIGN KEY constraint failed
+gencol.sqltest::update-virtual-not-null-deferred-trigger-ignore | expected success but got error: NOT NULL constraint failed: t.b
+gencol.sqltest::update-virtual-not-null-transitive-deferred-trigger-ignore | expected success but got error: NOT NULL constraint failed: t.c
+gencol.sqltest::update-virtual-not-null-deferred-trigger-abort | error 'NOT NULL constraint failed: t.b' does not match pattern 'trigger rejects null'
+gencol.sqltest::update-virtual-not-null-transitive-deferred-trigger-abort | error 'NOT NULL constraint failed: t.c' does not match pattern 'trigger rejects null'
+glob/memory.sqltest::glob-null-other-types | expected success but got error: Expected BETWEEN, IN, LIKE, GLOB, REGEXP, or MATCH after NOT. At SQL offset 59.
+glob/memory.sqltest::glob-embedded-nul-1 | expected 1 row(s), got 1 row(s); row 0 expected '0' but was '1'
+glob/memory.sqltest::glob-embedded-nul-2 | expected 1 row(s), got 1 row(s); row 0 expected '0' but was '1'
+group-by-expression-index.sqltest::group-by-expr-index-basic | expected success but got error: no such column: m
+group-by-expression-index.sqltest::group-by-compound-expr-no-index | expected success but got error: no such column: m
+group-by-expression-index.sqltest::group-by-func-expr-index | expected success but got error: no such column: n
+groupby/constant-expr.sqltest::group-by-order-by-constant-float | expected success but got error: Unsupported expression type StarExpression.
+groupby/constant-expr.sqltest::group-by-order-by-constant-string | expected success but got error: Unsupported expression type StarExpression.
+groupby/constant-expr.sqltest::group-by-order-by-null | expected success but got error: Unsupported expression type StarExpression.
+groupby/constant-expr.sqltest::group-by-view-constant-order-by | expected success but got error: Unsupported expression type StarExpression.
+groupby/memory.sqltest::having_or | expected success but got error: no such column: cnt
+groupby/memory.sqltest::group_by_nonconflicting_alias | expected success but got error: no such column: c
+groupby/memory.sqltest::group_by_column_having_alias | expected success but got error: no such column: total
+groupby/memory.sqltest::group_by_numeric_index_vs_alias | expected 4 row(s), got 1 row(s); row 0 expected '1/100' but was '1/1000'
+groupby/memory.sqltest::having_without_group_by_basic | expected success but got error: no such column: s
+groupby/memory.sqltest::having_without_group_by_no_match | expected success but got error: no such column: s
+groupby/memory.sqltest::having_without_group_by_multiple_aggregates | expected success but got error: no such column: c
+groupby/memory.sqltest::having_without_group_by_expression | expected success but got error: no such column: total
+groupby/memory.sqltest::having_without_group_by_complex_condition | expected success but got error: no such column: s
+groupby/memory.sqltest::having_without_group_by_count | expected success but got error: no such column: cnt
+groupby/memory.sqltest::having_without_group_by_max_min | expected success but got error: no such column: mx
+groupby/memory.sqltest::group-by-zero | expected an error but the statement succeeded
+groupby/memory.sqltest::group-by-out-of-range | expected an error but the statement succeeded
+groupby/memory.sqltest::group-by-negative | expected an error but the statement succeeded
+index-cursor-record-after-overflow-update.sqltest::rowid-after-overflow-update | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+index-cursor-record-after-overflow-update.sqltest::update-indexed-by-overflow-keys | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 9.
+index-cursor-record-after-overflow-update.sqltest::select-via-index-after-overflow-update | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 9.
+index-cursor-record-after-overflow-update.sqltest::select-via-index-empty-result-after-update | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 9.
+indexed_by.sqltest::indexed-by-delete | expected success but got error: Managed DELETE does not support INDEXED BY or NOT INDEXED. At SQL offset 15.
+indexed_by.sqltest::indexed-by-update | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 10.
+indexed_by.sqltest::not-indexed-delete | expected success but got error: Managed DELETE does not support INDEXED BY or NOT INDEXED. At SQL offset 16.
+indexed_by.sqltest::not-indexed-update | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 11.
+indexed_by.sqltest::indexed-by-attached-qualified-table | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+indexed_by.sqltest::indexed-by-attached-update-delete | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 15.
+insert.sqltest::insert-explicit-rowid-with-rowidalias | expected 6 row(s), got 6 row(s); row 0 expected '-12/-10/-12/-9' but was '4/2/4/1'
+insert.sqltest::uniq_constraint | error 'UNIQUE constraint failed: test.id' does not match pattern 'UNIQUE constraint failed: test.id \(19\)'
+insert.sqltest::insert-explicit-rowid-conflict | error 'UNIQUE constraint failed: t.rowid' does not match pattern 'UNIQUE constraint failed: t.rowid \(19\)'
+insert.sqltest::insert-integer-pk-i64-min-float-error | expected an error but the statement succeeded
+insert.sqltest::insert-1-3 | error 'table has a different number of columns' does not match pattern 'table test1 has 3 columns but 2 values were supplied'
+insert.sqltest::insert-1-3b | error 'table has a different number of columns' does not match pattern 'table test1 has 3 columns but 4 values were supplied'
+insert.sqltest::insert-column-count-mismatch-values | error 'table has a different number of columns' does not match pattern 'table t1 has 1 columns but 3 values were supplied'
+insert.sqltest::insert-column-count-mismatch-select | error 'table has a different number of columns' does not match pattern 'table t1 has 1 columns but 7 values were supplied'
+join/memory.sqltest::correlated-subquery-hash-join-reuse | expected success but got error: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were changed.
+join/memory.sqltest::full-outer-join | expected an error but the statement succeeded
+join/memory.sqltest::join-3-1 | error 'NATURAL joins may not have an ON or USING clause. At SQL offset 45.' does not match pattern 'a NATURAL join may not have an ON or USING clause'
+join/memory.sqltest::join-3-2 | error 'NATURAL joins may not have an ON or USING clause. At SQL offset 41.' does not match pattern 'a NATURAL join may not have an ON or USING clause'
+join/outer_hash_join.sqltest::full-outer-join-using-errors | expected an error but the statement succeeded
+join/outer_hash_join.sqltest::full-outer-join-with-group-by | expected success but got error: no such column: key
+join/outer_hash_join.sqltest::full-outer-join-group-by-having | expected success but got error: no such column: key
+join/outer_hash_join.sqltest::three-way-full-outer-join-errors | expected an error but the statement succeeded
+join/outer_hash_join.sqltest::left-then-full-outer-chain-errors | expected an error but the statement succeeded
+join/outer_hash_join.sqltest::right-then-full-outer-chain-errors | expected an error but the statement succeeded
+join/outer_hash_join.sqltest::left-then-right-join-chain-errors | expected an error but the statement succeeded
+join/outer_hash_join.sqltest::right-then-right-join-chain-errors | expected an error but the statement succeeded
+join/outer_hash_join.sqltest::full-outer-then-right-join-errors | expected an error but the statement succeeded
+join/outer_hash_join.sqltest::full-outer-with-not-exists-subquery | expected an error but the statement succeeded
+join/outer_hash_join.sqltest::full-outer-with-where-equijoin | expected 4 row(s), got 2 row(s); row 0 expected '1/' but was '2/2'
+joins/derived_subquery_on_predicate.sqltest::issue-7372-text-range-join-after-analyze | setup 'issue-7372-schema' failed: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were changed.
+json/json-insert-replace-odd-args.sqltest::json-insert-path-only-errors | error 'wrong number of arguments to function json_insert()' does not match pattern 'json_insert\(\) needs an odd number of arguments'
+json/json-insert-replace-odd-args.sqltest::json-replace-path-only-errors | error 'wrong number of arguments to function json_replace()' does not match pattern 'json_replace\(\) needs an odd number of arguments'
+json/json-insert-replace-odd-args.sqltest::jsonb-insert-path-only-errors | error 'no such function: JSONB_INSERT' does not match pattern 'json_insert\(\) needs an odd number of arguments'
+json/json-insert-replace-odd-args.sqltest::jsonb-replace-path-only-errors | error 'no such function: JSONB_REPLACE' does not match pattern 'json_replace\(\) needs an odd number of arguments'
+last_insert_rowid.sqltest::last-insert-rowid-after-insert-returning | expected 5 row(s), got 5 row(s); row 1 expected '20' but was '10'
+last_insert_rowid.sqltest::last-insert-rowid-unchanged-by-cdc-internal-inserts | expected success but got error: Unsupported PRAGMA capture_data_changes_conn. At SQL offset 33.
+literal.sqltest::numberic-literal-5 | expected success but got error: Expected End. At SQL offset 8.
+literal.sqltest::numberic-literal-6 | expected success but got error: Expected End. At SQL offset 9.
+literal.sqltest::numberic-literal-7 | expected success but got error: Expected End. At SQL offset 8.
+literal.sqltest::numberic-literal-8 | expected success but got error: Expected End. At SQL offset 10.
+literal.sqltest::numberic-literal-13 | expected success but got error: Expected End. At SQL offset 10.
+literal.sqltest::numberic-literal-14 | expected success but got error: Expected End. At SQL offset 9.
+literal.sqltest::numberic-literal-exceed-max-i64 | expected success but got error: Expected End. At SQL offset 8.
+literal.sqltest::numberic-literal-exceed-min-i64 | expected success but got error: Expected End. At SQL offset 9.
+math/memory.sqltest::ceil-int | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
+math/memory.sqltest::ceiling-int | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
+math/memory.sqltest::floor-int | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
+math/memory.sqltest::trunc-int | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '1.0'
+mvcc-begin-within-concurrent.sqltest::begin-immediate-inside-begin-concurrent-errors | error 'Expected End. At SQL offset 6.' does not match pattern 'cannot start a transaction within a transaction'
+mvcc-begin-within-concurrent.sqltest::begin-deferred-inside-begin-concurrent-errors | error 'Expected End. At SQL offset 6.' does not match pattern 'cannot start a transaction within a transaction'
+mvcc-begin-within-concurrent.sqltest::begin-concurrent-inside-begin-concurrent-errors | error 'Expected End. At SQL offset 6.' does not match pattern 'cannot start a transaction within a transaction'
+mvcc-idxdelete-exact-seek.sqltest::mvcc-idxdelete-exact-seek | expected success but got error: Unsupported PRAGMA wal_checkpoint. At SQL offset 21.
+mvcc-update-noop.sqltest::mvcc-update-self-does-not-delete-rows | expected 2 row(s), got 2 row(s); row 0 expected 'mvcc' but was 'wal'
+mvcc-update-noop.sqltest::mvcc-update-self-data-intact | expected 2 row(s), got 2 row(s); row 0 expected 'mvcc' but was 'wal'
+mvcc-update-noop.sqltest::mvcc-update-self-multiple-rows | expected 2 row(s), got 2 row(s); row 0 expected 'mvcc' but was 'wal'
+mvcc-update-noop.sqltest::mvcc-update-different-value | expected 2 row(s), got 2 row(s); row 0 expected 'mvcc' but was 'wal'
+not_between.sqltest::not-between-subquery-bound-orderby-offset | expected success but got error: Expected keyword AND. At SQL offset 120.
+null/default.sqltest::isnull | expected success but got error: Expected End. At SQL offset 12.
+null/default.sqltest::notnull | expected success but got error: Expected End. At SQL offset 12.
+null/default.sqltest::not-null | expected success but got error: Expected BETWEEN, IN, LIKE, GLOB, REGEXP, or MATCH after NOT. At SQL offset 16.
+nulls-first-last.sqltest::window-two-different-nulls-orderings | expected 5 row(s), got 5 row(s); row 1 expected '4//2/5' but was '2/3/5/3'
+numeric-text-overflow.sqltest::ceil-text-i64-max-stays-integer | expected 1 row(s), got 1 row(s); row 0 expected '9223372036854775807/integer' but was '9.22337203685478e+18/real'
+on_conflict.sqltest::mvcc-upsert-set-pk-on-conflict-target-resolves | expected 2 row(s), got 2 row(s); row 0 expected 'mvcc' but was 'memory'
+on_conflict_constraint_def.sqltest::update-pk-rollback | error 'Managed UPDATE cannot apply schema-level ON CONFLICT ROLLBACK until the pending row-update engine supports partial publication, transaction rollback, and replacement.' does not match pattern 'U
+on_conflict_constraint_def.sqltest::update-rollback-terminates-transaction | error 'Managed UPDATE cannot apply schema-level ON CONFLICT ROLLBACK until the pending row-update engine supports partial publication, transaction rollback, and replacement.' does not match pattern 'U
+on_conflict_constraint_def.sqltest::ddl-reject-multiple-pk-columns | expected an error but the statement succeeded
+orderby/memory.sqltest::orderby_rowid_truncation | expected success but got error: sub-select returns 2 columns - expected 1
+orderby/memory.sqltest::orderby_rowid_truncation_explicit_rowid | expected success but got error: sub-select returns 2 columns - expected 1
+orderby/memory.sqltest::order-by-plus-2 | expected 2 row(s), got 2 row(s); row 0 expected '2/9' but was '1/10'
+orderby/memory.sqltest::group-by-plus-1 | expected 2 row(s), got 1 row(s); row 0 expected 'x/3' but was 'x/6'
+orderby/memory.sqltest::order-by-negative-1 | expected an error but the statement succeeded
+orderby/memory.sqltest::order-by-negative-100 | expected an error but the statement succeeded
+orderby/memory.sqltest::order-by-out-of-range | expected an error but the statement succeeded
+orderby/memory.sqltest::order-by-zero | expected an error but the statement succeeded
+partial_idx.sqltest::partial-index-qualified-column-in-function | expected success but got error: the "." operator is prohibited in partial index WHERE clauses
+partial_idx.sqltest::partial-index-doubly-qualified-column-in-function | expected success but got error: Expected RightParen. At SQL offset 51.
+partial_idx.sqltest::plan-partial-index-and-where-eq-seek | expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH samples USING INDEX samples_pidx (name=?)' but was '0/0/0/SEARCH samples USING INDEX samples_pidx'
+partial_idx.sqltest::plan-partial-index-and-where-reversed-order | expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH samples USING INDEX samples_pidx (name=?)' but was '0/0/0/SEARCH samples USING INDEX samples_pidx'
+partial_idx.sqltest::plan-partial-index-qualified-where-matches | expected success but got error: the "." operator is prohibited in partial index WHERE clauses
+partial_idx.sqltest::plan-partial-index-full-scan-when-where-matched | expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN samples USING INDEX samples_user_processed_idx' but was '0/0/0/MANAGED COMPILED VDBE'
+partial_idx.sqltest::plan-partial-index-not-used-when-where-not-implied | expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN samples' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+partial_idx.sqltest::plan-partial-index-equality-predicate | expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH products USING INDEX idx_active_sku (sku=?)' but was '0/0/0/SEARCH products USING INDEX idx_active_sku'
+partial_idx.sqltest::plan-partial-index-range-predicate | expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SEARCH products USING INDEX idx_expensive (sku=?)' but was '0/0/0/SEARCH products USING INDEX idx_expensive'
+partial_idx.sqltest::plan-partial-index-range-not-implied | expected 1 row(s), got 1 row(s); row 0 expected '1/0/0/SCAN products' but was '0/0/0/MANAGED EVALUATOR FALLBACK'
+partial_idx.sqltest::partial-index-indexed-by-count-star-without-predicate-counts-table | expected success but got error: no query solution
+pragma-unknown-no-op.sqltest::unknown-pragma-reverse-unordered-selects | expected success but got error: Unsupported PRAGMA reverse_unordered_selects. At SQL offset 32.
+pragma-unknown-no-op.sqltest::unknown-pragma-legacy-alter-table | expected success but got error: Unsupported PRAGMA legacy_alter_table. At SQL offset 25.
+pragma/foreign_key_list.sqltest::pragma-foreign-key-list-equals-syntax | expected success but got error: Expected LeftParen. At SQL offset 23.
+pragma/foreign_key_list.sqltest::pragma-foreign-key-list-empty-results | expected success but got error: Expected LeftParen. At SQL offset 23.
+pragma/foreign_key_list.sqltest::pragma-foreign-key-list-attached-database | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+pragma/index_info.sqltest::pragma-index-info-equals-syntax | expected success but got error: Expected LeftParen. At SQL offset 17.
+pragma/index_list.sqltest::pragma-index-list-equals-syntax | expected success but got error: Expected LeftParen. At SQL offset 17.
+pragma/index_list.sqltest::pragma-index-list-attached-database | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+pragma/index_xinfo.sqltest::pragma-index-xinfo-equals-syntax | expected success but got error: Expected LeftParen. At SQL offset 18.
+pragma/memory.sqltest::pragma-cache-size-default | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 17.
+pragma/memory.sqltest::pragma-set-cache-size | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+pragma/memory.sqltest::pragma-cache-size | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 17.
+pragma/memory.sqltest::pragma-page-count-table | expected success but got error: Managed PRAGMA page_count requires a file-backed database.
+pragma/memory.sqltest::pragma-max-page-count-clamping-with-data | expected success but got error: Unsupported PRAGMA max_page_count. At SQL offset 22.
+pragma/memory.sqltest::pragma-page-count-empty | expected success but got error: Managed PRAGMA page_count requires a file-backed database.
+pragma/memory.sqltest::pragma-page-count-empty-2 | expected success but got error: Managed PRAGMA page_count requires a file-backed database.
+pragma/memory.sqltest::pragma-page-size-set | expected 1 row(s), got 1 row(s); row 0 expected '1024' but was '4096'
+pragma/memory.sqltest::pragma-max-page-count-default | expected success but got error: Unsupported PRAGMA max_page_count. At SQL offset 21.
+pragma/memory.sqltest::pragma-max-page-count-set-large | expected success but got error: Unsupported PRAGMA max_page_count. At SQL offset 22.
+pragma/memory.sqltest::pragma-max-page-count-set-zero-ignored | expected success but got error: Unsupported PRAGMA max_page_count. At SQL offset 22.
+pragma/memory.sqltest::pragma-cache-spill-off | expected success but got error: Unsupported PRAGMA cache_spill. At SQL offset 18.
+pragma/memory.sqltest::pragma-page-size-set-uninitialized-db | expected 1 row(s), got 1 row(s); row 0 expected '1024' but was '4096'
+pragma/require_where.sqltest::pragma-require-where-alias | expected success but got error: Unsupported PRAGMA require_where. At SQL offset 21.
+pragma/require_where.sqltest::pragma-require-where-delete-with-where-ok | expected success but got error: Unsupported PRAGMA i_am_a_dummy. At SQL offset 20.
+pragma/require_where.sqltest::pragma-require-where-update-with-where-ok | expected success but got error: Unsupported PRAGMA i_am_a_dummy. At SQL offset 20.
+pragma/require_where.sqltest::pragma-require-where-delete-without-where | error 'Unsupported PRAGMA i_am_a_dummy. At SQL offset 20.' does not match pattern 'DELETE without a WHERE clause is not allowed when require_where \(or i_am_a_dummy\) is enabled'
+pragma/require_where.sqltest::pragma-require-where-update-without-where | error 'Unsupported PRAGMA i_am_a_dummy. At SQL offset 20.' does not match pattern 'UPDATE without a WHERE clause is not allowed when require_where \(or i_am_a_dummy\) is enabled'
+pragma/table_list.sqltest::pragma-table-list-single-table | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
+pragma/table_list.sqltest::pragma-table-list-equals-syntax | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
+pragma/table_list.sqltest::pragma-table-list-view | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
+pragma/table_list.sqltest::pragma-table-list-strict | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
+pragma/table_list.sqltest::pragma-table-list-nonexistent | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 17.
+pragma/table_list.sqltest::pragma-table-list-includes-temp-schema | expected 1 row(s), got 0 row(s)
+pragma/table_list.sqltest::pragma-table-list-unqualified-includes-main-and-temp-matches | expected 2 row(s), got 1 row(s)
+pragma/table_list.sqltest::pragma-table-list-attached-database | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 21.
+pragma/table_list.sqltest::pragma-table-list-explicit-main-vs-temp | expected success but got error: PRAGMA table_list does not accept a value. At SQL offset 22.
+pragma_vdbe_trace.sqltest::pragma-vdbe-trace | expected success but got error: Unsupported PRAGMA vdbe_trace. At SQL offset 18.
+reindex.sqltest::reindex-table-with-multiple-index-types | expected success but got error: non-deterministic functions are prohibited in index expressions
+reindex.sqltest::reindex-attached-qualified-targets | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+reindex.sqltest::reindex-view-is-noop | expected success but got error: unable to identify the object to be reindexed
+reindex.sqltest::reindex-expression-index-outer-collate-target | expected 2 row(s), got 2 row(s); row 0 expected '0/0/a/0/RTRIM/1' but was '0/-2//0/RTRIM/1'
+reindex.sqltest::reindex-non-ascii-identifiers-use-ascii-case-folding | error 'Unexpected SQL character 'é' at offset 16.' does not match pattern 'unable to identify the object to be reindexed'
+reindex.sqltest::reindex-unquoted-compound-keyword-target-rejected | expected an error but the statement succeeded
+returning.sqltest::update-returning-target-selfread-reruns-per-row | expected 2 row(s), got 2 row(s); row 1 expected '2/2' but was '2/1'
+returning.sqltest::update-returning-target-selfread-correlated-updated-group | expected 2 row(s), got 2 row(s); row 0 expected '1/11/1' but was '1/11/0'
+returning.sqltest::update-returning-after-trigger-same-row-direct | expected 2 row(s), got 2 row(s); row 0 expected '120' but was '20'
+returning.sqltest::update-returning-after-trigger-same-row-subquery | expected 2 row(s), got 2 row(s); row 0 expected '120/120' but was '20/20'
+returning.sqltest::delete-returning-target-selfread-reruns-per-row | expected 2 row(s), got 2 row(s); row 0 expected '1/2' but was '1/3'
+returning.sqltest::delete-returning-target-selfread-correlated-group-count | expected 2 row(s), got 2 row(s); row 0 expected '1/1' but was '1/2'
+returning.sqltest::insert-returning-last-insert-rowid | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
+returning.sqltest::insert-returning-target-selfread-reruns-per-row | expected 2 row(s), got 2 row(s); row 0 expected '2/2' but was '2/3'
+rollback.sqltest::schema-change-rollback-2-2 | expected 2 row(s), got 2 row(s); row 0 expected 'before' but was 'after'
+rollback.sqltest::schema-alter-rollback | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (x)' but was 'CREATE TABLE "t" ("x")'
+rollback.sqltest::schema-alter-rollback-and-repeat | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (x, y)' but was 'CREATE TABLE "t" ("x", "y")'
+rollback.sqltest::schema-create-index-rollback | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (x)' but was 'CREATE TABLE "t" ("x")'
+rollback.sqltest::schema-drop-table-rollback | expected 1 row(s), got 1 row(s); row 0 expected 'CREATE TABLE t (x)' but was 'CREATE TABLE "t" ("x")'
+save-all-cursors.sqltest::save-all-cursors-window-triple-selfjoin-multi-partition | expected success but got error: managed execution exceeded 30 seconds
+save-all-cursors.sqltest::save-all-cursors-window-triple-selfjoin-delete-scalar-subquery | expected success but got error: managed execution exceeded 30 seconds
+save-all-cursors.sqltest::save-all-cursors-window-triple-selfjoin-update-in-subquery | expected success but got error: managed execution exceeded 30 seconds
+savepoint.sqltest::savepoint-rollback-overflow-issue-6352 | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+savepoint.sqltest::savepoint-rollback-overflow-nested-issue-6352 | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+savepoint.sqltest::savepoint-rollback-overflow-repeated-issue-6352 | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+savepoint.sqltest::savepoint-rollback-overflow-grow-issue-6352 | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+savepoint.sqltest::savepoint-rollback-cache-spill-issue-6351 | expected success but got error: Unsupported PRAGMA cache_size. At SQL offset 18.
+select/memory.sqltest::select-intersect-union-with-limit | expected 3 row(s), got 3 row(s); row 0 expected 'a/a' but was 'z/z'
+select/memory.sqltest::select-except-union | expected 3 row(s), got 3 row(s); row 0 expected 'x/x' but was 'y/y'
+select/memory.sqltest::limit-underscore-literal | expected success but got error: Expected End. At SQL offset 16.
+select/memory.sqltest::rowid-select-from-clause-subquery | expected an error but the statement succeeded
+select/memory.sqltest::ambiguous-self-join | expected an error but the statement succeeded
+select/memory.sqltest::ambiguous-column-error-message-format | error 'ambiguous column name: f2' does not match pattern 'ambiguous column name: f1'
+select/memory.sqltest::duplicate-alias-ambiguous-column | error 'ambiguous column name: f2' does not match pattern 'ambiguous column name: A.f1'
+select/memory.sqltest::collate-compound-1 | expected 1 row(s), got 1 row(s); row 0 expected 'ABC' but was 'abc'
+select/memory.sqltest::collate-compound-5 | expected 1 row(s), got 1 row(s); row 0 expected 'ABC' but was 'abc'
+select/memory.sqltest::collate-compound-7 | expected 2 row(s), got 2 row(s); row 0 expected 'A' but was 'a'
+select/memory.sqltest::collate-compound-10 | expected 3 row(s), got 3 row(s); row 0 expected 'ABC' but was 'abc'
+select/memory.sqltest::collate-compound-11 | expected 3 row(s), got 3 row(s); row 0 expected 'BANANA' but was 'apple'
+select/memory.sqltest::collate-compound-13 | expected 1 row(s), got 1 row(s); row 0 expected 'TEST' but was 'Test'
+select/memory.sqltest::collate-compound-14 | expected 2 row(s), got 2 row(s); row 0 expected 'ABC' but was 'abc'
+select/memory.sqltest::where-variable-predicate | expected success but got error: Missing value for parameter ?1.
+simple-count-optimization.sqltest::simple-count-index-correctness | expected success but got error: no query solution
+snapshot_tests/analyze/stat1_rows.sqltest::analyze-indexed-table-does-not-insert-null-stat1-row | expected success but got error: Managed ANALYZE is not supported because sqlite_stat tables and planner statistics are not implemented; no statistics were changed.
+snapshot_tests/subqueries/subquery-sort-elision.sqltest::partial-partition-match | expected 7 row(s), got 7 row(s); row 0 expected '1/20/20' but was '1/30/50'
+snapshot_tests/subqueries/subquery-sort-elision.sqltest::window-partial-not-elided | expected 7 row(s), got 7 row(s); row 0 expected '1/20/20' but was '1/30/50'
+snapshot_tests/subqueries/subquery-sort-elision.sqltest::window-no-cte-order-not-elided | expected 7 row(s), got 7 row(s); row 0 expected '1/50' but was '3/100'
+subquery/cte_materialization_adversarial.sqltest::range-scan-text-vs-int-affinity | expected 1 row(s), got 4 row(s); row 0 expected '3/30' but was '1/10'
+subquery/expressions.sqltest::subquery-join-two-subqueries | expected success but got error: Expected RightParen. At SQL offset 24.
+subquery/expressions.sqltest::subquery-left-join-two-subqueries | expected success but got error: Expected RightParen. At SQL offset 24.
+subquery/expressions.sqltest::subquery-cross-join-subqueries | expected success but got error: Expected RightParen. At SQL offset 24.
+subquery/expressions.sqltest::subquery-natural-join-subqueries | expected success but got error: Expected RightParen. At SQL offset 24.
+subquery/expressions.sqltest::subquery-from-union | expected success but got error: Expected RightParen. At SQL offset 24.
+subquery/expressions.sqltest::subquery-from-union-all | expected success but got error: Expected RightParen. At SQL offset 24.
+subquery/expressions.sqltest::subquery-from-intersect | expected success but got error: Expected RightParen. At SQL offset 24.
+subquery/expressions.sqltest::subquery-from-except | expected success but got error: Expected RightParen. At SQL offset 24.
+subquery/expressions.sqltest::subquery-nested-compound-in-scalar | expected success but got error: Expected RightParen. At SQL offset 37.
+subquery/expressions.sqltest::subquery-group-by-inside | expected success but got error: Expected RightParen. At SQL offset 39.
+subquery/expressions.sqltest::subquery-having-inside | expected success but got error: Expected RightParen. At SQL offset 39.
+subquery/memory.sqltest::subquery-correlated-outer-ref-in-group-by-in-subquery | expected an error but the statement succeeded
+subquery/memory.sqltest::subquery-correlated-outer-ref-in-group-by-function-call | expected an error but the statement succeeded
+subquery/memory.sqltest::subquery-correlated-outer-ref-in-group-by-rowid-alias-oid | expected an error but the statement succeeded
+subquery/memory.sqltest::subquery-correlated-outer-ref-in-group-by-rowid-alias-underscore | expected an error but the statement succeeded
+subquery/memory.sqltest::subquery-correlated-outer-ref-in-nested-group-by-subquery | expected an error but the statement succeeded
+subquery/memory.sqltest::subquery-uncorrelated-in-having | expected success but got error: no such column: total
+subquery/memory.sqltest::subquery-correlated-in-having-grouped-scalar-null | expected success but got error: no such column: total
+subquery/memory.sqltest::subquery-uncorrelated-in-having-in | expected success but got error: no such column: total
+subquery/memory.sqltest::subquery-column-affinity-inheritance | expected 1 row(s), got 1 row(s); row 0 expected '1' but was '0'
+subquery/memory.sqltest::subquery-correlated-exists-in-select-with-aggregate-empty-table | expected success but got error: no such column: t6.id
+subquery/memory.sqltest::correlated-exists-in-ungrouped-aggregate-empty-main-table | expected success but got error: no such column: t14.a
+temp_tables.sqltest::temp-table-join-can-distinguish-main-and-temp | expected success but got error: Cross-database statements are not supported by managed ATTACH; every persistent table reference must resolve to one database.
+temp_tables.sqltest::temp-store-memory-still-supports-temp-tables | expected success but got error: Unsupported PRAGMA temp_store. At SQL offset 18.
+temp_tables.sqltest::temp-store-file-still-supports-temp-tables | expected success but got error: Unsupported PRAGMA temp_store. At SQL offset 18.
+temp_tables.sqltest::pragma-temp-wal-checkpoint-without-temp-db-matches-sqlite | expected success but got error: Unsupported PRAGMA wal_checkpoint. At SQL offset 26.
+temp_tables.sqltest::temp-store-change-outside-transaction-resets-temp-schema | expected success but got error: Unsupported PRAGMA temp_store. At SQL offset 18.
+temp_tables.sqltest::temp-store-change-survives-rollback-before-temp-db-exists | expected success but got error: Unsupported PRAGMA temp_store. At SQL offset 18.
+temp_tables_mvcc.sqltest::pragma-temp-journal-mode-mvcc-is-ignored | expected 2 row(s), got 2 row(s); row 0 expected 'wal' but was 'memory'
+temp_tables_mvcc.sqltest::begin-concurrent-still-fails-after-temp-journal-mode-mvcc | error 'Expected End. At SQL offset 6.' does not match pattern 'Concurrent transaction mode is only supported when MVCC is enabled'
+temp_tables_mvcc.sqltest::temp-autoincrement-is-allowed-when-main-db-is-mvcc | expected 3 row(s), got 3 row(s); row 0 expected 'mvcc' but was 'wal'
+total-changes.sqltest::total-changes-includes-trigger-body-rows | expected 1 row(s), got 1 row(s); row 0 expected '2' but was '1'
+total-changes.sqltest::total-changes-includes-fk-cascade-rows | expected 2 row(s), got 2 row(s); row 1 expected '4' but was '3'
+transactions.sqltest::temp-and-main-table-in-immediate-tx | expected success but got error: Cross-database statements are not supported by managed ATTACH; every persistent table reference must resolve to one database.
+trigger-before-insert-affinity.sqltest::when-rowid-alias-keeps-integer-affinity | expected 1 row(s), got 0 row(s)
+trigger-before-insert-affinity.sqltest::rowid-keeps-integer-affinity | expected 1 row(s), got 0 row(s)
+trigger.sqltest::trigger-when-rowid-alias-string-literal-affinity | expected 1 row(s), got 0 row(s)
+trigger.sqltest::trigger-raise-shorthand | error 'Expected ROLLBACK, ABORT, FAIL, or IGNORE in RAISE(). At SQL offset 81.' does not match pattern 'shorthand abort'
+trigger.sqltest::trigger-raise-expr-concat | error 'Expected RightParen. At SQL offset 118.' does not match pattern 'bad: -5'
+trigger.sqltest::trigger-raise-expr-concat-pass | expected success but got error: Expected RightParen. At SQL offset 120.
+trigger.sqltest::trigger-raise-fail-expr | error 'Expected RightParen. At SQL offset 127.' does not match pattern 'invalid value: -10'
+trigger.sqltest::trigger-raise-rollback-expr | error 'Expected RightParen. At SQL offset 126.' does not match pattern 'rollback: -1'
+trigger.sqltest::trigger-raise-expr-case | error 'RAISE() error messages must be string literals. At SQL offset 110.' does not match pattern 'bad'
+trigger_attach_regression.sqltest::trigger-cross-db-subquery-reject | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_cross_subquery cannot reference objects in database aux
+trigger_attach_regression.sqltest::trigger-cross-db-when-subquery-reject | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_cross_when cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-explicit-main-qualification | expected success but got error: Managed persistent trigger bodies cannot reference another database schema.
+trigger_attach_regression.sqltest::trigger-attached-db-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::drop-trigger-finds-attached-trigger-without-qualifier | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::trigger-attached-db-cross-to-main-reject | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_aux_cross cannot reference objects in database main'
+trigger_attach_regression.sqltest::trigger-cross-db-nested-subquery-in-insert | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_ins_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-update-set-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_upd_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-delete-where-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_del_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-cte | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_cte_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-compound | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_cmp_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-from-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_fsub_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-join | error 'Expected Semicolon. At SQL offset 114.' does not match pattern 'trigger trg_join_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-doubly-qualified-expr-runtime-error | error 'Expected RightParen. At SQL offset 109.' does not match pattern 'no such column'
+trigger_attach_regression.sqltest::trigger-cross-db-in-select | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_in_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-doubly-qualified-when-runtime-error | error 'Expected keyword BEGIN. At SQL offset 62.' does not match pattern 'no such column'
+trigger_attach_regression.sqltest::trigger-cross-attached-dbs | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_cross_aux cannot reference objects in database aux2'
+trigger_attach_regression.sqltest::trigger-attached-db-explicit-self-qualification | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::trigger-cross-db-second-cmd | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_multi_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-before-trigger | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_before_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-update-trigger | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_utrig_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-delete-trigger | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_dtrig_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-update-of-trigger | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_uof_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-except | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_exc_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-intersect | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_int_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-deep-nested | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_deep_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-case-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_case_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-coalesce-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_coal_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-in-join-on-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_jon_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-having-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_hav_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-orderby-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_ord_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-limit-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_lim_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-select-where-subquery | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_sw_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-cross-db-insert-select-from | error 'Managed ATTACH requires a file-backed managed primary database so attachments share its file system.' does not match pattern 'trigger trg_isel_cross cannot reference objects in database aux'
+trigger_attach_regression.sqltest::trigger-attached-db-before-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::trigger-attached-db-update-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::trigger-attached-db-delete-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::trigger-attached-db-multi-cmd-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::trigger-attached-db-subquery-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::trigger-attached-db-explicit-qual-subquery | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_attach_regression.sqltest::trigger-attached-db-cte-same-db | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+trigger_namespace.sqltest::trigger-same-name-as-table | expected success but got error: there is already a table named t
+trigger_namespace.sqltest::trigger-same-name-as-other-table | expected success but got error: there is already a table named other
+trigger_namespace.sqltest::trigger-same-name-as-index | expected success but got error: there is already an index named idx
+trigger_namespace.sqltest::trigger-if-not-exists-same-name-as-table | expected success but got error: there is already a table named t
+trigger_namespace.sqltest::trigger-same-name-as-view | expected success but got error: there is already a view named v
+trigger_namespace.sqltest::drop-trigger-with-same-name-as-table | expected success but got error: there is already a table named t
+trigger_namespace.sqltest::multiple-triggers-sharing-names-with-tables | expected success but got error: there is already a table named a
+trigger_on_conflict.sqltest::trigger-upsert-new-column | expected success but got error: no such table: NEW
+trigger_on_conflict.sqltest::trigger-upsert-new-in-where | expected success but got error: no such table: NEW
+trigger_on_conflict.sqltest::trigger-upsert-new-in-where-no-update | expected success but got error: no such table: NEW
+update-from.sqltest::update-from-returning-reuses-row-cte-snapshot-after-trigger-mutation | expected 3 row(s), got 3 row(s); row 1 expected '2/100' but was '2/2'
+update-from.sqltest::update-from-indexed-by-target-hint-is-preserved | expected success but got error: Managed UPDATE does not support INDEXED BY or NOT INDEXED. At SQL offset 9.
+update-from.sqltest::update-from-attached-constant-where-literal-set | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+update-from.sqltest::update-from-attached-constant-where-zero | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+update-from.sqltest::update-from-attached-constant-where-one | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+update-from.sqltest::update-from-attached-constant-where-noop-set | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+update.sqltest::update-set-expression-missing-identifier | expected an error but the statement succeeded
+update.sqltest::update-integer-pk-underflow-error | expected an error but the statement succeeded
+update_attached_db_index.sqltest::update-attached-db-rowid-change-with-unique-index | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+update_attached_db_index.sqltest::update-attached-db-rowid-with-where-subquery | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+update_attached_db_index.sqltest::update-attached-db-integrity-after-rowid-change | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+update_attached_db_index.sqltest::update-attached-db-non-rowid-column | expected success but got error: Managed ATTACH requires a file-backed managed primary database so attachments share its file system.
+update_expression_index.sqltest::substr-expression-index | expected success but got error: non-deterministic functions are prohibited in index expressions
+upsert.sqltest::upsert-select-single | expected success but got error: Managed UPSERT supports VALUES rows only and does not support INSERT ... SELECT or CTE sources.
+upsert.sqltest::upsert-multilple-conflict-targets | expected success but got error: Expected End. At SQL offset 183.
+upsert.sqltest::upsert-qualified-target | expected success but got error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint on table qt.
+upsert.sqltest::upsert-current-qualified_1 | expected success but got error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint on table dq.
+upsert.sqltest::upsert-doubly-qualified-target | expected success but got error: Unexpected token in index expression. At SQL offset 57.
+upsert.sqltest::upsert-targets-chain | expected success but got error: Expected End. At SQL offset 215.
+upsert.sqltest::upsert-unresolved-table-reference | error 'no such table: other' does not match pattern '.*no such column.*'
+upsert.sqltest::upsert-unresolved-table-in-where | error 'no such table: other' does not match pattern '.*no such column.*'
+upsert.sqltest::upsert-conflict-target-nulls-first-rejected | error 'Unexpected token in index expression. At SQL offset 52.' does not match pattern 'NULLS'
+view-rowid.sqltest::view-rowid-order-by-index | expected an error but the statement succeeded
+view-rowid.sqltest::view-rowid-select | expected an error but the statement succeeded
+views.sqltest::view-rejects-aggregate-order-by | error 'ORDER BY within aggregate functions is not supported by the managed engine. At SQL offset 32.' does not match pattern 'ORDER BY clause is not supported yet in aggregate functions'
+views.sqltest::view-mutual-circle-detection | error 'no such table: vv' does not match pattern 'view v is circularly defined'
+views.sqltest::view-reserved-prefix-sqlite | expected an error but the statement succeeded
+where/memory.sqltest::where_alias_precedence_3 | expected success but got error: no such column: lmao
+window/dense_rank.sqltest::dense-rank-collate-nocase-peers | expected 4 row(s), got 4 row(s); row 1 expected 'apple/1' but was 'apple/3'
+window/dense_rank.sqltest::dense-rank-cross-type-numeric-peers | expected 6 row(s), got 6 row(s); row 0 expected 'zero/1' but was 'int/2'
+window/dense_rank.sqltest::dense-rank-float-precision-not-peers | expected 3 row(s), got 3 row(s); row 0 expected '2/1' but was '1/2'
+window/dense_rank.sqltest::dense-rank-infinities | expected 5 row(s), got 5 row(s); row 0 expected 'ninf/1' but was 'inf/4'
+window/dense_rank.sqltest::dense-rank-storage-class-ordering | expected 6 row(s), got 6 row(s); row 2 expected 'empty/3' but was 'text/4'
+window/dense_rank.sqltest::dense-rank-nocase-folds-ascii-only | expected 5 row(s), got 5 row(s); row 2 expected '5/3' but was '3/5'
+window/dense_rank.sqltest::dense-rank-column-declared-collation | expected 3 row(s), got 3 row(s); row 0 expected '2/1/1' but was '1/2/2'
+window/dense_rank.sqltest::dense-rank-over-dense-rank | expected success but got error: Expected RightParen. At SQL offset 92.
+window/dense_rank.sqltest::dense-rank-inside-expressions | expected 4 row(s), got 4 row(s); row 0 expected '105/first' but was '305/rest'
+window/dense_rank.sqltest::dense-rank-union-all-branches | expected 8 row(s), got 8 row(s); row 0 expected '1' but was '3'
+window/dense_rank.sqltest::dense-rank-multikey-mixed-directions | expected 5 row(s), got 5 row(s); row 0 expected '2/1/1' but was '1/1/2'
+window/dense_rank.sqltest::dense-rank-partitioned-volume-checksum | expected success but got error: Expected RightParen. At SQL offset 115.
+window/distinct.sqltest::distinct-with-order-by | expected success but got error: Expected End. At SQL offset 41.
+window/filter-over.sqltest::filter-over-scalar-function-rejected | error 'ABS is not a supported window function' does not match pattern 'may not be used as a window function'
+window/filter-over.sqltest::filter-over-repeated-nondeterministic-call | expected success but got error: no such function: TEST_NONDET_COUNTER
+window/filter-over.sqltest::filter-over-mixed-deterministic-and-nondeterministic-dedup | expected success but got error: no such function: TEST_NONDET_COUNTER
+window/first_last_value.sqltest::first-last-value-desc-hex-roundtrip | expected 5 row(s), got 5 row(s); row 0 expected '3432/3432' but was '3432/'
+window/first_last_value.sqltest::first-last-value-null-keys-nulls-last | expected 4 row(s), got 4 row(s); row 0 expected 'a/a/a' but was 'n1/a/n2'
+window/first_last_value.sqltest::first-last-value-column-declared-collation | expected 3 row(s), got 3 row(s); row 0 expected '1/1/1' but was '1/2/1'
+window/first_last_value.sqltest::first-last-value-case-expression-argument | expected 4 row(s), got 4 row(s); row 1 expected '30/20' but was '30/-1'
+window/first_last_value.sqltest::first-last-value-arg-is-key | expected 4 row(s), got 4 row(s); row 0 expected '1/1' but was '3/3'
+window/first_last_value.sqltest::first-last-value-over-row-number | expected success but got error: Expected RightParen. At SQL offset 146.
+window/first_last_value.sqltest::first-last-value-union-all-branches | expected 8 row(s), got 8 row(s); row 4 expected '1' but was '3'
+window/first_last_value.sqltest::first-last-value-generate-series-source | expected 7 row(s), got 7 row(s); row 0 expected '3/3' but was '3/1'
+window/first_last_value.sqltest::first-last-value-fat-values-checksum | expected success but got error: Expected RightParen. At SQL offset 90.
+window/lag_lead.sqltest::lag-lead-negative-offset-multi | expected 5 row(s), got 5 row(s); row 0 expected '1//' but was '1/4/'
+window/lag_lead.sqltest::lag-with-null-partition | expected 5 row(s), got 5 row(s); row 0 expected '/3/' but was 'a/1/'
+window/lag_lead.sqltest::lag-lead-per-row-mixed-sign-offset | expected 5 row(s), got 5 row(s); row 2 expected '3/-2//1' but was '3/-2/5/1'
+window/memory.sqltest::window-collate-partition-by | expected 3 row(s), got 3 row(s); row 1 expected 'apple/2' but was 'banana/1'
+window/memory.sqltest::window-collate-order-by | expected 3 row(s), got 3 row(s); row 0 expected 'Apple/2' but was 'Apple/1'
+window/memory.sqltest::window-row-number-nulls-in-order-by | expected 5 row(s), got 5 row(s); row 1 expected '3//2' but was '2/10/3'
+window/memory.sqltest::window-row-number-nulls-in-partition-by | expected 5 row(s), got 5 row(s); row 0 expected '5//1' but was '1/x/1'
+window/memory.sqltest::window-row-number-in-check-constraint | error 'aggregate and window functions are prohibited in CHECK constraints' does not match pattern 'misuse of window function ROW_NUMBER()'
+window/multi-window-ordering.sqltest::empty-over-first-then-ordered-then-partitioned | expected 5 row(s), got 5 row(s); row 0 expected 'c/50/1/1/1' but was 'a/10/1/5/1'
+window/nth_value.sqltest::nth-value-limit-stops-before-late-invalid-n | expected success but got error: second argument to nth_value must be a positive integer
+window/nth_value.sqltest::nth-value-unicode-whitespace-n-errors | expected an error but the statement succeeded
+window/nth_value.sqltest::nth-value-large-peer-group-uses-temp-storage | setup 'nth_large_peer' failed: Unsupported PRAGMA temp_store. At SQL offset 17.
+window/nth_value.sqltest::nth-value-return-cursor-survives-growing-buffer | setup 'nth_large_peer' failed: Unsupported PRAGMA temp_store. At SQL offset 17.
+window/ntile.sqltest::ntile-order-by-desc | expected 10 row(s), got 10 row(s); row 0 expected '10/1' but was '1/3'
+window/ntile.sqltest::ntile-n-text-prefix-coerces | expected success but got error: argument of ntile must be a positive integer
+window/ntile.sqltest::ntile-remainder-front-loaded | expected success but got error: Expected RightParen. At SQL offset 59.
+window/ntile.sqltest::ntile-n-scientific-text-is-integer-prefix | expected 4 row(s), got 4 row(s); row 1 expected '2/1' but was '2/2'
+window/ntile.sqltest::ntile-n-blob-read-as-text | expected success but got error: argument of ntile must be a positive integer
+window/rank.sqltest::rank-collate-nocase-peers | expected 4 row(s), got 4 row(s); row 1 expected 'apple/1' but was 'apple/3'

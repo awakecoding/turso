@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="src/Turso.Core/Turso.Core.csproj" />
+  <Project Path="src/Turso.Data/Turso.Data.csproj" />
+  <Project Path="src/Turso.Data.Sqlite/Turso.Data.Sqlite.csproj" />
+  <Project Path="src/Turso.EntityFrameworkCore.Sqlite/Turso.EntityFrameworkCore.Sqlite.csproj" />
+  <Project Path="src/Turso.Tests/Turso.Tests.csproj" />
+  <Project Path="src/Benchmarks/Benchmarks.csproj" />
+  <Project Path="src/ConsumerBenchmarks/ConsumerBenchmarks.csproj" />
+</Solution>
